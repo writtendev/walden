@@ -63,6 +63,40 @@ jobs:
             exit 1
           fi
 
+      - name: Dependency guard (standard-library maximalism)
+        run: |
+          # walden enforces standard-library maximalism. Zero external dependencies.
+          # Adding a dependency requires explicitly editing this allowlist in the same commit.
+          ALLOWED_MODULES=("github.com/writtendev/walden")
+
+          MODULES="$(go list -m -f '{{.Path}}' all)"
+          echo "Discovered modules:"
+          echo "${MODULES}"
+
+          for MOD in ${MODULES}; do
+            ALLOWED=false
+            for OK in "${ALLOWED_MODULES[@]}"; do
+              if [ "${MOD}" = "${OK}" ]; then
+                ALLOWED=true
+                break
+              fi
+            done
+            if [ "${ALLOWED}" != "true" ]; then
+              echo "Error: unauthorized external dependency found in go.mod: ${MOD}"
+              echo "walden enforces zero external dependencies outside the standard library."
+              echo "Adding a dependency requires editing the dependency guard allowlist in CI."
+              exit 1
+            fi
+          done
+
+          # Assert go.mod contains no require directive unless allowlist is expanded
+          if grep -qE '^\s*require\b' go.mod; then
+            if [ "${#ALLOWED_MODULES[@]}" -le 1 ]; then
+              echo "Error: require directive found in go.mod with empty external dependency allowlist"
+              exit 1
+            fi
+          fi
+
       - name: Vet
         run: go vet ./...
 
@@ -71,3 +105,4 @@ jobs:
 
       - name: Test (-race)
         run: go test -race -v ./...
+

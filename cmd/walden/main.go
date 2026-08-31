@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/writtendev/walden/internal/config"
 )
@@ -50,20 +51,37 @@ func run(args []string, stdout, stderr io.Writer) error {
 		printUsage(stdout)
 		return nil
 	default:
+		if strings.HasPrefix(args[1], "-") {
+			return runServe(args[1:], stdout, stderr)
+		}
 		return fmt.Errorf("unknown command: %s (run 'walden help' for usage)", args[1])
 	}
 }
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  walden serve         Start the walden git server
-  walden token <cmd>   Manage authentication tokens
-  walden pre-receive   Execute journal pre-receive hook
-  walden version       Show version information`)
+  walden serve [flags]  Start the walden git server
+  walden token <cmd>    Manage authentication tokens
+  walden pre-receive    Execute journal pre-receive hook
+  walden version        Show version information
+
+Flags for serve:
+  --data-dir PATH       Path to bare git repository storage (default: /data, env: WALDEN_DATA_DIR)
+  --journal URL         S3 URL for write-ahead journal (default: off, env: WALDEN_JOURNAL)
+  --auth-trust KEY      Public key for delegated token verification (default: off, env: WALDEN_AUTH_TRUST)
+  --listen ADDR         HTTP listen address (default: :8470, env: WALDEN_LISTEN_ADDR)
+  --print-config        Print resolved configuration and exit`)
 }
 
 func runServe(args []string, stdout, stderr io.Writer) error {
-	cfg := config.LoadFromEnv()
+	cfg, printConfig, err := config.Load(args)
+	if err != nil {
+		return err
+	}
+	if printConfig {
+		fmt.Fprintln(stdout, cfg.String())
+		return nil
+	}
 	fmt.Fprintf(stdout, "walden server starting on %s (data: %s)\n", cfg.ListenAddr, cfg.DataDir)
 	return nil
 }

@@ -30,22 +30,22 @@ walden is a storage layer, and only a storage layer.
     └──────────────────┬──────────────────────────┘
                        │ append-only journal
     ┌──────────────────▼──────────────────────────┐
-    │  object storage (any S3-compatible bucket)  │
+    │  object storage (requires compare-and-swap) │
     └─────────────────────────────────────────────┘
 
 walden never learns who its users are, how repositories relate to each other,
 or what the commits mean. Any richer model — accounts, teams, human-readable
 names — belongs to the layer above and must compile down to walden's entire
-vocabulary: _token T may read/write repo ID R_. walden is independently
+vocabulary: _token T may read/write/create repo R_. walden is independently
 useful with nothing above it at all; anything above it can treat walden as an
 ordinary git remote, because that is what it is.
 
 ## Repository model
 
-- Flat namespace of opaque repo IDs (e.g. `r_8f3a…`). No nesting, no owners.
+- A flat namespace of caller-chosen identifiers, no nesting, no hierarchy.
 - Each repo is an ordinary bare git repository on the data volume.
-- Repos are created implicitly on first authorized push (can be disabled).
-- walden serves exactly two protocol operations per repo:
+- Repos are created implicitly on first authorized push carrying the `c` (create) scope.
+- walden serves exactly three routes per repo:
   - `GET  /{repo}/info/refs` — ref advertisement
   - `POST /{repo}/git-upload-pack` — fetch/clone
   - `POST /{repo}/git-receive-pack` — push
@@ -59,6 +59,19 @@ git, where it belongs.
 
 The journal is the design. Everything else is plumbing around it.
 
+The journal is organized into append-only **streams** identified by
+`(stream-id, seq)` rather than per-repo journals. A repository is one stream.
+The instance's own configuration state — the token table and key rotations —
+is recorded in a second stream, the **meta stream**.
+
+The server's signing identity is born with the journal (as its genesis record)
+and lives in it. Journal signing provides tamper-evidence of history, not
+protection from a malicious server — a server that wants to lie can sign its
+lies.
+
+Object storage requires compare-and-swap (conditional write) support from the
+bucket provider; see the provider support table in [spec/](spec/).
+
 ### What gets written
 
 Every accepted push appends two kinds of immutable record to the bucket:
@@ -66,8 +79,9 @@ Every accepted push appends two kinds of immutable record to the bucket:
 1. **Pack segments.** The packfile the client sent, stored verbatim,
    content-addressed. walden already has these bytes in hand; journaling them
    costs one PUT.
-2. **Ref transactions.** A small record: repo ID, sequence number, and the
-   set of ref updates ("`refs/heads/main`: X → Y"), signed by the server.
+2. **Ref transactions.** A small record: stream ID, sequence number, and the
+   set of ref updates ("`refs/heads/main`: X → Y"), signed by the server's
+   signing identity.
 
 Nothing on the write path is ever mutated or deleted. Garbage collection and
 repacking on the _local_ disk are irrelevant to durability — they are cache
@@ -88,7 +102,7 @@ latency-tolerant; lost commits are none of those things.
 
 ### Fencing (single-writer safety)
 
-Exactly one walden process may append to a given repo's journal at a time.
+Exactly one walden process may append to a given stream at a time.
 The journal itself is the arbiter: every ref-transaction append is a
 **conditional put** carrying the expected previous sequence number. A stale
 writer — a process presumed dead that isn't, a second instance started by
@@ -101,7 +115,7 @@ before it is trusted with anyone's bytes.
 
 ### Compaction
 
-A background task periodically writes a consolidated snapshot pack per repo
+A background task periodically writes a consolidated snapshot pack per stream
 plus a "replay from here" marker, so that materialization does not require
 replaying all of history. Compaction runs off the critical path, writes new
 objects before publishing the marker, and may retain superseded segments for
@@ -109,7 +123,7 @@ months — object storage is nearly free, and paranoia is on brand.
 
 ### Materialization
 
-Given an empty data directory, walden lists the journal, replays each repo —
+Given an empty data directory, walden lists the journal, replays each stream —
 apply snapshot, fetch pack segments in order, apply ref transactions — then
 verifies (`git fsck`, refs identical to the journal head) and marks the repo
 ready. This is the boot path, the restore path, and the migration path,
@@ -122,16 +136,16 @@ times before it is ever needed in anger.
 
 ## Auth
 
-One question, one pluggable answer: _may this token read/write this repo?_
+One question, one pluggable answer: _may this token read, write, or create this repo?_
 
 - **Built-in mode (default).** Tokens are minted by the server's own CLI
   (`walden token create --allow 'rw:*'`), stored hashed in a small local
-  store (journaled, so restore restores your tokens too). Scopes are
-  read/write against repo-name globs. No accounts, no email, no OAuth — a
-  token list is the entire identity model.
+  store (journaled to the meta stream, so restore restores your tokens too).
+  Scopes are read/write/create (`r`, `w`, `c`) against repo-name globs. No
+  accounts, no email, no OAuth — a token list is the entire identity model.
 - **Delegated mode.** walden is given one public key
   (`WALDEN_AUTH_TRUST=<key>`) and accepts signed capability tokens minted by
-  an external system: "bearer may write r_8f3a until <time>." Verification
+  an external system: "bearer may write repo-name until <time>." Verification
   is local; no callback, no network dependency — the issuing system can be
   down and git keeps working. Revocation is lazy by TTL, so capabilities are
   short-lived. What that external system is — an identity provider, a forge,

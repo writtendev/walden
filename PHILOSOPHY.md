@@ -33,8 +33,8 @@ walden's entire job, stated in one paragraph:
 
 It speaks git's smart HTTP protocol for exactly two verbs: `upload-pack`
 (fetch/clone) and `receive-pack` (push). Before serving anything, it answers
-one question: does this token grant read or write on this repository? Every
-accepted write is recorded in an append-only journal in object storage
+one question: does this token grant read, write, or create on this repository?
+Every accepted write is recorded in an append-only journal in object storage
 _before_ the push is acknowledged. Given an empty disk and a journal, walden
 rebuilds everything. That's it.
 

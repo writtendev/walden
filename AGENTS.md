@@ -20,23 +20,52 @@ one-line `@AGENTS.md` imports, so every toolchain reads the same text
 and there is nothing to keep in sync. Edit AGENTS.md; leave the two
 stubs alone. Same pattern as lerp/ and writ/.
 
+## How we work
+
+Every change starts from a Linear ticket. There is no cold, ticket-less
+work — if it's worth doing, it's worth a ticket first.
+
+1. Claim the ticket and move it to **In Progress** at the start of the
+   session, not the end.
+2. Implement in a dedicated git worktree, never directly on `main` or
+   a shared checkout.
+3. Commit the change there.
+4. Push the branch and open a PR.
+5. Wait for CI (plain GitHub Actions) to go green before asking for
+   review.
+6. From there it's human review: merged as-is, amended, or sent back.
+   The agent's job ends at a green, reviewable PR — it does not merge
+   its own work.
+
+## Mechanical review rules
+
+Code review is mechanical against these rules:
+
+- **No dependencies outside the standard library.** Standard-library
+  maximalism (`net/http`, `crypto`, `os/exec`). Dependencies approach
+  zero; the object storage client is owned outright.
+- **No sixth knob.** walden's configuration surface is five knobs: data
+  directory, journal URL, trust key, listen port, and token CLI.
+- **No meaning in the storage layer.** Accounts, teams, pull requests,
+  issues, and webhooks belong above walden. walden is authenticated,
+  journaled bytes.
+- **A spec change requires a fixture change in the same commit.**
+  Changes to format or protocol specs under `spec/` must include
+  corresponding golden fixtures.
+- **Wrap git; never reimplement pack handling, delta resolution, or
+  protocol negotiation.** Exec the real `git` binary as a subprocess.
+- **Every operator-facing refusal is one line.** When walden refuses an
+  operation or detects a conflict, it states the reason in one line and
+  stops — never guesses.
+
 ## House rules
 
-- Boring, small, direct. Standard-library maximalism — net/http,
-  crypto, os/exec cover nearly everything walden does. Dependencies
-  approach zero; a new one needs a reason strong enough to survive
-  PHILOSOPHY.md's "five knobs" bar.
-- Wrap git, never reimplement it. Pack handling, delta resolution, and
-  protocol negotiation live in the real `git` binary, execed as a
-  subprocess — not in this codebase.
-- Treat scope growth, speculative abstraction, and framework-building
-  as bugs. walden is a storage layer and only a storage layer; feature
-  requests that add meaning to it belong above it, not in it.
+- Boring, small, direct. Standard-library maximalism.
 - Match the style of surrounding code. Write it like it's already old:
   it should read the same to a Go programmer in ten years as it does
   today.
-- Failures must be legible. When walden refuses or loses a race, it
-  detects it, says so in one line, and stops — never guesses.
+- Treat scope growth, speculative abstraction, and framework-building
+  as bugs.
 - When you file a Linear ticket, set a priority and an estimate — your
   best judgment, stated once, not discussed.
 

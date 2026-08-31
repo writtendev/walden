@@ -363,3 +363,37 @@ func TestNoExternalDependencies(t *testing.T) {
 		t.Fatalf("error checking dependencies: %v", err)
 	}
 }
+
+// TestGoModNoExternalDependencies verifies that go.mod contains no external dependencies.
+func TestGoModNoExternalDependencies(t *testing.T) {
+	goModPath := filepath.Join("..", "..", "go.mod")
+	data, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("failed to read go.mod: %v", err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	inRequireBlock := false
+	for lineNum, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		if trimmed == "require (" {
+			inRequireBlock = true
+			t.Errorf("go.mod:%d: unauthorized require block found; no external dependencies permitted", lineNum+1)
+			continue
+		}
+		if inRequireBlock {
+			if trimmed == ")" {
+				inRequireBlock = false
+			} else {
+				t.Errorf("go.mod:%d: unauthorized require entry %q found; no external dependencies permitted", lineNum+1, trimmed)
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "require ") {
+			t.Errorf("go.mod:%d: unauthorized require directive %q found; no external dependencies permitted", lineNum+1, trimmed)
+		}
+	}
+}

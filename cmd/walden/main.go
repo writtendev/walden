@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/writtendev/walden/internal/config"
+	"github.com/writtendev/walden/internal/githttp"
 	"github.com/writtendev/walden/internal/refusal"
 )
 
@@ -75,6 +77,12 @@ Flags for serve:
 }
 
 func runServe(args []string, stdout, stderr io.Writer) error {
+	ctx := context.Background()
+	gitVer, err := githttp.AssertGitFloor(ctx, githttp.MinGitVersion)
+	if err != nil {
+		return err
+	}
+
 	cfg, printConfig, err := config.Load(args)
 	if err != nil {
 		return err
@@ -83,7 +91,7 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stdout, cfg.String())
 		return nil
 	}
-	fmt.Fprintf(stdout, "walden server starting on %s (data: %s)\n", cfg.ListenAddr, cfg.DataDir)
+	fmt.Fprintf(stdout, "walden server starting on %s (data: %s, git: %s)\n", cfg.ListenAddr, cfg.DataDir, gitVer)
 	return nil
 }
 

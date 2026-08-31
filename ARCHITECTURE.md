@@ -160,13 +160,22 @@ interface.
 The complete list. A sixth knob requires amending this document, which is
 intended as friction.
 
-| Knob                | Meaning                                     | Default            |
-| ------------------- | ------------------------------------------- | ------------------ |
-| data directory      | where bare repos (the cache) live           | `/data`            |
-| `WALDEN_JOURNAL`    | S3-style URL; presence enables the journal  | off (loud warning) |
-| `WALDEN_AUTH_TRUST` | public key; presence enables delegated auth | built-in tokens    |
-| listen port         | HTTP listen address                         | `:8470`            |
-| token CLI           | `walden token create/list/revoke`           | —                  |
+| Knob                | Flag           | Environment Variable | Meaning                                     | Default            |
+| ------------------- | -------------- | -------------------- | ------------------------------------------- | ------------------ |
+| data directory      | `--data-dir`   | `WALDEN_DATA_DIR`    | where bare repos (the cache) live           | `/data`            |
+| `WALDEN_JOURNAL`    | `--journal`    | `WALDEN_JOURNAL`     | S3-style URL; presence enables the journal  | off (loud warning) |
+| `WALDEN_AUTH_TRUST` | `--auth-trust` | `WALDEN_AUTH_TRUST`  | public key; presence enables delegated auth | built-in tokens    |
+| listen address      | `--listen`     | `WALDEN_LISTEN_ADDR` | HTTP listen address                         | `:8470`            |
+| token CLI           | —              | —                    | `walden token create/list/revoke`           | —                  |
+
+Configuration resolves through a single documented precedence order:
+1. **CLI flag** (highest priority)
+2. **Environment variable**
+3. **Default value** (lowest priority)
+
+Every invalid value produces a single-line error naming the knob and stops
+immediately. Running `walden serve --print-config` displays the resolved
+configuration set and exits without starting the server.
 
 Zero-config boot is a working (journal-less) git server that prints a
 one-time admin token to stdout on first start.

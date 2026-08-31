@@ -38,6 +38,30 @@ func TestRunUsageAndVersion(t *testing.T) {
 			wantOutSub: "walden server starting",
 		},
 		{
+			name:       "serve-print-config-default",
+			args:       []string{"walden", "serve", "--print-config"},
+			wantErr:    false,
+			wantOutSub: "data-dir: /data\njournal: (disabled)\nauth-trust: (builtin)\nlisten: :8470",
+		},
+		{
+			name:       "serve-print-config-custom-flags",
+			args:       []string{"walden", "serve", "--data-dir", "/custom/data", "--listen", ":9090", "--print-config"},
+			wantErr:    false,
+			wantOutSub: "data-dir: /custom/data\njournal: (disabled)\nauth-trust: (builtin)\nlisten: :9090",
+		},
+		{
+			name:       "serve-direct-flag-print-config",
+			args:       []string{"walden", "--print-config"},
+			wantErr:    false,
+			wantOutSub: "data-dir: /data\njournal: (disabled)\nauth-trust: (builtin)\nlisten: :8470",
+		},
+		{
+			name:       "serve-invalid-listen-flag",
+			args:       []string{"walden", "serve", "--listen", "not-a-port"},
+			wantErr:    true,
+			wantErrSub: "invalid listen:",
+		},
+		{
 			name:       "version",
 			args:       []string{"walden", "version"},
 			wantErr:    false,
@@ -201,7 +225,7 @@ func TestSingleBinaryInCodebase(t *testing.T) {
 }
 
 // TestBinaryArgvDispatch builds the actual walden executable and exercises
-// argv dispatch and symlink execution end-to-end.
+// argv dispatch, symlink execution, flags, and --print-config end-to-end.
 func TestBinaryArgvDispatch(t *testing.T) {
 	tmpDir := t.TempDir()
 	binPath := filepath.Join(tmpDir, "walden")
@@ -222,6 +246,7 @@ func TestBinaryArgvDispatch(t *testing.T) {
 		name       string
 		cmdPath    string
 		args       []string
+		env        []string
 		wantExit0  bool
 		wantOutSub string
 		wantErrSub string
@@ -273,11 +298,36 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			args:      []string{"pre-receive"},
 			wantExit0: true,
 		},
+		{
+			name:       "serve-print-config-flags",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--data-dir", "/test/cache", "--journal", "s3://my-bucket/w", "--listen", ":8888", "--print-config"},
+			wantExit0:  true,
+			wantOutSub: "data-dir: /test/cache\njournal: s3://my-bucket/w\nauth-trust: (builtin)\nlisten: :8888",
+		},
+		{
+			name:       "serve-print-config-env",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--print-config"},
+			env:        append(os.Environ(), "WALDEN_DATA_DIR=/env/dir", "WALDEN_LISTEN_ADDR=:7777"),
+			wantExit0:  true,
+			wantOutSub: "data-dir: /env/dir\njournal: (disabled)\nauth-trust: (builtin)\nlisten: :7777",
+		},
+		{
+			name:       "serve-invalid-config-flag-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--listen", ":invalid-port"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid listen:",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cmd := exec.Command(tt.cmdPath, tt.args...)
+			if tt.env != nil {
+				cmd.Env = tt.env
+			}
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout = &stdout
 			cmd.Stderr = &stderr

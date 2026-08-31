@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} - ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.3'
+          cache: false
+
+      - name: Assert Go toolchain version and architecture
+        run: |
+          EXPECTED_GO="go1.25.3"
+          ACTUAL_GO="$(go version | awk '{print $3}')"
+          echo "Expected Go version: ${EXPECTED_GO}"
+          echo "Actual Go version:   ${ACTUAL_GO}"
+          if [ "${ACTUAL_GO}" != "${EXPECTED_GO}" ]; then
+            echo "Error: Go version mismatch (expected ${EXPECTED_GO}, got ${ACTUAL_GO})"
+            exit 1
+          fi
+
+          GOMOD_GO="$(grep -E '^go [0-9]+\.[0-9]+' go.mod | awk '{print $2}')"
+          if [ "${ACTUAL_GO#go}" != "${GOMOD_GO}" ]; then
+            echo "Error: go.mod version (${GOMOD_GO}) does not match toolchain (${ACTUAL_GO#go})"
+            exit 1
+          fi
+
+          GOOS="$(go env GOOS)"
+          GOARCH="$(go env GOARCH)"
+          echo "Running on ${GOOS}/${GOARCH} (expected linux/${{ matrix.arch }})"
+          if [ "${GOOS}" != "linux" ] || [ "${GOARCH}" != "${{ matrix.arch }}" ]; then
+            echo "Error: runner architecture mismatch (expected linux/${{ matrix.arch }}, got ${GOOS}/${GOARCH})"
+            exit 1
+          fi
+
+      - name: Check formatting (gofmt)
+        run: |
+          UNFORMATTED="$(gofmt -l .)"
+          if [ -n "${UNFORMATTED}" ]; then
+            echo "Error: The following files are not formatted with gofmt:"
+            echo "${UNFORMATTED}"
+            echo "Run 'gofmt -w .' to format."
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test (-race)
+        run: go test -race -v ./...

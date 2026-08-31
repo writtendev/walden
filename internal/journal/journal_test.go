@@ -216,6 +216,11 @@ func TestSpecFixturesLayout(t *testing.T) {
 		t.Errorf("missing fixture: %s", metaToken)
 	}
 
+	metaRotation := filepath.Join(fixturesDir, "streams", "_meta", "tx", "00000000000000000002.json")
+	if _, err := os.Stat(metaRotation); err != nil {
+		t.Errorf("missing fixture: %s", metaRotation)
+	}
+
 	// Verify repo stream fixtures exist
 	repoTx := filepath.Join(fixturesDir, "streams", "repo-alpha", "tx", "00000000000000000000.json")
 	if _, err := os.Stat(repoTx); err != nil {

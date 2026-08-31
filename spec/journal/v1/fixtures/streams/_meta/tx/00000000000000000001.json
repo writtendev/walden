@@ -1,0 +1,9 @@
+{
+  "version": "v1",
+  "stream": "_meta",
+  "seq": 1,
+  "type": "token_create",
+  "token_id": "tok_admin_01",
+  "scope": "rwc:*",
+  "timestamp": "2026-08-31T00:01:00Z"
+}

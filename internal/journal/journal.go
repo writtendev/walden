@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	ErrFenced        = errors.New("fenced: stale writer condition failed")
+	ErrFenced         = errors.New("fenced: stale writer condition failed")
 	ErrStreamNotFound = errors.New("journal stream not found")
 )
 

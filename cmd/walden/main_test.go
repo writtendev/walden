@@ -122,7 +122,7 @@ func TestRunUsageAndVersion(t *testing.T) {
 			name:       "token-missing-subcommand",
 			args:       []string{"walden", "token"},
 			wantErr:    true,
-			wantErrSub: "missing token subcommand (create, list, revoke)",
+			wantErrSub: "missing token subcommand",
 		},
 		{
 			name:       "token-create",
@@ -445,5 +445,101 @@ func TestGoModNoExternalDependencies(t *testing.T) {
 		if strings.HasPrefix(trimmed, "require ") {
 			t.Errorf("go.mod:%d: unauthorized require directive %q found; no external dependencies permitted", lineNum+1, trimmed)
 		}
+	}
+}
+
+// TestNoStackTraceOrWrappedChainToOperator asserts that all CLI error paths produce
+// a single-line refusal and never emit stack traces, panics, or multiline error dumps to stderr.
+func TestNoStackTraceOrWrappedChainToOperator(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "walden")
+
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\nOutput: %s", err, string(out))
+	}
+
+	invalidInvocations := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "unknown-subcommand",
+			args: []string{"nonexistent-cmd"},
+		},
+		{
+			name: "token-missing-subcommand",
+			args: []string{"token"},
+		},
+		{
+			name: "token-unknown-subcommand",
+			args: []string{"token", "invalid-subcmd"},
+		},
+	}
+
+	for _, tc := range invalidInvocations {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(binPath, tc.args...)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			err := cmd.Run()
+			if err == nil {
+				t.Fatalf("expected command %v to fail, but it exited 0", tc.args)
+			}
+
+			errOutput := stderr.String()
+			if errOutput == "" {
+				t.Fatalf("expected stderr output for failed command %v, got empty", tc.args)
+			}
+
+			// Must be prefixed by "walden: "
+			if !strings.HasPrefix(errOutput, "walden: ") {
+				t.Errorf("stderr = %q, expected prefix 'walden: '", errOutput)
+			}
+
+			// Must be strictly one line (excluding trailing newline)
+			trimmed := strings.TrimRight(errOutput, "\r\n")
+			if strings.Contains(trimmed, "\n") || strings.Contains(trimmed, "\r") {
+				t.Errorf("operator error for %v contains multiple lines:\n%s", tc.args, errOutput)
+			}
+
+			// Must not contain stack trace signatures or panics
+			forbiddenSignatures := []string{
+				"goroutine ",
+				"panic:",
+				"runtime.",
+				".go:",
+				"[running]:",
+			}
+			for _, sig := range forbiddenSignatures {
+				if strings.Contains(errOutput, sig) {
+					t.Errorf("operator error contains forbidden stack trace / internal artifact %q: %q", sig, errOutput)
+				}
+			}
+		})
+	}
+}
+
+// TestRefusalConventionFormat asserts that all refusals produced by walden
+// follow the standard format: "<what>: <why> (<fix>)".
+func TestRefusalConventionFormat(t *testing.T) {
+	errUnknown := run([]string{"walden", "invalid"}, &bytes.Buffer{}, &bytes.Buffer{})
+	if errUnknown == nil {
+		t.Fatal("expected error")
+	}
+	errStr := errUnknown.Error()
+	if !strings.Contains(errStr, ": ") || !strings.Contains(errStr, "(") || !strings.HasSuffix(errStr, ")") {
+		t.Errorf("refusal format mismatch: %q (expected '<what>: <why> (<fix>)')", errStr)
+	}
+
+	errToken := run([]string{"walden", "token"}, &bytes.Buffer{}, &bytes.Buffer{})
+	if errToken == nil {
+		t.Fatal("expected error")
+	}
+	tokenErrStr := errToken.Error()
+	if !strings.Contains(tokenErrStr, ": ") || !strings.Contains(tokenErrStr, "(") || !strings.HasSuffix(tokenErrStr, ")") {
+		t.Errorf("refusal format mismatch: %q (expected '<what>: <why> (<fix>)')", tokenErrStr)
 	}
 }

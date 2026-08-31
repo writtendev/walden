@@ -20,6 +20,23 @@ one-line `@AGENTS.md` imports, so every toolchain reads the same text
 and there is nothing to keep in sync. Edit AGENTS.md; leave the two
 stubs alone. Same pattern as lerp/ and writ/.
 
+## How we work
+
+Every change starts from a Linear ticket. There is no cold, ticket-less
+work — if it's worth doing, it's worth a ticket first.
+
+1. Claim the ticket and move it to **In Progress** at the start of the
+   session, not the end.
+2. Implement in a dedicated git worktree, never directly on `main` or
+   a shared checkout.
+3. Commit the change there.
+4. Push the branch and open a PR.
+5. Wait for CI (plain GitHub Actions) to go green before asking for
+   review.
+6. From there it's human review: merged as-is, amended, or sent back.
+   The agent's job ends at a green, reviewable PR — it does not merge
+   its own work.
+
 ## House rules
 
 - Boring, small, direct. Standard-library maximalism — net/http,

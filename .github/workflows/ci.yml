@@ -106,3 +106,28 @@ jobs:
       - name: Test (-race)
         run: go test -race -v ./...
 
+      - name: Build and test container image (pinned git and reproducibility)
+        run: |
+          # Verify Dockerfile builds reproducible container image
+          SOURCE_DATE_EPOCH=0 docker buildx build --no-cache --output type=docker,rewrite-timestamp=true -t walden:build1 .
+          SOURCE_DATE_EPOCH=0 docker buildx build --no-cache --output type=docker,rewrite-timestamp=true -t walden:build2 .
+
+          ID1="$(docker inspect --format '{{.Id}}' walden:build1)"
+          ID2="$(docker inspect --format '{{.Id}}' walden:build2)"
+          echo "Build 1 Image ID: ${ID1}"
+          echo "Build 2 Image ID: ${ID2}"
+
+          if [ "${ID1}" != "${ID2}" ]; then
+            echo "Error: non-reproducible container build (image ID mismatch)"
+            exit 1
+          fi
+
+          # Verify container runs walden serve as PID 1 and asserts pinned git version
+          OUTPUT="$(docker run --rm walden:build1)"
+          echo "Container startup output: ${OUTPUT}"
+
+          if ! echo "${OUTPUT}" | grep -q "walden server starting on :8470 (data: /data, git: 2.47.2)"; then
+            echo "Error: unexpected startup message from container"
+            exit 1
+          fi
+

@@ -1,0 +1,11 @@
+.git
+.claude
+.github
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+.env
+.idea
+.vscode

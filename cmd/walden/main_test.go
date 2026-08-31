@@ -171,6 +171,47 @@ func TestRunUsageAndVersion(t *testing.T) {
 	}
 }
 
+func TestRunServeOutputIncludesGitVersion(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := runServe(nil, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runServe failed: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "walden server starting on :8470") {
+		t.Errorf("expected listen address in output, got %q", out)
+	}
+	if !strings.Contains(out, "git: ") {
+		t.Errorf("expected git version in output, got %q", out)
+	}
+}
+
+func TestRunServeGitFloorRefusal(t *testing.T) {
+	tmpDir := t.TempDir()
+	fakeGit := filepath.Join(tmpDir, "git")
+
+	script := "#!/bin/sh\necho 'git version 2.20.0'\n"
+	if err := os.WriteFile(fakeGit, []byte(script), 0o755); err != nil {
+		t.Fatalf("failed to write fake git script: %v", err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", tmpDir)
+	defer os.Setenv("PATH", origPath)
+
+	var stdout, stderr bytes.Buffer
+	err := runServe(nil, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected runServe to fail when git is below floor, got success")
+	}
+
+	expectedSub := "git version 2.20.0 is below supported floor 2.40.0 (walden requires git >= 2.40.0)"
+	if !strings.Contains(err.Error(), expectedSub) {
+		t.Errorf("expected error %q to contain %q", err.Error(), expectedSub)
+	}
+}
+
 // TestSingleBinaryInCodebase asserts that cmd/walden is the only package main in the codebase,
 // ensuring there are no separate companion binaries or sidecars.
 func TestSingleBinaryInCodebase(t *testing.T) {
@@ -346,6 +387,55 @@ func TestBinaryArgvDispatch(t *testing.T) {
 				t.Errorf("stderr = %q, want substring %q", stderr.String(), tt.wantErrSub)
 			}
 		})
+	}
+}
+
+// TestDockerfilePinsAndEntrypoint parses Dockerfile and asserts pinning and configuration rules.
+func TestDockerfilePinsAndEntrypoint(t *testing.T) {
+	dockerfilePath := filepath.Join("..", "..", "Dockerfile")
+	content, err := os.ReadFile(dockerfilePath)
+	if err != nil {
+		t.Fatalf("failed to read Dockerfile: %v", err)
+	}
+
+	dockerfile := string(content)
+
+	// Assert FROM lines have pinned sha256 digests
+	fromLines := []string{}
+	for _, line := range strings.Split(dockerfile, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "FROM ") {
+			fromLines = append(fromLines, trimmed)
+		}
+	}
+
+	if len(fromLines) < 2 {
+		t.Fatalf("expected multi-stage build with at least 2 FROM lines, found %d", len(fromLines))
+	}
+
+	// Assert builder stage has pinned digest
+	if !strings.Contains(fromLines[0], "@sha256:") {
+		t.Errorf("builder FROM line %q does not pin image by @sha256: digest", fromLines[0])
+	}
+
+	// Assert runtime stage has pinned git image digest
+	if !strings.Contains(fromLines[1], "alpine/git:2.47.2@sha256:") {
+		t.Errorf("runtime FROM line %q does not pin alpine/git:2.47.2 by @sha256: digest", fromLines[1])
+	}
+
+	// Assert ENTRYPOINT is ["walden", "serve"]
+	if !strings.Contains(dockerfile, `ENTRYPOINT ["walden", "serve"]`) {
+		t.Errorf("Dockerfile missing expected ENTRYPOINT [\"walden\", \"serve\"]")
+	}
+
+	// Assert VOLUME is ["/data"]
+	if !strings.Contains(dockerfile, `VOLUME ["/data"]`) {
+		t.Errorf("Dockerfile missing expected VOLUME [\"/data\"]")
+	}
+
+	// Assert EXPOSE 8470
+	if !strings.Contains(dockerfile, `EXPOSE 8470`) {
+		t.Errorf("Dockerfile missing expected EXPOSE 8470")
 	}
 }
 

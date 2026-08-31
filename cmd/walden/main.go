@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/writtendev/walden/internal/config"
+	"github.com/writtendev/walden/internal/refusal"
 )
 
 // Version can be set via ldflags at build time.
@@ -54,7 +55,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if strings.HasPrefix(args[1], "-") {
 			return runServe(args[1:], stdout, stderr)
 		}
-		return fmt.Errorf("unknown command: %s (run 'walden help' for usage)", args[1])
+		return refusal.Refuse("unknown command", args[1], "run 'walden help' for usage")
 	}
 }
 
@@ -88,14 +89,14 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 
 func runToken(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("missing token subcommand (create, list, revoke)")
+		return refusal.Refuse("missing token subcommand", "no action specified", "expected create, list, or revoke")
 	}
 	switch args[0] {
 	case "create", "list", "revoke":
 		fmt.Fprintf(stdout, "walden token %s: not yet implemented\n", args[0])
 		return nil
 	default:
-		return fmt.Errorf("unknown token subcommand: %s (expected create, list, or revoke)", args[0])
+		return refusal.Refuse("unknown token subcommand", args[0], "expected create, list, or revoke")
 	}
 }
 

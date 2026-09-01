@@ -2,7 +2,7 @@
 
 > **Status:** Published Specification (v1)  
 > **Milestone:** M1 · Journal format v1  
-> **Rulings Covered:** Ruling 1 of 5 (Signing Identity & Genesis), Ruling 2 of 5 (Stream Model & Key Layout), Ruling 3 of 5 (Ref-Transaction Records & Payload Canonicalization)
+> **Rulings Covered:** Ruling 1 of 5 (Signing Identity & Genesis), Ruling 2 of 5 (Stream Model & Key Layout), Ruling 3 of 5 (Ref-Transaction Records & Payload Canonicalization), Ruling 4 of 5 (Pack Segments & Content Addressing)
 
 ---
 
@@ -150,7 +150,7 @@ The ref-transaction record is the atomic unit of repository history in walden. E
   "seq": 0,
   "type": "ref_update",
   "segments": [
-    "4a49646b96dbca4f1eb8699ef7cefdcae68fefc6ee7ae6305a3f25c7e1ef5638"
+    "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
   ],
   "updates": [
     {
@@ -160,7 +160,7 @@ The ref-transaction record is the atomic unit of repository history in walden. E
     }
   ],
   "timestamp": "2026-08-31T00:02:00Z",
-  "signature": "ed25519:3785d69cb247493acb68cf2951477fc3aa5e356e1975bfb83d35600785d80062a7feecc289147333cfc8f7c6ff1c0893d311e7d7822471bc157c192cdb31be08"
+  "signature": "ed25519:2ea7c2e8e15acf84573875fd8f94da0dca543fe8080c0a846d126ae3ba0a1a977af7a9fdedd920e8bb16b36c75184638d79e04cfa530b889f76e19a0823d0c07"
 }
 ```
 
@@ -227,7 +227,77 @@ History written in v1 is immutable and permanently verifiable.
 
 ---
 
-## 6. Reader Verification Algorithm
+## 6. Pack Segments and Content Addressing (Ruling 4)
+
+### 6.1 Verbatim Storage and Content Addressing Principle
+Packfiles uploaded by clients during push operations are stored **verbatim and content-addressed** in object storage:
+- **Zero Transformation:** Walden already has the exact packfile byte stream in hand from `git receive-pack`. Journaling them costs exactly one object storage `PUT`. Walden contains no pack decompression, no delta resolution, and no object repacking on the write path.
+- **Content Addressing:** Every pack segment is stored under an object key derived directly and exclusively from the cryptographic hash of its verbatim bytes.
+
+### 6.2 Hash Algorithm
+The content hash algorithm is standard **SHA-256** (`crypto/sha256`):
+- **Input:** The exact, raw packfile byte sequence from byte 0 through the final byte of the packfile (including the 12-byte pack header, all compressed object entries, and the trailing Git checksum).
+- **Encoding:** The hash is represented as exactly 64 lowercase hexadecimal characters matching `^[0-9a-f]{64}$`.
+
+### 6.3 Key Derivation
+The object storage key for a pack segment is deterministically derived as:
+```
+v1/streams/<stream-id>/segments/<sha256>.pack
+```
+- `<stream-id>`: The repository stream identifier (e.g. `repo-alpha`).
+- `<sha256>`: The 64-character lowercase hexadecimal SHA-256 digest of the raw packfile bytes.
+- Extension: `.pack`.
+
+### 6.4 Idempotency & Crash-and-Retry Semantics
+Re-uploading identical pack segment bytes is strictly defined as a **no-op success (idempotent PUT), never an error**:
+- **Crash Safety:** If a server process crashes or network connectivity is interrupted after uploading a pack segment to object storage but *before* the ref-transaction CAS record is appended, the push is unacknowledged. When the client retries the push, Walden uploads the segment again.
+- **Unconditional Write:** Unlike ref-transaction records (`tx/<seq>.json`) which require conditional CAS writes (`If-None-Match: *`), pack segment writes are unconditional. Object storage will overwrite the target key with identical bytes or return success (HTTP 200 OK).
+- **No Conflict:** A duplicate segment upload MUST NOT produce an error, conflict, or precondition refusal. The crash-and-retry durability path depends strictly on this idempotent behavior.
+
+### 6.5 Object Sidecar Metadata and Separation of Concerns
+When storing a pack segment, Walden sets standard HTTP headers and object metadata:
+- **`Content-Type`:** `application/x-git-packed-objects` (the standard MIME type for Git packfiles).
+- **`Content-Length`:** The exact size of the packfile in bytes.
+- **User Metadata Headers:**
+  - `x-amz-meta-walden-stream`: `<stream-id>`
+  - `x-amz-meta-walden-hash`: `<sha256>` (lowercase 64-hex)
+
+#### Separation of Storage and Semantics ("No Meaning in the Storage Layer")
+Per walden's core philosophy, the storage layer holds only authenticated, journaled bytes:
+- Object storage sidecar metadata is restricted strictly to transport and routing identifiers (`stream`, `hash`).
+- **No Semantic Meaning in Object Headers:** No ref names, sequence numbers, commit messages, author information, or branch mappings are stored in object metadata headers or sidecars.
+- **Transaction Sovereignty:** All semantic transitions (ref updates, sequences, and timestamps) are held exclusively in the signed ref-transaction record (`tx/<seq>.json`) that references the segment hash.
+
+### 6.6 Packfile Validation Invariants
+Before appending a pack segment to object storage, the server verifies basic packfile framing rules:
+1. **Header Magic:** The first 4 bytes MUST be ASCII `PACK` (`0x50 0x41 0x43 0x4B`).
+2. **Pack Version:** The next 4 bytes (big-endian `uint32`) MUST be version `2` or `3`.
+3. **Object Count:** The next 4 bytes (big-endian `uint32`) declare the number of objects contained in the pack.
+4. **Minimum Length:**
+   - For SHA-1 repositories: 12-byte header + 20-byte trailing checksum = **32 bytes minimum**.
+   - For SHA-256 repositories: 12-byte header + 32-byte trailing checksum = **44 bytes minimum**.
+   - Packfiles with length $< 32$ bytes are rejected as corrupt.
+5. **Trailing Checksum:** The final 20 bytes (SHA-1) or 32 bytes (SHA-256) of the packfile represent the Git checksum computed over all preceding bytes in the packfile.
+
+### 6.7 Reader & Materialization Verification
+When downloading pack segments during replay, restore, or materialization:
+1. **Hash Verification:** The reader MUST compute the SHA-256 digest over the downloaded bytes and assert equality with the hash referenced in the `ref_update` record.
+2. **Missing Segment Refusal:** If a referenced segment cannot be fetched from object storage, the reader MUST abort immediately with a single-line refusal:
+   ```
+   refusal: replay failed: missing pack segment <sha256> on stream <stream-id> (verify object storage bucket integrity or restore from backup)
+   ```
+3. **Hash Mismatch Refusal:** If downloaded bytes do not match the expected SHA-256 digest:
+   ```
+   refusal: replay failed: segment hash mismatch for <sha256> on stream <stream-id> (computed <actual-sha256>) (pack segment in object storage is corrupt)
+   ```
+4. **Corrupt Packfile Refusal:** If the packfile header magic, version, or length is invalid:
+   ```
+   refusal: replay failed: corrupt pack segment <sha256> on stream <stream-id> (<reason>) (packfile header is malformed)
+   ```
+
+---
+
+## 7. Reader Verification Algorithm
 
 Every reader or recovery engine verifying a journal MUST execute the following deterministic algorithm:
 
@@ -259,15 +329,18 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │    ├── Verify sequence starts at 0 with no gaps        │
 │    ├── For each ref transaction at seq 0, 1, 2, ...:   │
 │    │     Verify type == "ref_update"                   │
-│    │     Verify all segment packfiles exist in storage │
 │    │     Verify ref format and OID transition rules    │
+│    │     For each segment in record.segments:          │
+│    │       Fetch segment from segments/<sha256>.pack   │
+│    │       Verify SHA-256(bytes) == <sha256>           │
+│    │       Verify packfile header (PACK, len >= 32)    │
 │    │     Compute Canonical Ref-Transaction Payload     │
 │    │     Verify Ed25519 signature against ActiveKey    │
 │    └── Track ref states from seq 0 forward             │
 └────────────────────────────────────────────────────────┘
 ```
 
-### 6.1 Verification Failure Rules
+### 7.1 Verification Failure Rules
 1. **Unchainable Rotation:** If `record.old_public_key != ActiveKey`, the rotation does not chain to genesis. The reader MUST abort immediately with a single-line error:
    ```
    refusal: replay failed: key rotation at seq <N> does not chain to active key
@@ -284,18 +357,26 @@ Every reader or recovery engine verifying a journal MUST execute the following d
    ```
    refusal: replay failed: sequence gap detected on stream <id> (expected <E>, got <A>)
    ```
-5. **Never Guess:** Readers MUST never skip unverified or unchainable records. Partial or guessed recovery is strictly prohibited.
+5. **Missing Segment:** If a referenced pack segment does not exist in storage:
+   ```
+   refusal: replay failed: missing pack segment <sha256> on stream <id> (verify object storage bucket integrity or restore from backup)
+   ```
+6. **Segment Hash Mismatch:** If downloaded pack segment bytes fail SHA-256 verification:
+   ```
+   refusal: replay failed: segment hash mismatch for <sha256> on stream <id> (computed <actual>) (pack segment in object storage is corrupt)
+   ```
+7. **Never Guess:** Readers MUST never skip unverified, unchainable, or missing records. Partial or guessed recovery is strictly prohibited.
 
 ---
 
-## 7. Stream Model and Key Space Layout (Ruling 2)
+## 8. Stream Model and Key Space Layout (Ruling 2)
 
-### 7.1 Stream Partitioning
+### 8.1 Stream Partitioning
 - **Repository Streams:** Each repo is one stream with caller-chosen ID matching `^[a-zA-Z0-9._-]+$` (max 255 bytes). Sequence starts at `0` upon first push.
 - **The Meta Stream (`_meta`):** Reserved for server identity, key rotations, and token mutations.
 - **Per-Stream Fencing:** Fencing leases are strictly isolated per stream. A conditional append conflict on repo stream $A$ fences stream $A$ on that instance, with zero effect on repo stream $B$ or on `_meta`.
 
-### 7.2 Key Space Layout
+### 8.2 Key Space Layout
 All keys reside under base prefix `v1/streams/<stream-id>/`:
 ```
 v1/streams/<stream-id>/
@@ -318,7 +399,7 @@ v1/streams/<stream-id>/
 
 ---
 
-## 8. Lexicographical Ordering Guarantees
+## 9. Lexicographical Ordering Guarantees
 
 | Key Category | Key Pattern | Lexicographically Ordered by Sequence? | Reader Invariants |
 | :--- | :--- | :---: | :--- |
@@ -330,7 +411,7 @@ v1/streams/<stream-id>/
 
 ---
 
-## 9. Fencing and Compare-and-Swap (CAS)
+## 10. Fencing and Compare-and-Swap (CAS)
 
 1. **Conditional Append:** Every write to `v1/streams/<stream-id>/tx/<seq>.json` MUST be executed as a conditional PUT requiring that the target key does not yet exist (`If-None-Match: *` or provider equivalent).
 2. **Conflict as Fencing:** A precondition failure (HTTP 412) permanently transitions that stream to `fenced` on that instance.
@@ -338,7 +419,7 @@ v1/streams/<stream-id>/
 
 ---
 
-## 10. Replay and Materialization Rules
+## 11. Replay and Materialization Rules
 
 To materialize or restore a repository stream from the journal:
 
@@ -353,6 +434,6 @@ To materialize or restore a repository stream from the journal:
 
 ---
 
-## 11. Reimplementation Grant
+## 12. Reimplementation Grant
 
-This specification is published with an unconditional reimplementation grant. Anyone may implement this signing identity model, genesis record, key rotation protocol, ref-transaction record format, stream layout, and reader/writer semantics in any programming language, for any purpose, without restriction and without asking.
+This specification is published with an unconditional reimplementation grant. Anyone may implement this signing identity model, genesis record, key rotation protocol, ref-transaction record format, pack segment content addressing, stream layout, and reader/writer semantics in any programming language, for any purpose, without restriction and without asking.

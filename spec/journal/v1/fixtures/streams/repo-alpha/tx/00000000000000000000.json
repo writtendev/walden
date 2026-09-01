@@ -4,7 +4,7 @@
   "seq": 0,
   "type": "ref_update",
   "segments": [
-    "4a49646b96dbca4f1eb8699ef7cefdcae68fefc6ee7ae6305a3f25c7e1ef5638"
+    "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
   ],
   "updates": [
     {
@@ -14,5 +14,5 @@
     }
   ],
   "timestamp": "2026-08-31T00:02:00Z",
-  "signature": "ed25519:3785d69cb247493acb68cf2951477fc3aa5e356e1975bfb83d35600785d80062a7feecc289147333cfc8f7c6ff1c0893d311e7d7822471bc157c192cdb31be08"
+  "signature": "ed25519:2ea7c2e8e15acf84573875fd8f94da0dca543fe8080c0a846d126ae3ba0a1a977af7a9fdedd920e8bb16b36c75184638d79e04cfa530b889f76e19a0823d0c07"
 }

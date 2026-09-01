@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/writtendev/walden/internal/refusal"
@@ -202,14 +203,19 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 			"URL is malformed; it is not echoed because it may carry credentials",
 			"expected a URL such as s3://bucket/prefix")
 	}
+	// Everything below may quote a value read out of the URL. This is the one
+	// gate that makes that safe; see guardCredentials.
+	if err := guardCredentials(raw, u); err != nil {
+		return nil, err
+	}
 	if u.Fragment != "" {
 		return nil, refuseJournal("URL carries a fragment", "remove everything from the '#' onwards")
 	}
 
 	scheme := strings.ToLower(u.Scheme)
-	switch scheme {
-	case "s3", "https", "http":
-	case "":
+	switch {
+	case supportedScheme(scheme):
+	case scheme == "":
 		return nil, refuseJournal("URL has no scheme", "expected s3://, https://, or http://")
 	default:
 		return nil, refuseJournal(fmt.Sprintf("unsupported URL scheme %q", u.Scheme), "expected s3://, https://, or http://")
@@ -246,10 +252,12 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 		// s3://bucket/prefix: the host is the bucket and AWS is implied.
 		// A port has nowhere to go — the endpoint is AWS's — and silently
 		// dropping it would resolve s3://minio.local:9000/bucket/walden
-		// to a bucket named "minio.local" at Amazon.
-		if u.Port() != "" {
+		// to a bucket named "minio.local" at Amazon. The test is the ':'
+		// rather than u.Port(), which is empty for both "s3://bucket:" and
+		// a port net/url could not read.
+		if strings.Contains(u.Host, ":") {
 			return nil, refuseJournal(
-				fmt.Sprintf("s3:// URL carries port %q, but s3:// always addresses AWS", u.Port()),
+				"s3:// URL carries a port, but s3:// always addresses AWS",
 				"for a self-hosted endpoint use http(s)://host:port/bucket/prefix")
 		}
 		j.Provider = "AWS S3"
@@ -260,9 +268,9 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 		j.PathStyle = style == "path"
 	} else {
 		rule, known := matchProviderHost(host)
-		bucketLabel, endpointHost := "", host
+		bucketLabel, endpointHost, isEndpoint := "", host, true
 		if known {
-			bucketLabel, endpointHost = rule.split(host)
+			bucketLabel, endpointHost, isEndpoint = rule.split(host)
 		}
 		j.Provider = rule.provider
 
@@ -274,14 +282,17 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 				ErrProviderUnsupported,
 			)
 		}
+		if !isEndpoint {
+			// A provider host with no "s3" label anywhere in it is not an
+			// endpoint. Read as one, https://amazonaws.com/bucket/walden
+			// resolved to a region named "com".
+			return nil, refuseJournal(
+				fmt.Sprintf("host %q names no S3 endpoint", host),
+				fmt.Sprintf("expected an endpoint such as s3.<region>.%s", rule.suffix))
+		}
 
 		switch style {
 		case "path":
-			if bucketLabel != "" {
-				return nil, refuseJournal(
-					fmt.Sprintf("style=path conflicts with bucket %q in the hostname", bucketLabel),
-					"drop the bucket label from the host, or drop style=path")
-			}
 			j.PathStyle = true
 		case "virtual":
 			j.PathStyle = false
@@ -289,32 +300,32 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 			j.PathStyle = bucketLabel == ""
 		}
 
-		if j.PathStyle {
+		// Where the bucket is written and how the request addresses it are
+		// separate questions. A bucket label in the hostname names the
+		// bucket under either style, so an operator may also state
+		// outright the path-style walden would have chosen anyway.
+		if bucketLabel != "" {
+			j.Bucket = bucketLabel
+			j.Prefix = strings.Join(segments, "/")
+		} else {
 			if len(segments) == 0 {
 				return nil, refuseJournal("URL names no bucket", "expected https://endpoint/bucket/prefix")
 			}
 			j.Bucket = segments[0]
 			j.Prefix = strings.Join(segments[1:], "/")
-		} else {
-			if bucketLabel == "" {
-				// style=virtual on a host that carries no bucket label:
-				// the bucket is still the first path segment, and the
-				// client will move it into the hostname.
-				if len(segments) == 0 {
-					return nil, refuseJournal("URL names no bucket", "expected https://bucket.endpoint/prefix")
-				}
-				j.Bucket = segments[0]
-				j.Prefix = strings.Join(segments[1:], "/")
-			} else {
-				j.Bucket = bucketLabel
-				j.Prefix = strings.Join(segments, "/")
-			}
+		}
+
+		hostRegion, hostNamesRegion := rule.regionFromHost(endpointHost)
+		if !hostNamesRegion && region == "" {
+			return nil, refuseJournal(
+				fmt.Sprintf("endpoint host %q fronts every region and names none", endpointHost),
+				"add ?region=<region> to WALDEN_JOURNAL")
 		}
 
 		j.Endpoint = scheme + "://" + hostPort(endpointHost, u.Port())
 		j.Region = resolveRegion(
 			region,
-			rule.regionFromHost(endpointHost),
+			hostRegion,
 			rule.fixedRegion,
 			envValue(lookupEnv, EnvRegion),
 			envValue(lookupEnv, EnvDefaultRegion),
@@ -363,7 +374,120 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 	return j, nil
 }
 
-// journalQuery reads the two query parameters walden accepts and refuses any other.
+// guardCredentials is the one gate that makes every other refusal in this file
+// safe to quote a URL-derived value.
+//
+// A journal URL may carry an object-storage secret, and net/url is only half a
+// defence. When it returns an error the secret is still lexically in the
+// userinfo and walden refuses without echoing. But an unencoded '/', '?', or
+// '#' inside the credentials ends the authority before the '@', and then
+// net/url returns no error at all: it silently relocates the tail of the secret
+// into the host, the port, the path, or the query — fields the refusals below
+// treat as safe to print.
+//
+// The invariant that separates the two cases is the '@'. It ends the
+// credentials in the authority and has no other place in a journal URL: not in
+// a host, a bucket, a prefix, a region, or a style, all of which already refuse
+// it. So an '@' surviving outside the userinfo means net/url has read the URL
+// differently from the operator who wrote it, and the bytes in front of that
+// '@' are the secret. Refuse there, once, without echoing anything.
+//
+// Past this gate the credentials are confined to u.User, which no refusal
+// prints, and every other field of the URL is free of them.
+func guardCredentials(raw string, u *url.URL) error {
+	tail := raw[credentialsEnd(raw):]
+	if strings.Contains(tail, "@") {
+		return refuseRelocatedCredentials()
+	}
+	// Percent-encoded, an '@' reaches a refusal only after net/url decodes
+	// it back — into a host or a path segment walden would quote.
+	if decoded, err := url.PathUnescape(tail); err == nil && strings.Contains(decoded, "@") {
+		return refuseRelocatedCredentials()
+	}
+	// The scheme is the other place a credential can land: net/url reads
+	// ACCESS_KEY://SECRET@host as scheme "ACCESS_KEY". A URL that carries
+	// credentials under a scheme walden does not serve is refused without
+	// the scheme being named.
+	if u.User != nil && !supportedScheme(u.Scheme) {
+		return refuseJournal(
+			"URL scheme is unsupported; it is not echoed because it may be part of the credentials",
+			"expected s3://, https://, or http://")
+	}
+	return nil
+}
+
+// supportedScheme reports whether walden serves a journal under this scheme.
+func supportedScheme(scheme string) bool {
+	switch strings.ToLower(scheme) {
+	case "s3", "https", "http":
+		return true
+	}
+	return false
+}
+
+// refuseRelocatedCredentials refuses without naming any part of the URL.
+func refuseRelocatedCredentials() error {
+	return refuseJournal(
+		"URL is malformed; it is not echoed because it may carry credentials",
+		"percent-encode reserved characters in the credentials, as in s3://ACCESS_KEY:SEC%2FRET@bucket/prefix")
+}
+
+// credentialsEnd returns the number of leading bytes of raw that hold the
+// scheme, the "//", and the userinfo through the '@' that ends it — the only
+// part of a journal URL that may hold credentials. It is 0 when there is no
+// userinfo. The authority is delimited exactly as net/url delimits it: the
+// fragment, then the query, then the first '/' after the "//".
+func credentialsEnd(raw string) int {
+	rest := raw
+	if i := strings.IndexAny(rest, "#?"); i >= 0 {
+		rest = rest[:i]
+	}
+	start := 0
+	if i := strings.Index(rest, "://"); i >= 0 && isScheme(rest[:i]) {
+		start = i + len("://")
+	} else if strings.HasPrefix(rest, "//") {
+		start = len("//")
+	} else {
+		return 0
+	}
+	authority := rest[start:]
+	if i := strings.Index(authority, "/"); i >= 0 {
+		authority = authority[:i]
+	}
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		return 0
+	}
+	return start + at + 1
+}
+
+// isScheme reports whether s is a URL scheme, by the same rule net/url applies.
+func isScheme(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9', c == '+', c == '-', c == '.':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// journalQuery reads the two query parameters walden accepts and refuses any
+// other. The query is case-insensitive throughout — the region has to be folded
+// anyway, since it is case-sensitive in the SigV4 credential scope, and a rule
+// that folds the values but not the keys is a rule nobody can remember. A
+// parameter given twice is refused rather than silently resolved to one of
+// them; the keys are read in sorted order so which one a refusal names does not
+// depend on map iteration.
 func journalQuery(u *url.URL) (region, style string, err error) {
 	q, parseErr := url.ParseQuery(u.RawQuery)
 	if parseErr != nil {
@@ -371,15 +495,28 @@ func journalQuery(u *url.URL) (region, style string, err error) {
 		// back, and no part of a journal URL is echoed.
 		return "", "", refuseJournal("query string is malformed", "the only query parameters are region and style")
 	}
+	keys := make([]string, 0, len(q))
 	for key := range q {
-		switch key {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	values := make(map[string]string, len(keys))
+	for _, key := range keys {
+		canonical := strings.ToLower(key)
+		switch canonical {
 		case "region", "style":
 		default:
 			return "", "", refuseJournal(fmt.Sprintf("unknown query parameter %q", key), "the only query parameters are region and style")
 		}
+		if _, repeated := values[canonical]; repeated || len(q[key]) > 1 {
+			return "", "", refuseJournal(fmt.Sprintf("query parameter %q is given more than once", canonical), "give region and style at most once each")
+		}
+		values[canonical] = q[key][0]
 	}
-	region = strings.TrimSpace(q.Get("region"))
-	style = strings.TrimSpace(strings.ToLower(q.Get("style")))
+
+	region = strings.TrimSpace(values["region"])
+	style = strings.TrimSpace(strings.ToLower(values["style"]))
 	switch style {
 	case "", "path", "virtual":
 	default:
@@ -406,46 +543,72 @@ func matchProviderHost(host string) (providerHost, bool) {
 }
 
 // split separates a bucket label from the bare endpoint host. An empty bucket
-// means the URL is path-style.
-func (r providerHost) split(host string) (bucket, endpoint string) {
+// means the URL is path-style. isEndpoint is false when an AWS-style host
+// carries no "s3" label at all, which makes it no endpoint of this provider.
+func (r providerHost) split(host string) (bucket, endpoint string, isEndpoint bool) {
 	labels := strings.Split(host, ".")
 	if r.endpointLabels < 0 {
 		// Scan from the right so a bucket named "s3-backups" is not
 		// mistaken for the start of the endpoint host.
 		for i := len(labels) - 1; i >= 0; i-- {
 			if labels[i] == "s3" || strings.HasPrefix(labels[i], "s3-") {
-				return strings.Join(labels[:i], "."), strings.Join(labels[i:], ".")
+				return strings.Join(labels[:i], "."), strings.Join(labels[i:], "."), true
 			}
 		}
-		return "", host
+		return "", host, false
 	}
 	if len(labels) <= r.endpointLabels {
-		return "", host
+		return "", host, true
 	}
 	n := len(labels) - r.endpointLabels
-	return strings.Join(labels[:n], "."), strings.Join(labels[n:], ".")
+	return strings.Join(labels[:n], "."), strings.Join(labels[n:], "."), true
 }
 
-// regionFromHost returns the region named in a bare endpoint host, if any.
-// It recognises the AWS-style layouts s3.<region>.<suffix>, s3-<region>.<suffix>,
-// and s3.dualstack.<region>.<suffix>, which Backblaze B2 and Wasabi share.
-func (r providerHost) regionFromHost(endpoint string) string {
+// awsEndpointModifiers are the labels AWS writes where a region label could
+// otherwise stand. They are not regions. FIPS and dualstack qualify a regional
+// endpoint and leave the region elsewhere in the host; accelerate replaces it,
+// because one accelerate endpoint fronts every region at once.
+var awsEndpointModifiers = map[string]bool{
+	"dualstack":  true,
+	"fips":       true,
+	"accelerate": true,
+}
+
+// regionFromHost returns the region named in a bare endpoint host. It reads the
+// AWS-style layouts s3.<region>, s3-<region>, s3.dualstack.<region>, and
+// s3-fips.<region>, which Backblaze B2 and Wasabi share, plus the bare "s3"
+// global endpoint, which names no region and defaults to us-east-1.
+//
+// namesRegion is false only for a host whose region label is a modifier that
+// replaces it — s3-accelerate. There is no region to read there and no sane
+// default, so the caller refuses rather than sign a scope AWS will reject. The
+// old rule read the label after "s3-" as the region unconditionally, which made
+// s3-fips.us-east-1.amazonaws.com resolve to region "fips".
+func (r providerHost) regionFromHost(endpoint string) (region string, namesRegion bool) {
 	if r.endpointLabels >= 0 {
-		return ""
+		return "", true
 	}
-	middle := strings.Split(strings.TrimSuffix(endpoint, "."+r.suffix), ".")
-	if len(middle) == 0 || middle[0] == "" {
-		return ""
+	labels := strings.Split(strings.TrimSuffix(endpoint, "."+r.suffix), ".")
+	if len(labels) == 0 || labels[0] == "" {
+		return "", true
 	}
-	if rest, ok := strings.CutPrefix(middle[0], "s3-"); ok && rest != "" {
-		return rest
-	}
-	for _, label := range middle[1:] {
-		if label != "dualstack" && label != "" {
-			return label
+	// A region label to the right of the "s3" label wins: in
+	// s3-fips.us-east-1 the modifier is the qualifier, not the region.
+	for _, label := range labels[1:] {
+		if label != "" && !awsEndpointModifiers[label] {
+			return label, true
 		}
 	}
-	return ""
+	tail, legacy := strings.CutPrefix(labels[0], "s3-")
+	switch {
+	case !legacy || tail == "":
+		// The bare "s3" global endpoint. It has a default region.
+		return "", true
+	case awsEndpointModifiers[tail]:
+		return "", false
+	default:
+		return tail, true
+	}
 }
 
 // credentialsFromURL reads credentials embedded in the journal URL's userinfo.

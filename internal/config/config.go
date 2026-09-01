@@ -72,14 +72,47 @@ func redactURL(raw string) string {
 	if raw == "" {
 		return ""
 	}
+	const withheld = "(URL withheld; it may carry credentials)"
+
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "(unparseable URL)"
 	}
-	if u.User == nil {
-		return raw
+	if u.User != nil {
+		// u.Redacted() replaces the password and prints the username.
+		// That is only safe where the username is the access key ID —
+		// a URL walden would serve, whose userinfo is ACCESS_KEY:SECRET.
+		// Elsewhere the username may be a secret that landed there:
+		// net/url reads ACCESS_KEY://SECRET@host as scheme "ACCESS_KEY"
+		// with "SECRET" for a username, and there is no password to
+		// redact.
+		_, hasPassword := u.User.Password()
+		if !hasPassword || !journalSchemes[strings.ToLower(u.Scheme)] {
+			return withheld
+		}
+		return u.Redacted()
 	}
-	return u.Redacted()
+	// No userinfo, yet an '@' survives somewhere: an unencoded character in
+	// the credentials ended the authority early and net/url has moved the
+	// secret into the host, the path, or the query.
+	if hasAt(raw) {
+		return withheld
+	}
+	return raw
+}
+
+// journalSchemes are the schemes walden serves a journal under. internal/store
+// owns the real rule; this copy only decides whether a URL's userinfo is safe
+// to print, and a scheme missing from it means less is printed, never more.
+var journalSchemes = map[string]bool{"s3": true, "https": true, "http": true}
+
+// hasAt reports whether raw holds an '@', written plainly or percent-encoded.
+func hasAt(raw string) bool {
+	if strings.Contains(raw, "@") {
+		return true
+	}
+	decoded, err := url.PathUnescape(raw)
+	return err == nil && strings.Contains(decoded, "@")
 }
 
 // Validate checks that all runtime configuration values are valid.
@@ -89,11 +122,15 @@ func (c *Config) Validate() error {
 		return errors.New("invalid data-dir: cannot be empty")
 	}
 
-	if c.JournalURL != "" {
+	// A journal URL is trimmed before it is read. A value out of a file-backed
+	// secret or a .env line arrives with a trailing newline more often than it
+	// arrives malformed, and Validate runs before the deep parse in
+	// internal/store, so the trim there would never see it.
+	if journal := strings.TrimSpace(c.JournalURL); journal != "" {
 		// net/url's parse errors quote the whole URL back, userinfo and
 		// all, so the reason is reported without it. The journal URL may
 		// carry an object-storage secret, and stderr is a container log.
-		u, err := url.Parse(c.JournalURL)
+		u, err := url.Parse(journal)
 		if err != nil {
 			return errors.New("invalid journal: URL is malformed; it is not echoed because it may carry credentials (expected s3://bucket/path)")
 		}
@@ -175,10 +212,12 @@ func LoadWithEnv(args []string, lookupEnv func(string) (string, bool)) (*Config,
 	}
 
 	// 2. JournalURL: Flag > WALDEN_JOURNAL > ""
+	// Trimmed once, here, so that every later reader — Validate, String,
+	// and the deep parse in internal/store — sees the same value.
 	if setFlags["journal"] {
-		cfg.JournalURL = flagJournal
-	} else if val, ok := lookupEnv(EnvJournal); ok && val != "" {
-		cfg.JournalURL = val
+		cfg.JournalURL = strings.TrimSpace(flagJournal)
+	} else if val, ok := lookupEnv(EnvJournal); ok && strings.TrimSpace(val) != "" {
+		cfg.JournalURL = strings.TrimSpace(val)
 	}
 
 	// 3. AuthTrustKey: Flag > WALDEN_AUTH_TRUST > ""

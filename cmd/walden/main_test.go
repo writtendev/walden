@@ -291,6 +291,9 @@ func TestBinaryArgvDispatch(t *testing.T) {
 		wantExit0  bool
 		wantOutSub string
 		wantErrSub string
+		// wantErrNot are strings stderr must not contain: the credentials
+		// out of a journal URL, and the fragments a leak arrives in.
+		wantErrNot []string
 	}{
 		{
 			name:       "direct-version",
@@ -420,7 +423,49 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			cmdPath:    binPath,
 			args:       []string{"serve", "--journal", "s3://minio.local:9000/my-bucket/walden"},
 			wantExit0:  false,
-			wantErrSub: `walden: invalid journal: s3:// URL carries port "9000"`,
+			wantErrSub: "walden: invalid journal: s3:// URL carries a port, but s3:// always addresses AWS",
+		},
+		{
+			// The whole point of the boot-path resolution is that a
+			// journal URL never reaches an operator's log. An unencoded
+			// '/' in the secret ends the authority before the '@', so
+			// net/url reports no error and moves the rest of the secret
+			// into the prefix, where the refusal used to quote it.
+			name:       "serve-relocated-credentials-are-not-echoed",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "s3://PUBLICKEYIDEXAMPLE:/zzTOPSECRETzz@bucket/prefix"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: URL is malformed; it is not echoed because it may carry credentials",
+			wantErrNot: []string{"zzTOPSECRETzz", "zzT", "PUBLICKEYIDEXAMPLE"},
+		},
+		{
+			// A trailing newline is what a file-backed Kubernetes secret
+			// or a .env line gives you, and it is the likeliest cause of
+			// a "malformed" journal URL. It is trimmed, not refused.
+			name:       "serve-print-config-trims-the-journal-url",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", " s3://my-bucket/walden\n", "--print-config"},
+			wantExit0:  true,
+			wantOutSub: "journal: s3://my-bucket/walden\n",
+		},
+		{
+			// FIPS endpoints are mandatory for GovCloud and FedRAMP, and
+			// the modifier sits where the legacy s3-<region> form puts
+			// the region. This booted and signed with region "fips".
+			name:       "serve-print-config-fips-endpoint-region",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "https://s3-fips.us-east-1.amazonaws.com/my-bucket/walden", "--print-config"},
+			wantExit0:  true,
+			wantOutSub: "journal-region: us-east-1",
+		},
+		{
+			// One accelerate endpoint fronts every region, so there is no
+			// region to read and no default that is not a guess.
+			name:       "serve-accelerate-endpoint-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "https://s3-accelerate.amazonaws.com/my-bucket/walden"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: endpoint host \"s3-accelerate.amazonaws.com\" fronts every region and names none",
 		},
 		{
 			// A root-anchored FQDN must not walk past the provider table
@@ -455,6 +500,11 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			}
 			if tt.wantErrSub != "" && !strings.Contains(stderr.String(), tt.wantErrSub) {
 				t.Errorf("stderr = %q, want substring %q", stderr.String(), tt.wantErrSub)
+			}
+			for _, leak := range tt.wantErrNot {
+				if strings.Contains(stdout.String(), leak) || strings.Contains(stderr.String(), leak) {
+					t.Errorf("output leaked %q: stdout %q, stderr %q", leak, stdout.String(), stderr.String())
+				}
 			}
 		})
 	}

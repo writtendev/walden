@@ -258,6 +258,62 @@ func TestConfigStringRedactsJournalSecret(t *testing.T) {
 	}
 }
 
+// TestJournalURLIsTrimmed is the regression for the least actionable refusal
+// walden could produce. A journal URL out of a file-backed Kubernetes secret or
+// a .env line arrives with a trailing newline; walden refused it as "malformed,
+// not echoed", which tells a 3am operator nothing at all. internal/store trims,
+// but Validate runs first on the boot path, so the trim there never saw it.
+func TestJournalURLIsTrimmed(t *testing.T) {
+	tests := []struct {
+		name    string
+		journal string
+		want    string
+	}{
+		{"leading-space", " s3://my-bucket/prefix", "s3://my-bucket/prefix"},
+		{"trailing-newline", "s3://my-bucket/prefix\n", "s3://my-bucket/prefix"},
+		{"both", "\t s3://my-bucket/prefix \r\n", "s3://my-bucket/prefix"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Through the environment, which is how a file-backed secret
+			// reaches walden.
+			cfg, _, err := config.LoadWithEnv(nil, func(key string) (string, bool) {
+				if key == config.EnvJournal {
+					return tt.journal, true
+				}
+				return "", false
+			})
+			if err != nil {
+				t.Fatalf("LoadWithEnv(%q) refused a journal URL that only needed trimming: %v", tt.journal, err)
+			}
+			if cfg.JournalURL != tt.want {
+				t.Errorf("JournalURL = %q, want %q", cfg.JournalURL, tt.want)
+			}
+
+			// And through the flag, which is the higher-precedence knob.
+			cfg, _, err = config.LoadWithEnv([]string{"--journal", tt.journal}, func(string) (string, bool) { return "", false })
+			if err != nil {
+				t.Fatalf("LoadWithEnv(--journal %q) refused a journal URL that only needed trimming: %v", tt.journal, err)
+			}
+			if cfg.JournalURL != tt.want {
+				t.Errorf("JournalURL = %q, want %q", cfg.JournalURL, tt.want)
+			}
+
+			// Validate is exported and reads the knob itself, so it
+			// trims too rather than depending on Load having done it.
+			direct := &config.Config{
+				DataDir:    config.DefaultDataDir,
+				JournalURL: tt.journal,
+				ListenAddr: config.DefaultListenAddr,
+			}
+			if err := direct.Validate(); err != nil {
+				t.Errorf("Validate() refused a journal URL that only needed trimming: %v", err)
+			}
+		})
+	}
+}
+
 // TestValidateRefusalHidesJournalSecret is the regression for a leak on the
 // boot path: net/url's parse errors quote the whole URL back, and walden
 // wrapped one verbatim, so a leading space copied out of a .env file put an
@@ -274,7 +330,7 @@ func TestValidateRefusalHidesJournalSecret(t *testing.T) {
 		journal string
 	}{
 		{"invalid-port", "s3://" + keyID + ":" + secret + "@bucket:80x/p"},
-		{"leading-space", " s3://" + keyID + ":" + secret + "@bucket/prefix"},
+		{"leading-space", " s3://" + keyID + ":" + secret + "@bucket:80x/p"},
 		{"control-character", "s3://" + keyID + ":" + secret + "@bucket/p\x7f"},
 		{"unclosed-ipv6-literal", "https://" + keyID + ":" + secret + "@[::1/my-bucket/walden"},
 		{"bad-escape-in-userinfo", "s3://" + keyID + ":se%" + secret + "@my-bucket/walden"},

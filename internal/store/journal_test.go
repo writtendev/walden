@@ -187,10 +187,103 @@ func TestParseJournalURLLocations(t *testing.T) {
 			prefix:   "walden",
 		},
 		{
+			// walden resolves a dotted bucket path-style whatever the URL
+			// says, so an operator must be allowed to say it: refusing
+			// style=path here refused the operator who asked for exactly
+			// what walden had already chosen.
+			name:      "dotted-bucket-accepts-explicit-style-path",
+			raw:       "https://my.dotted.bucket.s3.eu-west-1.amazonaws.com/walden?style=path",
+			provider:  "AWS S3",
+			endpoint:  "https://s3.eu-west-1.amazonaws.com",
+			region:    "eu-west-1",
+			bucket:    "my.dotted.bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			// The bucket is named by the hostname label under either
+			// style; style only decides where the request writes it.
+			name:      "hostname-bucket-accepts-explicit-style-path",
+			raw:       "https://my-bucket.s3.eu-west-1.amazonaws.com/walden",
+			provider:  "AWS S3",
+			endpoint:  "https://s3.eu-west-1.amazonaws.com",
+			region:    "eu-west-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: false,
+		},
+		{
+			name:      "hostname-bucket-with-style-path",
+			raw:       "https://my-bucket.s3.eu-west-1.amazonaws.com/walden?style=path",
+			provider:  "AWS S3",
+			endpoint:  "https://s3.eu-west-1.amazonaws.com",
+			region:    "eu-west-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			// The query is case-insensitive throughout: the region has to
+			// be folded for the SigV4 scope, so folding the keys and the
+			// style value too is the rule an operator can remember.
+			name:      "query-keys-are-case-insensitive",
+			raw:       "s3://my-bucket/walden?REGION=EU-WEST-1&Style=PATH",
+			provider:  "AWS S3",
+			endpoint:  "https://s3.eu-west-1.amazonaws.com",
+			region:    "eu-west-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
 			name:      "aws-legacy-dash-region",
 			raw:       "https://s3-eu-west-1.amazonaws.com/my-bucket/walden",
 			provider:  "AWS S3",
 			endpoint:  "https://s3-eu-west-1.amazonaws.com",
+			region:    "eu-west-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			// FIPS is mandatory for GovCloud and FedRAMP, and the
+			// modifier sits where the legacy s3-<region> form puts the
+			// region. Read as one, this signed with region "fips".
+			name:      "aws-fips",
+			raw:       "https://s3-fips.us-east-1.amazonaws.com/my-bucket/walden",
+			provider:  "AWS S3",
+			endpoint:  "https://s3-fips.us-east-1.amazonaws.com",
+			region:    "us-east-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			name:      "aws-fips-dualstack",
+			raw:       "https://s3-fips.dualstack.us-east-1.amazonaws.com/my-bucket/walden",
+			provider:  "AWS S3",
+			endpoint:  "https://s3-fips.dualstack.us-east-1.amazonaws.com",
+			region:    "us-east-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			name:     "aws-fips-virtual-hosted",
+			raw:      "https://my-bucket.s3-fips.us-east-2.amazonaws.com/walden",
+			provider: "AWS S3",
+			endpoint: "https://s3-fips.us-east-2.amazonaws.com",
+			region:   "us-east-2",
+			bucket:   "my-bucket",
+			prefix:   "walden",
+		},
+		{
+			// Accelerate names no region, so the operator must. With
+			// ?region= there is nothing left to guess.
+			name:      "aws-accelerate-with-explicit-region",
+			raw:       "https://s3-accelerate.amazonaws.com/my-bucket/walden?region=eu-west-1",
+			provider:  "AWS S3",
+			endpoint:  "https://s3-accelerate.amazonaws.com",
 			region:    "eu-west-1",
 			bucket:    "my-bucket",
 			prefix:    "walden",
@@ -445,7 +538,9 @@ func TestParseJournalURLRefusals(t *testing.T) {
 		{name: "no-bucket-self-hosted", raw: "http://minio.internal:9000", wantErr: store.ErrInvalidJournal, wantSub: "names no bucket"},
 		{name: "unknown-query", raw: "s3://my-bucket/walden?acl=public", wantErr: store.ErrInvalidJournal, wantSub: `unknown query parameter "acl"`},
 		{name: "unknown-style", raw: "s3://my-bucket/walden?style=sideways", wantErr: store.ErrInvalidJournal, wantSub: "unknown addressing style"},
-		{name: "style-conflict", raw: "https://my-bucket.s3.amazonaws.com/walden?style=path", wantErr: store.ErrInvalidJournal, wantSub: "conflicts with bucket"},
+		{name: "repeated-region", raw: "s3://my-bucket/walden?region=eu-west-1&region=ap-south-1", wantErr: store.ErrInvalidJournal, wantSub: `query parameter "region" is given more than once`},
+		{name: "repeated-region-mixed-case", raw: "s3://my-bucket/walden?region=eu-west-1&REGION=ap-south-1", wantErr: store.ErrInvalidJournal, wantSub: `query parameter "region" is given more than once`},
+		{name: "repeated-style", raw: "s3://my-bucket/walden?style=path&Style=virtual", wantErr: store.ErrInvalidJournal, wantSub: `query parameter "style" is given more than once`},
 		{name: "bucket-too-short", raw: "s3://ab/walden", wantErr: store.ErrInvalidJournal, wantSub: "3 to 63 characters"},
 		{name: "bucket-underscore", raw: "s3://my_bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: `bucket "my_bucket" contains "_"`},
 		{name: "bucket-leading-dash", raw: "s3://-my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "start and end with"},
@@ -465,8 +560,19 @@ func TestParseJournalURLRefusals(t *testing.T) {
 		{name: "wasabi-root-anchored-virtual-hosted-no-cas", raw: "https://my-bucket.s3.wasabisys.com./walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
 		// s3:// always addresses AWS, so a port has nowhere to go. Dropping
 		// it silently resolved a self-hosted endpoint to a bucket at Amazon.
-		{name: "s3-scheme-with-port", raw: "s3://minio.local:9000/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: `s3:// URL carries port "9000"`},
+		{name: "s3-scheme-with-port", raw: "s3://minio.local:9000/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "s3:// URL carries a port"},
+		// A ':' with no digits behind it is still a port that has nowhere
+		// to go, and u.Port() reads "" for it.
+		{name: "s3-scheme-with-empty-port", raw: "s3://my-bucket:/walden", wantErr: store.ErrInvalidJournal, wantSub: "s3:// URL carries a port"},
 		{name: "dotted-bucket-cannot-be-forced-virtual-hosted", raw: "s3://my.dotted.bucket/walden?style=virtual", wantErr: store.ErrInvalidJournal, wantSub: "style=virtual conflicts with the dot in bucket"},
+		// An AWS-family host with no "s3" label is not an endpoint of that
+		// provider. Read as one, it resolved to a region named "com".
+		{name: "aws-suffix-is-no-endpoint", raw: "https://amazonaws.com/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: `host "amazonaws.com" names no S3 endpoint`},
+		{name: "b2-suffix-is-no-endpoint", raw: "https://backblazeb2.com/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: `host "backblazeb2.com" names no S3 endpoint`},
+		// s3-accelerate fronts every region, so there is no region to read
+		// and no default that is not a guess.
+		{name: "accelerate-names-no-region", raw: "https://s3-accelerate.amazonaws.com/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "fronts every region and names none"},
+		{name: "accelerate-dualstack-names-no-region", raw: "https://s3-accelerate.dualstack.amazonaws.com/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "fronts every region and names none"},
 	}
 
 	for _, tt := range tests {
@@ -732,6 +838,12 @@ func TestProviderNamesMatchSupportMatrix(t *testing.T) {
 				t.Errorf("host table says cas=%v for %q, support matrix says %v (status %q)", row.CAS, row.Provider, wantCAS, info.Status)
 			}
 
+			// The bare suffix is a host of the right provider family,
+			// which is all this assertion needs. It is not necessarily a
+			// usable endpoint — https://amazonaws.com names no S3
+			// endpoint and is refused as such — so the only thing
+			// checked here is the compare-and-swap bit. Whether a host
+			// resolves, and to what, is TestParseJournalURLLocations.
 			raw := "https://" + row.Suffix + "/my-bucket/walden"
 			_, err := store.ParseJournalURL(raw, envLookup(creds))
 			refused := errors.Is(err, store.ErrProviderUnsupported)
@@ -759,30 +871,46 @@ func TestProviderNamesMatchSupportMatrix(t *testing.T) {
 	}
 }
 
-// TestJournalRefusalsHideTheSecret is the regression for the leak that let
-// net/url quote a WALDEN_JOURNAL value, userinfo and all, into stderr. Every
-// URL here is one net/url (or url.ParseQuery) refuses to parse, and no refusal
-// walden returns for them may name any part of the credentials.
+// TestJournalRefusalsHideTheSecret is the regression for the leak that let a
+// WALDEN_JOURNAL value reach stderr with its userinfo intact.
+//
+// The first round of this test scoped itself to URLs net/url refuses to parse,
+// and that scoping was the bug: those are the safe half. The dangerous half is
+// the URL net/url parses happily, because an unencoded '/', '?', or '#' in the
+// credentials ended the authority before the '@' and moved the tail of the
+// secret into a port, a path, or a query — fields the refusals then quoted
+// verbatim. Both halves are here now.
 func TestJournalRefusalsHideTheSecret(t *testing.T) {
 	const (
-		keyID  = "AKIAKEYID"
-		secret = "SUPERSECRETVALUE"
+		keyID  = "PUBLICKEYIDEXAMPLE"
+		secret = "zzTOPSECRETzz"
 	)
 
 	raws := []struct {
 		name string
 		raw  string
 	}{
+		// net/url returns an error: the secret is still in the userinfo.
 		{"invalid-port", "s3://" + keyID + ":" + secret + "@bucket:80x/p"},
 		{"control-character", "s3://" + keyID + ":" + secret + "@bucket/p\x7f"},
 		{"unclosed-ipv6-literal", "https://" + keyID + ":" + secret + "@[::1/my-bucket/walden"},
 		{"bad-escape-in-query", "s3://" + keyID + ":" + secret + "@my-bucket/walden?region=%" + secret},
 		{"bad-escape-in-userinfo", "s3://" + keyID + ":se%" + secret + "@my-bucket/walden"},
+
+		// net/url returns no error: the secret has been relocated. Each of
+		// these was quoted back in full by a refusal.
+		{"slash-in-secret-lands-in-the-prefix", "s3://" + keyID + ":/" + secret + "@bucket/prefix"},
+		{"slash-in-secret-lands-in-the-bucket", "https://" + keyID + ":/" + secret + "@s3.eu-west-1.amazonaws.com/bucket/prefix"},
+		{"digits-before-the-slash-land-in-the-port", "s3://" + keyID + ":012/" + secret + "@bucket/prefix"},
+		{"question-mark-in-secret-lands-in-the-query", "s3://" + keyID + ":?" + secret + "@bucket/prefix"},
+		{"hash-in-secret-lands-in-the-fragment", "s3://" + keyID + ":#" + secret + "@bucket/prefix"},
+		{"slash-in-key-id-lands-in-the-prefix", "s3://AKIA/" + keyID + ":" + secret + "@bucket/prefix"},
+		{"encoded-delimiters-land-in-the-host", "s3://" + keyID + "%3A" + secret + "%40bucket/prefix"},
 	}
 
 	// net/url's escape errors quote the three characters around a bad '%',
 	// so a leak can be a fragment rather than the whole secret.
-	forbidden := []string{keyID, secret, secret[:2]}
+	forbidden := []string{keyID, secret, secret[:3]}
 
 	for _, tt := range raws {
 		t.Run(tt.name, func(t *testing.T) {
@@ -799,7 +927,7 @@ func TestJournalRefusalsHideTheSecret(t *testing.T) {
 				}
 				assertOneLineRefusal(t, err)
 				for _, leak := range forbidden {
-					if strings.Contains(err.Error(), leak) {
+					if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(leak)) {
 						t.Errorf("%s leaked %q: %q", entry.name, leak, err.Error())
 					}
 				}

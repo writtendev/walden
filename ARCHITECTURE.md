@@ -197,6 +197,12 @@ walden configuration; there is no `WALDEN_*` credential variable, and the
 shared credentials file, instance metadata, and role providers are
 deliberately not consulted.
 
+Reserved characters in the credentials must be percent-encoded. An unencoded
+`/`, `?`, or `#` in a secret ends the URL's authority before the `@`, which
+moves the rest of the secret into the host, the path, or the query — so a
+journal URL walden cannot read as written is refused without any part of it
+being echoed.
+
 Zero-config boot is a working (journal-less) git server that prints a
 one-time admin token to stdout on first start.
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -23,7 +24,8 @@ import (
 //
 // then commit the result. Signing keys, timestamps, and git object dates are all
 // fixed, so the records reproduce byte for byte. Packfile bytes are produced by the
-// local git binary; the committed packs came from git 2.50.1, and a different git
+// local git binary; the committed packs came from git 2.50.1 — not the git 2.47.2 the
+// container image pins, which these packs have nothing to do with — and a different git
 // version may pack the same objects differently, which changes the content-addressed
 // segment names but not their correctness.
 //
@@ -360,11 +362,29 @@ type conditionalPutFixture struct {
 	ConflictCode   string `json:"conflict_code"`
 }
 
+// txKeyFixture is one row of the append-target table: a stream, a sequence, and the key
+// the two derive. The sequence is carried as a decimal string. This table exists to pin
+// key derivation across the whole 64-bit range, and a JSON number cannot do that: a parser
+// that reads numbers as IEEE doubles — JavaScript's, and every parser built on it — turns
+// 18446744073709551615 into 18446744073709552000 and derives a key that does not match the
+// one beside it, failing a conformant reader against a correct fixture. A string is read
+// exactly by every conformant parser. This is a choice about the fixture table only;
+// journal records encode their own `seq` as a JSON number, as spec section 5.1 defines.
 type txKeyFixture struct {
 	Stream      journal.StreamID `json:"stream"`
-	Seq         uint64           `json:"seq"`
+	Seq         string           `json:"seq"`
 	Key         string           `json:"key"`
 	Description string           `json:"description"`
+}
+
+// txKeyRow builds one append-target row from the sequence a writer would hold in hand.
+func txKeyRow(stream journal.StreamID, seq uint64, description string) txKeyFixture {
+	return txKeyFixture{
+		Stream:      stream,
+		Seq:         strconv.FormatUint(seq, 10),
+		Key:         journal.TxKey(stream, seq),
+		Description: description,
+	}
 }
 
 type fencingRefusableFixture struct {
@@ -387,13 +407,13 @@ func buildConditionalAppendFixture() conditionalAppendFixture {
 			ConflictCode:   journal.CodePreconditionFailed,
 		},
 		TxKeys: []txKeyFixture{
-			{Stream: journal.MetaStreamID, Seq: 0, Key: journal.TxKey(journal.MetaStreamID, 0), Description: "Genesis record on the meta stream"},
-			{Stream: journal.MetaStreamID, Seq: 3, Key: journal.TxKey(journal.MetaStreamID, 3), Description: "Meta stream counter runs independently of any repository stream"},
-			{Stream: fixtureRepoStream, Seq: 0, Key: journal.TxKey(fixtureRepoStream, 0), Description: "First push into an empty repository"},
-			{Stream: fixtureRepoStream, Seq: 3, Key: journal.TxKey(fixtureRepoStream, 3), Description: "Force update on a human-chosen stream identifier"},
-			{Stream: fixtureOpaqueStream, Seq: 0, Key: journal.TxKey(fixtureOpaqueStream, 0), Description: "Opaque stream identifier restarts its own counter at zero"},
-			{Stream: fixtureRepoStream, Seq: 42, Key: journal.TxKey(fixtureRepoStream, 42), Description: "Zero padding to twenty digits keeps lexicographic order numeric"},
-			{Stream: fixtureRepoStream, Seq: ^uint64(0), Key: journal.TxKey(fixtureRepoStream, ^uint64(0)), Description: "Maximum unsigned 64-bit sequence still fits twenty digits"},
+			txKeyRow(journal.MetaStreamID, 0, "Genesis record on the meta stream"),
+			txKeyRow(journal.MetaStreamID, 3, "Meta stream counter runs independently of any repository stream"),
+			txKeyRow(fixtureRepoStream, 0, "First push into an empty repository"),
+			txKeyRow(fixtureRepoStream, 3, "Force update on a human-chosen stream identifier"),
+			txKeyRow(fixtureOpaqueStream, 0, "Opaque stream identifier restarts its own counter at zero"),
+			txKeyRow(fixtureRepoStream, fixtureSeq42, "Zero padding to twenty digits keeps lexicographic order numeric"),
+			txKeyRow(fixtureRepoStream, fixtureSeqMax, "Maximum unsigned 64-bit sequence still fits twenty digits, and is carried here as a string so that a parser reading JSON numbers as doubles derives this key rather than a rounded one"),
 		},
 		Refusals: []fencingRefusableFixture{
 			{Case: "fenced_by_conflict_repo_stream", Stream: fixtureRepoStream, Seq: &seq3, Message: journal.RefuseStreamFenced(fixtureRepoStream, seq3).Error()},

@@ -26,7 +26,8 @@ Every repository is modeled as an independent stream. The server instance's own 
  ┌─────────────────────────────┐               ┌─────────────────────────────┐
  │ seq 0: First push ref tx    │               │ seq 0: Genesis (public key) │
  │ seq 1: Second push ref tx   │               │ seq 1: Token create (rwc:*) │
- │ seq 2: Force-push ref tx    │               │ seq 2: Key rotation (...)   │
+ │ seq 2: Branch delete ref tx │               │ seq 2: Key rotation (...)   │
+ │ seq 3: Force-push ref tx    │               │ seq 3: Token revoke         │
  └─────────────────────────────┘               └─────────────────────────────┘
 ```
 

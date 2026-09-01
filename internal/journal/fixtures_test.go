@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -54,6 +55,12 @@ const (
 	// token create, the key rotation, and a token revoke. Asserted, so that a stray
 	// record appended past the end cannot go unnoticed by the partial replays below.
 	fixtureMetaRecords = 4
+
+	// fixtureSeq42 and fixtureSeqMax are the two sequences the conditional-append table
+	// pins beyond the journal's own coordinates: a small one that shows the zero padding
+	// doing its work, and the largest a 64-bit counter can reach.
+	fixtureSeq42  = uint64(42)
+	fixtureSeqMax = ^uint64(0)
 )
 
 // loadFixtureChain replays the _meta stream up to and including maxSeq and returns the chain.
@@ -342,14 +349,16 @@ func (p *fixtureReplay) unpack(key string) {
 }
 
 // requireCommittish asserts that the object database holds oid and that it is something
-// a ref may point at. This is the assertion that catches a transaction naming an object
-// its packs never carried, and one naming an object of the wrong kind — git's empty tree
-// dressed up as a commit, say.
+// a ref may point at. This is the assertion that catches a transaction naming an object no
+// pack replayed so far has carried, and one naming an object of the wrong kind — git's
+// empty tree dressed up as a commit, say. The object database is cumulative, so what it
+// holds is everything the replay has unpacked up to this record, not this record's
+// segments alone.
 func (p *fixtureReplay) requireCommittish(rec *journal.RefTransactionRecord, ref, oid string) {
 	p.t.Helper()
 	out, err := p.git.tryRun(nil, "cat-file", "-t", oid)
 	if err != nil {
-		p.t.Errorf("%s seq %d: %s names %s, which the packs it references do not contain: %v", rec.Stream, rec.Seq, ref, oid, err)
+		p.t.Errorf("%s seq %d: %s names %s, which is not in the object database at this point in the replay: %v", rec.Stream, rec.Seq, ref, oid, err)
 		return
 	}
 	if typ := strings.TrimSpace(string(out)); typ != "commit" && typ != "tag" {
@@ -396,6 +405,45 @@ func (p *fixtureReplay) apply(rec *journal.RefTransactionRecord, trackRefs bool)
 	}
 }
 
+// commitsAndTags lists every commit and tag object the replay has unpacked so far.
+func (p *fixtureReplay) commitsAndTags() []string {
+	p.t.Helper()
+	out, err := p.git.tryRun(nil, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)")
+	if err != nil {
+		p.t.Fatalf("failed to list the replayed object database: %v", err)
+	}
+	var oids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		name, typ, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		if typ == "commit" || typ == "tag" {
+			oids = append(oids, name)
+		}
+	}
+	return oids
+}
+
+// fsck asks git whether the object database the replay assembled is sound: every object
+// well-formed, and every link one of them makes resolvable.
+//
+// Every commit and tag in the database is named as a starting point, because git follows
+// links only out of the tips it is given. A replay from the marker has no refs to give it,
+// and a bare `git fsck` there walks nothing and passes an object database that is missing
+// half its history. Naming the objects the database already holds asks the question
+// without reconstructing ref state, which the marker does not carry.
+func (p *fixtureReplay) fsck() {
+	p.t.Helper()
+	args := append([]string{"fsck", "--strict", "--no-progress", "--no-dangling"}, p.commitsAndTags()...)
+	// fsck names the broken object on stdout, so the error alone does not say what is
+	// wrong; whoever is reading this failure wants git's own words.
+	out, err := p.git.tryRun(nil, args...)
+	if err != nil {
+		p.t.Errorf("git fsck rejects the replayed repository: %v\n%s", err, out)
+	}
+}
+
 // publish writes the replayed ref state into the scratch repository and fscks it, which
 // is what a materializing reader does last, before marking the repository ready.
 func (p *fixtureReplay) publish() {
@@ -405,17 +453,17 @@ func (p *fixtureReplay) publish() {
 			p.t.Fatalf("failed to set %s to %s: %v", ref, oid, err)
 		}
 	}
-	if _, err := p.git.tryRun(nil, "fsck", "--strict", "--no-progress", "--no-dangling"); err != nil {
-		p.t.Errorf("git fsck rejects the replayed repository: %v", err)
-	}
+	p.fsck()
 }
 
 // TestFixtureReplay materializes the golden journal with the real git binary, both from
-// sequence 0 and from the section 7.5 marker, and asserts that every object identifier
-// the transactions name is present, is a commit, and lands the refs where the journal
-// says they land. A well-formed record pointing at an object its packs do not hold is
-// exactly the defect these fixtures exist to rule out, and nothing short of resolving
-// the packs can see it.
+// sequence 0 and from the section 7.5 marker. Both paths assert that every object
+// identifier the transactions name is present and is a commit, and both fsck the object
+// database they leave behind; only the replay from sequence 0 reconstructs ref state and
+// checks that the refs land where the journal says they land, because a marker carries a
+// baseline sequence and a snapshot and no ref state to check against. A well-formed
+// record pointing at an object its packs do not hold is exactly the defect these fixtures
+// exist to rule out, and nothing short of resolving the packs can see it.
 func TestFixtureReplay(t *testing.T) {
 	t.Run("from_genesis", func(t *testing.T) {
 		records := fixtureStreamRecords(t, fixtureRepoStream)
@@ -486,7 +534,24 @@ func TestFixtureReplay(t *testing.T) {
 		if resumed == 0 {
 			t.Fatal("the marker leaves no transactions to replay, so this proves nothing")
 		}
+		// The marker path has no ref state to publish, but the snapshot and the segments
+		// it resumed with leave an object database behind, and git answers for that one
+		// the same way it answers for the replay from genesis.
+		replay.fsck()
 	})
+}
+
+// fixturePackInventory is the packfile inventory the fixtures README describes, directory
+// by directory: three segments on repo-alpha, because of its four pushes the branch delete
+// carried no objects; the one consolidated snapshot compaction wrote; and the opaque
+// stream's single push. A real journal may hold a pack no transaction references — section
+// 7.3, Guarantee 2 makes superseded and orphaned packs legal, and readers must ignore them
+// rather than reject them — so this pins what this tree holds, not what a journal may hold.
+// A pack that appears or disappears here is a change to the README as much as to the bytes.
+var fixturePackInventory = map[string]int{
+	fixtureRepoStream + "/segments":   3,
+	fixtureRepoStream + "/snapshots":  1,
+	fixtureOpaqueStream + "/segments": 1,
 }
 
 // TestFixtureSegmentsAreContentAddressed covers Ruling 4: every pack segment and
@@ -498,7 +563,7 @@ func TestFixtureSegmentsAreContentAddressed(t *testing.T) {
 		t.Fatalf("failed to read %s: %v", root, err)
 	}
 
-	packs := 0
+	found := make(map[string]int, len(fixturePackInventory))
 	for _, stream := range streams {
 		for _, kind := range []string{"segments", "snapshots"} {
 			dir := filepath.Join(root, stream.Name(), kind)
@@ -530,12 +595,20 @@ func TestFixtureSegmentsAreContentAddressed(t *testing.T) {
 				if err := journal.ValidatePackfileHeader(data); err != nil {
 					t.Errorf("%s/%s: not a real git packfile: %v", dir, name, err)
 				}
-				packs++
+				found[stream.Name()+"/"+kind]++
 			}
 		}
 	}
-	if packs == 0 {
-		t.Fatal("expected the fixture journal to contain pack segments")
+
+	for where, want := range fixturePackInventory {
+		if found[where] != want {
+			t.Errorf("%s holds %d packfiles, want %d", where, found[where], want)
+		}
+	}
+	for where, got := range found {
+		if _, expected := fixturePackInventory[where]; !expected {
+			t.Errorf("%s holds %d packfiles the fixture inventory does not account for", where, got)
+		}
 	}
 }
 
@@ -611,9 +684,12 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		t.Fatalf("failed to read %s: %v", path, err)
 	}
 
-	// The committed table must be byte for byte what the generator produces today. The
-	// conflict code and every description are prose that no other assertion reaches, so
-	// without this they could drift from the generator, or be hand-edited in place.
+	// The committed table must be byte for byte what the generator produces today, so it
+	// cannot be hand-edited in place or left stale. That proves agreement with the
+	// generator and nothing more, so every value it carries is pinned to a literal
+	// somewhere else as well: the refusal wording and the conflict code in
+	// fencing_test.go, the append targets in the loop below. Only the descriptions are
+	// unpinned prose, and they are checked for being present and single-line.
 	want, err := json.MarshalIndent(buildConditionalAppendFixture(), "", "  ")
 	if err != nil {
 		t.Fatalf("failed to marshal the expected conditional append fixture: %v", err)
@@ -632,7 +708,7 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		} `json:"conditional_put"`
 		TxKeys []struct {
 			Stream      journal.StreamID `json:"stream"`
-			Seq         uint64           `json:"seq"`
+			Seq         string           `json:"seq"`
 			Key         string           `json:"key"`
 			Description string           `json:"description"`
 		} `json:"tx_keys"`
@@ -677,15 +753,37 @@ func TestFixtureConditionalAppend(t *testing.T) {
 	if len(fixture.TxKeys) == 0 {
 		t.Fatal("expected conditional append key fixtures")
 	}
+	pinned := make(map[uint64]bool, len(fixture.TxKeys))
 	for _, tc := range fixture.TxKeys {
-		if got := journal.TxKey(tc.Stream, tc.Seq); got != tc.Key {
-			t.Errorf("TxKey(%q, %d) = %q, fixture says %q", tc.Stream, tc.Seq, got, tc.Key)
+		// The sequence is a decimal string, so that the largest one survives a parser
+		// that reads JSON numbers as doubles. Reject anything but its exact decimal
+		// form: a rounded or reformatted sequence derives the wrong key, which is the
+		// failure this row exists to keep a reimplementation from hitting.
+		seq, err := strconv.ParseUint(tc.Seq, 10, 64)
+		if err != nil {
+			t.Errorf("tx key %q: seq %q is not a decimal uint64: %v", tc.Key, tc.Seq, err)
+			continue
+		}
+		if canonical := strconv.FormatUint(seq, 10); canonical != tc.Seq {
+			t.Errorf("tx key %q: seq %q is not the exact decimal form of %d", tc.Key, tc.Seq, seq)
+		}
+		if got := journal.TxKey(tc.Stream, seq); got != tc.Key {
+			t.Errorf("TxKey(%q, %d) = %q, fixture says %q", tc.Stream, seq, got, tc.Key)
 		}
 		if strings.TrimSpace(tc.Description) == "" {
 			t.Errorf("tx key %q carries no description", tc.Key)
 		}
 		if strings.ContainsAny(tc.Description, "\n\r") {
 			t.Errorf("tx key %q description is not a single line: %q", tc.Key, tc.Description)
+		}
+		pinned[seq] = true
+	}
+
+	// Fixtures README rule 8 says the table reaches the ends of the range, so the two
+	// sequences that carry that claim are named here rather than left to the generator.
+	for _, seq := range []uint64{0, fixtureSeq42, fixtureSeqMax} {
+		if !pinned[seq] {
+			t.Errorf("the append target table pins no key at sequence %d", seq)
 		}
 	}
 

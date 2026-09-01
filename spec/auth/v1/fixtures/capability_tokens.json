@@ -1,0 +1,75 @@
+{
+  "version": "v1",
+  "description": "Golden fixtures for delegated capability tokens and Ed25519 signature verification",
+  "trusted_public_key": "ed25519:79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+  "evaluation_time": "2026-09-01T12:30:00Z",
+  "valid_capability": {
+    "payload": {
+      "version": "v1",
+      "id": "cap_01j7abc123456789",
+      "issuer": "forge.example.com",
+      "subject": "user_42",
+      "scopes": [
+        "rw:blog-*",
+        "r:docs"
+      ],
+      "issued_at": "2026-09-01T12:00:00Z",
+      "expires_at": "2026-09-01T13:00:00Z",
+      "not_before": "2026-09-01T12:00:00Z"
+    },
+    "canonical_payload": "walden-auth-capability:v1\nid:cap_01j7abc123456789\nissuer:forge.example.com\nsubject:user_42\nscope:rw:blog-*\nscope:r:docs\nissued_at:2026-09-01T12:00:00Z\nexpires_at:2026-09-01T13:00:00Z\nnot_before:2026-09-01T12:00:00Z\n",
+    "signature": "ed25519:b2cad790ebe3d87ced9b2f497d713b77ecade790824df72a434a4c0e9b4c728ccc99888b659935ee6913712006fb69d384200ce4506348f778bedd0ff4350206",
+    "signature_base64url": "ssrXkOvj2Hztmy9JfXE7d-yt55CCTfcqQ0pMDptMcozMmYiLZZk17mkTcSAG-2nThCAM5FBjSPd4vt0P9DUCBg",
+    "compact_token": "v1.eyJ2ZXJzaW9uIjoidjEiLCJpZCI6ImNhcF8wMWo3YWJjMTIzNDU2Nzg5IiwiaXNzdWVyIjoiZm9yZ2UuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoidXNlcl80MiIsInNjb3BlcyI6WyJydzpibG9nLSoiLCJyOmRvY3MiXSwiaXNzdWVkX2F0IjoiMjAyNi0wOS0wMVQxMjowMDowMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0wOS0wMVQxMzowMDowMFoiLCJub3RfYmVmb3JlIjoiMjAyNi0wOS0wMVQxMjowMDowMFoifQ.ssrXkOvj2Hztmy9JfXE7d-yt55CCTfcqQ0pMDptMcozMmYiLZZk17mkTcSAG-2nThCAM5FBjSPd4vt0P9DUCBg"
+  },
+  "admin_capability": {
+    "payload": {
+      "version": "v1",
+      "id": "cap_admin_999999999999",
+      "scopes": [
+        "rwc:*"
+      ],
+      "issued_at": "2026-09-01T12:00:00Z",
+      "expires_at": "2026-09-01T13:00:00Z"
+    },
+    "canonical_payload": "walden-auth-capability:v1\nid:cap_admin_999999999999\nscope:rwc:*\nissued_at:2026-09-01T12:00:00Z\nexpires_at:2026-09-01T13:00:00Z\n",
+    "signature": "ed25519:cd46a038786707a5cdde1dd9a4e00e4d8bcdf5aca8717f531d1496ce105cf96af183fc10ea2f9c76380774599892dc4c9cc75a8ff09dc66c412cc8a152645502",
+    "signature_base64url": "zUagOHhnB6XN3h3ZpOAOTYvN9ayocX9THRSWzhBc-Wrxg_wQ6i-cdjgHdFmYktxMnMdaj_CdxmxBLMihUmRVAg",
+    "compact_token": "v1.eyJ2ZXJzaW9uIjoidjEiLCJpZCI6ImNhcF9hZG1pbl85OTk5OTk5OTk5OTkiLCJzY29wZXMiOlsicndjOioiXSwiaXNzdWVkX2F0IjoiMjAyNi0wOS0wMVQxMjowMDowMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0wOS0wMVQxMzowMDowMFoifQ.zUagOHhnB6XN3h3ZpOAOTYvN9ayocX9THRSWzhBc-Wrxg_wQ6i-cdjgHdFmYktxMnMdaj_CdxmxBLMihUmRVAg"
+  },
+  "expired_capability": {
+    "payload": {
+      "version": "v1",
+      "id": "cap_expired_001",
+      "scopes": [
+        "rwc:*"
+      ],
+      "issued_at": "2026-09-01T10:00:00Z",
+      "expires_at": "2026-09-01T11:00:00Z"
+    },
+    "compact_token": "v1.eyJ2ZXJzaW9uIjoidjEiLCJpZCI6ImNhcF9leHBpcmVkXzAwMSIsInNjb3BlcyI6WyJyd2M6KiJdLCJpc3N1ZWRfYXQiOiIyMDI2LTA5LTAxVDEwOjAwOjAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTA5LTAxVDExOjAwOjAwWiJ9.CWIFRf29AfNAVOIulxOi1JDwABGMLJcEYGLsioYiuex7nugG4VvReuQoJbjVXJEuI7SiwLdn1G9yWLCUfHMRDA",
+    "expected_refusal": "capability expired"
+  },
+  "future_capability": {
+    "payload": {
+      "version": "v1",
+      "id": "cap_future_002",
+      "scopes": [
+        "rwc:*"
+      ],
+      "issued_at": "2026-09-01T12:00:00Z",
+      "expires_at": "2026-09-01T15:00:00Z",
+      "not_before": "2026-09-01T14:00:00Z"
+    },
+    "compact_token": "v1.eyJ2ZXJzaW9uIjoidjEiLCJpZCI6ImNhcF9mdXR1cmVfMDAyIiwic2NvcGVzIjpbInJ3YzoqIl0sImlzc3VlZF9hdCI6IjIwMjYtMDktMDFUMTI6MDA6MDBaIiwiZXhwaXJlc19hdCI6IjIwMjYtMDktMDFUMTU6MDA6MDBaIiwibm90X2JlZm9yZSI6IjIwMjYtMDktMDFUMTQ6MDA6MDBaIn0.i4DA4ecotKpHBXSrfoV1XsuBelgggsC9D0VG-RBF7k-NtZMz8-NfdeK5GpVNVoHtD5NNuaJGpxqmGujJ_x9iAQ",
+    "expected_refusal": "capability not yet valid"
+  },
+  "tampered_capability": {
+    "compact_token": "v1.eyJ2ZXJzaW9uIjoidjEiLCJpZCI6ImNhcF8wMWo3YWJjMTIzNDU2Nzg5IiwiaXNzdWVyIjoiZm9yZ2UuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoidXNlcl80MiIsInNjb3BlcyI6WyJyd2M6KiJdLCJpc3N1ZWRfYXQiOiIyMDI2LTA5LTAxVDEyOjAwOjAwWiIsImV4cGlyZXNfYXQiOiIyMDI2LTA5LTAxVDEzOjAwOjAwWiIsIm5vdF9iZWZvcmUiOiIyMDI2LTA5LTAxVDEyOjAwOjAwWiJ9.ssrXkOvj2Hztmy9JfXE7d-yt55CCTfcqQ0pMDptMcozMmYiLZZk17mkTcSAG-2nThCAM5FBjSPd4vt0P9DUCBg",
+    "expected_refusal": "signature mismatch"
+  },
+  "wrong_key_capability": {
+    "compact_token": "v1.eyJ2ZXJzaW9uIjoidjEiLCJpZCI6ImNhcF8wMWo3YWJjMTIzNDU2Nzg5IiwiaXNzdWVyIjoiZm9yZ2UuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoidXNlcl80MiIsInNjb3BlcyI6WyJydzpibG9nLSoiLCJyOmRvY3MiXSwiaXNzdWVkX2F0IjoiMjAyNi0wOS0wMVQxMjowMDowMFoiLCJleHBpcmVzX2F0IjoiMjAyNi0wOS0wMVQxMzowMDowMFoiLCJub3RfYmVmb3JlIjoiMjAyNi0wOS0wMVQxMjowMDowMFoifQ.HGqDI8drs5nOze45vv8rQ1cdG7ZZuS6mAiGEJCUoXq53te2T0L2cicczqhdgKAeP-CVhN1hLNQUDBJQnFCc1Ag",
+    "expected_refusal": "signature mismatch"
+  }
+}

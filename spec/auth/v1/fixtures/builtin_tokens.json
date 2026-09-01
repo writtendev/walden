@@ -1,0 +1,43 @@
+{
+  "version": "v1",
+  "description": "Golden fixtures for built-in bearer tokens and SHA-256 hashed storage records",
+  "tokens": [
+    {
+      "token_id": "tok_admin_01",
+      "raw_token": "walden_sec_admin_0123456789abcdef",
+      "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
+      "scopes": [
+        "rwc:*"
+      ],
+      "revoked": false
+    },
+    {
+      "token_id": "tok_writer_02",
+      "raw_token": "walden_sec_writer_0123456789abcdef",
+      "token_hash": "sha256:5453e0186b8b6f1d4852424e8ae33ecf685ce338a44862fc8db2acddc7b40d2a",
+      "scopes": [
+        "rw:blog-*",
+        "r:docs"
+      ],
+      "revoked": false
+    },
+    {
+      "token_id": "tok_reader_03",
+      "raw_token": "walden_sec_reader_0123456789abcdef",
+      "token_hash": "sha256:dcf2a3b4ba4b29687f0c2b86587dfa58dacc4b7b2d40fd9ace1734be83745756",
+      "scopes": [
+        "r:*"
+      ],
+      "revoked": false
+    },
+    {
+      "token_id": "tok_revoked_04",
+      "raw_token": "walden_sec_revoked_0123456789abcdef",
+      "token_hash": "sha256:3add43408f371c9e3736daac8113ae47eed2e219a82a8cabffb938cc69d0c5dd",
+      "scopes": [
+        "rwc:*"
+      ],
+      "revoked": true
+    }
+  ]
+}

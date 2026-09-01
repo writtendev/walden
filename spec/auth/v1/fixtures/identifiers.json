@@ -1,0 +1,119 @@
+{
+  "version": "v1",
+  "description": "Golden fixtures for repository identifier validation and refusal mapping",
+  "cases": [
+    {
+      "identifier": "repo-alpha",
+      "valid": true,
+      "description": "Standard hyphenated repository identifier"
+    },
+    {
+      "identifier": "blog_backend",
+      "valid": true,
+      "description": "Standard underscore repository identifier"
+    },
+    {
+      "identifier": "my.cool.project",
+      "valid": true,
+      "description": "Repository identifier with internal dots"
+    },
+    {
+      "identifier": "r_8f3a2b1c90de",
+      "valid": true,
+      "description": "Opaque random repository identifier"
+    },
+    {
+      "identifier": "a",
+      "valid": true,
+      "description": "Single character identifier"
+    },
+    {
+      "identifier": "12345",
+      "valid": true,
+      "description": "Numeric identifier"
+    },
+    {
+      "identifier": "a01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567z",
+      "valid": true,
+      "description": "Exactly 100 character maximum length identifier"
+    },
+    {
+      "identifier": "",
+      "valid": false,
+      "violation": "empty",
+      "description": "Empty identifier rejected"
+    },
+    {
+      "identifier": "a012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678z",
+      "valid": false,
+      "violation": "too_long",
+      "description": "101 characters exceeds 100 character limit"
+    },
+    {
+      "identifier": "-leading-dash",
+      "valid": false,
+      "violation": "leading_dash",
+      "description": "Leading hyphen is rejected"
+    },
+    {
+      "identifier": "trailing-dash-",
+      "valid": false,
+      "violation": "trailing_dash",
+      "description": "Trailing hyphen is rejected"
+    },
+    {
+      "identifier": ".leading-dot",
+      "valid": false,
+      "violation": "leading_dot",
+      "description": "Leading dot is rejected"
+    },
+    {
+      "identifier": "trailing-dot.",
+      "valid": false,
+      "violation": "trailing_dot",
+      "description": "Trailing dot is rejected"
+    },
+    {
+      "identifier": "path/traversal",
+      "valid": false,
+      "violation": "slash",
+      "description": "Forward slash is rejected (flat namespace)"
+    },
+    {
+      "identifier": "path\\traversal",
+      "valid": false,
+      "violation": "backslash",
+      "description": "Backslash is rejected"
+    },
+    {
+      "identifier": "repo..name",
+      "valid": false,
+      "violation": "path_traversal",
+      "description": "Consecutive dots (..) are rejected"
+    },
+    {
+      "identifier": "repo name",
+      "valid": false,
+      "violation": "whitespace",
+      "description": "Spaces are rejected"
+    },
+    {
+      "identifier": "repo:name",
+      "valid": false,
+      "violation": "invalid_char",
+      "description": "Colon is rejected"
+    },
+    {
+      "identifier": "repo@name",
+      "valid": false,
+      "violation": "invalid_char",
+      "description": "At sign is rejected"
+    },
+    {
+      "identifier": "_meta",
+      "valid": false,
+      "violation": "reserved",
+      "description": "_meta is reserved for journal meta stream"
+    }
+  ]
+}

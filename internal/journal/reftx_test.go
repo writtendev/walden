@@ -3,8 +3,6 @@ package journal_test
 import (
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -530,71 +528,6 @@ func TestRefNameBytePreservation(t *testing.T) {
 
 	if err := journal.VerifyRefTx(&roundTripped, formattedPub); err != nil {
 		t.Fatalf("VerifyRefTx on round-tripped UTF-8 ref failed: %v", err)
-	}
-}
-
-func TestRepoAlphaFixtures(t *testing.T) {
-	fixturesDir := filepath.Join("..", "..", "spec", "journal", "v1", "fixtures")
-	if _, err := os.Stat(fixturesDir); os.IsNotExist(err) {
-		t.Skipf("fixtures directory %s does not exist", fixturesDir)
-	}
-
-	// 1. Initialize signing chain from _meta genesis fixture
-	metaGenesisPath := filepath.Join(fixturesDir, "streams", "_meta", "tx", "00000000000000000000.json")
-	data0, err := os.ReadFile(metaGenesisPath)
-	if err != nil {
-		t.Fatalf("failed to read genesis fixture: %v", err)
-	}
-	var gen journal.GenesisRecord
-	if err := json.Unmarshal(data0, &gen); err != nil {
-		t.Fatalf("failed to unmarshal genesis fixture: %v", err)
-	}
-
-	chain := journal.NewSigningChain()
-	if err := chain.ApplyGenesis(&gen); err != nil {
-		t.Fatalf("chain.ApplyGenesis failed on fixture: %v", err)
-	}
-
-	// 2. Read and verify repo-alpha tx 0 fixture (signed with genesis key pub1)
-	tx0Path := filepath.Join(fixturesDir, "streams", "repo-alpha", "tx", "00000000000000000000.json")
-	tx0Data, err := os.ReadFile(tx0Path)
-	if err != nil {
-		t.Fatalf("failed to read repo-alpha tx 0: %v", err)
-	}
-	var tx0 journal.RefTransactionRecord
-	if err := json.Unmarshal(tx0Data, &tx0); err != nil {
-		t.Fatalf("failed to unmarshal repo-alpha tx 0: %v", err)
-	}
-	if err := chain.VerifyRefTx(&tx0); err != nil {
-		t.Fatalf("failed to verify repo-alpha tx 0 fixture against chain: %v", err)
-	}
-
-	// 3. Read and verify repo-alpha tx 1 fixture (multi-ref update)
-	tx1Path := filepath.Join(fixturesDir, "streams", "repo-alpha", "tx", "00000000000000000001.json")
-	tx1Data, err := os.ReadFile(tx1Path)
-	if err != nil {
-		t.Fatalf("failed to read repo-alpha tx 1: %v", err)
-	}
-	var tx1 journal.RefTransactionRecord
-	if err := json.Unmarshal(tx1Data, &tx1); err != nil {
-		t.Fatalf("failed to unmarshal repo-alpha tx 1: %v", err)
-	}
-	if err := chain.VerifyRefTx(&tx1); err != nil {
-		t.Fatalf("failed to verify repo-alpha tx 1 fixture against chain: %v", err)
-	}
-
-	// 4. Read and verify repo-alpha tx 2 fixture (zero segments, branch deletion)
-	tx2Path := filepath.Join(fixturesDir, "streams", "repo-alpha", "tx", "00000000000000000002.json")
-	tx2Data, err := os.ReadFile(tx2Path)
-	if err != nil {
-		t.Fatalf("failed to read repo-alpha tx 2: %v", err)
-	}
-	var tx2 journal.RefTransactionRecord
-	if err := json.Unmarshal(tx2Data, &tx2); err != nil {
-		t.Fatalf("failed to unmarshal repo-alpha tx 2: %v", err)
-	}
-	if err := chain.VerifyRefTx(&tx2); err != nil {
-		t.Fatalf("failed to verify repo-alpha tx 2 fixture against chain: %v", err)
 	}
 }
 

@@ -730,6 +730,8 @@ In accordance with Walden's operator-facing refusal convention (`refusal.Refusal
    refusal: journal append failed: storage provider does not support compare-and-swap (CAS) conditional writes (verify bucket provider compatibility in spec)
    ```
 
+These five messages, the `If-None-Match: *` precondition, and the derivation of the append target key are pinned by [`fixtures/conditional_append.json`](fixtures/conditional_append.json).
+
 ---
 
 ## 12. Replay and Materialization Rules
@@ -743,10 +745,12 @@ To materialize or restore a repository stream from the journal:
 3. **Verify Continuity:**
    - Verify that sequence numbers are strictly contiguous ($s_0+1, s_0+2, \dots$).
    - Any gap indicates journal truncation or missing objects and MUST cause materialization to abort loudly with a one-line error.
-4. **Apply and Verify:** Apply ref updates in sequence order, fetching required pack segments by content hash. Superseded segments or historical transactions ($s \le \text{marker.sequence}$) present in storage but not referenced in active replay MUST be ignored per Section 7.3.2.
+4. **Apply and Verify:** Apply ref updates in sequence order, fetching required pack segments by content hash. Superseded segments or historical transactions ($s \le \text{marker.sequence}$) present in storage but not referenced in active replay MUST be ignored per Section 7.3, Guarantee 2.
 
 ---
 
 ## 13. Reimplementation Grant
 
 This specification is published with an unconditional reimplementation grant. Anyone may implement this signing identity model, genesis record, key rotation protocol, ref-transaction record format, pack segment content addressing, stream layout, and reader/writer semantics in any programming language, for any purpose, without restriction and without asking.
+
+A complete golden journal covering every ruling in this document — genesis and rotation, both stream shapes, all four ref-transaction cases, real content-addressed packfiles, post-compaction snapshot and marker state, and the conditional-append targets and refusals of Section 11 — is published alongside it in [`fixtures/`](fixtures/) under the same grant.

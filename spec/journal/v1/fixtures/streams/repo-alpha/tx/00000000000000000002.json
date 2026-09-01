@@ -7,10 +7,10 @@
   "updates": [
     {
       "ref": "refs/heads/feature",
-      "old_oid": "8a65c6d3715c0e1e92d6e3e5362e49c7198cfb60",
+      "old_oid": "930ffee596a4e29a9049f3a465b0ae21fcefe6ea",
       "new_oid": "0000000000000000000000000000000000000000"
     }
   ],
   "timestamp": "2026-08-31T00:04:00Z",
-  "signature": "ed25519:e1e5d51294cddcf457c47603c3765050450ff3670e2c8534091ca045c5e5707bb9938bb8157739e6a0b6ec1de4db5d2b66fae53013c3d96b91252fab67fe8a07"
+  "signature": "ed25519:8a0c103ecd572e7aa2aa5ce7337d7be3352375cbd310feb853fdc97534236bb502130500b73b283cafa445dd3b3710c8d03bb06e173b16ac786e5fef2f2cdf0f"
 }

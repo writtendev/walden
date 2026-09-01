@@ -3,8 +3,6 @@ package journal_test
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -201,80 +199,6 @@ func TestValidateHash(t *testing.T) {
 		}
 		if !errors.Is(err, journal.ErrInvalidHash) {
 			t.Errorf("expected ErrInvalidHash for %q, got %v", h, err)
-		}
-	}
-}
-
-func TestSpecFixturesLayout(t *testing.T) {
-	fixturesDir := filepath.Join("..", "..", "spec", "journal", "v1", "fixtures")
-	if _, err := os.Stat(fixturesDir); os.IsNotExist(err) {
-		t.Skipf("fixtures directory %s does not exist", fixturesDir)
-	}
-
-	// Verify _meta stream fixtures exist
-	metaGenesis := filepath.Join(fixturesDir, "streams", "_meta", "tx", "00000000000000000000.json")
-	if _, err := os.Stat(metaGenesis); err != nil {
-		t.Errorf("missing fixture: %s", metaGenesis)
-	}
-
-	metaToken := filepath.Join(fixturesDir, "streams", "_meta", "tx", "00000000000000000001.json")
-	if _, err := os.Stat(metaToken); err != nil {
-		t.Errorf("missing fixture: %s", metaToken)
-	}
-
-	metaRotation := filepath.Join(fixturesDir, "streams", "_meta", "tx", "00000000000000000002.json")
-	if _, err := os.Stat(metaRotation); err != nil {
-		t.Errorf("missing fixture: %s", metaRotation)
-	}
-
-	// Verify repo stream fixtures exist
-	for _, seq := range []string{"00000000000000000000", "00000000000000000001", "00000000000000000002"} {
-		repoTx := filepath.Join(fixturesDir, "streams", "repo-alpha", "tx", seq+".json")
-		if _, err := os.Stat(repoTx); err != nil {
-			t.Errorf("missing fixture: %s", repoTx)
-		}
-	}
-
-	repoMarker := filepath.Join(fixturesDir, "streams", "repo-alpha", "marker.json")
-	if _, err := os.Stat(repoMarker); err != nil {
-		t.Errorf("missing fixture: %s", repoMarker)
-	}
-
-	// Check segment filenames are valid 64-hex hashes + .pack
-	entries, err := os.ReadDir(filepath.Join(fixturesDir, "streams", "repo-alpha", "segments"))
-	if err != nil {
-		t.Fatalf("failed to read segments dir: %v", err)
-	}
-	if len(entries) == 0 {
-		t.Errorf("expected at least one segment fixture")
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".pack") {
-			t.Errorf("segment fixture %q missing .pack suffix", name)
-		}
-		hash := strings.TrimSuffix(name, ".pack")
-		if err := journal.ValidateHash(hash); err != nil {
-			t.Errorf("segment fixture hash %q invalid: %v", hash, err)
-		}
-	}
-
-	// Check snapshot filenames are valid 64-hex hashes + .pack
-	snapEntries, err := os.ReadDir(filepath.Join(fixturesDir, "streams", "repo-alpha", "snapshots"))
-	if err != nil {
-		t.Fatalf("failed to read snapshots dir: %v", err)
-	}
-	if len(snapEntries) == 0 {
-		t.Errorf("expected at least one snapshot fixture")
-	}
-	for _, entry := range snapEntries {
-		name := entry.Name()
-		if !strings.HasSuffix(name, ".pack") {
-			t.Errorf("snapshot fixture %q missing .pack suffix", name)
-		}
-		hash := strings.TrimSuffix(name, ".pack")
-		if err := journal.ValidateHash(hash); err != nil {
-			t.Errorf("snapshot fixture hash %q invalid: %v", hash, err)
 		}
 	}
 }

@@ -4,20 +4,20 @@
   "seq": 1,
   "type": "ref_update",
   "segments": [
-    "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
+    "a99625fb50a5264db75a861d3fd42d1c3753bad283d542ab11f1935af595f023"
   ],
   "updates": [
     {
       "ref": "refs/heads/main",
-      "old_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-      "new_oid": "8a65c6d3715c0e1e92d6e3e5362e49c7198cfb60"
+      "old_oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96",
+      "new_oid": "930ffee596a4e29a9049f3a465b0ae21fcefe6ea"
     },
     {
       "ref": "refs/heads/feature",
       "old_oid": "0000000000000000000000000000000000000000",
-      "new_oid": "8a65c6d3715c0e1e92d6e3e5362e49c7198cfb60"
+      "new_oid": "930ffee596a4e29a9049f3a465b0ae21fcefe6ea"
     }
   ],
   "timestamp": "2026-08-31T00:03:00Z",
-  "signature": "ed25519:35235ab89142822a6d3d362a4a43685ea3d2e0782772ed54ce470bc5cad3a2bc01afca89672d99a328f210e5dfa41603ebb84b0c60b903b92981b41f756e710f"
+  "signature": "ed25519:7e88327a067c36cd8269c9bca5196e8e2bea56216542b66a9946bce8bca83bba4882eb6c986fed1b17f5fa144bbb6b1c53db77c6a452381e3b29fa5942a0cb0e"
 }

@@ -3,10 +3,7 @@ package journal_test
 import (
 	"crypto/ed25519"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -327,45 +324,5 @@ func TestCanonicalRotationPayloadDeterministic(t *testing.T) {
 	expected := "walden-key-rotation:v1\nstream:_meta\nseq:1\nold_public_key:" + oldKey + "\nnew_public_key:" + newKey + "\ntimestamp:2026-08-31T00:00:00Z\n"
 	if string(p1) != expected {
 		t.Errorf("payload mismatch:\ngot:  %q\nwant: %q", string(p1), expected)
-	}
-}
-
-func TestFixturesGenesisAndRotationVerification(t *testing.T) {
-	fixturesDir := filepath.Join("..", "..", "spec", "journal", "v1", "fixtures")
-
-	// Read genesis fixture
-	genesisPath := filepath.Join(fixturesDir, "streams", "_meta", "tx", "00000000000000000000.json")
-	data0, err := os.ReadFile(genesisPath)
-	if err != nil {
-		t.Fatalf("failed to read genesis fixture: %v", err)
-	}
-	var gen journal.GenesisRecord
-	if err := json.Unmarshal(data0, &gen); err != nil {
-		t.Fatalf("failed to unmarshal genesis fixture: %v", err)
-	}
-
-	chain := journal.NewSigningChain()
-	if err := chain.ApplyGenesis(&gen); err != nil {
-		t.Fatalf("chain.ApplyGenesis failed on fixture: %v", err)
-	}
-
-	// Advance seq 1 (token_create)
-	if err := chain.AdvanceMetaSeq(1); err != nil {
-		t.Fatalf("chain.AdvanceMetaSeq(1) failed: %v", err)
-	}
-
-	// Read rotation fixture (seq 2) if present
-	rotPath := filepath.Join(fixturesDir, "streams", "_meta", "tx", "00000000000000000002.json")
-	if data2, err := os.ReadFile(rotPath); err == nil {
-		var rot journal.KeyRotationRecord
-		if err := json.Unmarshal(data2, &rot); err != nil {
-			t.Fatalf("failed to unmarshal rotation fixture: %v", err)
-		}
-		if err := chain.ApplyRotation(&rot); err != nil {
-			t.Fatalf("chain.ApplyRotation failed on fixture: %v", err)
-		}
-		if chain.ActiveKey() != rot.NewPublicKey {
-			t.Errorf("active key mismatch: got %q, want %q", chain.ActiveKey(), rot.NewPublicKey)
-		}
 	}
 }

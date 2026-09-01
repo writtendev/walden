@@ -154,10 +154,34 @@ func TestParseJournalURLLocations(t *testing.T) {
 			prefix:   "walden",
 		},
 		{
-			name:     "aws-virtual-hosted-dotted-bucket",
-			raw:      "https://my.dotted.bucket.s3.amazonaws.com/walden",
-			provider: "AWS S3",
-			endpoint: "https://s3.amazonaws.com",
+			// A dotted bucket name is legal but cannot match an HTTPS
+			// wildcard certificate one label deep, so it resolves
+			// path-style however the URL was written.
+			name:      "aws-dotted-bucket-forces-path-style",
+			raw:       "https://my.dotted.bucket.s3.amazonaws.com/walden",
+			provider:  "AWS S3",
+			endpoint:  "https://s3.amazonaws.com",
+			region:    "us-east-1",
+			bucket:    "my.dotted.bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			name:      "aws-shorthand-dotted-bucket-forces-path-style",
+			raw:       "s3://my.dotted.bucket/walden",
+			provider:  "AWS S3",
+			endpoint:  "https://s3.us-east-1.amazonaws.com",
+			region:    "us-east-1",
+			bucket:    "my.dotted.bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			// No certificate to match over plain HTTP, so an explicit
+			// style=virtual on a dotted bucket stands.
+			name:     "http-dotted-bucket-keeps-explicit-virtual-hosted",
+			raw:      "http://minio.internal:9000/my.dotted.bucket/walden?style=virtual",
+			endpoint: "http://minio.internal:9000",
 			region:   "us-east-1",
 			bucket:   "my.dotted.bucket",
 			prefix:   "walden",
@@ -338,6 +362,41 @@ func TestParseJournalURLLocations(t *testing.T) {
 			prefix:    "walden",
 			pathStyle: true,
 		},
+		{
+			// A root-anchored FQDN names the same host as the bare form,
+			// so it must reach the same provider rule — and the same
+			// region-from-host reading.
+			name:      "aws-root-anchored-fqdn",
+			raw:       "https://s3.eu-west-1.amazonaws.com./my-bucket/walden",
+			provider:  "AWS S3",
+			endpoint:  "https://s3.eu-west-1.amazonaws.com",
+			region:    "eu-west-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			// The signing region is case-sensitive in the SigV4
+			// credential scope and appears in the endpoint host, so it
+			// is folded to lower case exactly like the host.
+			name:     "region-query-is-lowercased",
+			raw:      "s3://my-bucket/walden?region=US-EAST-2",
+			provider: "AWS S3",
+			endpoint: "https://s3.us-east-2.amazonaws.com",
+			region:   "us-east-2",
+			bucket:   "my-bucket",
+			prefix:   "walden",
+		},
+		{
+			name:      "region-environment-is-lowercased",
+			raw:       "http://minio.internal:9000/my-bucket/walden",
+			env:       map[string]string{store.EnvRegion: "EU-WEST-3"},
+			endpoint:  "http://minio.internal:9000",
+			region:    "eu-west-3",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -397,8 +456,17 @@ func TestParseJournalURLRefusals(t *testing.T) {
 		{name: "region-space", raw: "s3://my-bucket/walden?region=eu west", wantErr: store.ErrInvalidJournal, wantSub: "region"},
 		{name: "userinfo-no-secret", raw: "s3://AKIAEXAMPLE@my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "no secret"},
 		{name: "userinfo-no-key-id", raw: "s3://:secret@my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "no access key ID"},
+		{name: "userinfo-empty", raw: "s3://@my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "empty credentials"},
 		{name: "wasabi-no-cas", raw: "https://s3.eu-central-1.wasabisys.com/my-bucket/walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
 		{name: "wasabi-virtual-hosted-no-cas", raw: "https://my-bucket.s3.wasabisys.com/walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
+		// A root-anchored FQDN must not walk past the provider table and
+		// the compare-and-swap gate behind it.
+		{name: "wasabi-root-anchored-fqdn-no-cas", raw: "https://s3.wasabisys.com./my-bucket/walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
+		{name: "wasabi-root-anchored-virtual-hosted-no-cas", raw: "https://my-bucket.s3.wasabisys.com./walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
+		// s3:// always addresses AWS, so a port has nowhere to go. Dropping
+		// it silently resolved a self-hosted endpoint to a bucket at Amazon.
+		{name: "s3-scheme-with-port", raw: "s3://minio.local:9000/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: `s3:// URL carries port "9000"`},
+		{name: "dotted-bucket-cannot-be-forced-virtual-hosted", raw: "s3://my.dotted.bucket/walden?style=virtual", wantErr: store.ErrInvalidJournal, wantSub: "style=virtual conflicts with the dot in bucket"},
 	}
 
 	for _, tt := range tests {
@@ -545,81 +613,62 @@ func TestParseJournalURLNeedsNoCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJournalURL with no environment failed: %v", err)
 	}
-	if j.Credentials.AccessKeyID != "" || j.Credentials.Source != "" {
+	if j.Credentials.AccessKeyID != "" || j.Credentials.SecretAccessKey != "" {
 		t.Errorf("ParseJournalURL resolved credentials: %+v", j.Credentials)
+	}
+	if j.Credentials.Source != "(none found)" {
+		t.Errorf("Source = %q, want %q", j.Credentials.Source, "(none found)")
 	}
 }
 
-func TestJournalKeyAndObjectURL(t *testing.T) {
+// TestParseJournalURLNamesTheCredentialSource is the regression for a
+// --print-config that reported "(unresolved)" on a machine where the AWS
+// variables were set and boot would in fact succeed. The source is named; the
+// secret never is.
+func TestParseJournalURLNamesTheCredentialSource(t *testing.T) {
 	tests := []struct {
-		name    string
-		raw     string
-		key     string
-		wantKey string
-		wantURL string
+		name       string
+		raw        string
+		env        map[string]string
+		wantSource string
 	}{
 		{
-			name:    "path-style-with-prefix",
-			raw:     "http://minio.internal:9000/my-bucket/walden",
-			key:     "tx/000000000001.json",
-			wantKey: "walden/tx/000000000001.json",
-			wantURL: "http://minio.internal:9000/my-bucket/walden/tx/000000000001.json",
+			name:       "environment",
+			raw:        "s3://my-bucket/walden",
+			env:        map[string]string{store.EnvAccessKeyID: "AKIAENV", store.EnvSecretAccessKey: "envsecret"},
+			wantSource: store.EnvAccessKeyID,
 		},
 		{
-			name:    "path-style-bucket-root",
-			raw:     "http://minio.internal:9000/my-bucket",
-			key:     "tx/000000000001.json",
-			wantKey: "tx/000000000001.json",
-			wantURL: "http://minio.internal:9000/my-bucket/tx/000000000001.json",
+			name:       "url-userinfo",
+			raw:        "s3://AKIAURL:urlsecret@my-bucket/walden",
+			env:        nil,
+			wantSource: "WALDEN_JOURNAL URL",
 		},
 		{
-			name:    "virtual-hosted-with-prefix",
-			raw:     "https://my-bucket.s3.eu-west-1.amazonaws.com/walden",
-			key:     "tx/000000000001.json",
-			wantKey: "walden/tx/000000000001.json",
-			wantURL: "https://my-bucket.s3.eu-west-1.amazonaws.com/walden/tx/000000000001.json",
+			name:       "nothing-set",
+			raw:        "s3://my-bucket/walden",
+			env:        nil,
+			wantSource: "(none found)",
 		},
 		{
-			name:    "virtual-hosted-shorthand",
-			raw:     "s3://my-bucket/backups/walden",
-			key:     "packs/abc123.pack",
-			wantKey: "backups/walden/packs/abc123.pack",
-			wantURL: "https://my-bucket.s3.us-east-1.amazonaws.com/backups/walden/packs/abc123.pack",
-		},
-		{
-			name:    "r2-path-style",
-			raw:     "https://a1b2c3.r2.cloudflarestorage.com/my-bucket/walden",
-			key:     "tx/000000000002.json",
-			wantKey: "walden/tx/000000000002.json",
-			wantURL: "https://a1b2c3.r2.cloudflarestorage.com/my-bucket/walden/tx/000000000002.json",
-		},
-		{
-			name:    "leading-slash-on-key",
-			raw:     "s3://my-bucket/walden",
-			key:     "/tx/000000000003.json",
-			wantKey: "walden/tx/000000000003.json",
-			wantURL: "https://my-bucket.s3.us-east-1.amazonaws.com/walden/tx/000000000003.json",
-		},
-		{
-			name:    "empty-key-is-the-list-prefix",
-			raw:     "s3://my-bucket/walden",
-			key:     "",
-			wantKey: "walden/",
-			wantURL: "https://my-bucket.s3.us-east-1.amazonaws.com/walden/",
+			name:       "half-set-environment-is-not-a-source",
+			raw:        "s3://my-bucket/walden",
+			env:        map[string]string{store.EnvAccessKeyID: "AKIAENV"},
+			wantSource: "(none found)",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			j, err := store.ParseJournalURL(tt.raw, nil)
+			j, err := store.ParseJournalURL(tt.raw, envLookup(tt.env))
 			if err != nil {
 				t.Fatalf("ParseJournalURL(%q) failed: %v", tt.raw, err)
 			}
-			if got := j.Key(tt.key); got != tt.wantKey {
-				t.Errorf("Key(%q) = %q, want %q", tt.key, got, tt.wantKey)
+			if j.Credentials.Source != tt.wantSource {
+				t.Errorf("Source = %q, want %q", j.Credentials.Source, tt.wantSource)
 			}
-			if got := j.ObjectURL(tt.key); got != tt.wantURL {
-				t.Errorf("ObjectURL(%q) = %q, want %q", tt.key, got, tt.wantURL)
+			if got := j.String(); strings.Contains(got, "envsecret") || strings.Contains(got, "urlsecret") {
+				t.Errorf("Journal.String() leaked the secret: %q", got)
 			}
 		})
 	}
@@ -650,48 +699,112 @@ func TestJournalStringHidesSecret(t *testing.T) {
 	}
 }
 
-// TestProviderNamesMatchSupportMatrix ties the host table in this package to
+// TestProviderNamesMatchSupportMatrix binds the host table in this package to
 // the published support matrix. store must not import journal (journal is the
-// layer above), so the tie is checked here instead of at compile time.
+// layer above), so the binding is checked here rather than at compile time.
+// It ranges over both tables, so drift in either direction fails: a host rule
+// whose CAS bit disagrees with the matrix, and a provider the matrix marks
+// unsupported that has no refusing host rule here.
 func TestProviderNamesMatchSupportMatrix(t *testing.T) {
-	tests := []struct {
-		raw          string
-		wantProvider string
-		wantStatus   journal.ProviderStatus
-	}{
-		{raw: "s3://my-bucket/walden", wantProvider: "AWS S3", wantStatus: journal.ProviderSupported},
-		{raw: "https://a1b2c3.r2.cloudflarestorage.com/my-bucket/walden", wantProvider: "Cloudflare R2", wantStatus: journal.ProviderSupported},
-		{raw: "https://storage.googleapis.com/my-bucket/walden", wantProvider: "Google Cloud Storage", wantStatus: journal.ProviderSupported},
-		{raw: "https://s3.us-west-004.backblazeb2.com/my-bucket/walden", wantProvider: "Backblaze B2", wantStatus: journal.ProviderSupported},
-		{raw: "https://myaccount.blob.core.windows.net/my-container/walden", wantProvider: "Azure Blob Storage", wantStatus: journal.ProviderConditional},
+	rows := store.ProviderHostsForTest()
+	if len(rows) == 0 {
+		t.Fatal("the provider host table is empty")
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.wantProvider, func(t *testing.T) {
-			j, err := store.ParseJournalURL(tt.raw, nil)
-			if err != nil {
-				t.Fatalf("ParseJournalURL(%q) failed: %v", tt.raw, err)
-			}
-			if j.Provider != tt.wantProvider {
-				t.Fatalf("Provider = %q, want %q", j.Provider, tt.wantProvider)
-			}
-			info, ok := journal.LookupProvider(j.Provider)
+	byProvider := make(map[string]store.ProviderHostRow, len(rows))
+	for _, row := range rows {
+		byProvider[row.Provider] = row
+	}
+
+	// Every host rule here names a provider the matrix knows, agrees with
+	// the matrix about compare-and-swap, and behaves that way at boot.
+	for _, row := range rows {
+		t.Run("host-table/"+row.Provider, func(t *testing.T) {
+			info, ok := journal.LookupProvider(row.Provider)
 			if !ok {
-				t.Fatalf("provider %q is not in the support matrix", j.Provider)
+				t.Fatalf("provider %q is not in the support matrix", row.Provider)
 			}
-			if info.Status != tt.wantStatus {
-				t.Errorf("support matrix status for %q = %q, want %q", j.Provider, info.Status, tt.wantStatus)
+			if info.Name != row.Provider {
+				t.Fatalf("provider %q resolves to matrix entry %q", row.Provider, info.Name)
+			}
+			wantCAS := journal.ValidateProviderCAS(row.Provider) == nil
+			if row.CAS != wantCAS {
+				t.Errorf("host table says cas=%v for %q, support matrix says %v (status %q)", row.CAS, row.Provider, wantCAS, info.Status)
+			}
+
+			raw := "https://" + row.Suffix + "/my-bucket/walden"
+			_, err := store.ParseJournalURL(raw, envLookup(creds))
+			refused := errors.Is(err, store.ErrProviderUnsupported)
+			if refused == row.CAS {
+				t.Errorf("ParseJournalURL(%q) refused=%v, want %v (err: %v)", raw, refused, !row.CAS, err)
 			}
 		})
 	}
 
-	// Every provider the matrix marks unsupported must be refused at boot,
-	// not on the first push.
-	if err := journal.ValidateProviderCAS("Wasabi"); err == nil {
-		t.Fatal("support matrix no longer marks Wasabi unsupported; update providerHosts")
+	// Every provider the matrix marks unsupported has a refusing host rule
+	// here, so it is refused at boot rather than on the first push.
+	for _, info := range journal.ProviderSupportMatrix {
+		if info.Status != journal.ProviderUnsupported {
+			continue
+		}
+		t.Run("matrix/"+info.Name, func(t *testing.T) {
+			row, ok := byProvider[info.Name]
+			if !ok {
+				t.Fatalf("support matrix marks %q unsupported, but internal/store has no host rule for it: walden would accept it at boot", info.Name)
+			}
+			if row.CAS {
+				t.Errorf("support matrix marks %q unsupported, but its host rule says cas=true", info.Name)
+			}
+		})
 	}
-	if _, err := store.ParseJournalURL("https://s3.us-east-1.wasabisys.com/my-bucket/walden", nil); !errors.Is(err, store.ErrProviderUnsupported) {
-		t.Errorf("Wasabi URL was not refused at boot: %v", err)
+}
+
+// TestJournalRefusalsHideTheSecret is the regression for the leak that let
+// net/url quote a WALDEN_JOURNAL value, userinfo and all, into stderr. Every
+// URL here is one net/url (or url.ParseQuery) refuses to parse, and no refusal
+// walden returns for them may name any part of the credentials.
+func TestJournalRefusalsHideTheSecret(t *testing.T) {
+	const (
+		keyID  = "AKIAKEYID"
+		secret = "SUPERSECRETVALUE"
+	)
+
+	raws := []struct {
+		name string
+		raw  string
+	}{
+		{"invalid-port", "s3://" + keyID + ":" + secret + "@bucket:80x/p"},
+		{"control-character", "s3://" + keyID + ":" + secret + "@bucket/p\x7f"},
+		{"unclosed-ipv6-literal", "https://" + keyID + ":" + secret + "@[::1/my-bucket/walden"},
+		{"bad-escape-in-query", "s3://" + keyID + ":" + secret + "@my-bucket/walden?region=%" + secret},
+		{"bad-escape-in-userinfo", "s3://" + keyID + ":se%" + secret + "@my-bucket/walden"},
+	}
+
+	// net/url's escape errors quote the three characters around a bad '%',
+	// so a leak can be a fragment rather than the whole secret.
+	forbidden := []string{keyID, secret, secret[:2]}
+
+	for _, tt := range raws {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, entry := range []struct {
+				name string
+				fn   func(string, func(string) (string, bool)) (*store.Journal, error)
+			}{
+				{"ParseJournalURL", store.ParseJournalURL},
+				{"ResolveJournal", store.ResolveJournal},
+			} {
+				_, err := entry.fn(tt.raw, envLookup(creds))
+				if err == nil {
+					t.Fatalf("%s succeeded, want refusal", entry.name)
+				}
+				assertOneLineRefusal(t, err)
+				for _, leak := range forbidden {
+					if strings.Contains(err.Error(), leak) {
+						t.Errorf("%s leaked %q: %q", entry.name, leak, err.Error())
+					}
+				}
+			}
+		})
 	}
 }
 

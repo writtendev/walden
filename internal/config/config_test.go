@@ -257,3 +257,54 @@ func TestConfigStringRedactsJournalSecret(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateRefusalHidesJournalSecret is the regression for a leak on the
+// boot path: net/url's parse errors quote the whole URL back, and walden
+// wrapped one verbatim, so a leading space copied out of a .env file put an
+// object-storage secret into stderr, the container log, and the supervisor
+// journal. A malformed journal URL is never echoed.
+func TestValidateRefusalHidesJournalSecret(t *testing.T) {
+	const (
+		keyID  = "AKIAKEYID"
+		secret = "SUPERSECRETVALUE"
+	)
+
+	journals := []struct {
+		name    string
+		journal string
+	}{
+		{"invalid-port", "s3://" + keyID + ":" + secret + "@bucket:80x/p"},
+		{"leading-space", " s3://" + keyID + ":" + secret + "@bucket/prefix"},
+		{"control-character", "s3://" + keyID + ":" + secret + "@bucket/p\x7f"},
+		{"unclosed-ipv6-literal", "https://" + keyID + ":" + secret + "@[::1/my-bucket/walden"},
+		{"bad-escape-in-userinfo", "s3://" + keyID + ":se%" + secret + "@my-bucket/walden"},
+	}
+
+	for _, tt := range journals {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				DataDir:    config.DefaultDataDir,
+				JournalURL: tt.journal,
+				ListenAddr: config.DefaultListenAddr,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate() accepted a malformed journal URL")
+			}
+			// net/url's escape errors quote the three characters around a
+			// bad '%', so a leak can be a fragment rather than the whole
+			// secret.
+			for _, leak := range []string{keyID, secret, secret[:2]} {
+				if strings.Contains(err.Error(), leak) {
+					t.Errorf("Validate() leaked %q: %q", leak, err.Error())
+				}
+			}
+			if !strings.HasPrefix(err.Error(), "invalid journal: ") {
+				t.Errorf("error %q does not name the journal knob", err.Error())
+			}
+			if strings.ContainsAny(err.Error(), "\n\r") {
+				t.Errorf("error %q is not a single line", err.Error())
+			}
+		})
+	}
+}

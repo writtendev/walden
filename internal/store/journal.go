@@ -69,8 +69,8 @@ type Credentials struct {
 	SecretAccessKey string
 	SessionToken    string
 
-	// Source names where the credentials came from, for --print-config.
-	// It never contains the secret.
+	// Source names where the credentials came from, or would come from,
+	// for --print-config. It never contains the secret.
 	Source string
 }
 
@@ -82,8 +82,8 @@ type Journal struct {
 	Provider string
 
 	// Endpoint is scheme://host[:port] with no bucket label and no path.
-	// For virtual-hosted addressing the bucket label is prepended at
-	// request time; see ObjectURL.
+	// For virtual-hosted addressing the bucket label is prepended to the
+	// host at request time.
 	Endpoint string
 
 	// Region is the signing region.
@@ -100,7 +100,8 @@ type Journal struct {
 	// rather than in the hostname.
 	PathStyle bool
 
-	// Credentials is empty unless the Journal came from ResolveJournal.
+	// Credentials holds the resolved secret only for a Journal that came
+	// from ResolveJournal. ParseJournalURL fills in Source either way.
 	Credentials Credentials
 }
 
@@ -176,7 +177,10 @@ func ResolveJournal(raw string, lookupEnv func(string) (string, bool)) (*Journal
 // ParseJournalURL resolves the location half of a WALDEN_JOURNAL value:
 // provider, endpoint, region, bucket, prefix, and addressing style. It picks up
 // credentials embedded in the URL but does not require any, so that
-// --print-config can check a URL on a machine that holds no secrets.
+// --print-config can check a URL on a machine that holds no secrets. When the
+// URL carries none it still names where ResolveJournal would find them, in
+// Credentials.Source, so --print-config does not report an unresolved
+// configuration that would in fact boot.
 //
 // The region resolves through this order, first hit wins: the region query
 // parameter, then the region named in the endpoint host, then the provider's
@@ -191,7 +195,12 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, refuseJournalErr(err, "expected a URL such as s3://bucket/prefix")
+		// net/url's parse errors quote the whole URL back, userinfo and
+		// all. The journal URL may carry an object-storage secret and
+		// this line goes to stderr, so the URL is not echoed.
+		return nil, refuseJournal(
+			"URL is malformed; it is not echoed because it may carry credentials",
+			"expected a URL such as s3://bucket/prefix")
 	}
 	if u.Fragment != "" {
 		return nil, refuseJournal("URL carries a fragment", "remove everything from the '#' onwards")
@@ -211,25 +220,43 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 		return nil, err
 	}
 
-	host := u.Hostname()
+	// The s3:// shorthand always resolves to an AWS HTTPS endpoint.
+	endpointScheme := scheme
+	if scheme == "s3" {
+		endpointScheme = "https"
+	}
+
+	host := strings.ToLower(u.Hostname())
+	if scheme != "s3" {
+		// A root-anchored FQDN ("s3.wasabisys.com.") names the same host
+		// as the bare form. Strip the root dot so the provider table —
+		// and the compare-and-swap gate behind it — sees one spelling.
+		// Under s3:// the host is a bucket name, not a host, so a
+		// trailing dot there stays and fails the bucket rules.
+		host = strings.TrimRight(host, ".")
+	}
 	if host == "" {
 		return nil, refuseJournal("URL has no host", "expected s3://bucket/prefix or https://endpoint/bucket/prefix")
 	}
-	host = strings.ToLower(host)
 
 	j := &Journal{}
 	segments := pathSegments(u.Path)
 
 	if scheme == "s3" {
 		// s3://bucket/prefix: the host is the bucket and AWS is implied.
+		// A port has nowhere to go — the endpoint is AWS's — and silently
+		// dropping it would resolve s3://minio.local:9000/bucket/walden
+		// to a bucket named "minio.local" at Amazon.
+		if u.Port() != "" {
+			return nil, refuseJournal(
+				fmt.Sprintf("s3:// URL carries port %q, but s3:// always addresses AWS", u.Port()),
+				"for a self-hosted endpoint use http(s)://host:port/bucket/prefix")
+		}
 		j.Provider = "AWS S3"
 		j.Bucket = host
 		j.Prefix = strings.Join(segments, "/")
-		if region == "" {
-			region = firstNonEmpty(envValue(lookupEnv, EnvRegion), envValue(lookupEnv, EnvDefaultRegion), DefaultRegion)
-		}
-		j.Region = region
-		j.Endpoint = "https://s3." + region + ".amazonaws.com"
+		j.Region = resolveRegion(region, envValue(lookupEnv, EnvRegion), envValue(lookupEnv, EnvDefaultRegion), DefaultRegion)
+		j.Endpoint = "https://s3." + j.Region + ".amazonaws.com"
 		j.PathStyle = style == "path"
 	} else {
 		rule, known := matchProviderHost(host)
@@ -285,7 +312,7 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 		}
 
 		j.Endpoint = scheme + "://" + hostPort(endpointHost, u.Port())
-		j.Region = firstNonEmpty(
+		j.Region = resolveRegion(
 			region,
 			rule.regionFromHost(endpointHost),
 			rule.fixedRegion,
@@ -298,6 +325,22 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 	if err := validateBucket(j.Bucket); err != nil {
 		return nil, err
 	}
+
+	// A bucket name containing a dot cannot be addressed virtual-hosted over
+	// HTTPS: provider wildcard certificates are one label deep, so
+	// my.dotted.bucket.s3.<region>.amazonaws.com fails verification.
+	// Path-style is the only shape that can work, and is what every S3
+	// client falls back to. Over plain HTTP there is no certificate to
+	// match, so the operator's choice stands.
+	if !j.PathStyle && endpointScheme == "https" && strings.Contains(j.Bucket, ".") {
+		if style == "virtual" {
+			return nil, refuseJournal(
+				fmt.Sprintf("style=virtual conflicts with the dot in bucket %q", j.Bucket),
+				"a dotted bucket name cannot match an HTTPS wildcard certificate; drop style=virtual")
+		}
+		j.PathStyle = true
+	}
+
 	if err := validatePrefix(j.Prefix); err != nil {
 		return nil, err
 	}
@@ -309,6 +352,12 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 	if err != nil {
 		return nil, err
 	}
+	if creds.Source == "" {
+		// No credentials in the URL. Name where ResolveJournal would find
+		// them, without reading them, so --print-config tells the truth
+		// about a boot that will succeed.
+		creds.Source = envCredentialSource(lookupEnv)
+	}
 	j.Credentials = creds
 
 	return j, nil
@@ -318,7 +367,9 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 func journalQuery(u *url.URL) (region, style string, err error) {
 	q, parseErr := url.ParseQuery(u.RawQuery)
 	if parseErr != nil {
-		return "", "", refuseJournalErr(parseErr, "the only query parameters are region and style")
+		// Same reason as the URL itself: the parse error quotes the input
+		// back, and no part of a journal URL is echoed.
+		return "", "", refuseJournal("query string is malformed", "the only query parameters are region and style")
 	}
 	for key := range q {
 		switch key {
@@ -403,11 +454,13 @@ func credentialsFromURL(u *url.URL) (Credentials, error) {
 		return Credentials{}, nil
 	}
 	id := u.User.Username()
-	secret, hasSecret := u.User.Password()
-	if id == "" {
+	secret, _ := u.User.Password()
+	switch {
+	case id == "" && secret == "":
+		return Credentials{}, refuseJournal("URL carries empty credentials", "drop the '@', or use s3://ACCESS_KEY:SECRET@bucket/prefix")
+	case id == "":
 		return Credentials{}, refuseJournal("URL carries a secret with no access key ID", "use s3://ACCESS_KEY:SECRET@bucket/prefix")
-	}
-	if !hasSecret || secret == "" {
+	case secret == "":
 		return Credentials{}, refuseJournal("URL carries an access key ID with no secret", "use s3://ACCESS_KEY:SECRET@bucket/prefix, percent-encoding reserved characters")
 	}
 	return Credentials{
@@ -452,31 +505,15 @@ func credentialsFromEnv(lookupEnv func(string) (string, bool)) (Credentials, err
 	}, nil
 }
 
-// Key returns the full object key for name, including the journal prefix.
-// Key("") is the LIST prefix for the whole journal.
-func (j *Journal) Key(name string) string {
-	name = strings.TrimPrefix(name, "/")
-	if j.Prefix == "" {
-		return name
+// envCredentialSource names the environment credentials walden would sign
+// with, without printing any part of the secret. --print-config prints the
+// source rather than the credentials, so a URL can be checked on a machine
+// that holds no secrets.
+func envCredentialSource(lookupEnv func(string) (string, bool)) string {
+	if envValue(lookupEnv, EnvAccessKeyID) != "" && envValue(lookupEnv, EnvSecretAccessKey) != "" {
+		return EnvAccessKeyID
 	}
-	if name == "" {
-		return j.Prefix + "/"
-	}
-	return j.Prefix + "/" + name
-}
-
-// ObjectURL returns the request URL for an object under this journal, in
-// whichever addressing style the journal URL resolved to.
-func (j *Journal) ObjectURL(name string) string {
-	key := j.Key(name)
-	if j.PathStyle {
-		return j.Endpoint + "/" + j.Bucket + "/" + key
-	}
-	scheme, host, found := strings.Cut(j.Endpoint, "://")
-	if !found {
-		return j.Endpoint + "/" + j.Bucket + "/" + key
-	}
-	return scheme + "://" + j.Bucket + "." + host + "/" + key
+	return "(none found)"
 }
 
 // String renders the resolved journal for walden serve --print-config.
@@ -598,11 +635,6 @@ func refuseJournal(why, fix string) error {
 	return refusal.RefuseWithCause("invalid journal", why, fix, ErrInvalidJournal)
 }
 
-// refuseJournalErr wraps an underlying error into a journal refusal.
-func refuseJournalErr(err error, fix string) error {
-	return refuseJournal(err.Error(), fix)
-}
-
 // envValue reads one environment variable through the supplied lookup.
 func envValue(lookupEnv func(string) (string, bool), key string) string {
 	if lookupEnv == nil {
@@ -613,6 +645,14 @@ func envValue(lookupEnv func(string) (string, bool), key string) string {
 		return ""
 	}
 	return strings.TrimSpace(v)
+}
+
+// resolveRegion returns the first region named by the sources given, folded to
+// lower case. The region is normalised exactly like the host, and for the same
+// reason: it appears in endpoint hostnames and in the SigV4 credential scope,
+// which is case-sensitive, so "US-EAST-1" would be signed and then rejected.
+func resolveRegion(values ...string) string {
+	return strings.ToLower(firstNonEmpty(values...))
 }
 
 // firstNonEmpty returns the first non-empty string it is given.

@@ -92,7 +92,9 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	// Resolve the journal URL here, at boot, so a malformed WALDEN_JOURNAL
 	// stops walden now rather than on the first push. --print-config
 	// resolves the location but not the credentials, so an operator can
-	// check a URL on a machine that holds no secrets.
+	// check a URL on a machine that holds no secrets; it still names where
+	// the credentials would come from, so it cannot report an unresolved
+	// journal that would in fact boot.
 	var journal *store.Journal
 	if cfg.JournalURL != "" {
 		if printConfig {

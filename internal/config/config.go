@@ -64,9 +64,10 @@ func (c *Config) String() string {
 	)
 }
 
-// redactURL replaces any password in a URL's userinfo with "xxxxx", so that
-// credentials embedded in the journal URL never reach stdout or a log line.
-// A URL that will not parse is not printed at all.
+// redactURL replaces any password in a URL's userinfo with "xxxxx", so that a
+// secret embedded in the journal URL never reaches stdout or a log line. The
+// access key ID is a public identifier and is printed as given; the secret is
+// not. A URL that will not parse is not printed at all.
 func redactURL(raw string) string {
 	if raw == "" {
 		return ""
@@ -89,9 +90,12 @@ func (c *Config) Validate() error {
 	}
 
 	if c.JournalURL != "" {
+		// net/url's parse errors quote the whole URL back, userinfo and
+		// all, so the reason is reported without it. The journal URL may
+		// carry an object-storage secret, and stderr is a container log.
 		u, err := url.Parse(c.JournalURL)
 		if err != nil {
-			return fmt.Errorf("invalid journal: %w", err)
+			return errors.New("invalid journal: URL is malformed; it is not echoed because it may carry credentials (expected s3://bucket/path)")
 		}
 		if u.Scheme == "" {
 			return errors.New("invalid journal: missing URL scheme (e.g. s3://bucket/path)")

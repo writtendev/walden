@@ -399,6 +399,38 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			wantExit0:  true,
 			wantOutSub: "journal: s3://AKIAEXAMPLE:xxxxx@my-bucket/walden",
 		},
+		{
+			// --print-config names where the credentials come from, so it
+			// cannot report an unresolved journal that would in fact boot.
+			// It names the source, never the secret.
+			name:    "serve-print-config-names-the-credential-source",
+			cmdPath: binPath,
+			args:    []string{"serve", "--journal", "s3://my-bucket/walden", "--print-config"},
+			env: append(os.Environ(),
+				"AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+				"AWS_SECRET_ACCESS_KEY=topsecret",
+			),
+			wantExit0:  true,
+			wantOutSub: "journal-credentials: AWS_ACCESS_KEY_ID",
+		},
+		{
+			// A self-hosted endpoint written as s3://host:port silently
+			// resolved to a bucket named "minio.local" at Amazon.
+			name:       "serve-s3-scheme-with-port-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "s3://minio.local:9000/my-bucket/walden"},
+			wantExit0:  false,
+			wantErrSub: `walden: invalid journal: s3:// URL carries port "9000"`,
+		},
+		{
+			// A root-anchored FQDN must not walk past the provider table
+			// and the compare-and-swap gate behind it.
+			name:       "serve-journal-root-anchored-fqdn-without-cas-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "https://s3.wasabisys.com./my-bucket/walden"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: Wasabi does not support compare-and-swap",
+		},
 	}
 
 	for _, tt := range tests {

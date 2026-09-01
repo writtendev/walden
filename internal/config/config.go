@@ -47,9 +47,17 @@ type Config struct {
 }
 
 // String returns a human-readable representation of the resolved configuration.
+//
+// The journal URL itself is never rendered. It may carry an object-storage
+// secret, and deciding which parts of it are safe to print is the rule
+// internal/store already owns, in guardCredentials: a second, weaker copy here
+// printed most of a MinIO password whose secret held an unencoded '/'. So this
+// says only whether the journal is on, and walden serve --print-config prints
+// the resolved provider, endpoint, region, bucket, prefix, style, and
+// credential source from store.Journal.String(), all of them past that gate.
 func (c *Config) String() string {
-	journal := redactURL(c.JournalURL)
-	if journal == "" {
+	journal := "(configured)"
+	if c.JournalURL == "" {
 		journal = "(disabled)"
 	}
 	authTrust := c.AuthTrustKey
@@ -64,55 +72,20 @@ func (c *Config) String() string {
 	)
 }
 
-// redactURL replaces any password in a URL's userinfo with "xxxxx", so that a
-// secret embedded in the journal URL never reaches stdout or a log line. The
-// access key ID is a public identifier and is printed as given; the secret is
-// not. A URL that will not parse is not printed at all.
-func redactURL(raw string) string {
-	if raw == "" {
-		return ""
+// refuseWhitespaceJournal refuses a journal value that was given but holds
+// nothing but whitespace.
+//
+// Trimming alone would make it indistinguishable from unset, and unset means
+// journal-less: walden would boot without durability and say nothing. A
+// Kubernetes secret file holding one newline, or a Helm value that renders
+// blank, is a mistake, not a decision to run without a journal — and walden's
+// first promise is that an acknowledged push is in the journal. Journal-less
+// mode stays reachable by leaving the knob unset, deliberately.
+func refuseWhitespaceJournal(raw string) error {
+	if raw == "" || strings.TrimSpace(raw) != "" {
+		return nil
 	}
-	const withheld = "(URL withheld; it may carry credentials)"
-
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "(unparseable URL)"
-	}
-	if u.User != nil {
-		// u.Redacted() replaces the password and prints the username.
-		// That is only safe where the username is the access key ID —
-		// a URL walden would serve, whose userinfo is ACCESS_KEY:SECRET.
-		// Elsewhere the username may be a secret that landed there:
-		// net/url reads ACCESS_KEY://SECRET@host as scheme "ACCESS_KEY"
-		// with "SECRET" for a username, and there is no password to
-		// redact.
-		_, hasPassword := u.User.Password()
-		if !hasPassword || !journalSchemes[strings.ToLower(u.Scheme)] {
-			return withheld
-		}
-		return u.Redacted()
-	}
-	// No userinfo, yet an '@' survives somewhere: an unencoded character in
-	// the credentials ended the authority early and net/url has moved the
-	// secret into the host, the path, or the query.
-	if hasAt(raw) {
-		return withheld
-	}
-	return raw
-}
-
-// journalSchemes are the schemes walden serves a journal under. internal/store
-// owns the real rule; this copy only decides whether a URL's userinfo is safe
-// to print, and a scheme missing from it means less is printed, never more.
-var journalSchemes = map[string]bool{"s3": true, "https": true, "http": true}
-
-// hasAt reports whether raw holds an '@', written plainly or percent-encoded.
-func hasAt(raw string) bool {
-	if strings.Contains(raw, "@") {
-		return true
-	}
-	decoded, err := url.PathUnescape(raw)
-	return err == nil && strings.Contains(decoded, "@")
+	return errors.New("invalid journal: value is only whitespace (give a URL such as s3://bucket/prefix, or leave the journal unset for journal-less mode)")
 }
 
 // Validate checks that all runtime configuration values are valid.
@@ -120,6 +93,10 @@ func hasAt(raw string) bool {
 func (c *Config) Validate() error {
 	if c.DataDir == "" {
 		return errors.New("invalid data-dir: cannot be empty")
+	}
+
+	if err := refuseWhitespaceJournal(c.JournalURL); err != nil {
+		return err
 	}
 
 	// A journal URL is trimmed before it is read. A value out of a file-backed
@@ -213,10 +190,18 @@ func LoadWithEnv(args []string, lookupEnv func(string) (string, bool)) (*Config,
 
 	// 2. JournalURL: Flag > WALDEN_JOURNAL > ""
 	// Trimmed once, here, so that every later reader — Validate, String,
-	// and the deep parse in internal/store — sees the same value.
+	// and the deep parse in internal/store — sees the same value. A value
+	// that was given and is only whitespace is refused rather than trimmed
+	// down to unset; see refuseWhitespaceJournal.
 	if setFlags["journal"] {
+		if err := refuseWhitespaceJournal(flagJournal); err != nil {
+			return nil, flagPrintConfig, err
+		}
 		cfg.JournalURL = strings.TrimSpace(flagJournal)
-	} else if val, ok := lookupEnv(EnvJournal); ok && strings.TrimSpace(val) != "" {
+	} else if val, ok := lookupEnv(EnvJournal); ok && val != "" {
+		if err := refuseWhitespaceJournal(val); err != nil {
+			return nil, flagPrintConfig, err
+		}
 		cfg.JournalURL = strings.TrimSpace(val)
 	}
 

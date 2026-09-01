@@ -16,8 +16,8 @@ import (
 //
 // It imports internal/config, which internal/store does not and must not. The
 // guarantee is about the boot path, and the boot path is config.Load, then
-// config.Validate, then store.ResolveJournal, then --print-config's two
-// String() methods. A test that covered only this package's half would be the
+// config.Validate, then store.ResolveJournal, then --print-config's
+// Journal.String(). A test that covered only this package's half would be the
 // same mistake the first version of the leak test made: proving the safe half.
 
 // The sentinel credentials. The secret is built in three-character groups that
@@ -189,8 +189,8 @@ type output struct {
 
 // journalOutputs drives one URL through every path that can put a
 // URL-derived value in front of an operator: the two entry points in this
-// package, the shallow check and the printed configuration in internal/config,
-// and the resolved Journal that --print-config prints.
+// package, the resolved Journal that --print-config prints, and the shallow
+// check in internal/config.
 func journalOutputs(t *testing.T, raw string) []output {
 	t.Helper()
 
@@ -225,11 +225,14 @@ func journalOutputs(t *testing.T, raw string) []output {
 		)
 	}
 
-	cfg, _, err := config.LoadWithEnv([]string{"--journal", raw}, envLookup(nil))
-	if err != nil {
+	// Only the refusals from internal/config are checked. Config.String() no
+	// longer renders the journal URL at all — it prints "(configured)" or
+	// "(disabled)" — so asserting that it does not leak would be asserting a
+	// property of a constant, which is worse than no assertion: it reads like
+	// coverage and is not. The rendered journal location is store.Journal's,
+	// and it is checked above, field by field.
+	if _, _, err := config.LoadWithEnv([]string{"--journal", raw}, envLookup(nil)); err != nil {
 		outs = append(outs, output{origin: "config.LoadWithEnv refusal", text: err.Error()})
-	} else {
-		outs = append(outs, output{origin: "config.Config.String()", text: cfg.String(), publicKeyID: true})
 	}
 
 	// Validate on a hand-built Config too, so the check does not depend on
@@ -241,8 +244,6 @@ func journalOutputs(t *testing.T, raw string) []output {
 	}
 	if err := direct.Validate(); err != nil {
 		outs = append(outs, output{origin: "config.Validate refusal", text: err.Error()})
-	} else {
-		outs = append(outs, output{origin: "config.Config.String() untrimmed", text: direct.String(), publicKeyID: true})
 	}
 
 	return outs

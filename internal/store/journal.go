@@ -232,7 +232,14 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 		endpointScheme = "https"
 	}
 
-	host := strings.ToLower(u.Hostname())
+	// The host is folded to lower case for the provider table, which matches
+	// hostnames and is case-insensitive. Under s3:// the host is not a host
+	// but a bucket name, and bucket names are case-sensitive, so that reading
+	// keeps the operator's spelling: folding it made s3://BUCKET/walden
+	// silently address a bucket named "bucket", while the identical name
+	// written path-style was refused.
+	writtenHost := u.Hostname()
+	host := strings.ToLower(writtenHost)
 	if scheme != "s3" {
 		// A root-anchored FQDN ("s3.wasabisys.com.") names the same host
 		// as the bare form. Strip the root dot so the provider table —
@@ -261,7 +268,7 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 				"for a self-hosted endpoint use http(s)://host:port/bucket/prefix")
 		}
 		j.Provider = "AWS S3"
-		j.Bucket = host
+		j.Bucket = writtenHost
 		j.Prefix = strings.Join(segments, "/")
 		j.Region = resolveRegion(region, envValue(lookupEnv, EnvRegion), envValue(lookupEnv, EnvDefaultRegion), DefaultRegion)
 		j.Endpoint = "https://s3." + j.Region + ".amazonaws.com"
@@ -743,8 +750,12 @@ func validateBucket(bucket string) error {
 			if i == 0 || i == len(bucket)-1 {
 				return refuseJournal(fmt.Sprintf("bucket %q must start and end with a letter or digit", bucket), "use a valid S3 bucket name")
 			}
-			if bucket[i-1] == '-' || bucket[i-1] == '.' {
-				return refuseJournal(fmt.Sprintf("bucket %q has adjacent '.' or '-' characters", bucket), "use a valid S3 bucket name")
+			// The rule prohibits two adjacent periods, and a period
+			// next to a hyphen. Two adjacent hyphens are legal:
+			// "my--bucket" is a valid name on S3, GCS, R2, and MinIO,
+			// and walden refused to run for the operator who has one.
+			if (c == '.' || bucket[i-1] == '.') && (bucket[i-1] == '-' || bucket[i-1] == '.') {
+				return refuseJournal(fmt.Sprintf("bucket %q has a '.' adjacent to a '.' or '-'", bucket), "use a valid S3 bucket name")
 			}
 		default:
 			return refuseJournal(fmt.Sprintf("bucket %q contains %q", bucket, string(c)), "bucket names hold only lowercase letters, digits, '-', and '.'")

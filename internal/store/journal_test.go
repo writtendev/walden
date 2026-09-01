@@ -546,6 +546,8 @@ func TestParseJournalURLRefusals(t *testing.T) {
 		{name: "bucket-leading-dash", raw: "s3://-my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "start and end with"},
 		{name: "bucket-trailing-dot", raw: "s3://my-bucket./walden", wantErr: store.ErrInvalidJournal, wantSub: "start and end with"},
 		{name: "bucket-adjacent-dots", raw: "s3://my..bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "adjacent"},
+		{name: "bucket-dot-then-dash", raw: "s3://my.-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "adjacent"},
+		{name: "bucket-dash-then-dot", raw: "s3://my-.bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "adjacent"},
 		{name: "prefix-parent-segment", raw: "s3://my-bucket/walden/../escape", wantErr: store.ErrInvalidJournal, wantSub: "relative path"},
 		{name: "prefix-space", raw: "s3://my-bucket/wal den", wantErr: store.ErrInvalidJournal, wantSub: "prefix segment"},
 		{name: "region-space", raw: "s3://my-bucket/walden?region=eu west", wantErr: store.ErrInvalidJournal, wantSub: "region"},
@@ -933,6 +935,83 @@ func TestJournalRefusalsHideTheSecret(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestBucketWithAdjacentHyphensIsAccepted is the regression for a refusal that
+// told an operator their valid bucket name was invalid. The AWS general-purpose
+// bucket rules prohibit two adjacent periods, and a period next to a hyphen;
+// two adjacent hyphens are legal, and "acme--journal" is a real name on S3,
+// GCS, R2, and MinIO alike. walden refused to boot against one.
+func TestBucketWithAdjacentHyphensIsAccepted(t *testing.T) {
+	accepted := []struct {
+		name   string
+		raw    string
+		bucket string
+	}{
+		{"s3-shorthand", "s3://acme--journal/walden", "acme--journal"},
+		{"path-style", "https://s3.eu-west-1.amazonaws.com/acme--journal/walden", "acme--journal"},
+		{"self-hosted", "http://minio.internal:9000/acme--journal/walden", "acme--journal"},
+		{"three-hyphens", "s3://acme---journal/walden", "acme---journal"},
+	}
+	for _, tt := range accepted {
+		t.Run(tt.name, func(t *testing.T) {
+			j, err := store.ParseJournalURL(tt.raw, envLookup(creds))
+			if err != nil {
+				t.Fatalf("ParseJournalURL(%q) refused a legal bucket name: %v", tt.raw, err)
+			}
+			if j.Bucket != tt.bucket {
+				t.Errorf("Bucket = %q, want %q", j.Bucket, tt.bucket)
+			}
+		})
+	}
+
+	// The rule the hyphens were standing in for is still enforced: a period
+	// may not sit beside a period or a hyphen.
+	for _, raw := range []string{
+		"s3://acme..journal/walden",
+		"s3://acme.-journal/walden",
+		"s3://acme-.journal/walden",
+	} {
+		if _, err := store.ParseJournalURL(raw, envLookup(creds)); err == nil {
+			t.Errorf("ParseJournalURL(%q) accepted a period adjacent to a period or hyphen", raw)
+		}
+	}
+}
+
+// TestS3SchemeBucketKeepsItsCase is the regression for a URL that silently
+// addressed a bucket other than the one written. Under s3:// the host is a
+// bucket name, not a host, and folding it to lower case made
+// s3://BUCKET/walden resolve to a bucket called "bucket" — while the identical
+// name written path-style was refused for the uppercase. Same bucket, two
+// spellings, two outcomes, and the accepted one rewrote the operator's value.
+// walden never guesses: both spellings refuse.
+func TestS3SchemeBucketKeepsItsCase(t *testing.T) {
+	const pathStyle = "https://s3.eu-west-1.amazonaws.com/BUCKET/walden"
+	const shorthand = "s3://BUCKET/walden"
+
+	for _, raw := range []string{shorthand, pathStyle} {
+		_, err := store.ParseJournalURL(raw, envLookup(creds))
+		if err == nil {
+			t.Fatalf("ParseJournalURL(%q) accepted an uppercase bucket name", raw)
+		}
+		if !errors.Is(err, store.ErrInvalidJournal) {
+			t.Errorf("ParseJournalURL(%q) error %v does not match ErrInvalidJournal", raw, err)
+		}
+		assertOneLineRefusal(t, err)
+		const want = `bucket "BUCKET" contains "B"`
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("ParseJournalURL(%q) error %q does not contain %q", raw, err.Error(), want)
+		}
+	}
+
+	// The host is still folded for the provider table, which matches
+	// hostnames and is case-insensitive. This is the case round 3 verified:
+	// an uppercase, root-anchored Wasabi host must still reach the
+	// compare-and-swap gate.
+	_, err := store.ParseJournalURL("https://S3.WASABISYS.COM./my-bucket/walden", envLookup(creds))
+	if !errors.Is(err, store.ErrProviderUnsupported) {
+		t.Errorf("an uppercase Wasabi host gave %v, want the compare-and-swap refusal", err)
 	}
 }
 

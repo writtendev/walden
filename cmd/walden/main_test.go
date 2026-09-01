@@ -347,7 +347,7 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			cmdPath:    binPath,
 			args:       []string{"serve", "--data-dir", "/test/cache", "--journal", "s3://my-bucket/w", "--listen", ":8888", "--print-config"},
 			wantExit0:  true,
-			wantOutSub: "data-dir: /test/cache\njournal: s3://my-bucket/w\nauth-trust: (builtin)\nlisten: :8888",
+			wantOutSub: "data-dir: /test/cache\njournal: (configured)\nauth-trust: (builtin)\nlisten: :8888",
 		},
 		{
 			name:       "serve-print-config-env",
@@ -396,11 +396,27 @@ func TestBinaryArgvDispatch(t *testing.T) {
 				"journal-style: path",
 		},
 		{
-			name:       "serve-print-config-redacts-journal-secret",
+			// Config.String() does not render the journal URL. Printing
+			// it meant a second, weaker copy of guardCredentials living
+			// in internal/config, and that copy half-redacted a password
+			// holding an unencoded '/'. The location an operator needs
+			// comes from Journal.String(), past the one gate.
+			name:      "serve-print-config-withholds-the-journal-url",
+			cmdPath:   binPath,
+			args:      []string{"serve", "--journal", "http://minioadmin:p@ss/w0rd@minio.internal:9000/my-bucket/walden", "--print-config"},
+			wantExit0: false,
+			// The relocated '@' is refused by the gate, and nothing of
+			// the URL is echoed on the way out.
+			wantErrSub: "walden: invalid journal: URL is malformed; it is not echoed because it may carry credentials",
+			wantErrNot: []string{"p@ss", "ss/w0rd", "w0rd", "minio.internal"},
+		},
+		{
+			name:       "serve-print-config-journal-url-is-not-printed",
 			cmdPath:    binPath,
 			args:       []string{"serve", "--journal", "s3://AKIAEXAMPLE:topsecret@my-bucket/walden", "--print-config"},
 			wantExit0:  true,
-			wantOutSub: "journal: s3://AKIAEXAMPLE:xxxxx@my-bucket/walden",
+			wantOutSub: "journal: (configured)",
+			wantErrNot: []string{"topsecret", "AKIAEXAMPLE"},
 		},
 		{
 			// --print-config names where the credentials come from, so it
@@ -442,11 +458,38 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			// A trailing newline is what a file-backed Kubernetes secret
 			// or a .env line gives you, and it is the likeliest cause of
 			// a "malformed" journal URL. It is trimmed, not refused.
-			name:       "serve-print-config-trims-the-journal-url",
+			name:    "serve-print-config-trims-the-journal-url",
+			cmdPath: binPath,
+			// Config.String() no longer echoes the URL, so the proof that
+			// the trim happened is that the padded value resolved.
+			args:      []string{"serve", "--journal", " s3://my-bucket/walden\n", "--print-config"},
+			wantExit0: true,
+			wantOutSub: "journal: (configured)\n" +
+				"auth-trust: (builtin)\n" +
+				"listen: :8470\n" +
+				"journal-provider: AWS S3\n" +
+				"journal-endpoint: https://s3.us-east-1.amazonaws.com\n" +
+				"journal-region: us-east-1\n" +
+				"journal-bucket: my-bucket",
+		},
+		{
+			// The other half of the trim: a value that is nothing but
+			// whitespace was trimmed away to unset, and walden booted
+			// journal-less and silent. A secret file holding one newline
+			// is a mistake, not a decision to run without durability.
+			name:       "serve-whitespace-only-journal-exits-error",
 			cmdPath:    binPath,
-			args:       []string{"serve", "--journal", " s3://my-bucket/walden\n", "--print-config"},
-			wantExit0:  true,
-			wantOutSub: "journal: s3://my-bucket/walden\n",
+			args:       []string{"serve"},
+			env:        append(os.Environ(), "WALDEN_JOURNAL=   "),
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: value is only whitespace",
+		},
+		{
+			name:       "serve-whitespace-only-journal-flag-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "\n", "--print-config"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: value is only whitespace",
 		},
 		{
 			// FIPS endpoints are mandatory for GovCloud and FedRAMP, and

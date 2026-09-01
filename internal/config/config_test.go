@@ -94,7 +94,7 @@ func TestConfigPrecedence(t *testing.T) {
 		t.Errorf("expected ListenAddr :9999, got %q", cfg.ListenAddr)
 	}
 
-	expectedStr := "data-dir: /cli/data\njournal: s3://cli-bucket/walden\nauth-trust: cli-key-67890\nlisten: :9999"
+	expectedStr := "data-dir: /cli/data\njournal: (configured)\nauth-trust: cli-key-67890\nlisten: :9999"
 	if cfg.String() != expectedStr {
 		t.Errorf("expected cfg.String() %q, got %q", expectedStr, cfg.String())
 	}
@@ -214,31 +214,52 @@ func TestLoadFromEnvFallback(t *testing.T) {
 	}
 }
 
-// TestConfigStringRedactsJournalSecret guards --print-config and any log line
-// built from Config.String(): the journal URL may carry object-storage
-// credentials, and the secret half must never be printed.
-func TestConfigStringRedactsJournalSecret(t *testing.T) {
+// TestConfigStringWithholdsTheJournalURL is the regression for a second,
+// weaker copy of the rule internal/store owns in guardCredentials. This package
+// used to redact the journal URL itself, and its copy had no equivalent of
+// credentialsEnd: given a MinIO password holding an unencoded '/', it announced
+// that it had redacted and then printed most of the secret anyway.
+//
+//	journal: http://minioadmin:xxxxx@ss/w0rd@minio.internal:9000/my-bucket/walden
+//
+// The duplicated rule is gone rather than hardened. Config.String() now says
+// only whether the journal is on; walden serve --print-config prints the
+// resolved location from store.Journal.String(), every field of which is past
+// the one gate.
+func TestConfigStringWithholdsTheJournalURL(t *testing.T) {
 	tests := []struct {
 		name    string
 		journal string
 		want    string
 	}{
 		{
-			name:    "no-userinfo-is-printed-verbatim",
+			name:    "unset-says-disabled",
+			journal: "",
+			want:    "journal: (disabled)",
+		},
+		{
+			name:    "plain-url-is-not-rendered",
 			journal: "s3://my-bucket/walden",
-			want:    "journal: s3://my-bucket/walden",
+			want:    "journal: (configured)",
 		},
 		{
-			name:    "secret-is-redacted",
+			name:    "userinfo-url-is-not-rendered",
 			journal: "s3://AKIAEXAMPLE:topsecret@my-bucket/walden",
-			want:    "journal: s3://AKIAEXAMPLE:xxxxx@my-bucket/walden",
+			want:    "journal: (configured)",
 		},
 		{
-			name:    "secret-is-redacted-on-explicit-endpoint",
-			journal: "http://minioadmin:miniosecret@minio.internal:9000/my-bucket/walden",
-			want:    "journal: http://minioadmin:xxxxx@minio.internal:9000/my-bucket/walden",
+			// The reproducer: an unencoded '/' in the password ends
+			// the authority before the second '@', so u.Redacted()
+			// redacted "minioadmin:p" and printed "ss/w0rd" verbatim.
+			name:    "slash-in-the-password-is-not-half-redacted",
+			journal: "http://minioadmin:p@ss/w0rd@minio.internal:9000/my-bucket/walden",
+			want:    "journal: (configured)",
 		},
 	}
+
+	// Every fragment of a secret used above, plus the smallest window of the
+	// one that escaped. A leak arrives as a fragment, not the whole value.
+	leaks := []string{"topsecret", "p@ss", "ss/w0rd", "w0rd", "minio.internal"}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -251,10 +272,83 @@ func TestConfigStringRedactsJournalSecret(t *testing.T) {
 			if !strings.Contains(got, tt.want) {
 				t.Errorf("Config.String() = %q, want substring %q", got, tt.want)
 			}
-			if strings.Contains(got, "topsecret") || strings.Contains(got, "miniosecret") {
-				t.Errorf("Config.String() leaked the journal secret: %q", got)
+			for _, leak := range leaks {
+				if strings.Contains(got, leak) {
+					t.Errorf("Config.String() leaked %q: %q", leak, got)
+				}
 			}
 		})
+	}
+}
+
+// TestWhitespaceOnlyJournalIsRefused is the regression for a journal that
+// silently turned itself off. Trimming the value at assignment made a
+// whitespace-only WALDEN_JOURNAL indistinguishable from an unset one, so a
+// Kubernetes secret file holding a single newline, or a Helm value that
+// rendered blank, booted a durability-free walden with no output at all —
+// while the base commit refused both. Unset is still journal-less on purpose;
+// present-but-blank is a mistake and is refused, naming the knob, in one line.
+func TestWhitespaceOnlyJournalIsRefused(t *testing.T) {
+	blanks := []struct {
+		name  string
+		value string
+	}{
+		{"spaces", "   "},
+		{"newline", "\n"},
+		{"tab-and-crlf", "\t \r\n"},
+	}
+
+	const wantSub = "invalid journal: value is only whitespace"
+
+	assertRefusal := func(t *testing.T, what string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s accepted a whitespace-only journal value", what)
+		}
+		if !strings.Contains(err.Error(), wantSub) {
+			t.Errorf("%s error = %q, want substring %q", what, err.Error(), wantSub)
+		}
+		if strings.ContainsAny(err.Error(), "\n\r") {
+			t.Errorf("%s error %q is not a single line", what, err.Error())
+		}
+	}
+
+	for _, tt := range blanks {
+		t.Run(tt.name, func(t *testing.T) {
+			// Through the environment, which is how a file-backed
+			// secret reaches walden.
+			_, _, err := config.LoadWithEnv(nil, func(key string) (string, bool) {
+				if key == config.EnvJournal {
+					return tt.value, true
+				}
+				return "", false
+			})
+			assertRefusal(t, "LoadWithEnv(env)", err)
+
+			// And through the flag, where fs.Visit knows outright that
+			// the operator set the knob.
+			_, _, err = config.LoadWithEnv([]string{"--journal", tt.value}, func(string) (string, bool) { return "", false })
+			assertRefusal(t, "LoadWithEnv(--journal)", err)
+
+			// And on a hand-built Config, since Validate is exported
+			// and reads the knob itself.
+			direct := &config.Config{
+				DataDir:    config.DefaultDataDir,
+				JournalURL: tt.value,
+				ListenAddr: config.DefaultListenAddr,
+			}
+			assertRefusal(t, "Validate", direct.Validate())
+		})
+	}
+
+	// Unset stays unset: journal-less mode is reachable deliberately, and
+	// this refusal must not close that door.
+	cfg, _, err := config.LoadWithEnv(nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("LoadWithEnv with no journal set refused: %v", err)
+	}
+	if cfg.JournalURL != "" {
+		t.Errorf("JournalURL = %q, want empty for an unset journal", cfg.JournalURL)
 	}
 }
 

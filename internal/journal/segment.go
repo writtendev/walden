@@ -122,27 +122,30 @@ func SegmentContentType() string {
 
 // RefuseMissingSegment returns a single-line operator-facing refusal when a referenced pack segment is missing.
 func RefuseMissingSegment(stream StreamID, sha256Hex string) error {
-	return refusal.Refuse(
+	return refusal.RefuseWithCause(
 		"refusal: replay failed",
 		fmt.Sprintf("missing pack segment %s on stream %s", strings.ToLower(sha256Hex), stream),
 		"verify object storage bucket integrity or restore from backup",
+		ErrMissingSegment,
 	)
 }
 
 // RefuseSegmentHashMismatch returns a single-line operator-facing refusal when a downloaded pack segment does not match its hash.
 func RefuseSegmentHashMismatch(stream StreamID, expectedHash, computedHash string) error {
-	return refusal.Refuse(
+	return refusal.RefuseWithCause(
 		"refusal: replay failed",
 		fmt.Sprintf("segment hash mismatch for %s on stream %s (computed %s)", strings.ToLower(expectedHash), stream, computedHash),
 		"pack segment in object storage is corrupt",
+		ErrHashMismatch,
 	)
 }
 
 // RefuseCorruptSegment returns a single-line operator-facing refusal when a pack segment header or payload is corrupt.
 func RefuseCorruptSegment(stream StreamID, sha256Hex string, reason error) error {
-	return refusal.Refuse(
+	return refusal.RefuseWithCause(
 		"refusal: replay failed",
 		fmt.Sprintf("corrupt pack segment %s on stream %s (%v)", strings.ToLower(sha256Hex), stream, reason),
 		"packfile header is malformed",
+		ErrInvalidPackfile,
 	)
 }

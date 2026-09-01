@@ -115,3 +115,35 @@ func TestRefuseHelperAndTypeAssertion(t *testing.T) {
 		t.Errorf("errors.Is(err, &Refusal{}) returned false")
 	}
 }
+
+func TestRefuseWithCauseAndUnwrap(t *testing.T) {
+	sentinel := errors.New("underlying sentinel error")
+	err := RefuseWithCause("operation", "failed condition", "retry later", sentinel)
+	if err == nil {
+		t.Fatal("RefuseWithCause returned nil")
+	}
+
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected errors.Is(err, sentinel) to be true")
+	}
+
+	var ref *Refusal
+	if !errors.As(err, &ref) {
+		t.Fatalf("expected *Refusal, got %T", err)
+	}
+
+	if ref.Unwrap() != sentinel {
+		t.Errorf("Unwrap() = %v, want %v", ref.Unwrap(), sentinel)
+	}
+
+	// FromError also wraps sentinel
+	wrappedRef := FromError("operation", sentinel, "fix action")
+	if !errors.Is(wrappedRef, sentinel) {
+		t.Errorf("expected errors.Is(wrappedRef, sentinel) to be true")
+	}
+
+	// Nil target in Is
+	if ref.Is(nil) {
+		t.Errorf("expected ref.Is(nil) to be false")
+	}
+}

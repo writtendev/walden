@@ -177,6 +177,26 @@ Every invalid value produces a single-line error naming the knob and stops
 immediately. Running `walden serve --print-config` displays the resolved
 configuration set and exits without starting the server.
 
+`WALDEN_JOURNAL` is the whole journal configuration: one URL carrying
+endpoint, region, bucket, and prefix, in either addressing style —
+`s3://bucket/prefix`, `https://endpoint/bucket/prefix` (path-style, and the
+reading for any host walden does not recognise), or
+`https://bucket.endpoint/prefix` (virtual-hosted). Two query parameters, and
+only two, may override what the host implies: `region` and `style`. The URL is
+resolved at boot, so a malformed value — or a provider the support table marks
+as lacking compare-and-swap — stops walden immediately rather than on the
+first push.
+
+Object-storage credentials are not a sixth knob. They resolve through one
+documented order, first hit wins: credentials in the journal URL's userinfo
+(`s3://KEY:SECRET@bucket/prefix`), then the conventional `AWS_ACCESS_KEY_ID`
+and `AWS_SECRET_ACCESS_KEY` (plus `AWS_SESSION_TOKEN` when set), then a
+one-line refusal. The signing region falls back the same way, to `AWS_REGION`
+and then `AWS_DEFAULT_REGION`. Those are AWS conventions walden reads, not
+walden configuration; there is no `WALDEN_*` credential variable, and the
+shared credentials file, instance metadata, and role providers are
+deliberately not consulted.
+
 Zero-config boot is a working (journal-less) git server that prints a
 one-time admin token to stdout on first start.
 

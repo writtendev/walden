@@ -213,3 +213,47 @@ func TestLoadFromEnvFallback(t *testing.T) {
 		t.Errorf("expected non-empty defaults in LoadFromEnv: %+v", cfg)
 	}
 }
+
+// TestConfigStringRedactsJournalSecret guards --print-config and any log line
+// built from Config.String(): the journal URL may carry object-storage
+// credentials, and the secret half must never be printed.
+func TestConfigStringRedactsJournalSecret(t *testing.T) {
+	tests := []struct {
+		name    string
+		journal string
+		want    string
+	}{
+		{
+			name:    "no-userinfo-is-printed-verbatim",
+			journal: "s3://my-bucket/walden",
+			want:    "journal: s3://my-bucket/walden",
+		},
+		{
+			name:    "secret-is-redacted",
+			journal: "s3://AKIAEXAMPLE:topsecret@my-bucket/walden",
+			want:    "journal: s3://AKIAEXAMPLE:xxxxx@my-bucket/walden",
+		},
+		{
+			name:    "secret-is-redacted-on-explicit-endpoint",
+			journal: "http://minioadmin:miniosecret@minio.internal:9000/my-bucket/walden",
+			want:    "journal: http://minioadmin:xxxxx@minio.internal:9000/my-bucket/walden",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				DataDir:    config.DefaultDataDir,
+				JournalURL: tt.journal,
+				ListenAddr: config.DefaultListenAddr,
+			}
+			got := cfg.String()
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("Config.String() = %q, want substring %q", got, tt.want)
+			}
+			if strings.Contains(got, "topsecret") || strings.Contains(got, "miniosecret") {
+				t.Errorf("Config.String() leaked the journal secret: %q", got)
+			}
+		})
+	}
+}

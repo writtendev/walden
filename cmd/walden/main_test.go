@@ -361,6 +361,44 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			wantExit0:  false,
 			wantErrSub: "walden: invalid listen:",
 		},
+		{
+			// The journal URL is resolved at boot, so a malformed one
+			// stops walden now rather than on the first push.
+			name:       "serve-malformed-journal-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "ftp://example.org/my-bucket"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: unsupported URL scheme \"ftp\"",
+		},
+		{
+			name:       "serve-journal-provider-without-cas-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "https://s3.eu-central-1.wasabisys.com/my-bucket/walden"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: Wasabi does not support compare-and-swap",
+		},
+		{
+			// --print-config resolves the location but not the
+			// credentials, so a URL can be checked on a machine that
+			// holds no secrets.
+			name:      "serve-print-config-resolved-journal",
+			cmdPath:   binPath,
+			args:      []string{"serve", "--journal", "https://storage.googleapis.com/my-bucket/walden", "--print-config"},
+			wantExit0: true,
+			wantOutSub: "journal-provider: Google Cloud Storage\n" +
+				"journal-endpoint: https://storage.googleapis.com\n" +
+				"journal-region: auto\n" +
+				"journal-bucket: my-bucket\n" +
+				"journal-prefix: walden\n" +
+				"journal-style: path",
+		},
+		{
+			name:       "serve-print-config-redacts-journal-secret",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "s3://AKIAEXAMPLE:topsecret@my-bucket/walden", "--print-config"},
+			wantExit0:  true,
+			wantOutSub: "journal: s3://AKIAEXAMPLE:xxxxx@my-bucket/walden",
+		},
 	}
 
 	for _, tt := range tests {

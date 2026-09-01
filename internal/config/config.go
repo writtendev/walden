@@ -48,7 +48,7 @@ type Config struct {
 
 // String returns a human-readable representation of the resolved configuration.
 func (c *Config) String() string {
-	journal := c.JournalURL
+	journal := redactURL(c.JournalURL)
 	if journal == "" {
 		journal = "(disabled)"
 	}
@@ -62,6 +62,23 @@ func (c *Config) String() string {
 		authTrust,
 		c.ListenAddr,
 	)
+}
+
+// redactURL replaces any password in a URL's userinfo with "xxxxx", so that
+// credentials embedded in the journal URL never reach stdout or a log line.
+// A URL that will not parse is not printed at all.
+func redactURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "(unparseable URL)"
+	}
+	if u.User == nil {
+		return raw
+	}
+	return u.Redacted()
 }
 
 // Validate checks that all runtime configuration values are valid.

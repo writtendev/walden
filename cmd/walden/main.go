@@ -12,6 +12,7 @@ import (
 	"github.com/writtendev/walden/internal/config"
 	"github.com/writtendev/walden/internal/githttp"
 	"github.com/writtendev/walden/internal/refusal"
+	"github.com/writtendev/walden/internal/store"
 )
 
 // Version can be set via ldflags at build time.
@@ -87,8 +88,28 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+
+	// Resolve the journal URL here, at boot, so a malformed WALDEN_JOURNAL
+	// stops walden now rather than on the first push. --print-config
+	// resolves the location but not the credentials, so an operator can
+	// check a URL on a machine that holds no secrets.
+	var journal *store.Journal
+	if cfg.JournalURL != "" {
+		if printConfig {
+			journal, err = store.ParseJournalURL(cfg.JournalURL, os.LookupEnv)
+		} else {
+			journal, err = store.ResolveJournal(cfg.JournalURL, os.LookupEnv)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
 	if printConfig {
 		fmt.Fprintln(stdout, cfg.String())
+		if journal != nil {
+			fmt.Fprintln(stdout, journal.String())
+		}
 		return nil
 	}
 	fmt.Fprintf(stdout, "walden server starting on %s (data: %s, git: %s)\n", cfg.ListenAddr, cfg.DataDir, gitVer)

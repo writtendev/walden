@@ -13,7 +13,8 @@ import (
 
 var (
 	// ErrStreamFenced indicates that a stream is permanently fenced on this process instance.
-	ErrStreamFenced = errors.New("stream is permanently fenced on this instance")
+	// It is unified with ErrFenced for contract consistency across the journal package.
+	ErrStreamFenced = ErrFenced
 
 	// ErrCASNotSupported indicates that the object storage provider lacks compare-and-swap (CAS) support.
 	ErrCASNotSupported = errors.New("storage provider does not support compare-and-swap (CAS) conditional writes")
@@ -36,41 +37,46 @@ const (
 // RefuseStreamFenced returns a single-line operator-facing refusal when a writer is fenced out by a conflict.
 func RefuseStreamFenced(stream StreamID, seq uint64) error {
 	if stream == MetaStreamID {
-		return refusal.Refuse(
+		return refusal.RefuseWithCause(
 			"refusal: meta operation failed",
 			fmt.Sprintf("stream %s fenced by concurrent writer at seq %d", stream, seq),
 			"instance is fenced for this stream; restart or check active writer",
+			ErrFenced,
 		)
 	}
-	return refusal.Refuse(
+	return refusal.RefuseWithCause(
 		"refusal: push failed",
 		fmt.Sprintf("stream %s fenced by concurrent writer at seq %d", stream, seq),
 		"instance is fenced for this stream; restart or check active writer",
+		ErrFenced,
 	)
 }
 
 // RefusePermanentlyFenced returns a single-line operator-facing refusal when a write is attempted on a fenced stream.
 func RefusePermanentlyFenced(stream StreamID) error {
 	if stream == MetaStreamID {
-		return refusal.Refuse(
+		return refusal.RefuseWithCause(
 			"refusal: meta operation failed",
 			fmt.Sprintf("stream %s is permanently fenced on this instance", stream),
 			"restart walden process to re-materialize from journal",
+			ErrFenced,
 		)
 	}
-	return refusal.Refuse(
+	return refusal.RefuseWithCause(
 		"refusal: push failed",
 		fmt.Sprintf("stream %s is permanently fenced on this instance", stream),
 		"restart walden process to re-materialize from journal",
+		ErrFenced,
 	)
 }
 
 // RefuseCASNotSupported returns a single-line operator-facing refusal when the storage provider does not support CAS.
 func RefuseCASNotSupported() error {
-	return refusal.Refuse(
+	return refusal.RefuseWithCause(
 		"refusal: journal append failed",
 		"storage provider does not support compare-and-swap (CAS) conditional writes",
 		"verify bucket provider compatibility in spec",
+		ErrCASNotSupported,
 	)
 }
 
@@ -193,7 +199,7 @@ type ProviderInfo struct {
 var ProviderSupportMatrix = []ProviderInfo{
 	{
 		Name:           "AWS S3",
-		Aliases:        []string{"S3", "Amazon S3", "aws"},
+		Aliases:        []string{"S3", "Amazon S3", "aws", "amazonaws", "amazonaws.com"},
 		Header:         "If-None-Match: *",
 		ConflictStatus: http.StatusPreconditionFailed,
 		Status:         ProviderSupported,
@@ -201,7 +207,7 @@ var ProviderSupportMatrix = []ProviderInfo{
 	},
 	{
 		Name:           "Cloudflare R2",
-		Aliases:        []string{"R2", "Cloudflare"},
+		Aliases:        []string{"R2", "Cloudflare", "r2.cloudflarestorage.com"},
 		Header:         "If-None-Match: *",
 		ConflictStatus: http.StatusPreconditionFailed,
 		Status:         ProviderSupported,
@@ -209,7 +215,7 @@ var ProviderSupportMatrix = []ProviderInfo{
 	},
 	{
 		Name:           "Google Cloud Storage",
-		Aliases:        []string{"GCS", "Google Cloud", "gcs"},
+		Aliases:        []string{"GCS", "Google Cloud", "gcs", "googleapis.com", "storage.googleapis.com"},
 		Header:         "If-None-Match: *",
 		ConflictStatus: http.StatusPreconditionFailed,
 		Status:         ProviderSupported,
@@ -225,7 +231,7 @@ var ProviderSupportMatrix = []ProviderInfo{
 	},
 	{
 		Name:           "Ceph RGW",
-		Aliases:        []string{"Ceph", "RGW", "RadosGW"},
+		Aliases:        []string{"Ceph", "RGW", "RadosGW", "ceph-rgw"},
 		Header:         "If-None-Match: *",
 		ConflictStatus: http.StatusPreconditionFailed,
 		Status:         ProviderSupported,
@@ -233,7 +239,7 @@ var ProviderSupportMatrix = []ProviderInfo{
 	},
 	{
 		Name:           "Backblaze B2",
-		Aliases:        []string{"B2", "Backblaze"},
+		Aliases:        []string{"B2", "Backblaze", "backblazeb2.com"},
 		Header:         "If-None-Match: *",
 		ConflictStatus: http.StatusPreconditionFailed,
 		Status:         ProviderSupported,
@@ -249,7 +255,7 @@ var ProviderSupportMatrix = []ProviderInfo{
 	},
 	{
 		Name:           "Wasabi",
-		Aliases:        []string{"wasabi-cloud"},
+		Aliases:        []string{"wasabi", "wasabi-cloud", "wasabisys.com"},
 		Header:         "If-None-Match: *",
 		ConflictStatus: 0,
 		Status:         ProviderUnsupported,
@@ -257,7 +263,7 @@ var ProviderSupportMatrix = []ProviderInfo{
 	},
 	{
 		Name:           "Azure Blob Storage",
-		Aliases:        []string{"Azure", "Azure Blob", "azure-blob"},
+		Aliases:        []string{"Azure", "Azure Blob", "azure-blob", "blob.core.windows.net"},
 		Header:         "If-None-Match: *",
 		ConflictStatus: http.StatusPreconditionFailed,
 		Status:         ProviderConditional,
@@ -282,7 +288,7 @@ func LookupProvider(name string) (ProviderInfo, bool) {
 			}
 		}
 	}
-	// 2. Case-insensitive substring match
+	// 2. Case-insensitive substring match (provider name or alias contains query)
 	lower := strings.ToLower(trimmed)
 	for _, p := range ProviderSupportMatrix {
 		if strings.Contains(strings.ToLower(p.Name), lower) {
@@ -290,6 +296,20 @@ func LookupProvider(name string) (ProviderInfo, bool) {
 		}
 		for _, alias := range p.Aliases {
 			if strings.Contains(strings.ToLower(alias), lower) {
+				return p, true
+			}
+		}
+	}
+	// 3. Case-insensitive reverse substring match (query contains provider name or multi-char alias)
+	for _, p := range ProviderSupportMatrix {
+		pNameLower := strings.ToLower(p.Name)
+		if len(pNameLower) >= 3 && strings.Contains(lower, pNameLower) {
+			return p, true
+		}
+		for _, alias := range p.Aliases {
+			aliasLower := strings.ToLower(alias)
+			// Avoid overly broad single/two-character alias matches in reverse direction (e.g. "s3", "b2", "r2")
+			if len(aliasLower) >= 3 && aliasLower != "aws" && strings.Contains(lower, aliasLower) {
 				return p, true
 			}
 		}

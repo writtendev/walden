@@ -330,20 +330,37 @@ func TestLookupProviderVariants(t *testing.T) {
 
 func TestValidateProviderCAS(t *testing.T) {
 	// Supported providers must validate with no error
-	supported := []string{"AWS S3", "aws", "Cloudflare R2", "GCS", "Google Cloud Storage", "MinIO", "Ceph RGW", "Backblaze B2", "Garage S3", "Azure Blob Storage"}
+	supported := []string{
+		"AWS S3", "aws", "Amazon S3", "amazonaws.com", "s3.us-east-1.amazonaws.com",
+		"Cloudflare R2", "R2", "Cloudflare", "account.r2.cloudflarestorage.com",
+		"GCS", "Google Cloud Storage", "googleapis.com", "storage.googleapis.com",
+		"MinIO", "minio",
+		"Ceph RGW", "Ceph", "ceph-rgw",
+		"Backblaze B2", "Backblaze", "backblazeb2.com",
+		"Garage S3", "Garage", "garage-s3",
+		"Azure Blob Storage", "Azure Blob", "azure-blob", "blob.core.windows.net",
+	}
 	for _, p := range supported {
 		if err := journal.ValidateProviderCAS(p); err != nil {
 			t.Errorf("ValidateProviderCAS(%q) failed unexpectedly: %v", p, err)
 		}
 	}
 
-	// Unsupported provider (Wasabi) must return CAS refusal
-	errWasabi := journal.ValidateProviderCAS("Wasabi")
-	if errWasabi == nil {
-		t.Fatalf("expected ValidateProviderCAS(Wasabi) to fail, got nil")
+	// Unsupported provider (Wasabi, wasabi endpoints) must return CAS refusal
+	unsupported := []string{
+		"Wasabi", "wasabi", "wasabi-cloud", "wasabisys.com", "s3.wasabisys.com", "https://s3.wasabisys.com/mybucket",
 	}
-	if !strings.Contains(errWasabi.Error(), "storage provider does not support compare-and-swap") {
-		t.Errorf("unexpected refusal message for Wasabi: %v", errWasabi)
+	for _, p := range unsupported {
+		errWasabi := journal.ValidateProviderCAS(p)
+		if errWasabi == nil {
+			t.Fatalf("expected ValidateProviderCAS(%q) to fail, got nil", p)
+		}
+		if !strings.Contains(errWasabi.Error(), "storage provider does not support compare-and-swap") {
+			t.Errorf("unexpected refusal message for %q: %v", p, errWasabi)
+		}
+		if !errors.Is(errWasabi, journal.ErrCASNotSupported) {
+			t.Errorf("expected errors.Is(err, ErrCASNotSupported) for %q", p)
+		}
 	}
 
 	// Unknown provider must return CAS refusal
@@ -353,5 +370,77 @@ func TestValidateProviderCAS(t *testing.T) {
 	}
 	if !strings.Contains(errUnknown.Error(), "storage provider does not support compare-and-swap") {
 		t.Errorf("unexpected refusal message for unknown provider: %v", errUnknown)
+	}
+	if !errors.Is(errUnknown, journal.ErrCASNotSupported) {
+		t.Errorf("expected errors.Is(err, ErrCASNotSupported) for unknown provider")
+	}
+}
+
+func TestSentinelErrorsUnificationAndErrorsIs(t *testing.T) {
+	// 1. ErrStreamFenced and ErrFenced are unified
+	if !errors.Is(journal.ErrStreamFenced, journal.ErrFenced) {
+		t.Errorf("expected ErrStreamFenced to match ErrFenced with errors.Is")
+	}
+	if !errors.Is(journal.ErrFenced, journal.ErrStreamFenced) {
+		t.Errorf("expected ErrFenced to match ErrStreamFenced with errors.Is")
+	}
+
+	// 2. RefuseStreamFenced matches ErrFenced and ErrStreamFenced
+	errFenced := journal.RefuseStreamFenced("repo-alpha", 5)
+	if !errors.Is(errFenced, journal.ErrFenced) {
+		t.Errorf("expected RefuseStreamFenced to match ErrFenced")
+	}
+	if !errors.Is(errFenced, journal.ErrStreamFenced) {
+		t.Errorf("expected RefuseStreamFenced to match ErrStreamFenced")
+	}
+
+	// 3. RefusePermanentlyFenced matches ErrFenced and ErrStreamFenced
+	errPerm := journal.RefusePermanentlyFenced("repo-alpha")
+	if !errors.Is(errPerm, journal.ErrFenced) {
+		t.Errorf("expected RefusePermanentlyFenced to match ErrFenced")
+	}
+	if !errors.Is(errPerm, journal.ErrStreamFenced) {
+		t.Errorf("expected RefusePermanentlyFenced to match ErrStreamFenced")
+	}
+
+	// 4. RefuseCASNotSupported matches ErrCASNotSupported
+	errCAS := journal.RefuseCASNotSupported()
+	if !errors.Is(errCAS, journal.ErrCASNotSupported) {
+		t.Errorf("expected RefuseCASNotSupported to match ErrCASNotSupported")
+	}
+
+	// 5. Check Fencer methods return errors matching ErrFenced
+	f := journal.NewFencer()
+	f.FenceStream("repo-x", 1)
+	errCheck := f.CheckWritable("repo-x")
+	if !errors.Is(errCheck, journal.ErrFenced) {
+		t.Errorf("expected CheckWritable on fenced stream to match ErrFenced")
+	}
+	errConflict := f.HandleConflict("repo-y", 2)
+	if !errors.Is(errConflict, journal.ErrFenced) {
+		t.Errorf("expected HandleConflict to match ErrFenced")
+	}
+}
+
+func TestFencerEmptyStreamHandling(t *testing.T) {
+	f := journal.NewFencer()
+
+	if f.IsFenced("") {
+		t.Errorf("expected empty stream to not be fenced initially")
+	}
+	if err := f.CheckWritable(""); err != nil {
+		t.Errorf("expected CheckWritable(\"\") to succeed initially, got %v", err)
+	}
+
+	f.FenceStream("", 42)
+	if !f.IsFenced("") {
+		t.Errorf("expected empty stream to be fenced after FenceStream")
+	}
+	seq, ok := f.FencedSeq("")
+	if !ok || seq != 42 {
+		t.Errorf("expected FencedSeq(\"\") = (42, true), got (%d, %v)", seq, ok)
+	}
+	if err := f.CheckWritable(""); err == nil {
+		t.Errorf("expected CheckWritable(\"\") on fenced stream to return refusal")
 	}
 }

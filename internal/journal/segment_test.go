@@ -232,6 +232,9 @@ func TestSegmentRefusalFormatting(t *testing.T) {
 	if !errors.As(err, &ref) {
 		t.Fatalf("expected *refusal.Refusal type, got %T", err)
 	}
+	if !errors.Is(err, journal.ErrMissingSegment) {
+		t.Errorf("expected errors.Is(err, ErrMissingSegment) to be true")
+	}
 	msg := err.Error()
 	if strings.Contains(msg, "\n") {
 		t.Errorf("refusal message contains newline: %q", msg)
@@ -243,6 +246,9 @@ func TestSegmentRefusalFormatting(t *testing.T) {
 	// 2. Hash mismatch refusal
 	computed := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	err = journal.RefuseSegmentHashMismatch(stream, hash, computed)
+	if !errors.Is(err, journal.ErrHashMismatch) {
+		t.Errorf("expected errors.Is(err, ErrHashMismatch) to be true")
+	}
 	msg = err.Error()
 	if strings.Contains(msg, "\n") {
 		t.Errorf("refusal message contains newline: %q", msg)
@@ -253,6 +259,9 @@ func TestSegmentRefusalFormatting(t *testing.T) {
 
 	// 3. Corrupt segment refusal
 	err = journal.RefuseCorruptSegment(stream, hash, journal.ErrInvalidPackfile)
+	if !errors.Is(err, journal.ErrInvalidPackfile) {
+		t.Errorf("expected errors.Is(err, ErrInvalidPackfile) to be true")
+	}
 	msg = err.Error()
 	if strings.Contains(msg, "\n") {
 		t.Errorf("refusal message contains newline: %q", msg)

@@ -4,6 +4,7 @@
 package refusal
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -14,6 +15,7 @@ type Refusal struct {
 	What string
 	Why  string
 	Fix  string
+	Err  error
 }
 
 // New creates a new Refusal with what was refused, why, and what to do about it.
@@ -35,12 +37,21 @@ func FromError(what string, err error, fix string) *Refusal {
 	if err != nil {
 		why = err.Error()
 	}
-	return New(what, why, fix)
+	r := New(what, why, fix)
+	r.Err = err
+	return r
 }
 
 // Refuse is a convenience helper that returns a new Refusal as an error.
 func Refuse(what, why, fix string) error {
 	return New(what, why, fix)
+}
+
+// RefuseWithCause creates a new Refusal with an attached underlying cause error for errors.Is matching.
+func RefuseWithCause(what, why, fix string, cause error) error {
+	r := New(what, why, fix)
+	r.Err = cause
+	return r
 }
 
 // Error formats the refusal as a single-line string: "<what>: <why> (<fix>)".
@@ -63,10 +74,20 @@ func (r *Refusal) Error() string {
 	return fmt.Sprintf("%s: %s (%s)", what, why, fix)
 }
 
-// Is reports whether target is a *Refusal.
+// Unwrap returns the underlying causal error, if any.
+func (r *Refusal) Unwrap() error {
+	return r.Err
+}
+
+// Is reports whether target is a *Refusal or matches the underlying causal error.
 func (r *Refusal) Is(target error) bool {
-	_, ok := target.(*Refusal)
-	return ok
+	if _, ok := target.(*Refusal); ok {
+		return true
+	}
+	if r.Err != nil && errors.Is(r.Err, target) {
+		return true
+	}
+	return false
 }
 
 // sanitize strips newlines, carriage returns, tabs, and collapses whitespace,

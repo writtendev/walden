@@ -911,10 +911,47 @@ const specJSONExamples = 4
 // the example and whatever comes next — the field table, the next example, the next section.
 var specFixtureLink = regexp.MustCompile(`\]\((fixtures/[^)\s]+)\)`)
 
+// fenceOpener reports whether a line opens a fenced code block, and returns the fence marker
+// and the info string. Both markdown fence characters count, at any indentation, because the
+// question this test asks is which examples the document carries — and an example does not
+// stop being one for being written ~~~json, or for sitting inside a list item.
+func fenceOpener(line string) (marker, info string, ok bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	for _, m := range []string{"```", "~~~"} {
+		if strings.HasPrefix(trimmed, m) {
+			return m, strings.TrimSpace(strings.TrimPrefix(trimmed, m)), true
+		}
+	}
+	return "", "", false
+}
+
+// fenceCloses reports whether a line closes a block opened with marker. A closing fence
+// carries no info string, so a line that opens one is not one.
+func fenceCloses(line, marker string) bool {
+	m, info, ok := fenceOpener(line)
+	return ok && m == marker && info == ""
+}
+
+// looksLikeJSONDocument reports whether a fenced block holds a JSON object. The spec's
+// untagged blocks are refusal strings, key layouts and HTTP headers, none of which parse;
+// a block that does parse is a record example, whatever its fence says.
+func looksLikeJSONDocument(block string) bool {
+	trimmed := strings.TrimSpace(block)
+	return strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed))
+}
+
 // TestSpecExamplesMatchFixtures holds every JSON example in spec/journal/v1/README.md to the
 // fixture it links, byte for byte. The document claims the examples are real records from
 // the golden journal, and that claim is worth exactly as much as its enforcement: the two
 // agreed when they were written and agreed at review, which is how they will drift.
+//
+// It is also, as things stand, the only test that sees a repack. TestFixturesAreGenerated
+// matches packs by their object set and carries the committed bytes forward, so new pack
+// bytes for the same objects pass it; but two of these four examples — the ref transaction
+// of section 5.1 and the marker of section 7.2 — quote pack digests, and those move. That
+// detection is a side effect of which records the spec chose to illustrate, not a property
+// of this test, and it would disappear if either example were replaced with one that names
+// no pack. It is written down here and in the gap list rather than relied on quietly.
 func TestSpecExamplesMatchFixtures(t *testing.T) {
 	specPath := filepath.Join(journalSpecDir(), "README.md")
 	data, err := os.ReadFile(specPath)
@@ -925,20 +962,33 @@ func TestSpecExamplesMatchFixtures(t *testing.T) {
 
 	examples := 0
 	for i := 0; i < len(lines); i++ {
-		// A fence at column zero, which is how this document writes every one of them.
-		if lines[i] != "```json" {
+		marker, info, ok := fenceOpener(lines[i])
+		if !ok {
 			continue
 		}
 		start := i + 1
 		end := start
-		for end < len(lines) && lines[end] != "```" {
+		for end < len(lines) && !fenceCloses(lines[end], marker) {
 			end++
 		}
 		if end == len(lines) {
-			t.Fatalf("%s:%d: unterminated json example", specPath, i+1)
+			t.Fatalf("%s:%d: unterminated fenced block", specPath, i+1)
 		}
-		example := strings.Join(lines[start:end], "\n") + "\n"
+		block := strings.Join(lines[start:end], "\n") + "\n"
 		i = end
+
+		// A block that is not tagged json is prose, a key layout, or a refusal string, and
+		// none of this test's business — unless it holds a JSON document anyway, in which
+		// case it is an example wearing the wrong fence, and nothing below would hold it to
+		// a fixture. The document has to say json for the check to reach it, so this is the
+		// one place that can insist it does.
+		if info != "json" {
+			if looksLikeJSONDocument(block) {
+				t.Errorf("%s:%d: this block holds a JSON document but is not fenced as ```json, so nothing holds it to a fixture", specPath, start)
+			}
+			continue
+		}
+		example := block
 		examples++
 
 		link := ""
@@ -963,7 +1013,12 @@ func TestSpecExamplesMatchFixtures(t *testing.T) {
 			continue
 		}
 		if string(fixture) != example {
-			t.Errorf("%s:%d: the example and %s have drifted apart:\nspec:\n%s\nfixture:\n%s", specPath, start, link, example, fixture)
+			t.Errorf("%s:%d: the example and %s have drifted apart.\n"+
+				"If you have just regenerated the fixtures, this is the second half of that job: the\n"+
+				"examples are copied into the specification by hand, so paste the fixture over the\n"+
+				"example and review the diff — a changed pack digest here means your git packs these\n"+
+				"objects differently, which is a real change to a published artifact.\n"+
+				"spec:\n%s\nfixture:\n%s", specPath, start, link, example, fixture)
 		}
 	}
 	if examples != specJSONExamples {

@@ -5,9 +5,12 @@
 package journal
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -144,6 +147,66 @@ func ValidateSnapshotSHA256(data []byte, expectedHash string) error {
 		return fmt.Errorf("%w: expected %s, got %s: %w", ErrSnapshotHashMismatch, strings.ToLower(expectedHash), computed, ErrSnapshotCorrupt)
 	}
 	return nil
+}
+
+// ValidateSnapshotFromReader streams bytes from an io.Reader, verifies Git packfile framing rules, and asserts SHA-256 matches expectedHash.
+func ValidateSnapshotFromReader(r io.Reader, expectedHash string) (int64, error) {
+	if err := ValidateHash(expectedHash); err != nil {
+		return 0, fmt.Errorf("%w: invalid expected snapshot hash: %w", ErrSnapshotCorrupt, err)
+	}
+	if r == nil {
+		return 0, fmt.Errorf("%w: reader cannot be nil", ErrSnapshotCorrupt)
+	}
+	var hdr [PackfileMinSize]byte
+	n, err := io.ReadFull(r, hdr[:])
+	if err != nil {
+		return int64(n), fmt.Errorf("%w: length %d is less than minimum packfile size of %d bytes: %w", ErrSnapshotCorrupt, n, PackfileMinSize, err)
+	}
+	if err := ValidatePackfileHeader(hdr[:]); err != nil {
+		return int64(n), fmt.Errorf("%w: %w", ErrSnapshotCorrupt, err)
+	}
+	h := sha256.New()
+	h.Write(hdr[:])
+	copied, err := io.Copy(h, r)
+	total := int64(n) + copied
+	if err != nil {
+		return total, fmt.Errorf("failed to read snapshot pack: %w", err)
+	}
+	computed := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(computed, expectedHash) {
+		return total, fmt.Errorf("%w: expected %s, got %s: %w", ErrSnapshotHashMismatch, strings.ToLower(expectedHash), computed, ErrSnapshotCorrupt)
+	}
+	return total, nil
+}
+
+// ValidateSnapshotSHA256FromReader streams bytes from an io.Reader, verifies Git packfile framing rules for SHA-256 repos (>= 44 bytes), and asserts SHA-256 matches expectedHash.
+func ValidateSnapshotSHA256FromReader(r io.Reader, expectedHash string) (int64, error) {
+	if err := ValidateHash(expectedHash); err != nil {
+		return 0, fmt.Errorf("%w: invalid expected snapshot hash: %w", ErrSnapshotCorrupt, err)
+	}
+	if r == nil {
+		return 0, fmt.Errorf("%w: reader cannot be nil", ErrSnapshotCorrupt)
+	}
+	var hdr [PackfileMinSizeSHA256]byte
+	n, err := io.ReadFull(r, hdr[:])
+	if err != nil {
+		return int64(n), fmt.Errorf("%w: length %d is less than minimum SHA-256 packfile size of %d bytes: %w", ErrSnapshotCorrupt, n, PackfileMinSizeSHA256, err)
+	}
+	if err := ValidatePackfileHeaderSHA256(hdr[:]); err != nil {
+		return int64(n), fmt.Errorf("%w: %w", ErrSnapshotCorrupt, err)
+	}
+	h := sha256.New()
+	h.Write(hdr[:])
+	copied, err := io.Copy(h, r)
+	total := int64(n) + copied
+	if err != nil {
+		return total, fmt.Errorf("failed to read snapshot pack: %w", err)
+	}
+	computed := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(computed, expectedHash) {
+		return total, fmt.Errorf("%w: expected %s, got %s: %w", ErrSnapshotHashMismatch, strings.ToLower(expectedHash), computed, ErrSnapshotCorrupt)
+	}
+	return total, nil
 }
 
 // SnapshotMetadata returns the standard S3 user metadata key-value pairs for a snapshot packfile upload.

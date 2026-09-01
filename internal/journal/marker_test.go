@@ -1,6 +1,7 @@
 package journal_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -548,3 +549,101 @@ func TestMarkerRefusalFormatting(t *testing.T) {
 		t.Errorf("unexpected invalid marker refusal: got %q, want %q", msg, expectedMarkerInvalid)
 	}
 }
+
+func TestValidateSnapshotFromReader(t *testing.T) {
+	pack := validEmptyPackfile()
+	hash := journal.ComputeSegmentHash(pack)
+
+	// 1. Valid streaming snapshot
+	n, err := journal.ValidateSnapshotFromReader(bytes.NewReader(pack), hash)
+	if err != nil {
+		t.Fatalf("ValidateSnapshotFromReader failed: %v", err)
+	}
+	if n != int64(len(pack)) {
+		t.Errorf("bytes read = %d, want %d", n, len(pack))
+	}
+
+	// 2. Case-insensitive hash match
+	n, err = journal.ValidateSnapshotFromReader(bytes.NewReader(pack), strings.ToUpper(hash))
+	if err != nil {
+		t.Fatalf("ValidateSnapshotFromReader with uppercase hash failed: %v", err)
+	}
+	if n != int64(len(pack)) {
+		t.Errorf("bytes read = %d, want %d", n, len(pack))
+	}
+
+	// 3. Nil reader
+	_, err = journal.ValidateSnapshotFromReader(nil, hash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for nil reader, got %v", err)
+	}
+
+	// 4. Invalid expected hash
+	_, err = journal.ValidateSnapshotFromReader(bytes.NewReader(pack), "not-a-hash")
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for invalid hash format, got %v", err)
+	}
+
+	// 5. Short stream (< 32 bytes)
+	_, err = journal.ValidateSnapshotFromReader(bytes.NewReader([]byte("PACK short")), hash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for short stream, got %v", err)
+	}
+
+	// 6. Corrupt header magic
+	corruptHdr := make([]byte, 32)
+	copy(corruptHdr, pack)
+	corruptHdr[0] = 'Z'
+	_, err = journal.ValidateSnapshotFromReader(bytes.NewReader(corruptHdr), hash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for corrupt header, got %v", err)
+	}
+
+	// 7. Hash mismatch
+	wrongHash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	_, err = journal.ValidateSnapshotFromReader(bytes.NewReader(pack), wrongHash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotHashMismatch) {
+		t.Errorf("expected ErrSnapshotHashMismatch, got %v", err)
+	}
+}
+
+func TestValidateSnapshotSHA256FromReader(t *testing.T) {
+	pack := validEmptyPackfileSHA256()
+	hash := journal.ComputeSegmentHash(pack)
+
+	// 1. Valid streaming SHA-256 snapshot
+	n, err := journal.ValidateSnapshotSHA256FromReader(bytes.NewReader(pack), hash)
+	if err != nil {
+		t.Fatalf("ValidateSnapshotSHA256FromReader failed: %v", err)
+	}
+	if n != int64(len(pack)) {
+		t.Errorf("bytes read = %d, want %d", n, len(pack))
+	}
+
+	// 2. Too short for SHA-256 repo (< 44 bytes)
+	sha1Pack := validEmptyPackfile()
+	sha1Hash := journal.ComputeSegmentHash(sha1Pack)
+	_, err = journal.ValidateSnapshotSHA256FromReader(bytes.NewReader(sha1Pack), sha1Hash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for 32-byte pack in SHA-256 validator, got %v", err)
+	}
+
+	// 3. Nil reader
+	_, err = journal.ValidateSnapshotSHA256FromReader(nil, hash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for nil reader, got %v", err)
+	}
+
+	// 4. Invalid expected hash
+	_, err = journal.ValidateSnapshotSHA256FromReader(bytes.NewReader(pack), "not-a-hash")
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for invalid hash format, got %v", err)
+	}
+
+	// 5. Hash mismatch
+	_, err = journal.ValidateSnapshotSHA256FromReader(bytes.NewReader(pack), sha1Hash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotHashMismatch) {
+		t.Errorf("expected ErrSnapshotHashMismatch, got %v", err)
+	}
+}
+

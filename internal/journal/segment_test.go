@@ -424,3 +424,61 @@ func TestSignFixtureHelper(t *testing.T) {
 	}
 	t.Logf("tx1 sig: %s", tx1.Signature)
 }
+
+func TestValidateSegmentFromReader(t *testing.T) {
+	pack := validEmptyPackfile()
+	hash := journal.ComputeSegmentHash(pack)
+
+	// 1. Valid streaming segment
+	n, err := journal.ValidateSegmentFromReader(bytes.NewReader(pack), hash)
+	if err != nil {
+		t.Fatalf("ValidateSegmentFromReader failed: %v", err)
+	}
+	if n != int64(len(pack)) {
+		t.Errorf("bytes read = %d, want %d", n, len(pack))
+	}
+
+	// 2. Case-insensitive hash
+	n, err = journal.ValidateSegmentFromReader(bytes.NewReader(pack), strings.ToUpper(hash))
+	if err != nil {
+		t.Fatalf("ValidateSegmentFromReader with uppercase hash failed: %v", err)
+	}
+	if n != int64(len(pack)) {
+		t.Errorf("bytes read = %d, want %d", n, len(pack))
+	}
+
+	// 3. Nil reader
+	_, err = journal.ValidateSegmentFromReader(nil, hash)
+	if err == nil || !errors.Is(err, journal.ErrInvalidPackfile) {
+		t.Errorf("expected ErrInvalidPackfile for nil reader, got %v", err)
+	}
+
+	// 4. Invalid expected hash
+	_, err = journal.ValidateSegmentFromReader(bytes.NewReader(pack), "not-a-hash")
+	if err == nil || !errors.Is(err, journal.ErrInvalidPackfile) {
+		t.Errorf("expected ErrInvalidPackfile for invalid hash format, got %v", err)
+	}
+
+	// 5. Short stream (< 32 bytes)
+	_, err = journal.ValidateSegmentFromReader(bytes.NewReader([]byte("PACK short")), hash)
+	if err == nil || !errors.Is(err, journal.ErrInvalidPackfile) {
+		t.Errorf("expected ErrInvalidPackfile for short stream, got %v", err)
+	}
+
+	// 6. Corrupt header magic
+	corruptHdr := make([]byte, 32)
+	copy(corruptHdr, pack)
+	corruptHdr[0] = 'X'
+	_, err = journal.ValidateSegmentFromReader(bytes.NewReader(corruptHdr), hash)
+	if err == nil || !errors.Is(err, journal.ErrInvalidPackfile) {
+		t.Errorf("expected ErrInvalidPackfile for corrupt header, got %v", err)
+	}
+
+	// 7. Hash mismatch
+	wrongHash := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	_, err = journal.ValidateSegmentFromReader(bytes.NewReader(pack), wrongHash)
+	if err == nil || !errors.Is(err, journal.ErrHashMismatch) {
+		t.Errorf("expected ErrHashMismatch, got %v", err)
+	}
+}
+

@@ -32,6 +32,6 @@ fixtures/
 3. **Key Rotation (`_meta/tx/...`):** Carries `old_public_key`, `new_public_key`, and valid signature from `old_public_key` over canonical rotation payload.
 4. **Ref-Transaction Records (`<stream>/tx/...`):** Carries `segments`, `updates` (ref update triples with raw byte ref names), `timestamp`, and valid signature from active server signing key over canonical ref update payload.
 5. **Segment Keys (`segments/`):** Must strictly match `^[0-9a-f]{64}\.pack$`. Content-addressed by SHA-256 of raw packfile bytes verbatim.
-6. **Snapshot Keys (`snapshots/`):** Must strictly match `^[0-9a-f]{64}\.pack$`. Content-addressed by SHA-256 of consolidated pack bytes.
-7. **Marker (`marker.json`):** Points to the compacted baseline snapshot and sequence.
+6. **Snapshot Keys (`snapshots/`):** Must strictly match `^[0-9a-f]{64}\.pack$`. Content-addressed by SHA-256 of consolidated pack bytes. The snapshot pack MUST be uploaded and verified before `marker.json` is published (Publish-Last Invariant).
+7. **Marker (`marker.json`):** Declares replay baseline `sequence` and `snapshot` hash. Superseded historical segments and earlier transaction records ($s \le \text{marker.sequence}$) are valid historical artifacts and MUST be ignored during replay rather than treated as corruption.
 8. **Conditional Append & Single-Writer Fencing:** Every write to `tx/<seq>.json` is conditioned on `If-None-Match: *`. Storage precondition conflicts (HTTP 412) permanently fence the stream on the writer without retrying or guessing.

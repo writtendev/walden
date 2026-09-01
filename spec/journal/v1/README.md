@@ -2,7 +2,7 @@
 
 > **Status:** Published Specification (v1)  
 > **Milestone:** M1 · Journal format v1  
-> **Rulings Covered:** Ruling 1 of 5 (Signing Identity & Genesis), Ruling 2 of 5 (Stream Model & Key Layout), Ruling 3 of 5 (Ref-Transaction Records & Payload Canonicalization), Ruling 4 of 5 (Pack Segments & Content Addressing), Ruling 5 of 5 (Conditional Append, Per-Stream Fencing & CAS Requirement)
+> **Rulings & Topics Covered:** Ruling 1 of 5 (Signing Identity & Genesis), Ruling 2 of 5 (Stream Model & Key Layout), Ruling 3 of 5 (Ref-Transaction Records & Payload Canonicalization), Ruling 4 of 5 (Pack Segments & Content Addressing), Ruling 5 of 5 (Conditional Append, Per-Stream Fencing & CAS Requirement), Compaction Snapshots & Replay-from-Here Marker (`marker.json`)
 
 ---
 
@@ -297,7 +297,166 @@ When downloading pack segments during replay, restore, or materialization:
 
 ---
 
-## 7. Reader Verification Algorithm
+## 7. Compaction Snapshots and the Replay-from-Here Marker (`marker.json`)
+
+### 7.1 Background Compaction and the Published Marker Contract
+Compaction is an internal performance optimization, but the marker it publishes is a **contract** — a reader or materialization engine has to know what it may assume when it encounters a marker in object storage.
+
+A background task periodically consolidates all reachable Git objects across historical pack segments into a consolidated snapshot packfile per stream, and publishes a "replay from here" marker (`marker.json`). This prevents repository materialization and disaster recovery from having to replay the entire history of thousands of individual transactions and pack segments from sequence `0`.
+
+- **Marker Location:** `v1/streams/<stream-id>/marker.json`
+- **Snapshot Packfile Location:** `v1/streams/<stream-id>/snapshots/<sha256>.pack`
+- **Scope:** Snapshots and markers are published per repository stream. The `_meta` stream records small, rare server configuration events (genesis, token tables, key rotations) and is not subject to pack snapshotting.
+
+### 7.2 JSON Schema and Field Specification
+`marker.json` is a UTF-8 JSON document stored at the root of the stream prefix:
+
+```json
+{
+  "version": "v1",
+  "stream": "repo-alpha",
+  "sequence": 0,
+  "snapshot": "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db",
+  "timestamp": "2026-08-31T01:00:00Z"
+}
+```
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `version` | string | Format version; MUST be `"v1"`. |
+| `stream` | string | Stream identifier matching `^[a-zA-Z0-9._-]+$` (max 255 bytes). |
+| `sequence` | integer | Strictly non-negative unsigned 64-bit sequence number ($k \ge 0$) representing the latest ref transaction fully incorporated into the snapshot pack. |
+| `snapshot` | string | Exactly 64 lowercase hexadecimal characters representing the SHA-256 digest of the consolidated snapshot packfile bytes verbatim (`^[0-9a-f]{64}$`). |
+| `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp when the snapshot was generated and published (e.g. `"2026-08-31T01:00:00Z"`). |
+
+#### Forward Compatibility & Unknown Fields
+In accordance with Walden's forward compatibility principles:
+1. **Deserialization Tolerance:** Readers MUST ignore unrecognized JSON keys when parsing `marker.json`.
+2. **Writers:** Writers generating format v1 markers MUST NOT emit undefined keys.
+
+### 7.3 The Two Core Guarantees & Invariants
+
+From the reader's side, a published marker provides two non-negotiable guarantees:
+
+#### 1. The Publish-Last Invariant (Referential Integrity)
+> **Guarantee 1:** *Every object a published marker references already exists in storage.*
+
+The background compactor MUST strictly upload and verify the consolidated snapshot packfile at `v1/streams/<stream-id>/snapshots/<sha256>.pack` **BEFORE** creating or overwriting `v1/streams/<stream-id>/marker.json`.
+
+- **Atomic Publication Order:**
+  1. Compactor builds snapshot packfile locally.
+  2. Compactor computes SHA-256 digest `<sha256>`.
+  3. Compactor uploads snapshot packfile to `snapshots/<sha256>.pack` and verifies the upload (HTTP 200 OK).
+  4. Compactor writes or updates `marker.json` pointing to `<sha256>` and `sequence`.
+- **Crash Safety:** If a server process crashes, network partitions, or storage writes fail prior to step 4, the orphaned packfile in `snapshots/` is harmless. Readers will continue to find the previous `marker.json` (or replay from genesis/seq 0) and will never observe a `marker.json` pointing to a non-existent snapshot packfile.
+- **Reader Assumption:** When a reader observes `marker.json`, it may definitively assume that `snapshots/<sha256>.pack` is present, durable, and complete.
+
+#### 2. The Superseded Segments & Historical Transactions Invariant
+> **Guarantee 2:** *Superseded segments and historical transaction records may still be present in storage and MUST be ignored rather than treated as corruption.*
+
+Compaction is purely an acceleration mechanism. It does **not** synchronously purge historical pack segments (`segments/<sha256>.pack`) or earlier transaction records (`tx/<seq>.json`).
+
+- **Paranoia as Policy:** Object storage is cheap, and paranoia is on brand. Walden preserves older segments and transaction files for weeks, months, or indefinitely to support auditability, historical verification, and disaster recovery.
+- **Reader Obligation:** When a reader initializes state from a snapshot at `sequence = N`, any pack segment files under `segments/` or transaction files under `tx/` with sequence $s \le N$ remaining in storage are valid historical artifacts. Readers **MUST NOT** reject the journal, fail validation, or treat the presence of superseded records as duplicate writes, replay conflicts, or storage corruption. Readers simply begin active sequential replay at sequence $N + 1$.
+
+### 7.4 Snapshot Packfile Framing & Storage Rules
+Consolidated snapshot packfiles follow identical byte framing and verification rules as standard pack segments:
+1. **Verbatim Bytes:** Stored verbatim without proprietary encapsulation or transformation.
+2. **Key Derivation:** `v1/streams/<stream-id>/snapshots/<sha256>.pack`.
+3. **HTTP Headers & S3 Metadata:**
+   - `Content-Type`: `application/x-git-packed-objects`
+   - `x-amz-meta-walden-stream`: `<stream-id>`
+   - `x-amz-meta-walden-hash`: `<sha256>` (lowercase 64-hex)
+4. **Header Validation:** Must begin with `PACK`, specify version 2 or 3, object count $\ge 0$, and meet minimum size requirements ($\ge 32$ bytes for SHA-1 repos, $\ge 44$ bytes for SHA-256 repos).
+
+### 7.5 Step-by-Step Reader Verification & Replay Algorithm
+
+When initializing or materializing a repository from the journal, a reader MUST execute the following procedure:
+
+```
+┌────────────────────────────────────────────────────────┐
+│ 1. Check for marker.json                               │
+│    GET v1/streams/<stream-id>/marker.json              │
+└───────────────────────────┬────────────────────────────┘
+                            │
+             ┌──────────────┴──────────────┐
+             ▼                             ▼
+       [Marker Found]               [Marker Absent]
+             │                             │
+             ▼                             ▼
+┌───────────────────────────┐ ┌───────────────────────────┐
+│ 2. Parse & Validate       │ │ Start replay from seq 0   │
+│    marker.json            │ │ (tx/00000000000000000000) │
+└────────────┬──────────────┘ └─────────────┬─────────────┘
+             │                             │
+             ▼                             │
+┌───────────────────────────┐              │
+│ 3. Fetch Snapshot Pack    │              │
+│    snapshots/<hash>.pack  │              │
+│    Verify SHA-256 & PACK  │              │
+└────────────┬──────────────┘              │
+             │                             │
+             ▼                             │
+┌───────────────────────────┐              │
+│ 4. Apply Snapshot Pack    │              │
+│    Baseline Seq S = seq   │              │
+└────────────┬──────────────┘              │
+             │                             │
+             ▼                             │
+┌──────────────────────────────────────────▼──────────────┐
+│ 5. Sequential Replay of tx/ Starting at S + 1           │
+│    - Ignore any tx <= S and superseded segments         │
+│    - Assert strictly contiguous sequence: S+1, S+2, ... │
+│    - Verify transaction signatures against ActiveKey    │
+│    - Fetch & verify referenced segments/<hash>.pack     │
+│    - Apply ref updates                                  │
+└─────────────────────────────────────────────────────────┘
+```
+
+1. **Query Marker:** Issue a `GET` request for `v1/streams/<stream-id>/marker.json`.
+2. **If Marker Present:**
+   - **Validate Marker Structure:** Parse JSON and verify `version == "v1"`, `stream == <stream-id>`, valid `sequence`, valid 64-hex `snapshot` hash, and valid UTC `timestamp`.
+   - **Download Snapshot:** Fetch `v1/streams/<stream-id>/snapshots/<snapshot-hash>.pack`.
+   - **Verify Snapshot:** Compute SHA-256 over downloaded bytes; assert equality with `marker.snapshot`. Verify `PACK` header and Git checksum.
+   - **Apply Snapshot:** Index and unpack the snapshot packfile into the bare repository object database.
+   - **Set Replay Baseline:** Set baseline sequence $S = \text{marker.sequence}$.
+   - **List Tail Transactions:** Perform a `LIST` on `v1/streams/<stream-id>/tx/` with `start-after` set to `v1/streams/<stream-id>/tx/<S:020d>.json`.
+   - **Sequential Replay:** For each transaction record in ascending order ($S+1, S+2, \dots$):
+     - Assert that sequence numbers are strictly contiguous with no gaps.
+     - Verify the Ed25519 signature against the active signing key.
+     - Fetch referenced segments from `segments/<sha256>.pack` and apply ref updates.
+3. **If Marker Absent:**
+   - Set baseline sequence $S = -1$.
+   - Replay all transaction records sequentially from sequence `0` (`tx/00000000000000000000.json`) forward.
+
+### 7.6 Single-Line Refusal Message Formats
+
+When verification or download fails during marker or snapshot handling, Walden aborts immediately and emits a strictly formatted single-line refusal (`<what>: <why> (<fix>)`):
+
+1. **Missing Snapshot Packfile:**
+   ```
+   refusal: replay failed: missing snapshot pack <sha256> on stream <stream-id> (verify object storage bucket integrity or restore from backup)
+   ```
+2. **Snapshot Hash Mismatch:**
+   ```
+   refusal: replay failed: snapshot hash mismatch for <sha256> on stream <stream-id> (computed <actual-sha256>) (snapshot pack in object storage is corrupt)
+   ```
+3. **Corrupt Snapshot Packfile:**
+   ```
+   refusal: replay failed: corrupt snapshot pack <sha256> on stream <stream-id> (<reason>) (packfile header is malformed)
+   ```
+4. **Corrupt Marker JSON:**
+   ```
+   refusal: replay failed: corrupt marker on stream <stream-id> (<reason>) (marker.json in object storage is malformed)
+   ```
+5. **Invalid Marker Fields:**
+   ```
+   refusal: replay failed: invalid marker on stream <stream-id> (<reason>) (marker.json in object storage is invalid)
+   ```
+
+---
+
+## 8. Reader Verification Algorithm
 
 Every reader or recovery engine verifying a journal MUST execute the following deterministic algorithm:
 
@@ -326,8 +485,11 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 ┌────────────────────────────────────────────────────────┐
 │ 3. Verify Repository Streams & Ref Transactions        │
 │    For each stream matching ^[a-zA-Z0-9._-]+$:         │
-│    ├── Verify sequence starts at 0 with no gaps        │
-│    ├── For each ref transaction at seq 0, 1, 2, ...:   │
+│    ├── Check for marker.json:                          │
+│    │     If present: verify snapshot & set S = marker  │
+│    │     If absent: set S = -1                         │
+│    ├── Verify sequence starting at S + 1 with no gaps  │
+│    ├── For each ref transaction at seq S+1, S+2, ...:  │
 │    │     Verify type == "ref_update"                   │
 │    │     Verify ref format and OID transition rules    │
 │    │     For each segment in record.segments:          │
@@ -336,11 +498,11 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │    │       Verify packfile header (PACK, len >= 32)    │
 │    │     Compute Canonical Ref-Transaction Payload     │
 │    │     Verify Ed25519 signature against ActiveKey    │
-│    └── Track ref states from seq 0 forward             │
+│    └── Track ref states from baseline forward          │
 └────────────────────────────────────────────────────────┘
 ```
 
-### 7.1 Verification Failure Rules
+### 8.1 Verification Failure Rules
 1. **Unchainable Rotation:** If `record.old_public_key != ActiveKey`, the rotation does not chain to genesis. The reader MUST abort immediately with a single-line error:
    ```
    refusal: replay failed: key rotation at seq <N> does not chain to active key
@@ -353,7 +515,7 @@ Every reader or recovery engine verifying a journal MUST execute the following d
    ```
    refusal: replay failed: signature mismatch for ref update on stream <id> at seq <N>
    ```
-4. **Sequence Gap:** If sequence numbers are not strictly contiguous ($0, 1, 2, \dots$), the reader MUST abort immediately:
+4. **Sequence Gap:** If sequence numbers are not strictly contiguous ($S+1, S+2, \dots$), the reader MUST abort immediately:
    ```
    refusal: replay failed: sequence gap detected on stream <id> (expected <E>, got <A>)
    ```
@@ -365,18 +527,26 @@ Every reader or recovery engine verifying a journal MUST execute the following d
    ```
    refusal: replay failed: segment hash mismatch for <sha256> on stream <id> (computed <actual>) (pack segment in object storage is corrupt)
    ```
-7. **Never Guess:** Readers MUST never skip unverified, unchainable, or missing records. Partial or guessed recovery is strictly prohibited.
+7. **Missing Snapshot:** If a referenced snapshot pack does not exist in storage:
+   ```
+   refusal: replay failed: missing snapshot pack <sha256> on stream <id> (verify object storage bucket integrity or restore from backup)
+   ```
+8. **Snapshot Hash Mismatch:** If downloaded snapshot pack bytes fail SHA-256 verification:
+   ```
+   refusal: replay failed: snapshot hash mismatch for <sha256> on stream <id> (computed <actual>) (snapshot pack in object storage is corrupt)
+   ```
+9. **Never Guess:** Readers MUST never skip unverified, unchainable, or missing records. Partial or guessed recovery is strictly prohibited.
 
 ---
 
-## 8. Stream Model and Key Space Layout (Ruling 2)
+## 9. Stream Model and Key Space Layout (Ruling 2)
 
-### 8.1 Stream Partitioning
+### 9.1 Stream Partitioning
 - **Repository Streams:** Each repo is one stream with caller-chosen ID matching `^[a-zA-Z0-9._-]+$` (max 255 bytes). Sequence starts at `0` upon first push.
 - **The Meta Stream (`_meta`):** Reserved for server identity, key rotations, and token mutations.
 - **Per-Stream Fencing:** Fencing leases are strictly isolated per stream. A conditional append conflict on repo stream $A$ fences stream $A$ on that instance, with zero effect on repo stream $B$ or on `_meta`.
 
-### 8.2 Key Space Layout
+### 9.2 Key Space Layout
 All keys reside under base prefix `v1/streams/<stream-id>/`:
 ```
 v1/streams/<stream-id>/
@@ -399,7 +569,7 @@ v1/streams/<stream-id>/
 
 ---
 
-## 9. Lexicographical Ordering Guarantees
+## 10. Lexicographical Ordering Guarantees
 
 | Key Category | Key Pattern | Lexicographically Ordered by Sequence? | Reader Invariants |
 | :--- | :--- | :---: | :--- |
@@ -411,9 +581,9 @@ v1/streams/<stream-id>/
 
 ---
 
-## 10. Fencing, Conditional Append, and the Compare-and-Swap (CAS) Requirement (Ruling 5)
+## 11. Fencing, Conditional Append, and the Compare-and-Swap (CAS) Requirement (Ruling 5)
 
-### 10.1 Compare-and-Swap (CAS) as a Non-Negotiable Storage Requirement
+### 11.1 Compare-and-Swap (CAS) as a Non-Negotiable Storage Requirement
 
 Compare-and-swap (CAS) is a hard, non-negotiable requirement of the storage bucket, stated plainly rather than hedged.
 
@@ -430,7 +600,7 @@ If an object storage provider does not natively support atomic conditional write
 
 ---
 
-### 10.2 S3-Compatible Provider Support Matrix
+### 11.2 S3-Compatible Provider Support Matrix
 
 The following matrix documents the compatibility of major S3-compatible object storage providers with walden's compare-and-swap requirement:
 
@@ -448,7 +618,7 @@ The following matrix documents the compatibility of major S3-compatible object s
 
 ---
 
-### 10.3 Out of Scope Declaration (No Fallback Coordination)
+### 11.3 Out of Scope Declaration (No Fallback Coordination)
 
 **Explicitly out of scope, now and forever for format v1 (and not a follow-up ticket):** any fallback path for non-CAS storage providers — such as:
 - Distributed lock objects or lock-file dances in object storage
@@ -463,7 +633,7 @@ Walden deliberately chooses standard-library maximalism and an absolute minimum 
 
 ---
 
-### 10.4 Writer Obligations and Fencing Lifecycle
+### 11.4 Writer Obligations and Fencing Lifecycle
 
 Single-writer safety (fencing) is governed by strict deterministic rules. Any reimplementation of walden MUST adhere to the following writer obligations per stream without deviation:
 
@@ -535,7 +705,7 @@ Single-writer safety (fencing) is governed by strict deterministic rules. Any re
 
 ---
 
-### 10.5 Single-Line Refusal Message Formats
+### 11.5 Single-Line Refusal Message Formats
 
 In accordance with Walden's operator-facing refusal convention (`refusal.Refusal`: `<what>: <why> (<fix>)`), all fencing-related refusals MUST be formatted as single-line messages with no embedded newlines:
 
@@ -562,21 +732,21 @@ In accordance with Walden's operator-facing refusal convention (`refusal.Refusal
 
 ---
 
-## 11. Replay and Materialization Rules
+## 12. Replay and Materialization Rules
 
 To materialize or restore a repository stream from the journal:
 
 1. **Locate Marker:** Check for `v1/streams/<stream-id>/marker.json`.
-   - If present: Load the referenced snapshot packfile from `v1/streams/<stream-id>/snapshots/<sha256>.pack` and initialize repository state at `marker.sequence`.
+   - If present: Parse and validate `marker.json` per Section 7. Load and verify the referenced snapshot packfile from `v1/streams/<stream-id>/snapshots/<sha256>.pack` and initialize repository state at `marker.sequence`.
    - If absent: Begin replay from `seq = 00000000000000000000`.
-2. **Scan Transactions:** Perform a paginated `LIST` under `v1/streams/<stream-id>/tx/` with `start-after` set to the last materialized sequence.
+2. **Scan Transactions:** Perform a paginated `LIST` under `v1/streams/<stream-id>/tx/` with `start-after` set to the last materialized sequence (e.g. `v1/streams/<stream-id>/tx/<sequence:020d>.json`).
 3. **Verify Continuity:**
-   - Verify that sequence numbers are strictly contiguous ($s_0, s_0+1, s_0+2, \dots$).
+   - Verify that sequence numbers are strictly contiguous ($s_0+1, s_0+2, \dots$).
    - Any gap indicates journal truncation or missing objects and MUST cause materialization to abort loudly with a one-line error.
-4. **Apply and Verify:** Apply ref updates in sequence order, fetching required pack segments by content hash. Superseded segments present in storage but not referenced in active replay MUST be ignored.
+4. **Apply and Verify:** Apply ref updates in sequence order, fetching required pack segments by content hash. Superseded segments or historical transactions ($s \le \text{marker.sequence}$) present in storage but not referenced in active replay MUST be ignored per Section 7.3.2.
 
 ---
 
-## 12. Reimplementation Grant
+## 13. Reimplementation Grant
 
 This specification is published with an unconditional reimplementation grant. Anyone may implement this signing identity model, genesis record, key rotation protocol, ref-transaction record format, pack segment content addressing, stream layout, and reader/writer semantics in any programming language, for any purpose, without restriction and without asking.

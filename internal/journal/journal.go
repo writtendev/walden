@@ -91,9 +91,19 @@ func TxKey(stream StreamID, seq uint64) string {
 	return fmt.Sprintf("%s/streams/%s/tx/%020d.json", VersionPrefix, stream, seq)
 }
 
+// SegmentPrefix returns the segment listing prefix for a stream: "v1/streams/<stream-id>/segments/".
+func SegmentPrefix(stream StreamID) string {
+	return fmt.Sprintf("%s/streams/%s/segments/", VersionPrefix, stream)
+}
+
 // SegmentKey returns the object storage key for a pack segment: "v1/streams/<stream-id>/segments/<sha256>.pack".
 func SegmentKey(stream StreamID, sha256Hex string) string {
 	return fmt.Sprintf("%s/streams/%s/segments/%s.pack", VersionPrefix, stream, strings.ToLower(sha256Hex))
+}
+
+// SnapshotPrefix returns the snapshot listing prefix for a stream: "v1/streams/<stream-id>/snapshots/".
+func SnapshotPrefix(stream StreamID) string {
+	return fmt.Sprintf("%s/streams/%s/snapshots/", VersionPrefix, stream)
 }
 
 // SnapshotKey returns the object storage key for a snapshot packfile: "v1/streams/<stream-id>/snapshots/<sha256>.pack".

@@ -107,6 +107,36 @@ func ValidateSegment(data []byte, expectedHash string) error {
 	return nil
 }
 
+// ValidateSegmentFromReader streams bytes from an io.Reader, verifies packfile framing rules, and asserts SHA-256 matches expectedHash.
+func ValidateSegmentFromReader(r io.Reader, expectedHash string) (int64, error) {
+	if err := ValidateHash(expectedHash); err != nil {
+		return 0, fmt.Errorf("%w: invalid expected hash: %w", ErrInvalidPackfile, err)
+	}
+	if r == nil {
+		return 0, fmt.Errorf("%w: reader cannot be nil", ErrInvalidPackfile)
+	}
+	var hdr [PackfileMinSize]byte
+	n, err := io.ReadFull(r, hdr[:])
+	if err != nil {
+		return int64(n), fmt.Errorf("%w: length %d is less than minimum packfile size of %d bytes: %w", ErrInvalidPackfile, n, PackfileMinSize, err)
+	}
+	if err := ValidatePackfileHeader(hdr[:]); err != nil {
+		return int64(n), err
+	}
+	h := sha256.New()
+	h.Write(hdr[:])
+	copied, err := io.Copy(h, r)
+	total := int64(n) + copied
+	if err != nil {
+		return total, fmt.Errorf("failed to read pack segment: %w", err)
+	}
+	computed := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(computed, expectedHash) {
+		return total, fmt.Errorf("%w: expected %s, got %s", ErrHashMismatch, strings.ToLower(expectedHash), computed)
+	}
+	return total, nil
+}
+
 // SegmentMetadata returns the standard S3 user metadata key-value pairs for a pack segment upload.
 func SegmentMetadata(stream StreamID, sha256Hex string) map[string]string {
 	return map[string]string{

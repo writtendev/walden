@@ -153,8 +153,14 @@ func TestKeyConstructors(t *testing.T) {
 	if want, got := "v1/streams/repo-test/tx/00000000000000000005.json", journal.TxKey(stream, 5); want != got {
 		t.Errorf("TxKey = %q, want %q", got, want)
 	}
+	if want, got := "v1/streams/repo-test/segments/", journal.SegmentPrefix(stream); want != got {
+		t.Errorf("SegmentPrefix = %q, want %q", got, want)
+	}
 	if want, got := fmt.Sprintf("v1/streams/repo-test/segments/%s.pack", hash), journal.SegmentKey(stream, hash); want != got {
 		t.Errorf("SegmentKey = %q, want %q", got, want)
+	}
+	if want, got := "v1/streams/repo-test/snapshots/", journal.SnapshotPrefix(stream); want != got {
+		t.Errorf("SnapshotPrefix = %q, want %q", got, want)
 	}
 	if want, got := fmt.Sprintf("v1/streams/repo-test/snapshots/%s.pack", hash), journal.SnapshotKey(stream, hash); want != got {
 		t.Errorf("SnapshotKey = %q, want %q", got, want)
@@ -234,7 +240,7 @@ func TestSpecFixturesLayout(t *testing.T) {
 		t.Errorf("missing fixture: %s", repoMarker)
 	}
 
-	// Check segment and snapshot filenames are valid 64-hex hashes + .pack
+	// Check segment filenames are valid 64-hex hashes + .pack
 	entries, err := os.ReadDir(filepath.Join(fixturesDir, "streams", "repo-alpha", "segments"))
 	if err != nil {
 		t.Fatalf("failed to read segments dir: %v", err)
@@ -250,6 +256,25 @@ func TestSpecFixturesLayout(t *testing.T) {
 		hash := strings.TrimSuffix(name, ".pack")
 		if err := journal.ValidateHash(hash); err != nil {
 			t.Errorf("segment fixture hash %q invalid: %v", hash, err)
+		}
+	}
+
+	// Check snapshot filenames are valid 64-hex hashes + .pack
+	snapEntries, err := os.ReadDir(filepath.Join(fixturesDir, "streams", "repo-alpha", "snapshots"))
+	if err != nil {
+		t.Fatalf("failed to read snapshots dir: %v", err)
+	}
+	if len(snapEntries) == 0 {
+		t.Errorf("expected at least one snapshot fixture")
+	}
+	for _, entry := range snapEntries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".pack") {
+			t.Errorf("snapshot fixture %q missing .pack suffix", name)
+		}
+		hash := strings.TrimSuffix(name, ".pack")
+		if err := journal.ValidateHash(hash); err != nil {
+			t.Errorf("snapshot fixture hash %q invalid: %v", hash, err)
 		}
 	}
 }

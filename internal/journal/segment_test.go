@@ -481,4 +481,3 @@ func TestValidateSegmentFromReader(t *testing.T) {
 		t.Errorf("expected ErrHashMismatch, got %v", err)
 	}
 }
-

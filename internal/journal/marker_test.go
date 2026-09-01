@@ -646,4 +646,3 @@ func TestValidateSnapshotSHA256FromReader(t *testing.T) {
 		t.Errorf("expected ErrSnapshotHashMismatch, got %v", err)
 	}
 }
-

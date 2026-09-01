@@ -13,5 +13,6 @@
       "new_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
     }
   ],
-  "timestamp": "2026-08-31T00:02:00Z"
+  "timestamp": "2026-08-31T00:02:00Z",
+  "signature": "ed25519:3785d69cb247493acb68cf2951477fc3aa5e356e1975bfb83d35600785d80062a7feecc289147333cfc8f7c6ff1c0893d311e7d7822471bc157c192cdb31be08"
 }

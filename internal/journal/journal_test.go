@@ -222,9 +222,11 @@ func TestSpecFixturesLayout(t *testing.T) {
 	}
 
 	// Verify repo stream fixtures exist
-	repoTx := filepath.Join(fixturesDir, "streams", "repo-alpha", "tx", "00000000000000000000.json")
-	if _, err := os.Stat(repoTx); err != nil {
-		t.Errorf("missing fixture: %s", repoTx)
+	for _, seq := range []string{"00000000000000000000", "00000000000000000001", "00000000000000000002"} {
+		repoTx := filepath.Join(fixturesDir, "streams", "repo-alpha", "tx", seq+".json")
+		if _, err := os.Stat(repoTx); err != nil {
+			t.Errorf("missing fixture: %s", repoTx)
+		}
 	}
 
 	repoMarker := filepath.Join(fixturesDir, "streams", "repo-alpha", "marker.json")

@@ -2,7 +2,11 @@ package auth_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -209,3 +213,264 @@ func TestNewAuthorizerFactory(t *testing.T) {
 	}
 	_ = priv
 }
+
+func TestJSONEnvelopeCapability(t *testing.T) {
+	priv, pub, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+
+	refTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	payload := auth.CapabilityPayload{
+		Version:   "v1",
+		ID:        "cap_json_01",
+		Issuer:    "forge.example.com",
+		Subject:   "user_42",
+		Scopes:    []string{"rw:blog-*", "r:docs"},
+		IssuedAt:  refTime.Format(time.RFC3339),
+		ExpiresAt: refTime.Add(1 * time.Hour).Format(time.RFC3339),
+		NotBefore: refTime.Format(time.RFC3339),
+	}
+
+	canonicalBytes := auth.CanonicalCapabilityPayload(&payload)
+	sigBytes := ed25519.Sign(priv, canonicalBytes)
+	sigHex := journal.FormatSignature(sigBytes)
+
+	// Case 1: JSON envelope with ed25519:<hex> signature and version at envelope level
+	envHex := fmt.Sprintf(`{
+		"version": "v1",
+		"payload": {
+			"id": "%s",
+			"issuer": "%s",
+			"subject": "%s",
+			"scopes": ["rw:blog-*", "r:docs"],
+			"issued_at": "%s",
+			"expires_at": "%s",
+			"not_before": "%s"
+		},
+		"signature": "%s"
+	}`, payload.ID, payload.Issuer, payload.Subject, payload.IssuedAt, payload.ExpiresAt, payload.NotBefore, sigHex)
+
+	evalTime := refTime.Add(30 * time.Minute)
+	parsed, scopes, err := auth.ParseAndVerifyCapability(envHex, pub, evalTime)
+	if err != nil {
+		t.Fatalf("ParseAndVerifyCapability failed for JSON envelope (hex sig): %v", err)
+	}
+	if parsed.ID != "cap_json_01" || len(scopes) != 2 {
+		t.Errorf("unexpected parsed result: %+v, scopes: %v", parsed, scopes)
+	}
+
+	// Case 2: JSON envelope with base64url signature
+	sigB64 := base64.RawURLEncoding.EncodeToString(sigBytes)
+	envB64 := fmt.Sprintf(`{
+		"version": "v1",
+		"payload": {
+			"version": "v1",
+			"id": "%s",
+			"issuer": "%s",
+			"subject": "%s",
+			"scopes": ["rw:blog-*", "r:docs"],
+			"issued_at": "%s",
+			"expires_at": "%s",
+			"not_before": "%s"
+		},
+		"signature": "%s"
+	}`, payload.ID, payload.Issuer, payload.Subject, payload.IssuedAt, payload.ExpiresAt, payload.NotBefore, sigB64)
+
+	parsed, scopes, err = auth.ParseAndVerifyCapability(envB64, pub, evalTime)
+	if err != nil {
+		t.Fatalf("ParseAndVerifyCapability failed for JSON envelope (b64 sig): %v", err)
+	}
+	if parsed.ID != "cap_json_01" || len(scopes) != 2 {
+		t.Errorf("unexpected parsed result: %+v, scopes: %v", parsed, scopes)
+	}
+
+	// Case 3: Invalid JSON envelope syntax
+	_, _, err = auth.ParseAndVerifyCapability("{invalid-json", pub, evalTime)
+	if err == nil || !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken for malformed JSON envelope, got %v", err)
+	}
+
+	// Case 4: Invalid signature string in envelope
+	envBadSig := `{"version":"v1","payload":{"id":"cap1","scopes":["r:*"],"issued_at":"2026-09-01T12:00:00Z","expires_at":"2026-09-01T13:00:00Z"},"signature":"not-a-sig!!!"}`
+	_, _, err = auth.ParseAndVerifyCapability(envBadSig, pub, evalTime)
+	if err == nil || !errors.Is(err, auth.ErrInvalidSignature) {
+		t.Errorf("expected ErrInvalidSignature for bad signature in envelope, got %v", err)
+	}
+}
+
+func TestSignCapabilityValidation(t *testing.T) {
+	priv, _, _ := journal.GenerateKeypair()
+	refTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name    string
+		payload auth.CapabilityPayload
+		wantErr error
+	}{
+		{
+			name: "empty-id",
+			payload: auth.CapabilityPayload{
+				Scopes:    []string{"rwc:*"},
+				IssuedAt:  refTime.Format(time.RFC3339),
+				ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+			},
+			wantErr: auth.ErrInvalidToken,
+		},
+		{
+			name: "empty-scopes",
+			payload: auth.CapabilityPayload{
+				ID:        "cap_1",
+				Scopes:    []string{},
+				IssuedAt:  refTime.Format(time.RFC3339),
+				ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+			},
+			wantErr: auth.ErrInvalidScope,
+		},
+		{
+			name: "invalid-scope-syntax",
+			payload: auth.CapabilityPayload{
+				ID:        "cap_1",
+				Scopes:    []string{"invalid-scope"},
+				IssuedAt:  refTime.Format(time.RFC3339),
+				ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+			},
+			wantErr: auth.ErrInvalidScope,
+		},
+		{
+			name: "empty-issued-at",
+			payload: auth.CapabilityPayload{
+				ID:        "cap_1",
+				Scopes:    []string{"rwc:*"},
+				ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+			},
+			wantErr: auth.ErrInvalidToken,
+		},
+		{
+			name: "invalid-issued-at",
+			payload: auth.CapabilityPayload{
+				ID:        "cap_1",
+				Scopes:    []string{"rwc:*"},
+				IssuedAt:  "not-a-timestamp",
+				ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+			},
+			wantErr: auth.ErrInvalidToken,
+		},
+		{
+			name: "empty-expires-at",
+			payload: auth.CapabilityPayload{
+				ID:       "cap_1",
+				Scopes:   []string{"rwc:*"},
+				IssuedAt: refTime.Format(time.RFC3339),
+			},
+			wantErr: auth.ErrInvalidToken,
+		},
+		{
+			name: "invalid-expires-at",
+			payload: auth.CapabilityPayload{
+				ID:        "cap_1",
+				Scopes:    []string{"rwc:*"},
+				IssuedAt:  refTime.Format(time.RFC3339),
+				ExpiresAt: "bad-time",
+			},
+			wantErr: auth.ErrInvalidToken,
+		},
+		{
+			name: "invalid-not-before",
+			payload: auth.CapabilityPayload{
+				ID:        "cap_1",
+				Scopes:    []string{"rwc:*"},
+				IssuedAt:  refTime.Format(time.RFC3339),
+				ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+				NotBefore: "bad-time",
+			},
+			wantErr: auth.ErrInvalidToken,
+		},
+		{
+			name: "not-before-after-expires",
+			payload: auth.CapabilityPayload{
+				ID:        "cap_1",
+				Scopes:    []string{"rwc:*"},
+				IssuedAt:  refTime.Format(time.RFC3339),
+				ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+				NotBefore: refTime.Add(2 * time.Hour).Format(time.RFC3339),
+			},
+			wantErr: auth.ErrInvalidToken,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := auth.SignCapability(priv, &tt.payload)
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", tt.name)
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("expected error %v for %s, got %v", tt.wantErr, tt.name, err)
+			}
+			if strings.Contains(err.Error(), "\n") {
+				t.Errorf("refusal for %s contains newline: %q", tt.name, err.Error())
+			}
+		})
+	}
+}
+
+func TestParseAndVerifyCapabilityEdgeCases(t *testing.T) {
+	priv, pub, _ := journal.GenerateKeypair()
+	refTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	// 1. Bad public key size
+	_, _, err := auth.ParseAndVerifyCapability("v1.a.b", []byte{1, 2, 3}, refTime)
+	if err == nil || !errors.Is(err, auth.ErrInvalidSignature) {
+		t.Errorf("expected ErrInvalidSignature for invalid pubkey length, got %v", err)
+	}
+
+	// 2. Empty token string
+	_, _, err = auth.ParseAndVerifyCapability("   ", pub, refTime)
+	if err == nil || !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected ErrUnauthorized for empty token, got %v", err)
+	}
+
+	// 3. Unrecognized token format
+	_, _, err = auth.ParseAndVerifyCapability("unrecognized_token", pub, refTime)
+	if err == nil || !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken for unrecognized format, got %v", err)
+	}
+
+	// 4. Malformed compact token parts count
+	_, _, err = auth.ParseAndVerifyCapability("v1.payload", pub, refTime)
+	if err == nil || !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken for bad compact parts, got %v", err)
+	}
+
+	// 5. Invalid base64url payload
+	_, _, err = auth.ParseAndVerifyCapability("v1.invalid*b64.sig", pub, refTime)
+	if err == nil || !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken for invalid base64url payload, got %v", err)
+	}
+
+	// 6. Bad payload JSON
+	badPayloadB64 := base64.RawURLEncoding.EncodeToString([]byte("not json"))
+	_, _, err = auth.ParseAndVerifyCapability(fmt.Sprintf("v1.%s.sig", badPayloadB64), pub, refTime)
+	if err == nil || !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken for invalid payload JSON, got %v", err)
+	}
+
+	// 7. Unsupported version
+	payload := auth.CapabilityPayload{
+		Version:   "v2",
+		ID:        "cap_v2",
+		Scopes:    []string{"rwc:*"},
+		IssuedAt:  refTime.Format(time.RFC3339),
+		ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	canonical := auth.CanonicalCapabilityPayload(&payload)
+	sig := ed25519.Sign(priv, canonical)
+	tok := fmt.Sprintf("v1.%s.%s", base64.RawURLEncoding.EncodeToString(payloadBytes), base64.RawURLEncoding.EncodeToString(sig))
+	_, _, err = auth.ParseAndVerifyCapability(tok, pub, refTime)
+	if err == nil || !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken for unsupported version, got %v", err)
+	}
+}
+

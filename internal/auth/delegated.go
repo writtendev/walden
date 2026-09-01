@@ -75,6 +75,25 @@ func SignCapability(priv ed25519.PrivateKey, p *CapabilityPayload) (string, erro
 			ErrInvalidScope,
 		)
 	}
+	if _, err := ParseScopes(p.Scopes); err != nil {
+		return "", err
+	}
+	if p.IssuedAt == "" {
+		return "", refusal.RefuseWithCause(
+			"invalid capability",
+			"missing 'issued_at' timestamp",
+			"delegated capabilities must specify an issuance timestamp",
+			ErrInvalidToken,
+		)
+	}
+	if _, err := time.Parse(time.RFC3339, p.IssuedAt); err != nil {
+		return "", refusal.RefuseWithCause(
+			"invalid capability",
+			fmt.Sprintf("invalid 'issued_at' timestamp format %q", p.IssuedAt),
+			"use RFC 3339 UTC format (e.g. 2026-09-01T12:00:00Z)",
+			ErrInvalidToken,
+		)
+	}
 	if p.ExpiresAt == "" {
 		return "", refusal.RefuseWithCause(
 			"invalid capability",
@@ -82,6 +101,34 @@ func SignCapability(priv ed25519.PrivateKey, p *CapabilityPayload) (string, erro
 			"delegated capabilities must specify a finite expiration time",
 			ErrInvalidToken,
 		)
+	}
+	expTime, err := time.Parse(time.RFC3339, p.ExpiresAt)
+	if err != nil {
+		return "", refusal.RefuseWithCause(
+			"invalid capability",
+			fmt.Sprintf("invalid 'expires_at' timestamp format %q", p.ExpiresAt),
+			"use RFC 3339 UTC format (e.g. 2026-09-01T13:00:00Z)",
+			ErrInvalidToken,
+		)
+	}
+	if p.NotBefore != "" {
+		nbTime, err := time.Parse(time.RFC3339, p.NotBefore)
+		if err != nil {
+			return "", refusal.RefuseWithCause(
+				"invalid capability",
+				fmt.Sprintf("invalid 'not_before' timestamp format %q", p.NotBefore),
+				"use RFC 3339 UTC format (e.g. 2026-09-01T12:00:00Z)",
+				ErrInvalidToken,
+			)
+		}
+		if !nbTime.Before(expTime) {
+			return "", refusal.RefuseWithCause(
+				"invalid capability",
+				"'not_before' timestamp must be earlier than 'expires_at'",
+				"ensure token activation occurs before expiration",
+				ErrInvalidToken,
+			)
+		}
 	}
 
 	payloadJSON, err := json.Marshal(p)
@@ -110,7 +157,16 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 		)
 	}
 
-	var payloadBytes []byte
+	if len(pubKey) != ed25519.PublicKeySize {
+		return nil, nil, refusal.RefuseWithCause(
+			"invalid signature",
+			"invalid public key size for capability verification",
+			"ensure WALDEN_AUTH_TRUST is a valid 32-byte Ed25519 public key",
+			ErrInvalidSignature,
+		)
+	}
+
+	var payload CapabilityPayload
 	var sigBytes []byte
 
 	if strings.HasPrefix(tokenStr, "v1.") {
@@ -133,7 +189,14 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 				ErrInvalidToken,
 			)
 		}
-		payloadBytes = decodedPayload
+		if err := json.Unmarshal(decodedPayload, &payload); err != nil {
+			return nil, nil, refusal.RefuseWithCause(
+				"invalid capability",
+				"failed to parse capability payload JSON",
+				"provide a valid v1 JSON capability payload",
+				ErrInvalidToken,
+			)
+		}
 
 		sigStr := parts[2]
 		if strings.HasPrefix(sigStr, journal.SignaturePrefix) {
@@ -170,11 +233,10 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 				ErrInvalidToken,
 			)
 		}
-		marshaled, err := json.Marshal(env.Payload)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to marshal envelope payload: %w", err)
+		payload = env.Payload
+		if payload.Version == "" && env.Version != "" {
+			payload.Version = env.Version
 		}
-		payloadBytes = marshaled
 
 		parsedSig, err := journal.ParseSignature(env.Signature)
 		if err != nil {
@@ -207,16 +269,6 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 			fmt.Sprintf("signature length %d does not match expected Ed25519 size %d", len(sigBytes), ed25519.SignatureSize),
 			"provide a valid Ed25519 signature",
 			ErrInvalidSignature,
-		)
-	}
-
-	var payload CapabilityPayload
-	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return nil, nil, refusal.RefuseWithCause(
-			"invalid capability",
-			"failed to parse capability payload JSON",
-			"provide a valid v1 JSON capability payload",
-			ErrInvalidToken,
 		)
 	}
 
@@ -257,6 +309,24 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 		)
 	}
 
+	if payload.IssuedAt == "" {
+		return nil, nil, refusal.RefuseWithCause(
+			"invalid capability",
+			"missing 'issued_at' timestamp",
+			"delegated capabilities must specify an issuance timestamp",
+			ErrInvalidToken,
+		)
+	}
+
+	if _, err := time.Parse(time.RFC3339, payload.IssuedAt); err != nil {
+		return nil, nil, refusal.RefuseWithCause(
+			"invalid capability",
+			fmt.Sprintf("invalid 'issued_at' timestamp format %q", payload.IssuedAt),
+			"use RFC 3339 UTC format (e.g. 2026-09-01T12:00:00Z)",
+			ErrInvalidToken,
+		)
+	}
+
 	if payload.ExpiresAt == "" {
 		return nil, nil, refusal.RefuseWithCause(
 			"invalid capability",
@@ -277,14 +347,6 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 	}
 
 	utcNow := now.UTC()
-	if !utcNow.Before(expTime.UTC()) {
-		return nil, nil, refusal.RefuseWithCause(
-			"capability expired",
-			fmt.Sprintf("token expired at %s (current time %s)", payload.ExpiresAt, utcNow.Format(time.RFC3339)),
-			"request a fresh token from the issuer",
-			ErrExpired,
-		)
-	}
 
 	if payload.NotBefore != "" {
 		nbTime, err := time.Parse(time.RFC3339, payload.NotBefore)
@@ -296,6 +358,14 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 				ErrInvalidToken,
 			)
 		}
+		if !nbTime.Before(expTime) {
+			return nil, nil, refusal.RefuseWithCause(
+				"invalid capability",
+				"'not_before' timestamp must be earlier than 'expires_at'",
+				"ensure token activation occurs before expiration",
+				ErrInvalidToken,
+			)
+		}
 		if utcNow.Before(nbTime.UTC()) {
 			return nil, nil, refusal.RefuseWithCause(
 				"capability not yet valid",
@@ -304,6 +374,15 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 				ErrNotYetValid,
 			)
 		}
+	}
+
+	if !utcNow.Before(expTime.UTC()) {
+		return nil, nil, refusal.RefuseWithCause(
+			"capability expired",
+			fmt.Sprintf("token expired at %s (current time %s)", payload.ExpiresAt, utcNow.Format(time.RFC3339)),
+			"request a fresh token from the issuer",
+			ErrExpired,
+		)
 	}
 
 	scopes, err := ParseScopes(payload.Scopes)

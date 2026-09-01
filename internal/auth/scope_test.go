@@ -220,3 +220,40 @@ func TestParseScopesEmpty(t *testing.T) {
 		t.Errorf("expected empty error message, got %q", err.Error())
 	}
 }
+
+func TestCheckRepoAndToken(t *testing.T) {
+	// Valid
+	if err := auth.CheckRepoAndToken("token123", "repo-alpha"); err != nil {
+		t.Errorf("expected CheckRepoAndToken to succeed, got %v", err)
+	}
+
+	// Empty token
+	err := auth.CheckRepoAndToken("", "repo-alpha")
+	if err == nil || !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected ErrUnauthorized for empty token, got %v", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("refusal contains newline: %q", err.Error())
+	}
+
+	// Invalid repo
+	err = auth.CheckRepoAndToken("token123", "repo/sub")
+	if err == nil || !errors.Is(err, auth.ErrInvalidRepo) {
+		t.Errorf("expected ErrInvalidRepo for invalid repo, got %v", err)
+	}
+}
+
+func TestForbiddenRefusal(t *testing.T) {
+	err := auth.ForbiddenRefusal(auth.ActionWrite, "repo-alpha")
+	if err == nil || !errors.Is(err, auth.ErrForbidden) {
+		t.Errorf("expected ErrForbidden, got %v", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("refusal contains newline: %q", err.Error())
+	}
+	expected := "forbidden: token does not grant action \"w\" on repository \"repo-alpha\" (request scope 'w:repo-alpha' from administrator or issuer)"
+	if err.Error() != expected {
+		t.Errorf("got %q, want %q", err.Error(), expected)
+	}
+}
+

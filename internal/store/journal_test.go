@@ -1018,7 +1018,12 @@ func TestS3SchemeBucketKeepsItsCase(t *testing.T) {
 // assertOneLineRefusal checks the operator-facing refusal convention.
 func assertOneLineRefusal(t *testing.T, err error) {
 	t.Helper()
-	if !errors.Is(err, &refusal.Refusal{}) {
+	// errors.As, not errors.Is against a zero *Refusal: WALD-81 deleted
+	// (*Refusal).Is because its blanket target.(*Refusal) branch made two
+	// refusals with distinct causes errors.Is-equal. errors.As is how a
+	// caller asks "is this a refusal at all".
+	var r *refusal.Refusal
+	if !errors.As(err, &r) {
 		t.Errorf("error %v is not a *refusal.Refusal", err)
 	}
 	if strings.ContainsAny(err.Error(), "\n\r") {

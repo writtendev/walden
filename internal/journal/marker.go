@@ -131,6 +131,31 @@ func ValidateSnapshot(data []byte, expectedHash string) error {
 	return nil
 }
 
+// ValidateSnapshotSHA256 validates that data is a valid Git packfile for SHA-256 repositories and that its SHA-256 hash matches expectedHash.
+func ValidateSnapshotSHA256(data []byte, expectedHash string) error {
+	if err := ValidateHash(expectedHash); err != nil {
+		return fmt.Errorf("%w: invalid expected snapshot hash: %w", ErrSnapshotCorrupt, err)
+	}
+	if err := ValidatePackfileHeaderSHA256(data); err != nil {
+		return fmt.Errorf("%w: %w", ErrSnapshotCorrupt, err)
+	}
+	computed := ComputeSegmentHash(data)
+	if !strings.EqualFold(computed, expectedHash) {
+		return fmt.Errorf("%w: expected %s, got %s: %w", ErrSnapshotHashMismatch, strings.ToLower(expectedHash), computed, ErrSnapshotCorrupt)
+	}
+	return nil
+}
+
+// SnapshotMetadata returns the standard S3 user metadata key-value pairs for a snapshot packfile upload.
+func SnapshotMetadata(stream StreamID, sha256Hex string) map[string]string {
+	return SegmentMetadata(stream, sha256Hex)
+}
+
+// SnapshotContentType returns the HTTP Content-Type header value for snapshot packfiles.
+func SnapshotContentType() string {
+	return ContentTypeGitPackedObjects
+}
+
 // RefuseMissingSnapshot returns a single-line operator-facing refusal when a referenced snapshot pack is missing.
 func RefuseMissingSnapshot(stream StreamID, sha256Hex string) error {
 	return refusal.RefuseWithCause(
@@ -147,36 +172,48 @@ func RefuseSnapshotHashMismatch(stream StreamID, expectedHash, computedHash stri
 		"refusal: replay failed",
 		fmt.Sprintf("snapshot hash mismatch for %s on stream %s (computed %s)", strings.ToLower(expectedHash), stream, computedHash),
 		"snapshot pack in object storage is corrupt",
-		ErrSnapshotCorrupt,
+		fmt.Errorf("%w: %w", ErrSnapshotHashMismatch, ErrSnapshotCorrupt),
 	)
 }
 
 // RefuseCorruptSnapshot returns a single-line operator-facing refusal when a snapshot pack header or payload is corrupt.
 func RefuseCorruptSnapshot(stream StreamID, sha256Hex string, reason error) error {
+	cause := ErrSnapshotCorrupt
+	if reason != nil {
+		cause = fmt.Errorf("%w: %w", ErrSnapshotCorrupt, reason)
+	}
 	return refusal.RefuseWithCause(
 		"refusal: replay failed",
 		fmt.Sprintf("corrupt snapshot pack %s on stream %s (%v)", strings.ToLower(sha256Hex), stream, reason),
 		"packfile header is malformed",
-		ErrSnapshotCorrupt,
+		cause,
 	)
 }
 
 // RefuseCorruptMarker returns a single-line operator-facing refusal when marker.json is malformed JSON.
 func RefuseCorruptMarker(stream StreamID, reason error) error {
+	cause := ErrCorruptMarker
+	if reason != nil {
+		cause = fmt.Errorf("%w: %w", ErrCorruptMarker, reason)
+	}
 	return refusal.RefuseWithCause(
 		"refusal: replay failed",
 		fmt.Sprintf("corrupt marker on stream %s (%v)", stream, reason),
 		"marker.json in object storage is malformed",
-		ErrCorruptMarker,
+		cause,
 	)
 }
 
 // RefuseInvalidMarker returns a single-line operator-facing refusal when marker.json has invalid fields.
 func RefuseInvalidMarker(stream StreamID, reason error) error {
+	cause := ErrInvalidMarker
+	if reason != nil {
+		cause = fmt.Errorf("%w: %w", ErrInvalidMarker, reason)
+	}
 	return refusal.RefuseWithCause(
 		"refusal: replay failed",
 		fmt.Sprintf("invalid marker on stream %s (%v)", stream, reason),
 		"marker.json in object storage is invalid",
-		ErrInvalidMarker,
+		cause,
 	)
 }

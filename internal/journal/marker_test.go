@@ -88,6 +88,15 @@ func TestParseMarkerGoldenFixture(t *testing.T) {
 	if err := journal.ValidateSnapshot(snapBytes, m.Snapshot); err != nil {
 		t.Fatalf("ValidateSnapshot failed on golden snapshot fixture: %v", err)
 	}
+
+	// 3. Verify MarshalMarker produces exact fixture bytes
+	marshaled, err := journal.MarshalMarker(m)
+	if err != nil {
+		t.Fatalf("MarshalMarker failed on parsed golden fixture: %v", err)
+	}
+	if string(marshaled) != string(data) {
+		t.Errorf("MarshalMarker output differs from fixture:\ngot:\n%s\nwant:\n%s", string(marshaled), string(data))
+	}
 }
 
 func TestMarshalMarkerRoundTrip(t *testing.T) {
@@ -401,6 +410,52 @@ func TestValidateSnapshot(t *testing.T) {
 	}
 }
 
+func TestValidateSnapshotSHA256(t *testing.T) {
+	// 1. Valid SHA-256 packfile snapshot (>= 44 bytes)
+	sha256Pack := validEmptyPackfileSHA256()
+	sha256Hash := journal.ComputeSegmentHash(sha256Pack)
+	if err := journal.ValidateSnapshotSHA256(sha256Pack, sha256Hash); err != nil {
+		t.Errorf("ValidateSnapshotSHA256 failed on valid SHA-256 snapshot: %v", err)
+	}
+
+	// 2. Too short for SHA-256 repo (< 44 bytes, even if valid SHA-1 32 bytes)
+	sha1Pack := validEmptyPackfile()
+	sha1Hash := journal.ComputeSegmentHash(sha1Pack)
+	err := journal.ValidateSnapshotSHA256(sha1Pack, sha1Hash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for 32-byte packfile in SHA-256 validation, got %v", err)
+	}
+
+	// 3. Invalid expected hash
+	err = journal.ValidateSnapshotSHA256(sha256Pack, "invalid-hash")
+	if err == nil || !errors.Is(err, journal.ErrSnapshotCorrupt) {
+		t.Errorf("expected ErrSnapshotCorrupt for invalid hash, got %v", err)
+	}
+
+	// 4. Hash mismatch
+	err = journal.ValidateSnapshotSHA256(sha256Pack, sha1Hash)
+	if err == nil || !errors.Is(err, journal.ErrSnapshotHashMismatch) {
+		t.Errorf("expected ErrSnapshotHashMismatch, got %v", err)
+	}
+}
+
+func TestSnapshotMetadataAndContentType(t *testing.T) {
+	stream := journal.StreamID("repo-delta")
+	hash := "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
+
+	meta := journal.SnapshotMetadata(stream, strings.ToUpper(hash))
+	if meta[journal.MetaHeaderStream] != "repo-delta" {
+		t.Errorf("MetaHeaderStream = %q, want %q", meta[journal.MetaHeaderStream], "repo-delta")
+	}
+	if meta[journal.MetaHeaderHash] != hash {
+		t.Errorf("MetaHeaderHash = %q, want %q", meta[journal.MetaHeaderHash], hash)
+	}
+
+	if got := journal.SnapshotContentType(); got != "application/x-git-packed-objects" {
+		t.Errorf("SnapshotContentType = %q, want %q", got, "application/x-git-packed-objects")
+	}
+}
+
 func TestMarkerRefusalFormatting(t *testing.T) {
 	stream := journal.StreamID("repo-alpha")
 	hash := "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
@@ -432,6 +487,9 @@ func TestMarkerRefusalFormatting(t *testing.T) {
 	if !errors.Is(err, journal.ErrSnapshotCorrupt) {
 		t.Errorf("expected errors.Is(err, ErrSnapshotCorrupt) to be true")
 	}
+	if !errors.Is(err, journal.ErrSnapshotHashMismatch) {
+		t.Errorf("expected errors.Is(err, ErrSnapshotHashMismatch) to be true")
+	}
 	msg = err.Error()
 	if strings.Contains(msg, "\n") {
 		t.Errorf("refusal message contains newline: %q", msg)
@@ -446,6 +504,9 @@ func TestMarkerRefusalFormatting(t *testing.T) {
 	if !errors.Is(err, journal.ErrSnapshotCorrupt) {
 		t.Errorf("expected errors.Is(err, ErrSnapshotCorrupt) to be true")
 	}
+	if !errors.Is(err, journal.ErrInvalidPackfile) {
+		t.Errorf("expected errors.Is(err, ErrInvalidPackfile) to be true")
+	}
 	msg = err.Error()
 	if strings.Contains(msg, "\n") {
 		t.Errorf("refusal message contains newline: %q", msg)
@@ -456,9 +517,13 @@ func TestMarkerRefusalFormatting(t *testing.T) {
 	}
 
 	// 4. Corrupt marker refusal
-	err = journal.RefuseCorruptMarker(stream, errors.New("unexpected EOF"))
+	eofErr := errors.New("unexpected EOF")
+	err = journal.RefuseCorruptMarker(stream, eofErr)
 	if !errors.Is(err, journal.ErrCorruptMarker) {
 		t.Errorf("expected errors.Is(err, ErrCorruptMarker) to be true")
+	}
+	if !errors.Is(err, eofErr) {
+		t.Errorf("expected errors.Is(err, eofErr) to be true")
 	}
 	msg = err.Error()
 	if strings.Contains(msg, "\n") {

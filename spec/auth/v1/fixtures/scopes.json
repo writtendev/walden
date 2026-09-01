@@ -1,0 +1,240 @@
+{
+  "version": "v1",
+  "description": "Golden fixtures for scope parsing, action validation, and glob matching",
+  "scope_parsing": [
+    {
+      "scope": "rwc:*",
+      "valid": true,
+      "actions": ["r", "w", "c"],
+      "canonical_actions": "rwc",
+      "pattern": "*",
+      "description": "Standard administrative wildcard scope"
+    },
+    {
+      "scope": "rw:blog-*",
+      "valid": true,
+      "actions": ["r", "w"],
+      "canonical_actions": "rw",
+      "pattern": "blog-*",
+      "description": "Read-write prefix scope"
+    },
+    {
+      "scope": "r:docs",
+      "valid": true,
+      "actions": ["r"],
+      "canonical_actions": "r",
+      "pattern": "docs",
+      "description": "Read-only exact match scope"
+    },
+    {
+      "scope": "c:temp-*",
+      "valid": true,
+      "actions": ["c"],
+      "canonical_actions": "c",
+      "pattern": "temp-*",
+      "description": "Create-only prefix scope"
+    },
+    {
+      "scope": "wc:*-service",
+      "valid": true,
+      "actions": ["w", "c"],
+      "canonical_actions": "wc",
+      "pattern": "*-service",
+      "description": "Write and create suffix scope"
+    },
+    {
+      "scope": "rc:project-*-test",
+      "valid": true,
+      "actions": ["r", "c"],
+      "canonical_actions": "rc",
+      "pattern": "project-*-test",
+      "description": "Read and create infix scope"
+    },
+    {
+      "scope": "wr:app",
+      "valid": true,
+      "actions": ["r", "w"],
+      "canonical_actions": "rw",
+      "pattern": "app",
+      "description": "Permuted actions normalized to canonical ordering"
+    },
+    {
+      "scope": "crw:*",
+      "valid": true,
+      "actions": ["r", "w", "c"],
+      "canonical_actions": "rwc",
+      "pattern": "*",
+      "description": "Permuted 3-action scope normalized to rwc"
+    },
+    {
+      "scope": "",
+      "valid": false,
+      "description": "Empty scope string"
+    },
+    {
+      "scope": "rwc",
+      "valid": false,
+      "description": "Missing colon and pattern"
+    },
+    {
+      "scope": ":*",
+      "valid": false,
+      "description": "Missing actions"
+    },
+    {
+      "scope": "rw:",
+      "valid": false,
+      "description": "Missing pattern"
+    },
+    {
+      "scope": "rx:*",
+      "valid": false,
+      "description": "Unknown action 'x'"
+    },
+    {
+      "scope": "r w:*",
+      "valid": false,
+      "description": "Space in actions"
+    },
+    {
+      "scope": "rw:repo/sub",
+      "valid": false,
+      "description": "Slash in glob pattern"
+    }
+  ],
+  "evaluations": [
+    {
+      "scopes": ["rwc:*"],
+      "repo": "repo-alpha",
+      "action": "r",
+      "allowed": true,
+      "description": "Wildcard rwc permits read on repo-alpha"
+    },
+    {
+      "scopes": ["rwc:*"],
+      "repo": "repo-alpha",
+      "action": "w",
+      "allowed": true,
+      "description": "Wildcard rwc permits write on repo-alpha"
+    },
+    {
+      "scopes": ["rwc:*"],
+      "repo": "repo-alpha",
+      "action": "c",
+      "allowed": true,
+      "description": "Wildcard rwc permits create on repo-alpha"
+    },
+    {
+      "scopes": ["rw:blog-*"],
+      "repo": "blog-posts",
+      "action": "r",
+      "allowed": true,
+      "description": "Prefix rw permits read on matching repo"
+    },
+    {
+      "scopes": ["rw:blog-*"],
+      "repo": "blog-posts",
+      "action": "w",
+      "allowed": true,
+      "description": "Prefix rw permits write on matching repo"
+    },
+    {
+      "scopes": ["rw:blog-*"],
+      "repo": "blog-posts",
+      "action": "c",
+      "allowed": false,
+      "description": "Prefix rw denies create on matching repo"
+    },
+    {
+      "scopes": ["rw:blog-*"],
+      "repo": "docs",
+      "action": "r",
+      "allowed": false,
+      "description": "Prefix rw denies read on non-matching repo"
+    },
+    {
+      "scopes": ["r:docs"],
+      "repo": "docs",
+      "action": "r",
+      "allowed": true,
+      "description": "Exact match r permits read on docs"
+    },
+    {
+      "scopes": ["r:docs"],
+      "repo": "docs",
+      "action": "w",
+      "allowed": false,
+      "description": "Exact match r denies write on docs"
+    },
+    {
+      "scopes": ["r:docs"],
+      "repo": "docs-extra",
+      "action": "r",
+      "allowed": false,
+      "description": "Exact match does not match longer repo name"
+    },
+    {
+      "scopes": ["rc:*-service"],
+      "repo": "auth-service",
+      "action": "c",
+      "allowed": true,
+      "description": "Suffix glob matches auth-service for create"
+    },
+    {
+      "scopes": ["rc:*-service"],
+      "repo": "auth-service",
+      "action": "w",
+      "allowed": false,
+      "description": "Suffix rc denies write on auth-service"
+    },
+    {
+      "scopes": ["w:proj-*-backend"],
+      "repo": "proj-core-backend",
+      "action": "w",
+      "allowed": true,
+      "description": "Infix glob matches proj-core-backend for write"
+    },
+    {
+      "scopes": ["w:proj-*-backend"],
+      "repo": "proj-core-frontend",
+      "action": "w",
+      "allowed": false,
+      "description": "Infix glob denies non-matching suffix"
+    },
+    {
+      "scopes": ["r:*", "w:staging-*", "rwc:sandbox-*"],
+      "repo": "prod-app",
+      "action": "r",
+      "allowed": true,
+      "description": "Multi-scope: r:* grants read on prod-app"
+    },
+    {
+      "scopes": ["r:*", "w:staging-*", "rwc:sandbox-*"],
+      "repo": "prod-app",
+      "action": "w",
+      "allowed": false,
+      "description": "Multi-scope: write on prod-app is denied"
+    },
+    {
+      "scopes": ["r:*", "w:staging-*", "rwc:sandbox-*"],
+      "repo": "staging-api",
+      "action": "w",
+      "allowed": true,
+      "description": "Multi-scope: w:staging-* grants write on staging-api"
+    },
+    {
+      "scopes": ["r:*", "w:staging-*", "rwc:sandbox-*"],
+      "repo": "staging-api",
+      "action": "c",
+      "allowed": false,
+      "description": "Multi-scope: create on staging-api is denied"
+    },
+    {
+      "scopes": ["r:*", "w:staging-*", "rwc:sandbox-*"],
+      "repo": "sandbox-demo",
+      "action": "c",
+      "allowed": true,
+      "description": "Multi-scope: rwc:sandbox-* grants create on sandbox-demo"
+    }
+  ]
+}

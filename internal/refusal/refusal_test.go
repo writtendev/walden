@@ -110,9 +110,50 @@ func TestRefuseHelperAndTypeAssertion(t *testing.T) {
 	if ref.What != "token" || ref.Why != "missing subcommand" || ref.Fix != "expected create, list, or revoke" {
 		t.Errorf("unexpected refusal fields: %+v", ref)
 	}
+}
 
-	if !errors.Is(err, &Refusal{}) {
-		t.Errorf("errors.Is(err, &Refusal{}) returned false")
+func TestRefusalsWithDifferentCausesDoNotMatch(t *testing.T) {
+	causeA := errors.New("cause a")
+	causeB := errors.New("cause b")
+
+	a := RefuseWithCause("operation a", "condition a", "retry a", causeA)
+	b := RefuseWithCause("operation b", "condition b", "retry b", causeB)
+
+	if errors.Is(a, b) {
+		t.Errorf("errors.Is(a, b) returned true for refusals with distinct causes")
+	}
+	if errors.Is(b, a) {
+		t.Errorf("errors.Is(b, a) returned true for refusals with distinct causes")
+	}
+
+	// Each refusal still matches its own cause, and only its own.
+	if !errors.Is(a, causeA) {
+		t.Errorf("expected errors.Is(a, causeA) to be true")
+	}
+	if errors.Is(a, causeB) {
+		t.Errorf("expected errors.Is(a, causeB) to be false")
+	}
+	if !errors.Is(b, causeB) {
+		t.Errorf("expected errors.Is(b, causeB) to be true")
+	}
+	if errors.Is(b, causeA) {
+		t.Errorf("expected errors.Is(b, causeA) to be false")
+	}
+
+	// A cause reached through an intermediate wrap is still matchable, which is
+	// what makes the old "errors.Is(r.Err, target)" branch redundant.
+	wrapped := RefuseWithCause("operation c", "condition c", "retry c", fmt.Errorf("layer: %w", causeA))
+	if !errors.Is(wrapped, causeA) {
+		t.Errorf("expected errors.Is(wrapped, causeA) to be true")
+	}
+
+	// Each is still reachable as a refusal, and a causeless refusal is too.
+	plain := Refuse("operation d", "condition d", "retry d")
+	for name, err := range map[string]error{"a": a, "b": b, "wrapped": wrapped, "plain": plain} {
+		var ref *Refusal
+		if !errors.As(err, &ref) {
+			t.Errorf("expected errors.As(%s, &ref) to be true", name)
+		}
 	}
 }
 
@@ -140,10 +181,5 @@ func TestRefuseWithCauseAndUnwrap(t *testing.T) {
 	wrappedRef := FromError("operation", sentinel, "fix action")
 	if !errors.Is(wrappedRef, sentinel) {
 		t.Errorf("expected errors.Is(wrappedRef, sentinel) to be true")
-	}
-
-	// Nil target in Is
-	if ref.Is(nil) {
-		t.Errorf("expected ref.Is(nil) to be false")
 	}
 }

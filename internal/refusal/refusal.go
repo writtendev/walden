@@ -4,7 +4,6 @@
 package refusal
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 )
@@ -74,20 +73,12 @@ func (r *Refusal) Error() string {
 	return fmt.Sprintf("%s: %s (%s)", what, why, fix)
 }
 
-// Unwrap returns the underlying causal error, if any.
+// Unwrap returns the underlying causal error, if any. There is deliberately no
+// Is method: errors.Is already walks Unwrap to reach the cause, and any Is that
+// matched another *Refusal would make every refusal equal to every other one.
+// Callers asking "is this a refusal at all" use errors.As.
 func (r *Refusal) Unwrap() error {
 	return r.Err
-}
-
-// Is reports whether target is a *Refusal or matches the underlying causal error.
-func (r *Refusal) Is(target error) bool {
-	if _, ok := target.(*Refusal); ok {
-		return true
-	}
-	if r.Err != nil && errors.Is(r.Err, target) {
-		return true
-	}
-	return false
 }
 
 // sanitize strips newlines, carriage returns, tabs, and collapses whitespace,

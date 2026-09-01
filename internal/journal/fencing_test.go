@@ -409,6 +409,25 @@ func TestSentinelErrorsUnificationAndErrorsIs(t *testing.T) {
 		t.Errorf("expected RefuseCASNotSupported to match ErrCASNotSupported")
 	}
 
+	// 4b. Refusals with distinct causes stay distinct in both directions, so a
+	// caller mapping fenced refusals does not also catch CAS refusals.
+	if errors.Is(errCAS, errFenced) || errors.Is(errFenced, errCAS) {
+		t.Errorf("expected CAS and fenced refusals not to match each other")
+	}
+
+	// 4c. Each fencing refusal carries its own sentinel and no other. These two
+	// guard against cross-sentinel contamination in the causes themselves — an
+	// extra sentinel joined into a cause, not the blanket-match Is of WALD-81 —
+	// which would let a writer hitting a CAS capability error conclude it had
+	// been fenced. The positive assertions above catch a replaced sentinel; only
+	// these catch an added one.
+	if errors.Is(errCAS, journal.ErrFenced) {
+		t.Errorf("expected RefuseCASNotSupported not to match ErrFenced")
+	}
+	if errors.Is(errFenced, journal.ErrCASNotSupported) {
+		t.Errorf("expected RefuseStreamFenced not to match ErrCASNotSupported")
+	}
+
 	// 5. Check Fencer methods return errors matching ErrFenced
 	f := journal.NewFencer()
 	f.FenceStream("repo-x", 1)

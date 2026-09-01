@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -34,6 +36,9 @@ type CapabilityEnvelope struct {
 
 // CanonicalCapabilityPayload produces the deterministic byte sequence for Ed25519 signing and verification.
 func CanonicalCapabilityPayload(p *CapabilityPayload) []byte {
+	if p == nil {
+		return nil
+	}
 	var sb strings.Builder
 	sb.WriteString("walden-auth-capability:v1\n")
 	sb.WriteString(fmt.Sprintf("id:%s\n", p.ID))
@@ -56,6 +61,22 @@ func CanonicalCapabilityPayload(p *CapabilityPayload) []byte {
 
 // SignCapability signs a capability payload with an Ed25519 private key and returns a compact token string.
 func SignCapability(priv ed25519.PrivateKey, p *CapabilityPayload) (string, error) {
+	if len(priv) != ed25519.PrivateKeySize {
+		return "", refusal.RefuseWithCause(
+			"invalid signature",
+			"invalid private key size for capability signing",
+			"provide a valid 64-byte Ed25519 private key",
+			ErrInvalidSignature,
+		)
+	}
+	if p == nil {
+		return "", refusal.RefuseWithCause(
+			"invalid capability",
+			"capability payload cannot be nil",
+			"provide a valid capability payload",
+			ErrInvalidToken,
+		)
+	}
 	if p.Version == "" {
 		p.Version = "v1"
 	}
@@ -180,7 +201,7 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 			)
 		}
 
-		decodedPayload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		decodedPayload, err := decodeBase64URL(parts[1])
 		if err != nil {
 			return nil, nil, refusal.RefuseWithCause(
 				"invalid capability",
@@ -198,30 +219,16 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 			)
 		}
 
-		sigStr := parts[2]
-		if strings.HasPrefix(sigStr, journal.SignaturePrefix) {
-			parsedSig, err := journal.ParseSignature(sigStr)
-			if err != nil {
-				return nil, nil, refusal.RefuseWithCause(
-					"invalid capability",
-					"invalid hex signature format",
-					"ensure signature matches ed25519:<128-hex>",
-					ErrInvalidSignature,
-				)
-			}
-			sigBytes = parsedSig
-		} else {
-			decodedSig, err := base64.RawURLEncoding.DecodeString(sigStr)
-			if err != nil {
-				return nil, nil, refusal.RefuseWithCause(
-					"invalid capability",
-					"invalid base64url signature encoding",
-					"provide a valid v1 capability token",
-					ErrInvalidSignature,
-				)
-			}
-			sigBytes = decodedSig
+		sig, err := decodeSignatureBytes(parts[2])
+		if err != nil {
+			return nil, nil, refusal.RefuseWithCause(
+				"invalid capability",
+				"invalid signature encoding in compact token",
+				"provide a valid v1 capability token",
+				ErrInvalidSignature,
+			)
 		}
+		sigBytes = sig
 	} else if strings.HasPrefix(tokenStr, "{") {
 		// Structured JSON envelope
 		var env CapabilityEnvelope
@@ -238,22 +245,16 @@ func ParseAndVerifyCapability(tokenStr string, pubKey ed25519.PublicKey, now tim
 			payload.Version = env.Version
 		}
 
-		parsedSig, err := journal.ParseSignature(env.Signature)
+		sig, err := decodeSignatureBytes(env.Signature)
 		if err != nil {
-			// Try base64url decoding if hex prefix not present
-			decodedSig, b64err := base64.RawURLEncoding.DecodeString(env.Signature)
-			if b64err != nil {
-				return nil, nil, refusal.RefuseWithCause(
-					"invalid capability",
-					"invalid signature in JSON envelope",
-					"signature must be ed25519:<128-hex> or base64url encoded",
-					ErrInvalidSignature,
-				)
-			}
-			sigBytes = decodedSig
-		} else {
-			sigBytes = parsedSig
+			return nil, nil, refusal.RefuseWithCause(
+				"invalid capability",
+				"invalid signature in JSON envelope",
+				"signature must be ed25519:<128-hex> or base64url encoded",
+				ErrInvalidSignature,
+			)
 		}
+		sigBytes = sig
 	} else {
 		return nil, nil, refusal.RefuseWithCause(
 			"invalid capability",
@@ -415,8 +416,46 @@ func NewDelegatedAuthorizerWithClock(pubKey ed25519.PublicKey, nowFunc func() ti
 	}
 }
 
+// decodeBase64URL decodes a base64url string, accepting either unpadded (standard) or padded representations.
+func decodeBase64URL(s string) ([]byte, error) {
+	if b, err := base64.RawURLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return base64.URLEncoding.DecodeString(s)
+}
+
+// decodeSignatureBytes parses an Ed25519 signature from hex ("ed25519:<128-hex>" or 128 raw hex) or base64url.
+func decodeSignatureBytes(sigStr string) ([]byte, error) {
+	sigStr = strings.TrimSpace(sigStr)
+	if strings.HasPrefix(sigStr, journal.SignaturePrefix) {
+		return journal.ParseSignature(sigStr)
+	}
+	if len(sigStr) == 128 {
+		b, err := hex.DecodeString(sigStr)
+		if err == nil && len(b) == ed25519.SignatureSize {
+			return b, nil
+		}
+	}
+	if b, err := base64.RawURLEncoding.DecodeString(sigStr); err == nil && len(b) == ed25519.SignatureSize {
+		return b, nil
+	}
+	if b, err := base64.URLEncoding.DecodeString(sigStr); err == nil && len(b) == ed25519.SignatureSize {
+		return b, nil
+	}
+	return nil, errors.New("invalid signature encoding")
+}
+
 // Authorize validates the capability token against the trusted public key and checks permissions.
 func (d *DelegatedAuthorizer) Authorize(ctx context.Context, token string, action Action, repo string) (bool, error) {
+	if d == nil || len(d.pubKey) == 0 {
+		return false, refusal.RefuseWithCause(
+			"unauthorized",
+			"delegated capability auth is not enabled on this server",
+			"configure WALDEN_AUTH_TRUST or use a built-in token",
+			ErrUnauthorized,
+		)
+	}
+
 	if err := CheckRepoAndToken(token, repo); err != nil {
 		return false, err
 	}

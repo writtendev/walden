@@ -52,6 +52,11 @@ func TestParseActionsInvalid(t *testing.T) {
 		"r w",
 		"r-w",
 		"123",
+		"rr",
+		"rwr",
+		"cc",
+		"ww",
+		"rwcc",
 	}
 
 	for _, in := range invalid {

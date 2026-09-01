@@ -77,18 +77,31 @@ func (m *MemoryTokenStore) GetTokenByHash(ctx context.Context, hash string) (*To
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	rec, ok := m.byHash[hash]
-	if !ok {
+	if !ok || rec == nil {
 		return nil, nil
 	}
-	return rec, nil
+	cp := *rec
+	if rec.Scopes != nil {
+		cp.Scopes = make([]Scope, len(rec.Scopes))
+		copy(cp.Scopes, rec.Scopes)
+	}
+	return &cp, nil
 }
 
 // SaveToken saves or updates a token record.
 func (m *MemoryTokenStore) SaveToken(ctx context.Context, record *TokenRecord) error {
+	if record == nil {
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.byHash[record.TokenHash] = record
-	m.byID[record.TokenID] = record
+	cp := *record
+	if record.Scopes != nil {
+		cp.Scopes = make([]Scope, len(record.Scopes))
+		copy(cp.Scopes, record.Scopes)
+	}
+	m.byHash[record.TokenHash] = &cp
+	m.byID[record.TokenID] = &cp
 	return nil
 }
 
@@ -97,7 +110,7 @@ func (m *MemoryTokenStore) RevokeToken(ctx context.Context, tokenID string) erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rec, ok := m.byID[tokenID]
-	if !ok {
+	if !ok || rec == nil {
 		return refusal.RefuseWithCause(
 			"token not found",
 			fmt.Sprintf("no token with ID %q exists", tokenID),
@@ -106,8 +119,15 @@ func (m *MemoryTokenStore) RevokeToken(ctx context.Context, tokenID string) erro
 		)
 	}
 	now := time.Now().UTC()
-	rec.Revoked = true
-	rec.RevokedAt = &now
+	updated := *rec
+	if rec.Scopes != nil {
+		updated.Scopes = make([]Scope, len(rec.Scopes))
+		copy(updated.Scopes, rec.Scopes)
+	}
+	updated.Revoked = true
+	updated.RevokedAt = &now
+	m.byID[tokenID] = &updated
+	m.byHash[rec.TokenHash] = &updated
 	return nil
 }
 
@@ -117,7 +137,15 @@ func (m *MemoryTokenStore) ListTokens(ctx context.Context) ([]*TokenRecord, erro
 	defer m.mu.RUnlock()
 	list := make([]*TokenRecord, 0, len(m.byID))
 	for _, rec := range m.byID {
-		list = append(list, rec)
+		if rec == nil {
+			continue
+		}
+		cp := *rec
+		if rec.Scopes != nil {
+			cp.Scopes = make([]Scope, len(rec.Scopes))
+			copy(cp.Scopes, rec.Scopes)
+		}
+		list = append(list, &cp)
 	}
 	return list, nil
 }
@@ -129,11 +157,23 @@ type BuiltinAuthorizer struct {
 
 // NewBuiltinAuthorizer creates a new BuiltinAuthorizer.
 func NewBuiltinAuthorizer(store TokenStore) *BuiltinAuthorizer {
+	if store == nil {
+		store = NewMemoryTokenStore()
+	}
 	return &BuiltinAuthorizer{store: store}
 }
 
 // Authorize checks whether the token grants action on repo.
 func (b *BuiltinAuthorizer) Authorize(ctx context.Context, token string, action Action, repo string) (bool, error) {
+	if b == nil || b.store == nil {
+		return false, refusal.RefuseWithCause(
+			"unauthorized",
+			"token store not available",
+			"initialize token store before checking authorization",
+			ErrUnauthorized,
+		)
+	}
+
 	if err := CheckRepoAndToken(token, repo); err != nil {
 		return false, err
 	}

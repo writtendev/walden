@@ -77,10 +77,34 @@ func ParseActions(s string) (Actions, error) {
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
 		case 'r':
+			if a.Read {
+				return Actions{}, refusal.RefuseWithCause(
+					"invalid scope",
+					"duplicate action 'r'",
+					"each action [r, w, c] may appear at most once in a scope",
+					ErrInvalidScope,
+				)
+			}
 			a.Read = true
 		case 'w':
+			if a.Write {
+				return Actions{}, refusal.RefuseWithCause(
+					"invalid scope",
+					"duplicate action 'w'",
+					"each action [r, w, c] may appear at most once in a scope",
+					ErrInvalidScope,
+				)
+			}
 			a.Write = true
 		case 'c':
+			if a.Create {
+				return Actions{}, refusal.RefuseWithCause(
+					"invalid scope",
+					"duplicate action 'c'",
+					"each action [r, w, c] may appear at most once in a scope",
+					ErrInvalidScope,
+				)
+			}
 			a.Create = true
 		default:
 			return Actions{}, refusal.RefuseWithCause(

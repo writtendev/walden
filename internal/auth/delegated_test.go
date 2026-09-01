@@ -473,3 +473,71 @@ func TestParseAndVerifyCapabilityEdgeCases(t *testing.T) {
 		t.Errorf("expected ErrInvalidToken for unsupported version, got %v", err)
 	}
 }
+
+func TestParseAndVerifyCapabilityEncodingVariants(t *testing.T) {
+	priv, pub, _ := journal.GenerateKeypair()
+	refTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	payload := auth.CapabilityPayload{
+		Version:   "v1",
+		ID:        "cap_enc_var",
+		Scopes:    []string{"rw:blog-*"},
+		IssuedAt:  refTime.Format(time.RFC3339),
+		ExpiresAt: refTime.Add(time.Hour).Format(time.RFC3339),
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	canonical := auth.CanonicalCapabilityPayload(&payload)
+	sigBytes := ed25519.Sign(priv, canonical)
+
+	// 1. Padded base64url payload and signature
+	payloadPadded := base64.URLEncoding.EncodeToString(payloadBytes)
+	sigPadded := base64.URLEncoding.EncodeToString(sigBytes)
+	tokenPadded := fmt.Sprintf("v1.%s.%s", payloadPadded, sigPadded)
+
+	parsed, scopes, err := auth.ParseAndVerifyCapability(tokenPadded, pub, refTime.Add(10*time.Minute))
+	if err != nil {
+		t.Fatalf("ParseAndVerifyCapability failed with padded base64url: %v", err)
+	}
+	if parsed.ID != "cap_enc_var" || len(scopes) != 1 {
+		t.Errorf("unexpected parsed payload: %+v, scopes: %v", parsed, scopes)
+	}
+
+	// 2. Raw 128-hex signature (without ed25519: prefix)
+	sigRawHex := journal.FormatSignature(sigBytes)[len("ed25519:"):]
+	tokenRawHex := fmt.Sprintf("v1.%s.%s", base64.RawURLEncoding.EncodeToString(payloadBytes), sigRawHex)
+
+	parsed, scopes, err = auth.ParseAndVerifyCapability(tokenRawHex, pub, refTime.Add(10*time.Minute))
+	if err != nil {
+		t.Fatalf("ParseAndVerifyCapability failed with raw hex signature: %v", err)
+	}
+	if parsed.ID != "cap_enc_var" || len(scopes) != 1 {
+		t.Errorf("unexpected parsed payload: %+v, scopes: %v", parsed, scopes)
+	}
+}
+
+func TestDelegatedNilGuards(t *testing.T) {
+	// 1. CanonicalCapabilityPayload with nil
+	if b := auth.CanonicalCapabilityPayload(nil); b != nil {
+		t.Errorf("CanonicalCapabilityPayload(nil) expected nil, got %v", b)
+	}
+
+	// 2. SignCapability with nil payload
+	priv, _, _ := journal.GenerateKeypair()
+	_, err := auth.SignCapability(priv, nil)
+	if err == nil || !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("SignCapability(priv, nil) expected ErrInvalidToken, got %v", err)
+	}
+
+	// 3. SignCapability with bad private key length
+	_, err = auth.SignCapability([]byte{1, 2, 3}, &auth.CapabilityPayload{ID: "c1", Scopes: []string{"rwc:*"}})
+	if err == nil || !errors.Is(err, auth.ErrInvalidSignature) {
+		t.Errorf("SignCapability(badPriv, ...) expected ErrInvalidSignature, got %v", err)
+	}
+
+	// 4. DelegatedAuthorizer with nil / empty key
+	nilAuth := auth.NewDelegatedAuthorizer(nil)
+	ok, err := nilAuth.Authorize(context.Background(), "v1.a.b", auth.ActionRead, "repo-alpha")
+	if ok || !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected unauthorized for nil DelegatedAuthorizer, got ok=%v, err=%v", ok, err)
+	}
+}

@@ -3,7 +3,9 @@ package auth_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -160,5 +162,68 @@ func TestBuiltinAuthorizer(t *testing.T) {
 	ok, err = authorizer.Authorize(ctx, "walden_admin", auth.ActionRead, "repo/with/slash")
 	if ok || !errors.Is(err, auth.ErrInvalidRepo) {
 		t.Errorf("expected invalid repo error, got ok=%v, err=%v", ok, err)
+	}
+}
+
+func TestMemoryTokenStoreConcurrent(t *testing.T) {
+	ctx := context.Background()
+	store := auth.NewMemoryTokenStore()
+	authorizer := auth.NewBuiltinAuthorizer(store)
+
+	const numWorkers = 16
+	const iterations = 50
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		workerID := w
+		go func() {
+			defer wg.Done()
+			tokenID := fmt.Sprintf("tok_worker_%d", workerID)
+			rawToken := fmt.Sprintf("walden_token_worker_%d", workerID)
+			tokenHash := auth.HashToken(rawToken)
+			scopes, _ := auth.ParseScopes([]string{"rwc:*"})
+
+			for i := 0; i < iterations; i++ {
+				// Save
+				_ = store.SaveToken(ctx, &auth.TokenRecord{
+					TokenID:   tokenID,
+					TokenHash: tokenHash,
+					Scopes:    scopes,
+					CreatedAt: time.Now().UTC(),
+				})
+
+				// Read & Authorize
+				rec, _ := store.GetTokenByHash(ctx, tokenHash)
+				if rec != nil && len(rec.Scopes) > 0 {
+					// Mutating local slice must not affect store
+					rec.Scopes[0].Pattern = "mutated"
+				}
+
+				_, _ = authorizer.Authorize(ctx, rawToken, auth.ActionRead, "repo-alpha")
+
+				// List
+				_, _ = store.ListTokens(ctx)
+
+				// Revoke
+				if i%2 == 0 {
+					_ = store.RevokeToken(ctx, tokenID)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+func TestBuiltinAuthorizerNilStore(t *testing.T) {
+	ctx := context.Background()
+	authorizer := auth.NewBuiltinAuthorizer(nil)
+
+	// NewBuiltinAuthorizer(nil) initializes an empty MemoryTokenStore
+	ok, err := authorizer.Authorize(ctx, "walden_nonexistent", auth.ActionRead, "repo-alpha")
+	if ok || !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected unauthorized for nonexistent token with default store, got ok=%v, err=%v", ok, err)
 	}
 }

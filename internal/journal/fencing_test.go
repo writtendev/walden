@@ -21,6 +21,12 @@ func TestFencingConstants(t *testing.T) {
 	if journal.StatusPreconditionFailed != http.StatusPreconditionFailed {
 		t.Errorf("StatusPreconditionFailed = %d, want %d", journal.StatusPreconditionFailed, http.StatusPreconditionFailed)
 	}
+	// The conflict code is generated into conditional_append.json, so comparing the
+	// fixture against the constant proves only that the two agree. This is the literal
+	// that says which string is the right one.
+	if journal.CodePreconditionFailed != "PreconditionFailed" {
+		t.Errorf("CodePreconditionFailed = %q, want %q", journal.CodePreconditionFailed, "PreconditionFailed")
+	}
 }
 
 func TestRefusalMessagesSingleLineAndFormat(t *testing.T) {

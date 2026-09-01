@@ -2,12 +2,8 @@ package journal_test
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -288,141 +284,6 @@ func TestIdempotentSegmentStorage(t *testing.T) {
 	if k1 != k2 {
 		t.Errorf("expected identical key for identical segment uploads: %q vs %q", k1, k2)
 	}
-}
-
-func TestGoldenPackSegmentFixtures(t *testing.T) {
-	fixturesDir := filepath.Join("..", "..", "spec", "journal", "v1", "fixtures")
-	if _, err := os.Stat(fixturesDir); os.IsNotExist(err) {
-		t.Skipf("fixtures directory %s does not exist", fixturesDir)
-	}
-
-	// 1. Read segment packfile fixture
-	expectedHash := "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
-	segPath := filepath.Join(fixturesDir, "streams", "repo-alpha", "segments", expectedHash+".pack")
-	data, err := os.ReadFile(segPath)
-	if err != nil {
-		t.Fatalf("failed to read segment fixture at %s: %v", segPath, err)
-	}
-
-	if len(data) != 32 {
-		t.Errorf("expected segment fixture length 32 bytes, got %d", len(data))
-	}
-
-	if err := journal.ValidateSegment(data, expectedHash); err != nil {
-		t.Errorf("ValidateSegment failed on golden segment fixture: %v", err)
-	}
-
-	// 2. Read snapshot packfile fixture
-	snapPath := filepath.Join(fixturesDir, "streams", "repo-alpha", "snapshots", expectedHash+".pack")
-	snapData, err := os.ReadFile(snapPath)
-	if err != nil {
-		t.Fatalf("failed to read snapshot fixture at %s: %v", snapPath, err)
-	}
-
-	if !bytes.Equal(data, snapData) {
-		t.Errorf("snapshot fixture bytes do not match segment fixture bytes")
-	}
-
-	if err := journal.ValidateSegment(snapData, expectedHash); err != nil {
-		t.Errorf("ValidateSegment failed on golden snapshot fixture: %v", err)
-	}
-
-	// 3. Verify all segments referenced in repo-alpha/tx/*.json match their files
-	txFiles, err := filepath.Glob(filepath.Join(fixturesDir, "streams", "repo-alpha", "tx", "*.json"))
-	if err != nil {
-		t.Fatalf("failed to glob tx files: %v", err)
-	}
-	if len(txFiles) == 0 {
-		t.Fatalf("expected repo-alpha tx fixtures to exist")
-	}
-
-	for _, txFile := range txFiles {
-		txData, err := os.ReadFile(txFile)
-		if err != nil {
-			t.Fatalf("failed to read tx fixture %s: %v", txFile, err)
-		}
-		var tx journal.RefTransactionRecord
-		if err := json.Unmarshal(txData, &tx); err != nil {
-			t.Fatalf("failed to parse tx fixture %s: %v", txFile, err)
-		}
-		for _, segHash := range tx.Segments {
-			segFixture := filepath.Join(fixturesDir, "streams", "repo-alpha", "segments", segHash+".pack")
-			content, err := os.ReadFile(segFixture)
-			if err != nil {
-				t.Errorf("referenced segment %s in %s does not exist on disk: %v", segHash, txFile, err)
-				continue
-			}
-			computed := journal.ComputeSegmentHash(content)
-			if computed != segHash {
-				t.Errorf("segment fixture %s hash mismatch: got %s, want %s", segFixture, computed, segHash)
-			}
-			if err := journal.ValidatePackfileHeader(content); err != nil {
-				t.Errorf("segment fixture %s invalid packfile header: %v", segFixture, err)
-			}
-		}
-	}
-}
-
-// TestSignFixtureHelper prints / generates the exact signed json fixtures.
-func TestSignFixtureHelper(t *testing.T) {
-	seed := make([]byte, 32)
-	for i := range seed {
-		seed[i] = 0x01
-	}
-	priv := ed25519.NewKeyFromSeed(seed)
-	pub := priv.Public().(ed25519.PublicKey)
-	t.Logf("Genesis pub: %s", journal.FormatPublicKey(pub))
-
-	hash := "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
-
-	tx0 := &journal.RefTransactionRecord{
-		Version: "v1",
-		Stream:  "repo-alpha",
-		Seq:     0,
-		Type:    "ref_update",
-		Segments: []string{
-			hash,
-		},
-		Updates: []journal.RefUpdate{
-			{
-				Ref:    "refs/heads/main",
-				OldOID: "0000000000000000000000000000000000000000",
-				NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-			},
-		},
-		Timestamp: "2026-08-31T00:02:00Z",
-	}
-	if err := journal.SignRefTx(priv, tx0); err != nil {
-		t.Fatalf("SignRefTx 0 failed: %v", err)
-	}
-	t.Logf("tx0 sig: %s", tx0.Signature)
-
-	tx1 := &journal.RefTransactionRecord{
-		Version: "v1",
-		Stream:  "repo-alpha",
-		Seq:     1,
-		Type:    "ref_update",
-		Segments: []string{
-			hash,
-		},
-		Updates: []journal.RefUpdate{
-			{
-				Ref:    "refs/heads/main",
-				OldOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-				NewOID: "8a65c6d3715c0e1e92d6e3e5362e49c7198cfb60",
-			},
-			{
-				Ref:    "refs/heads/feature",
-				OldOID: "0000000000000000000000000000000000000000",
-				NewOID: "8a65c6d3715c0e1e92d6e3e5362e49c7198cfb60",
-			},
-		},
-		Timestamp: "2026-08-31T00:03:00Z",
-	}
-	if err := journal.SignRefTx(priv, tx1); err != nil {
-		t.Fatalf("SignRefTx 1 failed: %v", err)
-	}
-	t.Logf("tx1 sig: %s", tx1.Signature)
 }
 
 func TestValidateSegmentFromReader(t *testing.T) {

@@ -26,7 +26,8 @@ Every repository is modeled as an independent stream. The server instance's own 
  ┌─────────────────────────────┐               ┌─────────────────────────────┐
  │ seq 0: First push ref tx    │               │ seq 0: Genesis (public key) │
  │ seq 1: Second push ref tx   │               │ seq 1: Token create (rwc:*) │
- │ seq 2: Force-push ref tx    │               │ seq 2: Key rotation (...)   │
+ │ seq 2: Branch delete ref tx │               │ seq 2: Key rotation (...)   │
+ │ seq 3: Force-push ref tx    │               │ seq 3: Token revoke         │
  └─────────────────────────────┘               └─────────────────────────────┘
 ```
 
@@ -71,6 +72,11 @@ The genesis record establishes the root of trust for the entire journal instance
 }
 ```
 
+This is the golden journal's own genesis record, byte for byte:
+[`fixtures/v1/streams/_meta/tx/00000000000000000000.json`](fixtures/v1/streams/_meta/tx/00000000000000000000.json).
+Every example record in this document is a real record from that journal, so an
+implementation can check itself against the example and the fixture at once.
+
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `version` | string | Format version; MUST be `"v1"`. |
@@ -104,10 +110,13 @@ Signing keys can be rotated without out-of-band coordination by appending a `key
   "type": "key_rotation",
   "old_public_key": "ed25519:8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
   "new_public_key": "ed25519:8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
-  "timestamp": "2026-08-31T00:02:00Z",
-  "signature": "ed25519:8d0d7ae5d2d52ad753cdb533a1db8f8608d85600fc3809333f197e48f65cd03a5f11581b21d5f87c29c1f6adc9b9baad949cae3ac0de73719ab2405c9a241c0e"
+  "timestamp": "2026-08-31T00:06:00Z",
+  "signature": "ed25519:2f995aefc909b3e1030557e484b513d0e09045a46f39fc63333cfd4c20a10412f58bb158ea41ff3a36d1f506c9388f46f93613438573e2c8f1322db2dc80c003"
 }
 ```
+
+This is the golden journal's own rotation record, byte for byte:
+[`fixtures/v1/streams/_meta/tx/00000000000000000002.json`](fixtures/v1/streams/_meta/tx/00000000000000000002.json).
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
@@ -150,19 +159,25 @@ The ref-transaction record is the atomic unit of repository history in walden. E
   "seq": 0,
   "type": "ref_update",
   "segments": [
-    "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
+    "db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"
   ],
   "updates": [
     {
       "ref": "refs/heads/main",
       "old_oid": "0000000000000000000000000000000000000000",
-      "new_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+      "new_oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
     }
   ],
   "timestamp": "2026-08-31T00:02:00Z",
-  "signature": "ed25519:2ea7c2e8e15acf84573875fd8f94da0dca543fe8080c0a846d126ae3ba0a1a977af7a9fdedd920e8bb16b36c75184638d79e04cfa530b889f76e19a0823d0c07"
+  "signature": "ed25519:a91e5413e54463c4a1e33f7bc0825434284eb33465de77f7d116a4801c207aa2a5e3eab96b82c0eb702bf8bfda0b4a8c81b6a8addff7a1911fc71441272bca04"
 }
 ```
+
+This is the golden journal's own first record, byte for byte:
+[`fixtures/v1/streams/repo-alpha/tx/00000000000000000000.json`](fixtures/v1/streams/repo-alpha/tx/00000000000000000000.json).
+The segment it names is a real packfile in the fixture tree, `new_oid` is the
+commit that packfile carries, and the signature verifies against the public key
+the genesis record declares.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
@@ -315,11 +330,17 @@ A background task periodically consolidates all reachable Git objects across his
 {
   "version": "v1",
   "stream": "repo-alpha",
-  "sequence": 0,
-  "snapshot": "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db",
+  "sequence": 1,
+  "snapshot": "3731601fba561af499185a3875c5df9f2b5e5ab71ea260a3297e12e1ddf9576c",
   "timestamp": "2026-08-31T01:00:00Z"
 }
 ```
+
+This is the golden journal's own marker, byte for byte:
+[`fixtures/v1/streams/repo-alpha/marker.json`](fixtures/v1/streams/repo-alpha/marker.json).
+Note that `snapshot` names an object under `snapshots/`, not under `segments/`:
+the two are separate key spaces, and a digest that resolves in one has no
+meaning in the other.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
@@ -730,6 +751,8 @@ In accordance with Walden's operator-facing refusal convention (`refusal.Refusal
    refusal: journal append failed: storage provider does not support compare-and-swap (CAS) conditional writes (verify bucket provider compatibility in spec)
    ```
 
+These five messages, the `If-None-Match: *` precondition, and the derivation of the append target key are pinned by [`fixtures/conditional_append.json`](fixtures/conditional_append.json).
+
 ---
 
 ## 12. Replay and Materialization Rules
@@ -743,10 +766,12 @@ To materialize or restore a repository stream from the journal:
 3. **Verify Continuity:**
    - Verify that sequence numbers are strictly contiguous ($s_0+1, s_0+2, \dots$).
    - Any gap indicates journal truncation or missing objects and MUST cause materialization to abort loudly with a one-line error.
-4. **Apply and Verify:** Apply ref updates in sequence order, fetching required pack segments by content hash. Superseded segments or historical transactions ($s \le \text{marker.sequence}$) present in storage but not referenced in active replay MUST be ignored per Section 7.3.2.
+4. **Apply and Verify:** Apply ref updates in sequence order, fetching required pack segments by content hash. Superseded segments or historical transactions ($s \le \text{marker.sequence}$) present in storage but not referenced in active replay MUST be ignored per Section 7.3, Guarantee 2.
 
 ---
 
 ## 13. Reimplementation Grant
 
 This specification is published with an unconditional reimplementation grant. Anyone may implement this signing identity model, genesis record, key rotation protocol, ref-transaction record format, pack segment content addressing, stream layout, and reader/writer semantics in any programming language, for any purpose, without restriction and without asking.
+
+A complete golden journal covering every ruling in this document — genesis and rotation, both stream shapes, all four ref-transaction cases, real content-addressed packfiles, post-compaction snapshot and marker state, and the conditional-append targets and refusals of Section 11 — is published alongside it in [`fixtures/`](fixtures/) under the same grant.

@@ -1,0 +1,82 @@
+{
+  "version": "v1",
+  "description": "Conditional append targets and fencing refusals for journal format v1 (spec README section 11)",
+  "conditional_put": {
+    "header": "If-None-Match",
+    "value": "*",
+    "conflict_status": 412,
+    "conflict_code": "PreconditionFailed"
+  },
+  "tx_keys": [
+    {
+      "stream": "_meta",
+      "seq": "0",
+      "key": "v1/streams/_meta/tx/00000000000000000000.json",
+      "description": "Genesis record on the meta stream"
+    },
+    {
+      "stream": "_meta",
+      "seq": "3",
+      "key": "v1/streams/_meta/tx/00000000000000000003.json",
+      "description": "Meta stream counter runs independently of any repository stream"
+    },
+    {
+      "stream": "repo-alpha",
+      "seq": "0",
+      "key": "v1/streams/repo-alpha/tx/00000000000000000000.json",
+      "description": "First push into an empty repository"
+    },
+    {
+      "stream": "repo-alpha",
+      "seq": "3",
+      "key": "v1/streams/repo-alpha/tx/00000000000000000003.json",
+      "description": "Force update on a human-chosen stream identifier"
+    },
+    {
+      "stream": "9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4",
+      "seq": "0",
+      "key": "v1/streams/9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4/tx/00000000000000000000.json",
+      "description": "Opaque stream identifier restarts its own counter at zero"
+    },
+    {
+      "stream": "repo-alpha",
+      "seq": "42",
+      "key": "v1/streams/repo-alpha/tx/00000000000000000042.json",
+      "description": "Zero padding to twenty digits keeps lexicographic order numeric"
+    },
+    {
+      "stream": "repo-alpha",
+      "seq": "18446744073709551615",
+      "key": "v1/streams/repo-alpha/tx/18446744073709551615.json",
+      "description": "Maximum unsigned 64-bit sequence still fits twenty digits, and is carried here as a string so that a parser reading JSON numbers as doubles derives this key rather than a rounded one"
+    }
+  ],
+  "refusals": [
+    {
+      "case": "fenced_by_conflict_repo_stream",
+      "stream": "repo-alpha",
+      "seq": 3,
+      "message": "refusal: push failed: stream repo-alpha fenced by concurrent writer at seq 3 (instance is fenced for this stream; restart or check active writer)"
+    },
+    {
+      "case": "permanently_fenced_repo_stream",
+      "stream": "repo-alpha",
+      "message": "refusal: push failed: stream repo-alpha is permanently fenced on this instance (restart walden process to re-materialize from journal)"
+    },
+    {
+      "case": "fenced_by_conflict_meta_stream",
+      "stream": "_meta",
+      "seq": 7,
+      "message": "refusal: meta operation failed: stream _meta fenced by concurrent writer at seq 7 (instance is fenced for this stream; restart or check active writer)"
+    },
+    {
+      "case": "permanently_fenced_meta_stream",
+      "stream": "_meta",
+      "message": "refusal: meta operation failed: stream _meta is permanently fenced on this instance (restart walden process to re-materialize from journal)"
+    },
+    {
+      "case": "storage_provider_lacks_cas",
+      "message": "refusal: journal append failed: storage provider does not support compare-and-swap (CAS) conditional writes (verify bucket provider compatibility in spec)"
+    }
+  ]
+}

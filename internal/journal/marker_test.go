@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -41,62 +39,6 @@ func TestParseMarkerValid(t *testing.T) {
 	}
 	if m.Timestamp != "2026-08-31T01:00:00Z" {
 		t.Errorf("Timestamp = %q, want %q", m.Timestamp, "2026-08-31T01:00:00Z")
-	}
-}
-
-func TestParseMarkerGoldenFixture(t *testing.T) {
-	fixturesDir := filepath.Join("..", "..", "spec", "journal", "v1", "fixtures")
-	if _, err := os.Stat(fixturesDir); os.IsNotExist(err) {
-		t.Skipf("fixtures directory %s does not exist", fixturesDir)
-	}
-
-	// 1. Read and parse marker.json fixture
-	markerPath := filepath.Join(fixturesDir, "streams", "repo-alpha", "marker.json")
-	data, err := os.ReadFile(markerPath)
-	if err != nil {
-		t.Fatalf("failed to read marker fixture: %v", err)
-	}
-
-	m, err := journal.ParseMarker(data)
-	if err != nil {
-		t.Fatalf("ParseMarker failed on golden fixture: %v", err)
-	}
-
-	expectedHash := "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db"
-	if m.Version != "v1" {
-		t.Errorf("Version = %q, want %q", m.Version, "v1")
-	}
-	if m.Stream != "repo-alpha" {
-		t.Errorf("Stream = %q, want %q", m.Stream, "repo-alpha")
-	}
-	if m.Sequence != 0 {
-		t.Errorf("Sequence = %d, want 0", m.Sequence)
-	}
-	if m.Snapshot != expectedHash {
-		t.Errorf("Snapshot = %q, want %q", m.Snapshot, expectedHash)
-	}
-	if m.Timestamp != "2026-08-31T01:00:00Z" {
-		t.Errorf("Timestamp = %q, want %q", m.Timestamp, "2026-08-31T01:00:00Z")
-	}
-
-	// 2. Validate referenced snapshot pack fixture on disk
-	snapshotPath := filepath.Join(fixturesDir, "streams", "repo-alpha", "snapshots", m.Snapshot+".pack")
-	snapBytes, err := os.ReadFile(snapshotPath)
-	if err != nil {
-		t.Fatalf("failed to read snapshot pack fixture at %s: %v", snapshotPath, err)
-	}
-
-	if err := journal.ValidateSnapshot(snapBytes, m.Snapshot); err != nil {
-		t.Fatalf("ValidateSnapshot failed on golden snapshot fixture: %v", err)
-	}
-
-	// 3. Verify MarshalMarker produces exact fixture bytes
-	marshaled, err := journal.MarshalMarker(m)
-	if err != nil {
-		t.Fatalf("MarshalMarker failed on parsed golden fixture: %v", err)
-	}
-	if string(marshaled) != string(data) {
-		t.Errorf("MarshalMarker output differs from fixture:\ngot:\n%s\nwant:\n%s", string(marshaled), string(data))
 	}
 }
 

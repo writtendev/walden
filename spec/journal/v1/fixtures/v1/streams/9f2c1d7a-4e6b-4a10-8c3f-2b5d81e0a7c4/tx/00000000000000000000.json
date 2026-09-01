@@ -1,0 +1,23 @@
+{
+  "version": "v1",
+  "stream": "9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4",
+  "seq": 0,
+  "type": "ref_update",
+  "segments": [
+    "b57e002c347f2488844f25584abf312c4293c730ca8082efd680e67930084cbd"
+  ],
+  "updates": [
+    {
+      "ref": "refs/heads/main",
+      "old_oid": "0000000000000000000000000000000000000000",
+      "new_oid": "6b12394eb608eb9d28b91a6efab75991cd6940e5"
+    },
+    {
+      "ref": "refs/tags/v1.0",
+      "old_oid": "0000000000000000000000000000000000000000",
+      "new_oid": "6b12394eb608eb9d28b91a6efab75991cd6940e5"
+    }
+  ],
+  "timestamp": "2026-08-31T00:05:00Z",
+  "signature": "ed25519:6e9272d5dc69c0e5cb8295a5f151f95541fac2a0d0a406d6d3cbb184c177fb37d0051272a77e6b957a7ca161cb48e094a720ae3f5dd31759d6abb9a5d36c9e0d"
+}

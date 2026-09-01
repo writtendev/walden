@@ -1,0 +1,18 @@
+{
+  "version": "v1",
+  "stream": "repo-alpha",
+  "seq": 0,
+  "type": "ref_update",
+  "segments": [
+    "db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"
+  ],
+  "updates": [
+    {
+      "ref": "refs/heads/main",
+      "old_oid": "0000000000000000000000000000000000000000",
+      "new_oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
+    }
+  ],
+  "timestamp": "2026-08-31T00:02:00Z",
+  "signature": "ed25519:a91e5413e54463c4a1e33f7bc0825434284eb33465de77f7d116a4801c207aa2a5e3eab96b82c0eb702bf8bfda0b4a8c81b6a8addff7a1911fc71441272bca04"
+}

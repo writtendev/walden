@@ -63,7 +63,7 @@ func TestValidateRefName(t *testing.T) {
 		"refs/remotes/origin/main",
 		"refs/changes/01/123/1",
 		"refs/heads/föö-bär", // Non-ASCII UTF-8 bytes
-		"refs/heads/日本語",   // Multi-byte UTF-8
+		"refs/heads/日本語",     // Multi-byte UTF-8
 	}
 	for _, ref := range valid {
 		if err := journal.ValidateRefName(ref); err != nil {

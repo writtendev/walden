@@ -2,7 +2,7 @@
 
 > **Status:** Published Specification (v1)  
 > **Milestone:** M1 · Journal format v1  
-> **Rulings Covered:** Ruling 1 of 5 (Signing Identity & Genesis), Ruling 2 of 5 (Stream Model & Key Layout), Ruling 3 of 5 (Ref-Transaction Records & Payload Canonicalization), Ruling 4 of 5 (Pack Segments & Content Addressing)
+> **Rulings Covered:** Ruling 1 of 5 (Signing Identity & Genesis), Ruling 2 of 5 (Stream Model & Key Layout), Ruling 3 of 5 (Ref-Transaction Records & Payload Canonicalization), Ruling 4 of 5 (Pack Segments & Content Addressing), Ruling 5 of 5 (Conditional Append, Per-Stream Fencing & CAS Requirement)
 
 ---
 
@@ -411,11 +411,154 @@ v1/streams/<stream-id>/
 
 ---
 
-## 10. Fencing and Compare-and-Swap (CAS)
+## 10. Fencing, Conditional Append, and the Compare-and-Swap (CAS) Requirement (Ruling 5)
 
-1. **Conditional Append:** Every write to `v1/streams/<stream-id>/tx/<seq>.json` MUST be executed as a conditional PUT requiring that the target key does not yet exist (`If-None-Match: *` or provider equivalent).
-2. **Conflict as Fencing:** A precondition failure (HTTP 412) permanently transitions that stream to `fenced` on that instance.
-3. **Strict Invariant:** Re-reading the head sequence and retrying is **strictly forbidden**.
+### 10.1 Compare-and-Swap (CAS) as a Non-Negotiable Storage Requirement
+
+Compare-and-swap (CAS) is a hard, non-negotiable requirement of the storage bucket, stated plainly rather than hedged.
+
+Fencing rests entirely on conditional writes. Claiming support for "any S3-compatible bucket" overstates reality: object storage providers differ significantly in their protocol support, and several major providers gained conditional-write capabilities only recently. Walden requires native compare-and-swap semantics from its underlying storage tier to guarantee single-writer mutual exclusion, linearizability, and split-brain prevention.
+
+#### Storage Contract and Invariants
+The underlying object storage backend MUST support atomic conditional object creation via standard HTTP conditional headers (specifically `If-None-Match: *`).
+1. **Atomic Object Creation:** When an upload request carrying `If-None-Match: *` is received for a key that does not exist, the storage backend MUST create the object and return HTTP `200 OK` (or `201 Created`).
+2. **Precondition Failure:** If the target key already exists at the moment of evaluation, the storage backend MUST reject the write atomically, return HTTP status `412 Precondition Failed` (or S3 error code `PreconditionFailed`), and leave the existing object bytes completely untouched.
+3. **No Overwrites Under Precondition:** Under no circumstance may the storage backend perform an overwrite or return success when `If-None-Match: *` is supplied against an existing key.
+4. **Strong Consistency:** The storage backend MUST provide strong read-after-write consistency and atomic evaluation of conditional PUT operations across all storage nodes.
+
+If an object storage provider does not natively support atomic conditional writes with HTTP 412 rejection, it **CANNOT** be used as a backend for the walden journal.
+
+---
+
+### 10.2 S3-Compatible Provider Support Matrix
+
+The following matrix documents the compatibility of major S3-compatible object storage providers with walden's compare-and-swap requirement:
+
+| Provider | Conditional Header Mechanism | Conflict Response Status & Code | Support Status | Notes & Compatibility Details |
+| :--- | :--- | :--- | :---: | :--- |
+| **AWS S3** | `If-None-Match: *` | `412 Precondition Failed`<br>`PreconditionFailed` | **Supported** | Native conditional PUT support launched in August 2024. Strong read-after-write consistency and atomic evaluation across all standard AWS regions. |
+| **Cloudflare R2** | `If-None-Match: *` | `412 Precondition Failed`<br>`PreconditionFailed` | **Supported** | Full native support for S3 conditional operations (`If-None-Match: *`) on object PUT with atomic 412 rejection. |
+| **Google Cloud Storage (GCS)** | `If-None-Match: *`<br>`x-goog-if-generation-match: 0` | `412 Precondition Failed`<br>`PreconditionFailed` | **Supported** | Supported via GCS S3 XML API. GCS evaluates `If-None-Match: *` against object generation 0, returning 412 on conflict. |
+| **MinIO** | `If-None-Match: *` | `412 Precondition Failed`<br>`PreconditionFailed` | **Supported** | Supported in modern releases (RELEASE.2023+). Atomic precondition checking is coordinated across distributed erasure sets. |
+| **Ceph Rados Gateway (RGW)** | `If-None-Match: *` | `412 Precondition Failed`<br>`PreconditionFailed` | **Supported** | Supported in Ceph Quincy (v17.2+), Reef (v18.2+), and Squid (v19.2+). Earlier releases (e.g. Pacific, Nautilus) lack S3 conditional write support. |
+| **Backblaze B2** | `If-None-Match: *` | `412 Precondition Failed`<br>`PreconditionFailed` | **Supported** | Supported on S3-compatible endpoints for conditional object PUT. |
+| **Garage S3** | `If-None-Match: *` | `412 Precondition Failed`<br>`PreconditionFailed` | **Supported** | Supported in modern Garage releases (v0.9+) with distributed CAS coordination. |
+| **Wasabi** | `If-None-Match: *` | Non-standard / Unconditional Overwrite | **Unsupported** | Does not reliably evaluate `If-None-Match: *` atomically on object PUT; may overwrite existing objects without returning 412. Incompatible with walden v1. |
+| **Azure Blob Storage (via S3 Gateway)** | `If-None-Match: *`<br>`x-ms-blob-condition-if-none-match: *` | `412 Precondition Failed` | **Conditional** | Native Azure Blob REST API supports conditional writes. S3 gateway proxies must faithfully translate `If-None-Match: *` to Azure headers and propagate 412 status. |
+
+---
+
+### 10.3 Out of Scope Declaration (No Fallback Coordination)
+
+**Explicitly out of scope, now and forever for format v1 (and not a follow-up ticket):** any fallback path for non-CAS storage providers — such as:
+- Distributed lock objects or lock-file dances in object storage
+- Lease files, renewal loops, or heartbeat files
+- Two-phase commit or consensus sidecars
+- External distributed coordinators (e.g. etcd, Consul, ZooKeeper, DynamoDB, Redis)
+
+#### Rationale
+Building fallback coordination paths is how a hundred correctness-critical lines of code become five hundred lines of brittle failure modes. *"Works on fewer providers, correctly"* beats *"works everywhere, probably."*
+
+Walden deliberately chooses standard-library maximalism and an absolute minimum surface area for correctness. If industry demand ever materializes for storage backends that lack native CAS, that is a v2 conversation with an explicit format revision, never a v1 compromise.
+
+---
+
+### 10.4 Writer Obligations and Fencing Lifecycle
+
+Single-writer safety (fencing) is governed by strict deterministic rules. Any reimplementation of walden MUST adhere to the following writer obligations per stream without deviation:
+
+```
+                  ┌─────────────────────────────────┐
+                  │ Push Request for Stream S       │
+                  └────────────────┬────────────────┘
+                                   │
+                                   ▼
+                  ┌─────────────────────────────────┐
+                  │ Is Stream S Fenced in Memory?   │
+                  └───────┬─────────────────┬───────┘
+                          │                 │
+                     YES  │                 │  NO
+                          ▼                 ▼
+          ┌───────────────────────┐  ┌───────────────────────────────────┐
+          │ Refuse Write          │  │ Construct Key:                    │
+          │ "stream S is          │  │   tx/<seq>.json                   │
+          │  permanently fenced"  │  │ Header: If-None-Match: *          │
+          │ (Zero network calls)  │  └─────────────────┬─────────────────┘
+          └───────────────────────┘                    │
+                                                       ▼
+                                             ┌───────────────────┐
+                                             │ HTTP PUT to S3    │
+                                             └─────────┬─────────┘
+                                                       │
+                                 ┌─────────────────────┴─────────────────────┐
+                                 │                                           │
+                         HTTP 200 OK                                 HTTP 412 Precondition
+                                 │                                           │
+                                 ▼                                           ▼
+                    ┌─────────────────────────┐                 ┌─────────────────────────┐
+                    │ Ref Transaction Success │                 │ 1. Mark Stream S Fenced │
+                    │ Acknowledge Push        │                 │ 2. Return Refusal       │
+                    └─────────────────────────┘                 │ 3. FORBIDDEN: Do not    │
+                                                                │    re-read head & retry │
+                                                                └─────────────────────────┘
+```
+
+#### 1. Exact Preconditions for Appending `tx/<seq>.json`
+- When appending a ref-transaction record at sequence number `seq` for stream `<stream-id>`:
+  - The object key is deterministically computed as: `v1/streams/<stream-id>/tx/<seq:020d>.json`.
+  - The writer MUST issue an HTTP `PUT` request containing the HTTP header:
+    ```http
+    If-None-Match: *
+    ```
+  - The writer MUST condition the write on the target key not existing prior to this request.
+
+#### 2. Handling HTTP 412 Precondition Failed
+- If the storage backend returns HTTP status `412 Precondition Failed` (or S3 error code `PreconditionFailed`):
+  - The writer has received definitive proof that another writer has already appended a record at `seq` (or higher) to this stream.
+  - The current writer has lost the race or is a stale writer that was presumed dead.
+
+#### 3. Permanent Per-Stream Fenced State on the Instance
+- Upon receiving HTTP 412 Precondition Failed on stream `S`, the instance MUST immediately transition stream `S` to **permanently fenced** in memory for the remaining lifetime of the process.
+- The stream state transition to fenced is irreversible in the running process.
+- Any subsequent write attempt targeting stream `S` on this instance MUST be refused immediately without making any network calls to object storage.
+
+#### 4. Strict Prohibition of Retrying and Guessing (Never Re-read Head and Retry)
+- **The forbidden action is the important half:** A fenced writer **MUST NOT** re-read the head sequence (via `LIST` or `GET`) and retry appending with `seq+1` or higher.
+- Retrying after a failed condition is **guessing**. A fenced writer does not know why another writer took over, what ref updates the competing writer made, or whether the current writer's in-memory view of refs is stale.
+- Attempting to re-read and retry would risk interleaving unrelated ref transitions, corrupting history, or violating client intent.
+- When fenced, the writer MUST stop serving writes for that stream immediately and return a one-line refusal to the client.
+
+#### 5. Stream Isolation Invariant
+- Fencing is strictly isolated per stream coordinate `stream-id`.
+- If repository stream `A` is fenced due to a conflict at sequence $k$, repository stream `B` and the `_meta` stream on the same walden instance are completely unaffected and continue normal write and read operations.
+- Fencing on the `_meta` stream prevents further configuration/token mutations while repository push operations on individual repo streams continue unaffected (and vice-versa).
+
+---
+
+### 10.5 Single-Line Refusal Message Formats
+
+In accordance with Walden's operator-facing refusal convention (`refusal.Refusal`: `<what>: <why> (<fix>)`), all fencing-related refusals MUST be formatted as single-line messages with no embedded newlines:
+
+1. **Fencing Detection on Conflict (Repository Stream):**
+   ```
+   refusal: push failed: stream <stream-id> fenced by concurrent writer at seq <seq> (instance is fenced for this stream; restart or check active writer)
+   ```
+2. **Subsequent Write on Permanently Fenced Stream (Repository Stream):**
+   ```
+   refusal: push failed: stream <stream-id> is permanently fenced on this instance (restart walden process to re-materialize from journal)
+   ```
+3. **Fencing Detection on Conflict (Meta Stream):**
+   ```
+   refusal: meta operation failed: stream _meta fenced by concurrent writer at seq <seq> (instance is fenced for this stream; restart or check active writer)
+   ```
+4. **Subsequent Write on Permanently Fenced Stream (Meta Stream):**
+   ```
+   refusal: meta operation failed: stream _meta is permanently fenced on this instance (restart walden process to re-materialize from journal)
+   ```
+5. **Storage Provider Lacks CAS Support:**
+   ```
+   refusal: journal append failed: storage provider does not support compare-and-swap (CAS) conditional writes (verify bucket provider compatibility in spec)
+   ```
 
 ---
 

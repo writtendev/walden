@@ -256,4 +256,3 @@ func TestForbiddenRefusal(t *testing.T) {
 		t.Errorf("got %q, want %q", err.Error(), expected)
 	}
 }
-

@@ -473,4 +473,3 @@ func TestParseAndVerifyCapabilityEdgeCases(t *testing.T) {
 		t.Errorf("expected ErrInvalidToken for unsupported version, got %v", err)
 	}
 }
-

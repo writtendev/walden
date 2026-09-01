@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+// ErrRefusal is the canonical marker for "this error is an operator-facing
+// refusal." Every *Refusal matches it, so a caller that only wants to know
+// whether an operation was refused can ask errors.Is(err, refusal.ErrRefusal)
+// without naming a particular cause. Callers that need the fields use
+// errors.As; callers that need the cause match against that cause directly.
+var ErrRefusal = errors.New("refusal")
+
 // Refusal represents an operator-facing refusal that guarantees a single-line
 // message naming what was refused, why, and what to do about it.
 type Refusal struct {
@@ -79,15 +86,12 @@ func (r *Refusal) Unwrap() error {
 	return r.Err
 }
 
-// Is reports whether target is a *Refusal or matches the underlying causal error.
+// Is reports whether target is the canonical refusal marker. Matching against
+// the underlying cause is left to Unwrap, which errors.Is walks on its own;
+// matching against any other *Refusal would make every refusal equal to every
+// other one and destroy per-cause discrimination.
 func (r *Refusal) Is(target error) bool {
-	if _, ok := target.(*Refusal); ok {
-		return true
-	}
-	if r.Err != nil && errors.Is(r.Err, target) {
-		return true
-	}
-	return false
+	return target == ErrRefusal
 }
 
 // sanitize strips newlines, carriage returns, tabs, and collapses whitespace,

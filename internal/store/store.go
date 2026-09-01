@@ -1,4 +1,5 @@
-// Package store manages local bare git repositories (the disk cache).
+// Package store manages local bare git repositories (the disk cache) and the
+// object storage the journal lives in.
 // Per ARCHITECTURE.md: "Local disk is a cache; the journal is the truth."
 package store
 

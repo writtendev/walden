@@ -291,6 +291,9 @@ func TestBinaryArgvDispatch(t *testing.T) {
 		wantExit0  bool
 		wantOutSub string
 		wantErrSub string
+		// wantErrNot are strings stderr must not contain: the credentials
+		// out of a journal URL, and the fragments a leak arrives in.
+		wantErrNot []string
 	}{
 		{
 			name:       "direct-version",
@@ -344,7 +347,7 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			cmdPath:    binPath,
 			args:       []string{"serve", "--data-dir", "/test/cache", "--journal", "s3://my-bucket/w", "--listen", ":8888", "--print-config"},
 			wantExit0:  true,
-			wantOutSub: "data-dir: /test/cache\njournal: s3://my-bucket/w\nauth-trust: (builtin)\nlisten: :8888",
+			wantOutSub: "data-dir: /test/cache\njournal: (configured)\nauth-trust: (builtin)\nlisten: :8888",
 		},
 		{
 			name:       "serve-print-config-env",
@@ -360,6 +363,161 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			args:       []string{"serve", "--listen", ":invalid-port"},
 			wantExit0:  false,
 			wantErrSub: "walden: invalid listen:",
+		},
+		{
+			// The journal URL is resolved at boot, so a malformed one
+			// stops walden now rather than on the first push.
+			name:       "serve-malformed-journal-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "ftp://example.org/my-bucket"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: unsupported URL scheme \"ftp\"",
+		},
+		{
+			name:       "serve-journal-provider-without-cas-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "https://s3.eu-central-1.wasabisys.com/my-bucket/walden"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: Wasabi does not support compare-and-swap",
+		},
+		{
+			// --print-config resolves the location but not the
+			// credentials, so a URL can be checked on a machine that
+			// holds no secrets.
+			name:      "serve-print-config-resolved-journal",
+			cmdPath:   binPath,
+			args:      []string{"serve", "--journal", "https://storage.googleapis.com/my-bucket/walden", "--print-config"},
+			wantExit0: true,
+			wantOutSub: "journal-provider: Google Cloud Storage\n" +
+				"journal-endpoint: https://storage.googleapis.com\n" +
+				"journal-region: auto\n" +
+				"journal-bucket: my-bucket\n" +
+				"journal-prefix: walden\n" +
+				"journal-style: path",
+		},
+		{
+			// Config.String() does not render the journal URL. Printing
+			// it meant a second, weaker copy of guardCredentials living
+			// in internal/config, and that copy half-redacted a password
+			// holding an unencoded '/'. The location an operator needs
+			// comes from Journal.String(), past the one gate.
+			name:      "serve-print-config-withholds-the-journal-url",
+			cmdPath:   binPath,
+			args:      []string{"serve", "--journal", "http://minioadmin:p@ss/w0rd@minio.internal:9000/my-bucket/walden", "--print-config"},
+			wantExit0: false,
+			// The relocated '@' is refused by the gate, and nothing of
+			// the URL is echoed on the way out.
+			wantErrSub: "walden: invalid journal: URL is malformed; it is not echoed because it may carry credentials",
+			wantErrNot: []string{"p@ss", "ss/w0rd", "w0rd", "minio.internal"},
+		},
+		{
+			name:       "serve-print-config-journal-url-is-not-printed",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "s3://AKIAEXAMPLE:topsecret@my-bucket/walden", "--print-config"},
+			wantExit0:  true,
+			wantOutSub: "journal: (configured)",
+			wantErrNot: []string{"topsecret", "AKIAEXAMPLE"},
+		},
+		{
+			// --print-config names where the credentials come from, so it
+			// cannot report an unresolved journal that would in fact boot.
+			// It names the source, never the secret.
+			name:    "serve-print-config-names-the-credential-source",
+			cmdPath: binPath,
+			args:    []string{"serve", "--journal", "s3://my-bucket/walden", "--print-config"},
+			env: append(os.Environ(),
+				"AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+				"AWS_SECRET_ACCESS_KEY=topsecret",
+			),
+			wantExit0:  true,
+			wantOutSub: "journal-credentials: AWS_ACCESS_KEY_ID",
+		},
+		{
+			// A self-hosted endpoint written as s3://host:port silently
+			// resolved to a bucket named "minio.local" at Amazon.
+			name:       "serve-s3-scheme-with-port-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "s3://minio.local:9000/my-bucket/walden"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: s3:// URL carries a port, but s3:// always addresses AWS",
+		},
+		{
+			// The whole point of the boot-path resolution is that a
+			// journal URL never reaches an operator's log. An unencoded
+			// '/' in the secret ends the authority before the '@', so
+			// net/url reports no error and moves the rest of the secret
+			// into the prefix, where the refusal used to quote it.
+			name:       "serve-relocated-credentials-are-not-echoed",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "s3://PUBLICKEYIDEXAMPLE:/zzTOPSECRETzz@bucket/prefix"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: URL is malformed; it is not echoed because it may carry credentials",
+			wantErrNot: []string{"zzTOPSECRETzz", "zzT", "PUBLICKEYIDEXAMPLE"},
+		},
+		{
+			// A trailing newline is what a file-backed Kubernetes secret
+			// or a .env line gives you, and it is the likeliest cause of
+			// a "malformed" journal URL. It is trimmed, not refused.
+			name:    "serve-print-config-trims-the-journal-url",
+			cmdPath: binPath,
+			// Config.String() no longer echoes the URL, so the proof that
+			// the trim happened is that the padded value resolved.
+			args:      []string{"serve", "--journal", " s3://my-bucket/walden\n", "--print-config"},
+			wantExit0: true,
+			wantOutSub: "journal: (configured)\n" +
+				"auth-trust: (builtin)\n" +
+				"listen: :8470\n" +
+				"journal-provider: AWS S3\n" +
+				"journal-endpoint: https://s3.us-east-1.amazonaws.com\n" +
+				"journal-region: us-east-1\n" +
+				"journal-bucket: my-bucket",
+		},
+		{
+			// The other half of the trim: a value that is nothing but
+			// whitespace was trimmed away to unset, and walden booted
+			// journal-less and silent. A secret file holding one newline
+			// is a mistake, not a decision to run without durability.
+			name:       "serve-whitespace-only-journal-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve"},
+			env:        append(os.Environ(), "WALDEN_JOURNAL=   "),
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: value is only whitespace",
+		},
+		{
+			name:       "serve-whitespace-only-journal-flag-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "\n", "--print-config"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: value is only whitespace",
+		},
+		{
+			// FIPS endpoints are mandatory for GovCloud and FedRAMP, and
+			// the modifier sits where the legacy s3-<region> form puts
+			// the region. This booted and signed with region "fips".
+			name:       "serve-print-config-fips-endpoint-region",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "https://s3-fips.us-east-1.amazonaws.com/my-bucket/walden", "--print-config"},
+			wantExit0:  true,
+			wantOutSub: "journal-region: us-east-1",
+		},
+		{
+			// One accelerate endpoint fronts every region, so there is no
+			// region to read and no default that is not a guess.
+			name:       "serve-accelerate-endpoint-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "https://s3-accelerate.amazonaws.com/my-bucket/walden"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: endpoint host \"s3-accelerate.amazonaws.com\" fronts every region and names none",
+		},
+		{
+			// A root-anchored FQDN must not walk past the provider table
+			// and the compare-and-swap gate behind it.
+			name:       "serve-journal-root-anchored-fqdn-without-cas-exits-error",
+			cmdPath:    binPath,
+			args:       []string{"serve", "--journal", "https://s3.wasabisys.com./my-bucket/walden"},
+			wantExit0:  false,
+			wantErrSub: "walden: invalid journal: Wasabi does not support compare-and-swap",
 		},
 	}
 
@@ -385,6 +543,11 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			}
 			if tt.wantErrSub != "" && !strings.Contains(stderr.String(), tt.wantErrSub) {
 				t.Errorf("stderr = %q, want substring %q", stderr.String(), tt.wantErrSub)
+			}
+			for _, leak := range tt.wantErrNot {
+				if strings.Contains(stdout.String(), leak) || strings.Contains(stderr.String(), leak) {
+					t.Errorf("output leaked %q: stdout %q, stderr %q", leak, stdout.String(), stderr.String())
+				}
 			}
 		})
 	}

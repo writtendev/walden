@@ -94,7 +94,7 @@ func TestConfigPrecedence(t *testing.T) {
 		t.Errorf("expected ListenAddr :9999, got %q", cfg.ListenAddr)
 	}
 
-	expectedStr := "data-dir: /cli/data\njournal: s3://cli-bucket/walden\nauth-trust: cli-key-67890\nlisten: :9999"
+	expectedStr := "data-dir: /cli/data\njournal: (configured)\nauth-trust: cli-key-67890\nlisten: :9999"
 	if cfg.String() != expectedStr {
 		t.Errorf("expected cfg.String() %q, got %q", expectedStr, cfg.String())
 	}
@@ -211,5 +211,250 @@ func TestLoadFromEnvFallback(t *testing.T) {
 	}
 	if cfg.DataDir == "" || cfg.ListenAddr == "" {
 		t.Errorf("expected non-empty defaults in LoadFromEnv: %+v", cfg)
+	}
+}
+
+// TestConfigStringWithholdsTheJournalURL is the regression for a second,
+// weaker copy of the rule internal/store owns in guardCredentials. This package
+// used to redact the journal URL itself, and its copy had no equivalent of
+// credentialsEnd: given a MinIO password holding an unencoded '/', it announced
+// that it had redacted and then printed most of the secret anyway.
+//
+//	journal: http://minioadmin:xxxxx@ss/w0rd@minio.internal:9000/my-bucket/walden
+//
+// The duplicated rule is gone rather than hardened. Config.String() now says
+// only whether the journal is on; walden serve --print-config prints the
+// resolved location from store.Journal.String(), every field of which is past
+// the one gate.
+func TestConfigStringWithholdsTheJournalURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		journal string
+		want    string
+	}{
+		{
+			name:    "unset-says-disabled",
+			journal: "",
+			want:    "journal: (disabled)",
+		},
+		{
+			name:    "plain-url-is-not-rendered",
+			journal: "s3://my-bucket/walden",
+			want:    "journal: (configured)",
+		},
+		{
+			name:    "userinfo-url-is-not-rendered",
+			journal: "s3://AKIAEXAMPLE:topsecret@my-bucket/walden",
+			want:    "journal: (configured)",
+		},
+		{
+			// The reproducer: an unencoded '/' in the password ends
+			// the authority before the second '@', so u.Redacted()
+			// redacted "minioadmin:p" and printed "ss/w0rd" verbatim.
+			name:    "slash-in-the-password-is-not-half-redacted",
+			journal: "http://minioadmin:p@ss/w0rd@minio.internal:9000/my-bucket/walden",
+			want:    "journal: (configured)",
+		},
+	}
+
+	// Every fragment of a secret used above, plus the smallest window of the
+	// one that escaped. A leak arrives as a fragment, not the whole value.
+	leaks := []string{"topsecret", "p@ss", "ss/w0rd", "w0rd", "minio.internal"}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				DataDir:    config.DefaultDataDir,
+				JournalURL: tt.journal,
+				ListenAddr: config.DefaultListenAddr,
+			}
+			got := cfg.String()
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("Config.String() = %q, want substring %q", got, tt.want)
+			}
+			for _, leak := range leaks {
+				if strings.Contains(got, leak) {
+					t.Errorf("Config.String() leaked %q: %q", leak, got)
+				}
+			}
+		})
+	}
+}
+
+// TestWhitespaceOnlyJournalIsRefused is the regression for a journal that
+// silently turned itself off. Trimming the value at assignment made a
+// whitespace-only WALDEN_JOURNAL indistinguishable from an unset one, so a
+// Kubernetes secret file holding a single newline, or a Helm value that
+// rendered blank, booted a durability-free walden with no output at all —
+// while the base commit refused both. Unset is still journal-less on purpose;
+// present-but-blank is a mistake and is refused, naming the knob, in one line.
+func TestWhitespaceOnlyJournalIsRefused(t *testing.T) {
+	blanks := []struct {
+		name  string
+		value string
+	}{
+		{"spaces", "   "},
+		{"newline", "\n"},
+		{"tab-and-crlf", "\t \r\n"},
+	}
+
+	const wantSub = "invalid journal: value is only whitespace"
+
+	assertRefusal := func(t *testing.T, what string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s accepted a whitespace-only journal value", what)
+		}
+		if !strings.Contains(err.Error(), wantSub) {
+			t.Errorf("%s error = %q, want substring %q", what, err.Error(), wantSub)
+		}
+		if strings.ContainsAny(err.Error(), "\n\r") {
+			t.Errorf("%s error %q is not a single line", what, err.Error())
+		}
+	}
+
+	for _, tt := range blanks {
+		t.Run(tt.name, func(t *testing.T) {
+			// Through the environment, which is how a file-backed
+			// secret reaches walden.
+			_, _, err := config.LoadWithEnv(nil, func(key string) (string, bool) {
+				if key == config.EnvJournal {
+					return tt.value, true
+				}
+				return "", false
+			})
+			assertRefusal(t, "LoadWithEnv(env)", err)
+
+			// And through the flag, where fs.Visit knows outright that
+			// the operator set the knob.
+			_, _, err = config.LoadWithEnv([]string{"--journal", tt.value}, func(string) (string, bool) { return "", false })
+			assertRefusal(t, "LoadWithEnv(--journal)", err)
+
+			// And on a hand-built Config, since Validate is exported
+			// and reads the knob itself.
+			direct := &config.Config{
+				DataDir:    config.DefaultDataDir,
+				JournalURL: tt.value,
+				ListenAddr: config.DefaultListenAddr,
+			}
+			assertRefusal(t, "Validate", direct.Validate())
+		})
+	}
+
+	// Unset stays unset: journal-less mode is reachable deliberately, and
+	// this refusal must not close that door.
+	cfg, _, err := config.LoadWithEnv(nil, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("LoadWithEnv with no journal set refused: %v", err)
+	}
+	if cfg.JournalURL != "" {
+		t.Errorf("JournalURL = %q, want empty for an unset journal", cfg.JournalURL)
+	}
+}
+
+// TestJournalURLIsTrimmed is the regression for the least actionable refusal
+// walden could produce. A journal URL out of a file-backed Kubernetes secret or
+// a .env line arrives with a trailing newline; walden refused it as "malformed,
+// not echoed", which tells a 3am operator nothing at all. internal/store trims,
+// but Validate runs first on the boot path, so the trim there never saw it.
+func TestJournalURLIsTrimmed(t *testing.T) {
+	tests := []struct {
+		name    string
+		journal string
+		want    string
+	}{
+		{"leading-space", " s3://my-bucket/prefix", "s3://my-bucket/prefix"},
+		{"trailing-newline", "s3://my-bucket/prefix\n", "s3://my-bucket/prefix"},
+		{"both", "\t s3://my-bucket/prefix \r\n", "s3://my-bucket/prefix"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Through the environment, which is how a file-backed secret
+			// reaches walden.
+			cfg, _, err := config.LoadWithEnv(nil, func(key string) (string, bool) {
+				if key == config.EnvJournal {
+					return tt.journal, true
+				}
+				return "", false
+			})
+			if err != nil {
+				t.Fatalf("LoadWithEnv(%q) refused a journal URL that only needed trimming: %v", tt.journal, err)
+			}
+			if cfg.JournalURL != tt.want {
+				t.Errorf("JournalURL = %q, want %q", cfg.JournalURL, tt.want)
+			}
+
+			// And through the flag, which is the higher-precedence knob.
+			cfg, _, err = config.LoadWithEnv([]string{"--journal", tt.journal}, func(string) (string, bool) { return "", false })
+			if err != nil {
+				t.Fatalf("LoadWithEnv(--journal %q) refused a journal URL that only needed trimming: %v", tt.journal, err)
+			}
+			if cfg.JournalURL != tt.want {
+				t.Errorf("JournalURL = %q, want %q", cfg.JournalURL, tt.want)
+			}
+
+			// Validate is exported and reads the knob itself, so it
+			// trims too rather than depending on Load having done it.
+			direct := &config.Config{
+				DataDir:    config.DefaultDataDir,
+				JournalURL: tt.journal,
+				ListenAddr: config.DefaultListenAddr,
+			}
+			if err := direct.Validate(); err != nil {
+				t.Errorf("Validate() refused a journal URL that only needed trimming: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateRefusalHidesJournalSecret is the regression for a leak on the
+// boot path: net/url's parse errors quote the whole URL back, and walden
+// wrapped one verbatim, so a leading space copied out of a .env file put an
+// object-storage secret into stderr, the container log, and the supervisor
+// journal. A malformed journal URL is never echoed.
+func TestValidateRefusalHidesJournalSecret(t *testing.T) {
+	const (
+		keyID  = "AKIAKEYID"
+		secret = "SUPERSECRETVALUE"
+	)
+
+	journals := []struct {
+		name    string
+		journal string
+	}{
+		{"invalid-port", "s3://" + keyID + ":" + secret + "@bucket:80x/p"},
+		{"leading-space", " s3://" + keyID + ":" + secret + "@bucket:80x/p"},
+		{"control-character", "s3://" + keyID + ":" + secret + "@bucket/p\x7f"},
+		{"unclosed-ipv6-literal", "https://" + keyID + ":" + secret + "@[::1/my-bucket/walden"},
+		{"bad-escape-in-userinfo", "s3://" + keyID + ":se%" + secret + "@my-bucket/walden"},
+	}
+
+	for _, tt := range journals {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				DataDir:    config.DefaultDataDir,
+				JournalURL: tt.journal,
+				ListenAddr: config.DefaultListenAddr,
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("Validate() accepted a malformed journal URL")
+			}
+			// net/url's escape errors quote the three characters around a
+			// bad '%', so a leak can be a fragment rather than the whole
+			// secret.
+			for _, leak := range []string{keyID, secret, secret[:2]} {
+				if strings.Contains(err.Error(), leak) {
+					t.Errorf("Validate() leaked %q: %q", leak, err.Error())
+				}
+			}
+			if !strings.HasPrefix(err.Error(), "invalid journal: ") {
+				t.Errorf("error %q does not name the journal knob", err.Error())
+			}
+			if strings.ContainsAny(err.Error(), "\n\r") {
+				t.Errorf("error %q is not a single line", err.Error())
+			}
+		})
 	}
 }

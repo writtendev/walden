@@ -110,10 +110,6 @@ func TestRefuseHelperAndTypeAssertion(t *testing.T) {
 	if ref.What != "token" || ref.Why != "missing subcommand" || ref.Fix != "expected create, list, or revoke" {
 		t.Errorf("unexpected refusal fields: %+v", ref)
 	}
-
-	if !errors.Is(err, ErrRefusal) {
-		t.Errorf("errors.Is(err, ErrRefusal) returned false")
-	}
 }
 
 func TestRefusalsWithDifferentCausesDoNotMatch(t *testing.T) {
@@ -151,18 +147,13 @@ func TestRefusalsWithDifferentCausesDoNotMatch(t *testing.T) {
 		t.Errorf("expected errors.Is(wrapped, causeA) to be true")
 	}
 
-	// Both are still refusals, and a causeless refusal is too.
+	// Each is still reachable as a refusal, and a causeless refusal is too.
 	plain := Refuse("operation d", "condition d", "retry d")
 	for name, err := range map[string]error{"a": a, "b": b, "wrapped": wrapped, "plain": plain} {
-		if !errors.Is(err, ErrRefusal) {
-			t.Errorf("expected errors.Is(%s, ErrRefusal) to be true", name)
+		var ref *Refusal
+		if !errors.As(err, &ref) {
+			t.Errorf("expected errors.As(%s, &ref) to be true", name)
 		}
-	}
-
-	// The marker itself is not mistaken for a structured refusal.
-	var ref *Refusal
-	if errors.As(ErrRefusal, &ref) {
-		t.Errorf("expected ErrRefusal not to be a *Refusal")
 	}
 }
 
@@ -190,10 +181,5 @@ func TestRefuseWithCauseAndUnwrap(t *testing.T) {
 	wrappedRef := FromError("operation", sentinel, "fix action")
 	if !errors.Is(wrappedRef, sentinel) {
 		t.Errorf("expected errors.Is(wrappedRef, sentinel) to be true")
-	}
-
-	// Nil target in Is
-	if ref.Is(nil) {
-		t.Errorf("expected ref.Is(nil) to be false")
 	}
 }

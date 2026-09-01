@@ -4,17 +4,9 @@
 package refusal
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 )
-
-// ErrRefusal is the canonical marker for "this error is an operator-facing
-// refusal." Every *Refusal matches it, so a caller that only wants to know
-// whether an operation was refused can ask errors.Is(err, refusal.ErrRefusal)
-// without naming a particular cause. Callers that need the fields use
-// errors.As; callers that need the cause match against that cause directly.
-var ErrRefusal = errors.New("refusal")
 
 // Refusal represents an operator-facing refusal that guarantees a single-line
 // message naming what was refused, why, and what to do about it.
@@ -81,17 +73,12 @@ func (r *Refusal) Error() string {
 	return fmt.Sprintf("%s: %s (%s)", what, why, fix)
 }
 
-// Unwrap returns the underlying causal error, if any.
+// Unwrap returns the underlying causal error, if any. There is deliberately no
+// Is method: errors.Is already walks Unwrap to reach the cause, and any Is that
+// matched another *Refusal would make every refusal equal to every other one.
+// Callers asking "is this a refusal at all" use errors.As.
 func (r *Refusal) Unwrap() error {
 	return r.Err
-}
-
-// Is reports whether target is the canonical refusal marker. Matching against
-// the underlying cause is left to Unwrap, which errors.Is walks on its own;
-// matching against any other *Refusal would make every refusal equal to every
-// other one and destroy per-cause discrimination.
-func (r *Refusal) Is(target error) bool {
-	return target == ErrRefusal
 }
 
 // sanitize strips newlines, carriage returns, tabs, and collapses whitespace,

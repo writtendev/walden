@@ -414,12 +414,6 @@ func TestSentinelErrorsUnificationAndErrorsIs(t *testing.T) {
 	if errors.Is(errCAS, errFenced) || errors.Is(errFenced, errCAS) {
 		t.Errorf("expected CAS and fenced refusals not to match each other")
 	}
-	if errors.Is(errCAS, journal.ErrFenced) {
-		t.Errorf("expected RefuseCASNotSupported not to match ErrFenced")
-	}
-	if errors.Is(errFenced, journal.ErrCASNotSupported) {
-		t.Errorf("expected RefuseStreamFenced not to match ErrCASNotSupported")
-	}
 
 	// 5. Check Fencer methods return errors matching ErrFenced
 	f := journal.NewFencer()

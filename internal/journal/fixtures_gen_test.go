@@ -23,8 +23,12 @@ import (
 //
 // then commit the result. Signing keys, timestamps, and git object dates are all
 // fixed, so the records reproduce byte for byte. Packfile bytes are produced by the
-// local git binary; a different git version may pack the same objects differently,
-// which changes the content-addressed segment names but not their correctness.
+// local git binary; the committed packs came from git 2.50.1, and a different git
+// version may pack the same objects differently, which changes the content-addressed
+// segment names but not their correctness.
+//
+// Objects are written at the object storage keys of spec section 9.2, rooted at
+// fixtures/, so the fixture tree is bucket contents rather than a rearrangement.
 
 // fixtureGitDate is the fixed author and committer date for every fixture commit.
 const fixtureGitDate = "1767225600 +0000"
@@ -38,7 +42,8 @@ func fixtureKey(seedByte byte) ed25519.PrivateKey {
 	return ed25519.NewKeyFromSeed(seed)
 }
 
-// gitRepo is a throwaway bare repository used to mint real commits and real packfiles.
+// gitRepo is a throwaway bare repository. The generator mints real commits and real
+// packfiles in one; the fixture tests replay the golden journal back into another.
 type gitRepo struct {
 	t   *testing.T
 	dir string
@@ -51,7 +56,10 @@ func newGitRepo(t *testing.T) *gitRepo {
 	return r
 }
 
-func (r *gitRepo) run(stdin []byte, args ...string) []byte {
+// tryRun runs git and returns its stdout, or an error carrying stderr. Callers that ask
+// git a question whose answer may legitimately be "no" — does this object exist, is this
+// commit an ancestor of that one — use this rather than run.
+func (r *gitRepo) tryRun(stdin []byte, args ...string) ([]byte, error) {
 	r.t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = r.dir
@@ -72,7 +80,16 @@ func (r *gitRepo) run(stdin []byte, args ...string) []byte {
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		r.t.Fatalf("git %s failed: %v: %s", strings.Join(args, " "), err, stderr.String())
+		return out, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return out, nil
+}
+
+func (r *gitRepo) run(stdin []byte, args ...string) []byte {
+	r.t.Helper()
+	out, err := r.tryRun(stdin, args...)
+	if err != nil {
+		r.t.Fatalf("%v", err)
 	}
 	return out
 }
@@ -97,14 +114,18 @@ func (r *gitRepo) pack(revs ...string) []byte {
 }
 
 // fixtureWriter accumulates the object tree that will be written under fixtures/.
+//
+// Every journal object is written at the object storage key spec section 9.2 derives
+// for it, rooted at fixtures/: the fixture tree is bucket contents, not a rearrangement
+// of them, so key "v1/streams/repo-alpha/marker.json" lands at that path on disk.
 type fixtureWriter struct {
 	t    *testing.T
 	root string
 }
 
-func (w *fixtureWriter) write(rel string, data []byte) {
+func (w *fixtureWriter) write(key string, data []byte) {
 	w.t.Helper()
-	path := filepath.Join(w.root, filepath.FromSlash(rel))
+	path := filepath.Join(w.root, filepath.FromSlash(key))
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		w.t.Fatalf("failed to create %s: %v", filepath.Dir(path), err)
 	}
@@ -114,13 +135,13 @@ func (w *fixtureWriter) write(rel string, data []byte) {
 }
 
 // writeJSON writes an indented JSON document with a trailing newline.
-func (w *fixtureWriter) writeJSON(rel string, v any) {
+func (w *fixtureWriter) writeJSON(key string, v any) {
 	w.t.Helper()
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		w.t.Fatalf("failed to marshal %s: %v", rel, err)
+		w.t.Fatalf("failed to marshal %s: %v", key, err)
 	}
-	w.write(rel, append(data, '\n'))
+	w.write(key, append(data, '\n'))
 }
 
 // writeSegment writes a pack segment under its own SHA-256 and returns that hash.
@@ -130,7 +151,7 @@ func (w *fixtureWriter) writeSegment(stream journal.StreamID, pack []byte) strin
 	if err := journal.ValidateSegment(pack, hash); err != nil {
 		w.t.Fatalf("generated segment for stream %s is not a valid packfile: %v", stream, err)
 	}
-	w.write(fmt.Sprintf("streams/%s/segments/%s.pack", stream, hash), pack)
+	w.write(journal.SegmentKey(stream, hash), pack)
 	return hash
 }
 
@@ -140,7 +161,7 @@ func (w *fixtureWriter) writeRefTx(priv ed25519.PrivateKey, rec *journal.RefTran
 	if err := journal.SignRefTx(priv, rec); err != nil {
 		w.t.Fatalf("failed to sign %s seq %d: %v", rec.Stream, rec.Seq, err)
 	}
-	w.writeJSON(fmt.Sprintf("streams/%s/tx/%s.json", rec.Stream, journal.FormatSeq(rec.Seq)), rec)
+	w.writeJSON(journal.TxKey(rec.Stream, rec.Seq), rec)
 }
 
 // metaRecord is a meta-stream record that carries no signature (genesis and token mutations).
@@ -161,8 +182,8 @@ func TestRegenerateFixtures(t *testing.T) {
 	}
 
 	root := journalFixturesDir()
-	if err := os.RemoveAll(filepath.Join(root, "streams")); err != nil {
-		t.Fatalf("failed to clear streams: %v", err)
+	if err := os.RemoveAll(filepath.Join(root, journal.VersionPrefix)); err != nil {
+		t.Fatalf("failed to clear the fixture bucket tree: %v", err)
 	}
 	w := &fixtureWriter{t: t, root: root}
 
@@ -172,7 +193,7 @@ func TestRegenerateFixtures(t *testing.T) {
 	rotatedPub := journal.FormatPublicKey(rotatedKey.Public().(ed25519.PublicKey))
 
 	// --- Ruling 1: the signing identity is born with the journal and rotates inside it.
-	w.writeJSON("streams/_meta/tx/00000000000000000000.json", metaRecord{
+	w.writeJSON(journal.TxKey(journal.MetaStreamID, 0), metaRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       0,
@@ -180,7 +201,7 @@ func TestRegenerateFixtures(t *testing.T) {
 		PublicKey: genesisPub,
 		Timestamp: "2026-08-31T00:00:00Z",
 	})
-	w.writeJSON("streams/_meta/tx/00000000000000000001.json", metaRecord{
+	w.writeJSON(journal.TxKey(journal.MetaStreamID, 1), metaRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       1,
@@ -202,9 +223,9 @@ func TestRegenerateFixtures(t *testing.T) {
 	if err := journal.SignRotation(genesisKey, rotation); err != nil {
 		t.Fatalf("failed to sign key rotation: %v", err)
 	}
-	w.writeJSON("streams/_meta/tx/00000000000000000002.json", rotation)
+	w.writeJSON(journal.TxKey(journal.MetaStreamID, rotation.Seq), rotation)
 
-	w.writeJSON("streams/_meta/tx/00000000000000000003.json", metaRecord{
+	w.writeJSON(journal.TxKey(journal.MetaStreamID, 3), metaRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       3,
@@ -285,7 +306,7 @@ func TestRegenerateFixtures(t *testing.T) {
 	if err := journal.ValidateSnapshot(snapshot, snapshotHash); err != nil {
 		t.Fatalf("generated snapshot is not a valid packfile: %v", err)
 	}
-	w.write(fmt.Sprintf("streams/%s/snapshots/%s.pack", fixtureRepoStream, snapshotHash), snapshot)
+	w.write(journal.SnapshotKey(fixtureRepoStream, snapshotHash), snapshot)
 
 	marker := &journal.Marker{
 		Version:   journal.VersionPrefix,
@@ -298,7 +319,7 @@ func TestRegenerateFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to marshal marker: %v", err)
 	}
-	w.write(fmt.Sprintf("streams/%s/marker.json", fixtureRepoStream), markerBytes)
+	w.write(journal.MarkerKey(fixtureRepoStream), markerBytes)
 
 	// --- Ruling 2: a second repository stream under an opaque identifier, with its own
 	// sequence counter starting at zero and no marker of its own.
@@ -363,7 +384,7 @@ func buildConditionalAppendFixture() conditionalAppendFixture {
 			Header:         journal.HeaderIfNoneMatch,
 			Value:          journal.IfNoneMatchWildcard,
 			ConflictStatus: journal.StatusPreconditionFailed,
-			ConflictCode:   "PreconditionFailed",
+			ConflictCode:   journal.CodePreconditionFailed,
 		},
 		TxKeys: []txKeyFixture{
 			{Stream: journal.MetaStreamID, Seq: 0, Key: journal.TxKey(journal.MetaStreamID, 0), Description: "Genesis record on the meta stream"},

@@ -32,6 +32,11 @@ const (
 
 	// StatusPreconditionFailed is the standard HTTP status code for conditional write conflict.
 	StatusPreconditionFailed = http.StatusPreconditionFailed
+
+	// CodePreconditionFailed is the S3 error code returned alongside HTTP 412 on a
+	// conditional write conflict, as required of every supported provider in the
+	// support matrix of spec/journal/v1/README.md section 11.2.
+	CodePreconditionFailed = "PreconditionFailed"
 )
 
 // RefuseStreamFenced returns a single-line operator-facing refusal when a writer is fenced out by a conflict.

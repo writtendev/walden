@@ -1,6 +1,7 @@
 package journal_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -16,9 +17,23 @@ func journalFixturesDir() string {
 	return filepath.Join("..", "..", "spec", "journal", "v1", "fixtures")
 }
 
-// The golden journal is laid out as a real bucket would be, so these tests read it the
-// way a reimplementation would: replay _meta from genesis, then replay each repository
-// stream against the signing key that was active when its records were written.
+// fixtureKeyPath maps an object storage key to the file that holds it. The fixture tree
+// is bucket contents, so key "v1/streams/repo-alpha/marker.json" is that path under
+// fixtures/ — which is why these tests address the golden journal through the same key
+// derivation functions a reimplementation would use, and never through hand-built paths.
+func fixtureKeyPath(key string) string {
+	return filepath.Join(journalFixturesDir(), filepath.FromSlash(key))
+}
+
+// The golden journal is laid out as a real bucket would be, and these tests read it as
+// a reader of the specification would, between them covering the whole replay path:
+//
+//	TestFixtureMetaStream          replays _meta from genesis and chains the rotation
+//	TestFixtureRepoStreams         verifies every ref transaction's signature
+//	TestFixtureReplay              resolves the packs: unpacks every referenced segment
+//	                               into a scratch repository, reconstructs ref state,
+//	                               and walks the section 7.5 marker path
+//	TestFixtureConditionalAppend   pins the section 11 append targets and refusals
 //
 // Timeline of the fixture journal:
 //
@@ -34,16 +49,20 @@ func journalFixturesDir() string {
 const (
 	fixtureRepoStream   = "repo-alpha"
 	fixtureOpaqueStream = "9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4"
+
+	// fixtureMetaRecords is the number of records the _meta stream holds: genesis, a
+	// token create, the key rotation, and a token revoke. Asserted, so that a stray
+	// record appended past the end cannot go unnoticed by the partial replays below.
+	fixtureMetaRecords = 4
 )
 
 // loadFixtureChain replays the _meta stream up to and including maxSeq and returns the chain.
 func loadFixtureChain(t *testing.T, maxSeq uint64) *journal.SigningChain {
 	t.Helper()
-	dir := filepath.Join(journalFixturesDir(), "streams", string(journal.MetaStreamID), "tx")
 	chain := journal.NewSigningChain()
 
 	for seq := uint64(0); seq <= maxSeq; seq++ {
-		path := filepath.Join(dir, journal.FormatSeq(seq)+".json")
+		path := fixtureKeyPath(journal.TxKey(journal.MetaStreamID, seq))
 		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("failed to read meta fixture %s: %v", path, err)
@@ -99,6 +118,16 @@ func loadFixtureChain(t *testing.T, maxSeq uint64) *journal.SigningChain {
 // TestFixtureMetaStream covers Ruling 1: the signing identity is born in the journal as
 // the genesis record and rotates inside it, chained to and signed by the outgoing key.
 func TestFixtureMetaStream(t *testing.T) {
+	// The partial replays below stop at a named sequence, so the stream's length has to
+	// be pinned separately: without this, a record appended past seq 3 would be ignored.
+	metaTx, err := os.ReadDir(fixtureKeyPath(journal.TxPrefix(journal.MetaStreamID)))
+	if err != nil {
+		t.Fatalf("failed to read the meta stream: %v", err)
+	}
+	if len(metaTx) != fixtureMetaRecords {
+		t.Errorf("meta stream holds %d records, want %d", len(metaTx), fixtureMetaRecords)
+	}
+
 	chain := loadFixtureChain(t, 0)
 	genesisKey := chain.ActiveKey()
 	if genesisKey == "" {
@@ -119,7 +148,7 @@ func TestFixtureMetaStream(t *testing.T) {
 
 	// A rotation that does not chain to the active key is unusable, which is the whole
 	// point of recording old_public_key.
-	data, err := os.ReadFile(filepath.Join(journalFixturesDir(), "streams", string(journal.MetaStreamID), "tx", journal.FormatSeq(2)+".json"))
+	data, err := os.ReadFile(fixtureKeyPath(journal.TxKey(journal.MetaStreamID, 2)))
 	if err != nil {
 		t.Fatalf("failed to read rotation fixture: %v", err)
 	}
@@ -135,7 +164,7 @@ func TestFixtureMetaStream(t *testing.T) {
 // fixtureStreamRecords reads every tx record of a stream in sequence order.
 func fixtureStreamRecords(t *testing.T, stream journal.StreamID) []*journal.RefTransactionRecord {
 	t.Helper()
-	dir := filepath.Join(journalFixturesDir(), "streams", string(stream), "tx")
+	dir := fixtureKeyPath(journal.TxPrefix(stream))
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("failed to read %s: %v", dir, err)
@@ -187,7 +216,7 @@ func fixtureStreamRecords(t *testing.T, stream journal.StreamID) []*journal.RefT
 func checkFixtureSegments(t *testing.T, stream journal.StreamID, rec *journal.RefTransactionRecord) {
 	t.Helper()
 	for _, hash := range rec.Segments {
-		path := filepath.Join(journalFixturesDir(), "streams", string(stream), "segments", hash+".pack")
+		path := fixtureKeyPath(journal.SegmentKey(stream, hash))
 		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Errorf("%s seq %d references missing segment %s: %v", stream, rec.Seq, hash, err)
@@ -245,14 +274,13 @@ func TestFixtureRepoStreams(t *testing.T) {
 	}
 
 	// seq 3: a force update replaces the tip with a commit that is not its descendant.
+	// That the new tip is not a descendant is a claim about the commit graph, so it is
+	// git that answers it, in TestFixtureReplay; here we only pin which ref moved.
 	if alpha[3].Updates[0].Ref != "refs/heads/main" {
 		t.Errorf("repo-alpha seq 3 updates %q, want refs/heads/main", alpha[3].Updates[0].Ref)
 	}
 	if alpha[3].Updates[0].OldOID != alpha[1].Updates[0].NewOID {
 		t.Error("repo-alpha seq 3 does not force-update the tip left by seq 1")
-	}
-	if alpha[3].Updates[0].NewOID == alpha[2].Updates[0].OldOID {
-		t.Error("repo-alpha seq 3 is a fast-forward, not a force update")
 	}
 
 	// Ruling 2: an opaque stream identifier keeps its own counter, starting at zero.
@@ -278,10 +306,193 @@ func TestFixtureRepoStreams(t *testing.T) {
 	}
 }
 
+// isZeroOID reports whether an object ID is the all-zero OID of a creation or deletion.
+func isZeroOID(oid string) bool {
+	return oid == journal.ZeroOID40 || oid == journal.ZeroOID64
+}
+
+// fixtureReplay is a scratch bare repository that the golden journal is replayed into.
+//
+// The records and the packfiles are separately well-formed — the digests are honest, the
+// signatures verify, the packs parse — and none of that says the two agree. Only git can
+// answer whether the object a transaction names is an object the packs it references
+// actually carry, so this replays them and asks it.
+type fixtureReplay struct {
+	t    *testing.T
+	git  *gitRepo
+	refs map[string]string
+}
+
+func newFixtureReplay(t *testing.T) *fixtureReplay {
+	t.Helper()
+	return &fixtureReplay{t: t, git: newGitRepo(t), refs: make(map[string]string)}
+}
+
+// unpack applies one packfile from the fixture bucket to the scratch object database,
+// as a reader applies a segment it has fetched and verified.
+func (p *fixtureReplay) unpack(key string) {
+	p.t.Helper()
+	data, err := os.ReadFile(fixtureKeyPath(key))
+	if err != nil {
+		p.t.Fatalf("failed to read %s: %v", key, err)
+	}
+	if _, err := p.git.tryRun(data, "unpack-objects", "-q"); err != nil {
+		p.t.Fatalf("%s is not a packfile git can unpack: %v", key, err)
+	}
+}
+
+// requireCommittish asserts that the object database holds oid and that it is something
+// a ref may point at. This is the assertion that catches a transaction naming an object
+// its packs never carried, and one naming an object of the wrong kind — git's empty tree
+// dressed up as a commit, say.
+func (p *fixtureReplay) requireCommittish(rec *journal.RefTransactionRecord, ref, oid string) {
+	p.t.Helper()
+	out, err := p.git.tryRun(nil, "cat-file", "-t", oid)
+	if err != nil {
+		p.t.Errorf("%s seq %d: %s names %s, which the packs it references do not contain: %v", rec.Stream, rec.Seq, ref, oid, err)
+		return
+	}
+	if typ := strings.TrimSpace(string(out)); typ != "commit" && typ != "tag" {
+		p.t.Errorf("%s seq %d: %s names %s, which is a %s, not a commit or a tag", rec.Stream, rec.Seq, ref, oid, typ)
+		return
+	}
+	if _, err := p.git.tryRun(nil, "rev-parse", "--verify", "--quiet", oid+"^{commit}"); err != nil {
+		p.t.Errorf("%s seq %d: %s names %s, which does not resolve to a commit: %v", rec.Stream, rec.Seq, ref, oid, err)
+	}
+}
+
+// apply replays one ref transaction: unpack the segments it references, resolve every
+// object ID it names, then move the refs. trackRefs is false on the marker path, where
+// the snapshot supplies the objects but the marker carries no ref state to check against.
+func (p *fixtureReplay) apply(rec *journal.RefTransactionRecord, trackRefs bool) {
+	p.t.Helper()
+	for _, hash := range rec.Segments {
+		p.unpack(journal.SegmentKey(rec.Stream, hash))
+	}
+	for _, u := range rec.Updates {
+		if !isZeroOID(u.OldOID) {
+			p.requireCommittish(rec, u.Ref+" old_oid", u.OldOID)
+		}
+		if !isZeroOID(u.NewOID) {
+			p.requireCommittish(rec, u.Ref, u.NewOID)
+		}
+		if !trackRefs {
+			continue
+		}
+		current, exists := p.refs[u.Ref]
+		switch {
+		case isZeroOID(u.OldOID) && exists:
+			p.t.Errorf("%s seq %d: %s is created from the zero OID but already stands at %s", rec.Stream, rec.Seq, u.Ref, current)
+		case !isZeroOID(u.OldOID) && !exists:
+			p.t.Errorf("%s seq %d: %s moves from %s but does not exist yet", rec.Stream, rec.Seq, u.Ref, u.OldOID)
+		case !isZeroOID(u.OldOID) && current != u.OldOID:
+			p.t.Errorf("%s seq %d: %s moves from %s but stands at %s", rec.Stream, rec.Seq, u.Ref, u.OldOID, current)
+		}
+		if isZeroOID(u.NewOID) {
+			delete(p.refs, u.Ref)
+		} else {
+			p.refs[u.Ref] = u.NewOID
+		}
+	}
+}
+
+// publish writes the replayed ref state into the scratch repository and fscks it, which
+// is what a materializing reader does last, before marking the repository ready.
+func (p *fixtureReplay) publish() {
+	p.t.Helper()
+	for ref, oid := range p.refs {
+		if _, err := p.git.tryRun(nil, "update-ref", ref, oid); err != nil {
+			p.t.Fatalf("failed to set %s to %s: %v", ref, oid, err)
+		}
+	}
+	if _, err := p.git.tryRun(nil, "fsck", "--strict", "--no-progress", "--no-dangling"); err != nil {
+		p.t.Errorf("git fsck rejects the replayed repository: %v", err)
+	}
+}
+
+// TestFixtureReplay materializes the golden journal with the real git binary, both from
+// sequence 0 and from the section 7.5 marker, and asserts that every object identifier
+// the transactions name is present, is a commit, and lands the refs where the journal
+// says they land. A well-formed record pointing at an object its packs do not hold is
+// exactly the defect these fixtures exist to rule out, and nothing short of resolving
+// the packs can see it.
+func TestFixtureReplay(t *testing.T) {
+	t.Run("from_genesis", func(t *testing.T) {
+		records := fixtureStreamRecords(t, fixtureRepoStream)
+		alpha := newFixtureReplay(t)
+		for _, rec := range records {
+			alpha.apply(rec, true)
+		}
+		alpha.publish()
+
+		// After the whole stream, main stands where seq 3 left it and the branch that
+		// seq 2 deleted is gone.
+		if got, want := alpha.refs["refs/heads/main"], records[3].Updates[0].NewOID; got != want {
+			t.Errorf("replayed refs/heads/main = %q, want %q", got, want)
+		}
+		if len(alpha.refs) != 1 {
+			t.Errorf("replayed repo-alpha holds %d refs, want only refs/heads/main: %v", len(alpha.refs), alpha.refs)
+		}
+
+		// seq 3 is a force update: its new tip is not a descendant of the tip it
+		// replaces. That is a claim about the commit graph, so git answers it.
+		force := records[3].Updates[0]
+		if _, err := alpha.git.tryRun(nil, "merge-base", "--is-ancestor", force.OldOID, force.NewOID); err == nil {
+			t.Errorf("repo-alpha seq 3 fast-forwards %s to %s; it is meant to be a force update", force.OldOID, force.NewOID)
+		}
+		if _, err := alpha.git.tryRun(nil, "merge-base", force.OldOID, force.NewOID); err != nil {
+			t.Errorf("repo-alpha seq 3 rewrites onto unrelated history, not a shared base: %v", err)
+		}
+
+		// The opaque stream replays on its own, from its own sequence 0.
+		opaque := newFixtureReplay(t)
+		for _, rec := range fixtureStreamRecords(t, fixtureOpaqueStream) {
+			opaque.apply(rec, true)
+		}
+		opaque.publish()
+		if len(opaque.refs) != 2 {
+			t.Errorf("replayed opaque stream holds %d refs, want a branch and a tag: %v", len(opaque.refs), opaque.refs)
+		}
+	})
+
+	t.Run("from_marker", func(t *testing.T) {
+		data, err := os.ReadFile(fixtureKeyPath(journal.MarkerKey(fixtureRepoStream)))
+		if err != nil {
+			t.Fatalf("failed to read marker fixture: %v", err)
+		}
+		marker, err := journal.ParseMarker(data)
+		if err != nil {
+			t.Fatalf("ParseMarker failed on the golden marker: %v", err)
+		}
+
+		// Section 7.5: apply the snapshot, set the baseline, resume at sequence + 1, and
+		// ignore everything the snapshot supersedes rather than treating it as corruption.
+		replay := newFixtureReplay(t)
+		replay.unpack(journal.SnapshotKey(fixtureRepoStream, marker.Snapshot))
+
+		resumed := 0
+		for _, rec := range fixtureStreamRecords(t, fixtureRepoStream) {
+			if rec.Seq <= marker.Sequence {
+				continue
+			}
+			if want := marker.Sequence + 1 + uint64(resumed); rec.Seq != want {
+				t.Fatalf("replay from the marker hit sequence %d, want %d", rec.Seq, want)
+			}
+			resumed++
+			// The marker carries a baseline sequence and a snapshot, and no ref state, so
+			// this path resolves objects without a prior ref map to check them against.
+			replay.apply(rec, false)
+		}
+		if resumed == 0 {
+			t.Fatal("the marker leaves no transactions to replay, so this proves nothing")
+		}
+	})
+}
+
 // TestFixtureSegmentsAreContentAddressed covers Ruling 4: every pack segment and
 // snapshot in the journal is stored under the SHA-256 of its own verbatim bytes.
 func TestFixtureSegmentsAreContentAddressed(t *testing.T) {
-	root := filepath.Join(journalFixturesDir(), "streams")
+	root := filepath.Join(journalFixturesDir(), journal.VersionPrefix, "streams")
 	streams, err := os.ReadDir(root)
 	if err != nil {
 		t.Fatalf("failed to read %s: %v", root, err)
@@ -332,7 +543,7 @@ func TestFixtureSegmentsAreContentAddressed(t *testing.T) {
 // published marker whose snapshot exists, with the transactions and segments it
 // supersedes retained in storage and ignored rather than treated as corruption.
 func TestFixtureMarkerAndSupersededHistory(t *testing.T) {
-	markerPath := filepath.Join(journalFixturesDir(), "streams", fixtureRepoStream, "marker.json")
+	markerPath := fixtureKeyPath(journal.MarkerKey(fixtureRepoStream))
 	data, err := os.ReadFile(markerPath)
 	if err != nil {
 		t.Fatalf("failed to read marker fixture: %v", err)
@@ -354,7 +565,7 @@ func TestFixtureMarkerAndSupersededHistory(t *testing.T) {
 	}
 
 	// Publish-last: the snapshot the marker names is already in storage.
-	snapshotPath := filepath.Join(journalFixturesDir(), "streams", fixtureRepoStream, "snapshots", marker.Snapshot+".pack")
+	snapshotPath := fixtureKeyPath(journal.SnapshotKey(fixtureRepoStream, marker.Snapshot))
 	snapshot, err := os.ReadFile(snapshotPath)
 	if err != nil {
 		t.Fatalf("marker names a snapshot that is not in storage: %v", err)
@@ -373,7 +584,7 @@ func TestFixtureMarkerAndSupersededHistory(t *testing.T) {
 		if rec.Seq <= marker.Sequence {
 			superseded++
 			for _, hash := range rec.Segments {
-				path := filepath.Join(journalFixturesDir(), "streams", fixtureRepoStream, "segments", hash+".pack")
+				path := fixtureKeyPath(journal.SegmentKey(fixtureRepoStream, hash))
 				if _, err := os.Stat(path); err != nil {
 					t.Errorf("superseded segment %s was purged; compaction must retain it: %v", hash, err)
 				}
@@ -385,7 +596,7 @@ func TestFixtureMarkerAndSupersededHistory(t *testing.T) {
 	}
 
 	// The opaque stream has never been compacted: no marker means replay from seq 0.
-	opaqueMarker := filepath.Join(journalFixturesDir(), "streams", fixtureOpaqueStream, "marker.json")
+	opaqueMarker := fixtureKeyPath(journal.MarkerKey(fixtureOpaqueStream))
 	if _, err := os.Stat(opaqueMarker); !os.IsNotExist(err) {
 		t.Errorf("expected the opaque stream to have no marker, stat returned %v", err)
 	}
@@ -399,6 +610,18 @@ func TestFixtureConditionalAppend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read %s: %v", path, err)
 	}
+
+	// The committed table must be byte for byte what the generator produces today. The
+	// conflict code and every description are prose that no other assertion reaches, so
+	// without this they could drift from the generator, or be hand-edited in place.
+	want, err := json.MarshalIndent(buildConditionalAppendFixture(), "", "  ")
+	if err != nil {
+		t.Fatalf("failed to marshal the expected conditional append fixture: %v", err)
+	}
+	want = append(want, '\n')
+	if !bytes.Equal(data, want) {
+		t.Errorf("conditional_append.json is stale; regenerate it:\ngot:\n%s\nwant:\n%s", data, want)
+	}
 	var fixture struct {
 		Version        string `json:"version"`
 		ConditionalPut struct {
@@ -408,9 +631,10 @@ func TestFixtureConditionalAppend(t *testing.T) {
 			ConflictCode   string `json:"conflict_code"`
 		} `json:"conditional_put"`
 		TxKeys []struct {
-			Stream journal.StreamID `json:"stream"`
-			Seq    uint64           `json:"seq"`
-			Key    string           `json:"key"`
+			Stream      journal.StreamID `json:"stream"`
+			Seq         uint64           `json:"seq"`
+			Key         string           `json:"key"`
+			Description string           `json:"description"`
 		} `json:"tx_keys"`
 		Refusals []struct {
 			Case    string           `json:"case"`
@@ -435,6 +659,20 @@ func TestFixtureConditionalAppend(t *testing.T) {
 	if fixture.ConditionalPut.ConflictStatus != journal.StatusPreconditionFailed {
 		t.Errorf("conflict status = %d, want %d", fixture.ConditionalPut.ConflictStatus, journal.StatusPreconditionFailed)
 	}
+	if fixture.ConditionalPut.ConflictCode != journal.CodePreconditionFailed {
+		t.Errorf("conflict code = %q, want %q", fixture.ConditionalPut.ConflictCode, journal.CodePreconditionFailed)
+	}
+
+	// Section 11.2 requires the same conflict response of every supported provider, so
+	// the code and status the fixture pins are the ones the whole matrix agrees on.
+	for _, provider := range journal.ProviderSupportMatrix {
+		if provider.Status != journal.ProviderSupported {
+			continue
+		}
+		if provider.ConflictStatus != fixture.ConditionalPut.ConflictStatus {
+			t.Errorf("provider %s conflicts with status %d, fixture says %d", provider.Name, provider.ConflictStatus, fixture.ConditionalPut.ConflictStatus)
+		}
+	}
 
 	if len(fixture.TxKeys) == 0 {
 		t.Fatal("expected conditional append key fixtures")
@@ -442,6 +680,12 @@ func TestFixtureConditionalAppend(t *testing.T) {
 	for _, tc := range fixture.TxKeys {
 		if got := journal.TxKey(tc.Stream, tc.Seq); got != tc.Key {
 			t.Errorf("TxKey(%q, %d) = %q, fixture says %q", tc.Stream, tc.Seq, got, tc.Key)
+		}
+		if strings.TrimSpace(tc.Description) == "" {
+			t.Errorf("tx key %q carries no description", tc.Key)
+		}
+		if strings.ContainsAny(tc.Description, "\n\r") {
+			t.Errorf("tx key %q description is not a single line: %q", tc.Key, tc.Description)
 		}
 	}
 

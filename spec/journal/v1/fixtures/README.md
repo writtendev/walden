@@ -1,8 +1,8 @@
 # Journal Format v1 Golden Fixtures
 
-This directory holds a small, complete walden journal exactly as it would sit in an object storage bucket, plus one table of conditional-append targets and refusals that has no on-disk representation. Together they pin down the five rulings of [the format specification](../README.md): the server signing identity (spec section 2), the stream model and key layout (section 9), ref-transaction records (section 5), pack segments and content addressing (section 6), and conditional append, fencing, and the compare-and-swap requirement (section 11).
+The `v1/` subtree here is a small, complete walden journal, and its paths are the object storage keys of spec section 9.2 verbatim: copy the `v1/` directory to the root of a bucket and a reader deriving keys from the specification finds every object exactly where it looks for it. Beside it sits one table of conditional-append targets and refusals, which pins behavior that has no on-disk representation in a journal. Together they pin down the five rulings of [the format specification](../README.md): the server signing identity, born as the genesis record and rotated in place (spec sections 3 and 4), the stream model and key layout (section 9), ref-transaction records (section 5), pack segments and content addressing (section 6), and conditional append, fencing, and the compare-and-swap requirement (section 11).
 
-Everything here is real, not illustrative. Every SHA-256 in a filename is the digest of that file's bytes. Every packfile came out of the real `git` binary and parses with `git index-pack`. Every signature verifies against the public key the genesis record declares, over the canonical payloads of spec sections 4.2 and 5.3.
+Everything here is real, not illustrative. Every SHA-256 in a filename is the digest of that file's bytes. Every packfile came out of the real `git` binary, and git unpacks every one of them again: the journal is replayed into a scratch repository on each test run, from sequence 0 and from the marker both, so every object ID a ref transaction names is an object the packs it references actually carry, the refs land where the journal says they land, and `git fsck` is clean at the end. Every signature verifies against the signing key that was active when its record was written — see the journal timeline below — over the canonical payloads of spec sections 4.2 and 5.3.
 
 ## Reimplementation Grant
 
@@ -10,30 +10,35 @@ These fixtures, like the specification they pin down, are published with an unco
 
 ## Directory Structure
 
+Everything under `v1/` is bucket contents; the two files beside it are documentation and a behavior table, and belong to no journal.
+
 ```
 fixtures/
 ├── README.md
-├── conditional_append.json               # CAS precondition, tx key derivation, fencing refusals
-└── streams/
-    ├── _meta/
-    │   └── tx/
-    │       ├── 00000000000000000000.json # Genesis record: the server's root signing identity
-    │       ├── 00000000000000000001.json # Token table mutation (token_create, rwc:*)
-    │       ├── 00000000000000000002.json # Key rotation, chained to and signed by the outgoing key
-    │       └── 00000000000000000003.json # Token table mutation (token_revoke)
-    ├── repo-alpha/                        # A repository stream under a human-chosen name
-    │   ├── tx/
-    │   │   ├── 00000000000000000000.json # First push into an empty repository
-    │   │   ├── 00000000000000000001.json # Fast-forward main and create feature, atomically
-    │   │   ├── 00000000000000000002.json # Branch delete: no new objects, empty segments array
-    │   │   └── 00000000000000000003.json # Force update of main, signed by the rotated key
-    │   ├── segments/                     # Three content-addressed packfiles, one per push
-    │   ├── snapshots/                    # One consolidated snapshot pack
-    │   └── marker.json                   # Replay from sequence 1 forward
-    └── 9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4/  # The same thing under an opaque identifier
-        ├── tx/
-        │   └── 00000000000000000000.json # First push: create a branch and a tag together
-        └── segments/                     # One content-addressed packfile
+├── conditional_append.json                   # CAS precondition, tx key derivation, fencing refusals
+└── v1/                                       # ── the bucket tree: paths below are object keys ──
+    └── streams/
+        ├── _meta/
+        │   └── tx/
+        │       ├── 00000000000000000000.json # Genesis record: the server's root signing identity
+        │       ├── 00000000000000000001.json # Token table mutation (token_create, rwc:*)
+        │       ├── 00000000000000000002.json # Key rotation, chained to and signed by the outgoing key
+        │       └── 00000000000000000003.json # Token table mutation (token_revoke)
+        ├── repo-alpha/                       # A repository stream under a human-chosen name
+        │   ├── tx/
+        │   │   ├── 00000000000000000000.json # First push into an empty repository
+        │   │   ├── 00000000000000000001.json # Fast-forward main and create feature, atomically
+        │   │   ├── 00000000000000000002.json # Branch delete: no new objects, empty segments array
+        │   │   └── 00000000000000000003.json # Force update of main, signed by the rotated key
+        │   ├── segments/                     # Three content-addressed packfiles: the branch
+        │   │                                 #   delete introduced no objects, so of the four
+        │   │                                 #   pushes only three carried a pack
+        │   ├── snapshots/                    # One consolidated snapshot pack
+        │   └── marker.json                   # Replay from sequence 1 forward
+        └── 9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4/  # The same thing under an opaque identifier
+            ├── tx/
+            │   └── 00000000000000000000.json # First push: create a branch and a tag together
+            └── segments/                     # One content-addressed packfile
 ```
 
 ## The Journal in Order
@@ -57,6 +62,8 @@ A ref transaction is verified against the signing key that was active when it wa
 
 ## Key Space and Identity Conformance Rules
 
+Every object key is `v1/streams/<stream-id>/…`, exactly as spec section 9.2 derives it. The `v1/` component is part of the key, not a directory this repository added for tidiness.
+
 1. **Transaction Keys (`tx/`):** Must strictly match `^[0-9]{20}\.json$`. Zero-indexed, strictly monotonic, and sequential, with no gaps.
 2. **Genesis Record (`_meta/tx/00000000000000000000.json`):** Declares the root Ed25519 public key. No signature field; it is the root of trust, not a claim about one.
 3. **Key Rotation (`_meta/tx/…`):** Carries `old_public_key`, `new_public_key`, and a signature by `old_public_key` over the canonical rotation payload. A rotation whose `old_public_key` is not the active key does not chain and must be refused.
@@ -74,4 +81,4 @@ The fixtures are generated, not hand-edited:
 WALDEN_REGENERATE_FIXTURES=1 go test ./internal/journal -run TestRegenerateFixtures
 ```
 
-Signing keys, record timestamps, and git author and committer dates are all fixed, so the records and the commit OIDs reproduce exactly. The packfile bytes come from whichever `git` binary is on the path; a different git version may pack the same objects differently, which would change the content-addressed segment names without making either set wrong.
+Signing keys, record timestamps, and git author and committer dates are all fixed, so the records and the commit OIDs reproduce exactly. The packfile bytes, however, come from whichever `git` binary is on the path, and packing is toolchain-dependent: **the committed pack bytes were generated with git 2.50.1.** A different git version may pack the same objects differently, which changes the content-addressed segment and snapshot names — and therefore the digests the transaction records and `marker.json` carry — without making either set wrong. Regenerating with a different git is a real change to the fixtures, not a no-op, so review the resulting diff rather than assuming it is noise.

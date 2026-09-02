@@ -9,3 +9,5 @@ This directory contains reference golden fixture files demonstrating Walden auth
 ## Conformance Testing
 
 Every implementation of Walden format v1 MUST pass all test cases defined in these fixture files without modification.
+
+walden holds itself to that in `internal/auth/fixtures_test.go`, which pins the file list above, pins how many cases each file carries, counts the cases it actually ran against those numbers, and refuses a fixture field no test reads. A file added here therefore has to be read by a test, and a case removed from one fails the suite rather than quietly shrinking it. The examples in [the specification](../README.md) are held to these fixtures by the same tests, so the prose and the tables cannot drift apart either.

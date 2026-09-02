@@ -174,6 +174,9 @@ When a built-in token is created, a record is conditionally appended to the `_me
 }
 ```
 
+Quoted from
+[spec/journal/v1](../../journal/v1/fixtures/v1/streams/_meta/tx/00000000000000000001.json).
+
 The token is `tok_admin_01` of [`fixtures/builtin_tokens.json`](fixtures/builtin_tokens.json), and `token_hash` is the hash of section 5.1 over that token's raw string — the two fixture sets agree on hash and scopes. They do not agree on membership or on revocation state, and are not meant to: `builtin_tokens.json` is a conformance table of tokens to authorize against, while the golden journal is authoritative for whether a token is live. Section 5.3 below revokes `tok_admin_01` on the meta stream, and `builtin_tokens.json` still publishes it with `"revoked": false`, because it is describing its own table and not this journal's rebuilt one. `scopes` is an array because a token may carry more than one (section 3.4); the journal spec's section 4.3 shows `tok_writer_02` and its two.
 
 These are journal records, so their `seq` field is a JSON string holding its exact decimal form — here and in Section 5.3 — and the normative rule is [journal specification section 1.1](../../journal/v1/README.md#11-sequence-numbers-are-json-strings), not restated here.
@@ -191,6 +194,9 @@ Revoking a token appends a `token_revoke` record to the `_meta` stream, defined 
   "timestamp": "2026-08-31T00:08:00Z"
 }
 ```
+
+Quoted from
+[spec/journal/v1](../../journal/v1/fixtures/v1/streams/_meta/tx/00000000000000000003.json).
 
 ---
 
@@ -217,17 +223,24 @@ Alternatively, Walden accepts a structured JSON envelope string:
 {
   "version": "v1",
   "payload": {
-    "id": "cap_01j7abc",
+    "version": "v1",
+    "id": "cap_01j7abc123456789",
     "issuer": "forge.example.com",
     "subject": "user_42",
-    "scopes": ["rw:blog-*", "r:docs"],
+    "scopes": [
+      "rw:blog-*",
+      "r:docs"
+    ],
     "issued_at": "2026-09-01T12:00:00Z",
     "expires_at": "2026-09-01T13:00:00Z",
     "not_before": "2026-09-01T12:00:00Z"
   },
-  "signature": "ed25519:2ea7c2e8e15acf84573875fd8f94da0dca543fe8080c0a846d126ae3ba0a1a977af7a9fdedd920e8bb16b36c75184638d79e04cfa530b889f76e19a0823d0c07"
+  "signature": "ed25519:b2cad790ebe3d87ced9b2f497d713b77ecade790824df72a434a4c0e9b4c728ccc99888b659935ee6913712006fb69d384200ce4506348f778bedd0ff4350206"
 }
 ```
+
+The envelope above and the compact token of the previous section carry the same capability:
+both are [`valid_capability`](fixtures/capability_tokens.json) of the golden fixtures.
 
 ### 6.3 Capability Payload Schema
 ```json

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/writtendev/walden/internal/journal"
+	"github.com/writtendev/walden/internal/spectest"
 )
 
 // journalSpecDir returns the published journal format specification, spec/journal/v1.
@@ -1230,115 +1231,17 @@ const specJSONExamples = 7
 // the example and whatever comes next — the field table, the next example, the next section.
 var specFixtureLink = regexp.MustCompile(`\]\((fixtures/[^)\s]+)\)`)
 
-// stripQuote removes a markdown blockquote marker from a line, and reports whether there
-// was one. CommonMark lets a fenced block sit inside a blockquote, and the block's content
-// is then its lines with that marker taken off — so this is how such a block is read back
-// out. It matters twice over: ">" is not JSON whitespace, so a quoted record example does
-// not parse until the marker is gone.
-func stripQuote(line string) (rest string, quoted bool) {
-	trimmed := strings.TrimLeft(line, " \t")
-	if !strings.HasPrefix(trimmed, ">") {
-		return line, false
-	}
-	return strings.TrimPrefix(strings.TrimPrefix(trimmed, ">"), " "), true
-}
-
-// fenceOpener reports whether a line opens a fenced code block, and returns the fence marker
-// and the info string. Both markdown fence characters count, at any indentation, inside a
-// blockquote or out, because the question this test asks is which examples the document
-// carries — and an example does not stop being one for being written ~~~json, or for sitting
-// inside a list item, or for being quoted.
-//
-// The marker is the whole run of fence characters, not the first three. CommonMark allows a
-// longer run, and a longer run demands an at-least-as-long closer, so the length belongs to
-// the marker rather than being a detail to round off. Read as three characters, ````json
-// carries the info string "`json" — a legal json example nothing would then check — and its
-// legal closer stops being recognizable as one.
-func fenceOpener(line string) (marker, info string, ok bool) {
-	trimmed, _ := stripQuote(line)
-	trimmed = strings.TrimLeft(trimmed, " \t")
-	for _, c := range []byte{'`', '~'} {
-		run := 0
-		for run < len(trimmed) && trimmed[run] == c {
-			run++
-		}
-		if run >= 3 {
-			return trimmed[:run], strings.TrimSpace(trimmed[run:]), true
-		}
-	}
-	return "", "", false
-}
-
-// fenceCloses reports whether a line closes a block opened with marker. CommonMark's closer
-// is a run of at least as many of the same fence character as the opener, with nothing after
-// it but whitespace — so a longer run closes a shorter fence, and an info string disqualifies
-// a line from closing anything.
-func fenceCloses(line, marker string) bool {
-	trimmed, _ := stripQuote(line)
-	trimmed = strings.TrimSpace(trimmed)
-	if !strings.HasPrefix(trimmed, marker) {
-		return false
-	}
-	return strings.Trim(trimmed, marker[:1]) == ""
-}
-
-// looksLikeJSONDocument reports whether a run of text is a JSON object. The spec's untagged
-// blocks are refusal strings, key layouts and HTTP headers, none of which parse; text that
-// does parse is a record example, whatever markdown is wrapped around it.
-func looksLikeJSONDocument(block string) bool {
-	trimmed := strings.TrimSpace(block)
-	return strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed))
-}
-
-// jsonObjectEnd reports whether a JSON object begins on line i and, if so, the line it ends
-// on. The object is the shortest run of lines from i that parses, and the run stops at a blank
-// line, which no record example contains.
-//
-// Nothing about the markdown around it is consulted, and that is the point. The fence walk in
-// TestSpecExamplesMatchFixtures can only see examples that are fences; a JSON example written
-// as CommonMark's other code block — four-space indented — or tucked inside a blockquote is
-// not a fence at all, so it would otherwise pass the document without ever being counted,
-// linked or compared. This finds JSON by being JSON. Indentation is left alone because JSON
-// ignores whitespace; the blockquote marker is taken off because JSON does not ignore ">".
-func jsonObjectEnd(lines []string, i int) (int, bool) {
-	if first, _ := stripQuote(lines[i]); !strings.HasPrefix(strings.TrimSpace(first), "{") {
-		return 0, false
-	}
-	var b strings.Builder
-	for end := i; end < len(lines); end++ {
-		line, _ := stripQuote(lines[end])
-		if strings.TrimSpace(line) == "" {
-			return 0, false
-		}
-		b.WriteString(line)
-		b.WriteByte('\n')
-		if looksLikeJSONDocument(b.String()) {
-			return end, true
-		}
-	}
-	return 0, false
-}
-
 // TestSpecExamplesMatchFixtures holds every JSON example in spec/journal/v1/README.md to the
 // fixture it links, byte for byte. The document claims the examples are real records from
 // the golden journal, and that claim is worth exactly as much as its enforcement: the two
 // agreed when they were written and agreed at review, which is how they will drift.
 //
-// The document is read twice. The first pass walks its fenced blocks and holds every ```json
-// one to its fixture; the second sweeps everything the first did not claim and finds JSON by
-// parsing it, so an example written as an indented code block, inside a blockquote, or under
-// any other fence tag is caught rather than passing unseen. What neither pass covers is an
-// example that is neither: not carried by a ```json fence, and not parseable as a JSON object
-// from some line of its own through an unbroken run of lines, once one level of blockquote
-// marker is off.
-//
-// Being incomplete is one way to land there — a fragment, a record with an ellipsis through
-// it, one split by a blank line, one quoted twice over — but completeness is not the boundary,
-// and reading only that list would suggest it is. A whole record escapes just as readily
-// whenever the line its object opens on does not itself begin with "{" after one blockquote
-// strip: inline in a prose sentence, on one line in a table cell, or prefixed line by line
-// inside a ```diff fence. All of those are illustrations rather than records, and section
-// 3.1's claim is about records.
+// Finding the examples is spectest.JSONExamples' job, and what it can and cannot see is
+// documented there; spec/auth/v1 has the same gate over its own document and reads it through
+// the same code. What arrives here is the ```json blocks in document order, plus the line of
+// every JSON document that no such block carries — an example written as an indented code
+// block, inside a blockquote, or under any other fence tag — which is reported rather than
+// passing unseen.
 //
 // It is also, as things stand, the only test that sees a repack. TestFixturesAreGenerated
 // matches packs by their object set and carries the committed bytes forward, so new pack
@@ -1354,51 +1257,16 @@ func TestSpecExamplesMatchFixtures(t *testing.T) {
 		t.Fatalf("failed to read %s: %v", specPath, err)
 	}
 	lines := strings.Split(string(data), "\n")
+	examples, stray, err := spectest.JSONExamples(lines)
+	if err != nil {
+		t.Fatalf("failed to read the examples of %s: %v", specPath, err)
+	}
 
-	// carried marks every line a ```json fence accounts for. What is left over is swept
-	// below for JSON the fence walk cannot see.
-	carried := make([]bool, len(lines))
-	examples := 0
-	for i := 0; i < len(lines); i++ {
-		marker, info, ok := fenceOpener(lines[i])
-		if !ok {
-			continue
-		}
-		_, quoted := stripQuote(lines[i])
-		start := i + 1
-		end := start
-		for end < len(lines) && !fenceCloses(lines[end], marker) {
-			end++
-		}
-		if end == len(lines) {
-			t.Fatalf("%s:%d: unterminated fenced block", specPath, i+1)
-		}
-		body := make([]string, 0, end-start)
-		for _, line := range lines[start:end] {
-			if quoted {
-				line, _ = stripQuote(line)
-			}
-			body = append(body, line)
-		}
-		block := strings.Join(body, "\n") + "\n"
-		i = end
-
-		// A block that is not tagged json is prose, a key layout, or a refusal string, and
-		// none of this test's business. If it holds a JSON document anyway it is an example
-		// wearing the wrong fence, and the sweep below is what says so.
-		if info != "json" {
-			continue
-		}
-		for j := start - 1; j <= end; j++ {
-			carried[j] = true
-		}
-		example := block
-		examples++
-
+	for _, example := range examples {
 		link := ""
-		for j := end + 1; j < len(lines); j++ {
+		for j := example.End + 1; j < len(lines); j++ {
 			line := lines[j]
-			if _, _, isFence := fenceOpener(line); isFence {
+			if spectest.IsFence(line) {
 				break
 			}
 			if strings.HasPrefix(line, "#") || strings.HasPrefix(line, "|") {
@@ -1410,53 +1278,38 @@ func TestSpecExamplesMatchFixtures(t *testing.T) {
 			}
 		}
 		if link == "" {
-			t.Errorf("%s:%d: this json example cites no fixture, so nothing holds it to one", specPath, start)
+			t.Errorf("%s:%d: this json example cites no fixture, so nothing holds it to one", specPath, example.Start)
 			continue
 		}
 
 		fixture, err := os.ReadFile(filepath.Join(journalSpecDir(), filepath.FromSlash(link)))
 		if err != nil {
-			t.Errorf("%s:%d: cites %s, which is not in the fixture tree: %v", specPath, start, link, err)
+			t.Errorf("%s:%d: cites %s, which is not in the fixture tree: %v", specPath, example.Start, link, err)
 			continue
 		}
-		if string(fixture) != example {
+		if string(fixture) != example.Body {
 			t.Errorf("%s:%d: the example and %s have drifted apart.\n"+
 				"If you have just regenerated the fixtures, this is the second half of that job: the\n"+
 				"examples are copied into the specification by hand, so paste the fixture over the\n"+
 				"example and review the diff — a changed pack digest here means your git packs these\n"+
 				"objects differently, which is a real change to a published artifact.\n"+
-				"spec:\n%s\nfixture:\n%s", specPath, start, link, example, fixture)
+				"spec:\n%s\nfixture:\n%s", specPath, example.Start, link, example.Body, fixture)
 		}
 	}
 
-	// Everything above reads fences, so everything above is blind to a JSON example that is
-	// not one: an untagged or mis-tagged fence, four-space indentation, a block the document
-	// quotes rather than fences. This sweeps what the fence walk did not claim and finds JSON
-	// by parsing it, so no shape of markdown gets an example past the link check.
-	//
-	// The question widened on the way here, and a future author should know it was meant to.
-	// The check this replaced asked whether a whole fence body was a JSON document; this asks
-	// it of every unclaimed line, so JSON that is only part of a block fires too. The case
-	// that will actually come up is an HTTP example carrying a record body — a natural
-	// addition to section 11, which already fences one ```http request — and there is no way
-	// to write it that this gate accepts: left as http it reports the message below, and
-	// fenced json instead it must then cite a fixture, which a block holding a request line
-	// and headers can never match byte for byte. That is the rule working, not failing: any
-	// JSON object in this document is a record held to a fixture. An example of that shape
-	// cannot be added without changing the rule.
-	for i := 0; i < len(lines); i++ {
-		if carried[i] {
-			continue
-		}
-		end, ok := jsonObjectEnd(lines, i)
-		if !ok {
-			continue
-		}
-		t.Errorf("%s:%d: this JSON document is not inside a ```json fence, so nothing holds it to a fixture", specPath, i+1)
-		i = end
+	// A JSON document the fence walk did not claim is an example wearing the wrong markdown,
+	// and there is no way to write one that this gate accepts. The case that will actually
+	// come up is an HTTP example carrying a record body — a natural addition to section 11,
+	// which already fences one ```http request: left as http it reports the message below,
+	// and fenced json instead it must then cite a fixture, which a block holding a request
+	// line and headers can never match byte for byte. That is the rule working, not failing:
+	// any JSON object in this document is a record held to a fixture. An example of that
+	// shape cannot be added without changing the rule.
+	for _, line := range stray {
+		t.Errorf("%s:%d: this JSON document is not inside a ```json fence, so nothing holds it to a fixture", specPath, line+1)
 	}
 
-	if examples != specJSONExamples {
-		t.Errorf("the specification carries %d json examples, want %d", examples, specJSONExamples)
+	if len(examples) != specJSONExamples {
+		t.Errorf("the specification carries %d json examples, want %d", len(examples), specJSONExamples)
 	}
 }

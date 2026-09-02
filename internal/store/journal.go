@@ -129,10 +129,19 @@ type providerHost struct {
 	cas bool
 }
 
-// providerHosts mirrors the support matrix in spec/journal/v1 section 11.2 and
-// internal/journal.ProviderSupportMatrix. MinIO, Ceph RGW, and Garage are
-// self-hosted under operator-chosen hostnames; they are the unrecognised,
-// path-style default rather than entries here.
+// providerHosts reads a hostname into an endpoint, a region, and an addressing
+// style. MinIO, Ceph RGW, and Garage are self-hosted under operator-chosen
+// hostnames; they are the unrecognised, path-style default rather than entries
+// here.
+//
+// The cas bit is a fast pre-flight refusal for a provider already known not to
+// support conditional writes, not the compare-and-swap check. A hostname cannot
+// see a proxy in front of the bucket or a build too old to honour the
+// precondition, and the three self-hosted implementations above — where support
+// is version-gated rather than vendor-gated — do not appear here at all. CAS
+// will be settled at boot by probing the real bucket (WALD-23); until that
+// lands there is no CAS enforcement, and nothing writes to the bucket either.
+// See spec/journal/v1 section 11.2.
 var providerHosts = []providerHost{
 	{suffix: "amazonaws.com", provider: "AWS S3", endpointLabels: -1, cas: true},
 	{suffix: "backblazeb2.com", provider: "Backblaze B2", endpointLabels: -1, cas: true},
@@ -534,7 +543,7 @@ func journalQuery(u *url.URL) (region, style string, err error) {
 
 // matchProviderHost returns the longest-suffix provider rule matching host.
 // An unrecognised host gets a rule that says: path-style, no fixed region, and
-// no provider name to check against the support matrix.
+// no provider name, so there is nothing for the pre-flight refusal to match.
 func matchProviderHost(host string) (providerHost, bool) {
 	best := providerHost{cas: true}
 	found := false

@@ -1,9 +1,10 @@
 package store
 
 // ProviderHostRow is one row of the provider host table, in the shape a test
-// can read. It exists so the external test package can bind the table to the
-// published support matrix in internal/journal — store must not import
-// journal, so the binding cannot be a compile-time one.
+// can read. The table and its fields are unexported, so the external test
+// package reaches them through this row rather than directly. There is no Go
+// table anywhere else to bind it to: spec/journal/v1 section 11.2 is
+// documentation, and compare-and-swap is the boot probe's business.
 type ProviderHostRow struct {
 	Provider string
 	Suffix   string

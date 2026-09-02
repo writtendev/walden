@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/refusal"
 	"github.com/writtendev/walden/internal/store"
 )
@@ -807,39 +806,25 @@ func TestJournalStringHidesSecret(t *testing.T) {
 	}
 }
 
-// TestProviderNamesMatchSupportMatrix binds the host table in this package to
-// the published support matrix. store must not import journal (journal is the
-// layer above), so the binding is checked here rather than at compile time.
-// It ranges over both tables, so drift in either direction fails: a host rule
-// whose CAS bit disagrees with the matrix, and a provider the matrix marks
-// unsupported that has no refusing host rule here.
-func TestProviderNamesMatchSupportMatrix(t *testing.T) {
+// TestProviderHostsRefuseWithoutCAS checks that each host rule behaves at boot
+// the way its CAS bit claims: a rule marked cas=false refuses with
+// ErrProviderUnsupported, and one marked cas=true does not.
+//
+// This test used to bind the table to journal.ProviderSupportMatrix as well.
+// That matrix is gone (WALD-79): a hostname is not a capability, so CAS will be
+// settled by the boot probe against the real bucket (WALD-23) — until then
+// there is no CAS enforcement — and spec §11.2 is documentation rather than
+// something Go re-derives. What remains here is
+// the half that was never table-against-table — that the code refuses what it
+// says it refuses.
+func TestProviderHostsRefuseWithoutCAS(t *testing.T) {
 	rows := store.ProviderHostsForTest()
 	if len(rows) == 0 {
 		t.Fatal("the provider host table is empty")
 	}
 
-	byProvider := make(map[string]store.ProviderHostRow, len(rows))
 	for _, row := range rows {
-		byProvider[row.Provider] = row
-	}
-
-	// Every host rule here names a provider the matrix knows, agrees with
-	// the matrix about compare-and-swap, and behaves that way at boot.
-	for _, row := range rows {
-		t.Run("host-table/"+row.Provider, func(t *testing.T) {
-			info, ok := journal.LookupProvider(row.Provider)
-			if !ok {
-				t.Fatalf("provider %q is not in the support matrix", row.Provider)
-			}
-			if info.Name != row.Provider {
-				t.Fatalf("provider %q resolves to matrix entry %q", row.Provider, info.Name)
-			}
-			wantCAS := journal.ValidateProviderCAS(row.Provider) == nil
-			if row.CAS != wantCAS {
-				t.Errorf("host table says cas=%v for %q, support matrix says %v (status %q)", row.CAS, row.Provider, wantCAS, info.Status)
-			}
-
+		t.Run(row.Provider, func(t *testing.T) {
 			// The bare suffix is a host of the right provider family,
 			// which is all this assertion needs. It is not necessarily a
 			// usable endpoint — https://amazonaws.com names no S3
@@ -851,23 +836,6 @@ func TestProviderNamesMatchSupportMatrix(t *testing.T) {
 			refused := errors.Is(err, store.ErrProviderUnsupported)
 			if refused == row.CAS {
 				t.Errorf("ParseJournalURL(%q) refused=%v, want %v (err: %v)", raw, refused, !row.CAS, err)
-			}
-		})
-	}
-
-	// Every provider the matrix marks unsupported has a refusing host rule
-	// here, so it is refused at boot rather than on the first push.
-	for _, info := range journal.ProviderSupportMatrix {
-		if info.Status != journal.ProviderUnsupported {
-			continue
-		}
-		t.Run("matrix/"+info.Name, func(t *testing.T) {
-			row, ok := byProvider[info.Name]
-			if !ok {
-				t.Fatalf("support matrix marks %q unsupported, but internal/store has no host rule for it: walden would accept it at boot", info.Name)
-			}
-			if row.CAS {
-				t.Errorf("support matrix marks %q unsupported, but its host rule says cas=true", info.Name)
 			}
 		})
 	}

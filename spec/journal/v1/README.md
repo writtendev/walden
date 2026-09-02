@@ -623,7 +623,9 @@ If an object storage provider does not natively support atomic conditional write
 
 ### 11.2 S3-Compatible Provider Support Matrix
 
-The following matrix documents the compatibility of major S3-compatible object storage providers with walden's compare-and-swap requirement:
+The following matrix documents the compatibility of major S3-compatible object storage providers with walden's compare-and-swap requirement.
+
+**This table is documentation, not enforcement.** It exists so an operator can choose a provider before deploying; walden's enforcement of the requirement above will be a boot-time probe of the bucket itself rather than this table — a hostname is not a capability — and that probe is not implemented yet.
 
 | Provider | Conditional Header Mechanism | Conflict Response Status & Code | Support Status | Notes & Compatibility Details |
 | :--- | :--- | :--- | :---: | :--- |

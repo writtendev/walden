@@ -70,7 +70,8 @@ protection from a malicious server — a server that wants to lie can sign its
 lies.
 
 Object storage requires compare-and-swap (conditional write) support from the
-bucket provider; see the provider support table in [spec/](spec/).
+bucket provider. The provider support table in [spec/](spec/) documents which
+providers have it — advice for choosing one, not the check.
 
 ### What gets written
 
@@ -183,9 +184,11 @@ endpoint, region, bucket, and prefix, in either addressing style —
 reading for any host walden does not recognise), or
 `https://bucket.endpoint/prefix` (virtual-hosted). Two query parameters, and
 only two, may override what the host implies: `region` and `style`. The URL is
-resolved at boot, so a malformed value — or a provider the support table marks
-as lacking compare-and-swap — stops walden immediately rather than on the
-first push.
+resolved at boot, so a malformed value — or a hostname belonging to a provider
+already known to lack compare-and-swap — stops walden immediately rather than
+on the first push. That hostname check is a pre-flight refusal, not the
+compare-and-swap check itself; the check itself is a boot-time probe of the
+bucket, and it is not implemented yet.
 
 Object-storage credentials are not a sixth knob. They resolve through one
 documented order, first hit wins: credentials in the journal URL's userinfo

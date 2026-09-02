@@ -182,3 +182,73 @@ func TestTokenRecordRoundTrip(t *testing.T) {
 		t.Errorf("Validate rejected a record carrying an unknown field: %v", err)
 	}
 }
+
+// TestTokenHashRefusalWithholdsTheValue holds the refusals of ValidateTokenHash to the
+// reason the check exists. The check is what keeps a raw bearer token out of the journal
+// (spec section 8.1, rule 13): a writer that puts one where the hash belongs is refused
+// rather than publishing the secret. A refusal that quoted the offending value would
+// publish it anyway — to the operator's terminal, the server log, and whatever aggregates
+// that log — on a code path whose whole premise is that the value may be a live credential.
+// So the message reports the length and the failing rule, and never the bytes.
+func TestTokenHashRefusalWithholdsTheValue(t *testing.T) {
+	// Shaped like the mistake this guards against: a raw bearer token, and a raw token
+	// pasted after the prefix. Both are the published fixture tokens, so nothing secret is
+	// in this file either.
+	rawToken := "walden_sec_writer_0123456789abcdef"
+
+	tests := []struct {
+		name    string
+		hash    string
+		secrets []string
+	}{
+		{"raw token where the hash belongs", rawToken, []string{rawToken}},
+		{"raw token after the prefix", journal.TokenHashPrefix + rawToken, []string{rawToken}},
+		{"uppercase hex", journal.TokenHashPrefix + strings.ToUpper("b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb"), []string{strings.ToUpper("b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb")}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := journal.ValidateTokenHash(tt.hash)
+			if err == nil {
+				t.Fatalf("ValidateTokenHash(%d-byte value) accepted it, want a refusal", len(tt.hash))
+			}
+			if !errors.Is(err, journal.ErrInvalidTokenHash) {
+				t.Errorf("error is not ErrInvalidTokenHash: %v", err)
+			}
+			msg := err.Error()
+			for _, secret := range tt.secrets {
+				if strings.Contains(msg, secret) {
+					t.Errorf("the refusal echoes the value it refused, which may be a live credential; message = %q", msg)
+				}
+			}
+			if strings.Contains(msg, "\n") {
+				t.Errorf("the refusal is not one line: %q", msg)
+			}
+		})
+	}
+
+	// The same must hold through a whole record: Validate wraps ValidateTokenHash, and a
+	// wrapper that re-quoted the field would undo this.
+	create := validTokenCreate()
+	create.TokenHash = rawToken
+	revoke := validTokenRevoke()
+	revoke.TokenHash = rawToken
+	for name, err := range map[string]error{
+		"TokenCreateRecord.Validate": create.Validate(),
+		"TokenRevokeRecord.Validate": revoke.Validate(),
+	} {
+		if err == nil {
+			t.Fatalf("%s accepted a raw token where the hash belongs", name)
+		}
+		if strings.Contains(err.Error(), rawToken) {
+			t.Errorf("%s echoes the raw token in its refusal: %q", name, err.Error())
+		}
+	}
+
+	// The identifier is a different case and stays quoted: spec section 4.3 makes a token id
+	// a name, not a secret, and an operator needs to see which one failed.
+	idErr := journal.ValidateTokenID("tok admin 01")
+	if idErr == nil || !strings.Contains(idErr.Error(), "tok admin 01") {
+		t.Errorf("ValidateTokenID should name the identifier it refused, got %v", idErr)
+	}
+}

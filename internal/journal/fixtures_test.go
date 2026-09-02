@@ -88,6 +88,12 @@ const (
 // fixtureBuiltinToken is one built-in token as spec/auth/v1/fixtures/builtin_tokens.json
 // publishes it. The raw token is in a published fixture rather than a secret: a walden that
 // ever hashes to one of these has been handed the fixture on purpose.
+//
+// The published "revoked" flag is deliberately not decoded. The auth fixtures are a
+// conformance table of tokens to authorize against, not a snapshot of the table this journal
+// rebuilds to: the golden journal revokes tok_admin_01 at meta sequence 3 and the auth
+// fixtures publish it unrevoked, on purpose. What the two sets agree on is hash and scopes,
+// which is what this struct carries and what the prose in both trees now claims.
 type fixtureBuiltinToken struct {
 	TokenID   string   `json:"token_id"`
 	RawToken  string   `json:"raw_token"`
@@ -100,10 +106,9 @@ type fixtureBuiltinToken struct {
 // The golden journal's token_create records mint these tokens, and both the generator and
 // the replay test take the raw token from here rather than restating it. That is the whole
 // point of reading the file: fixtures/README.md and spec section 4.3 both claim in print
-// that the two published fixture sets describe one instance rather than two, and a claim
-// held up by the same literal typed into two trees is a claim nothing is watching. Rotate a
-// raw token in builtin_tokens.json and this tree stops agreeing with it, loudly, in the same
-// commit.
+// that the two published fixture sets agree on hash and scopes, and a claim held up by the
+// same literal typed into two trees is a claim nothing is watching. Rotate a raw token in
+// builtin_tokens.json and this tree stops agreeing with it, loudly, in the same commit.
 //
 // The file lives under spec/auth/v1 and this test reads its bytes; internal/journal itself
 // does not import internal/auth, and must not.
@@ -998,9 +1003,11 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 // assertFixtureTokenMatchesAuthSpec holds one row rebuilt from the golden journal to the
 // token spec/auth/v1/fixtures/builtin_tokens.json publishes under the same identifier: the
 // hash in the journal must be the real SHA-256 of the raw token published there, and the
-// scopes must be the ones published with it. Both fixture trees are quoted in prose as one
-// instance — fixtures/README.md, journal spec section 4.3, auth spec section 5.2 — and this
-// is what stops them drifting into two.
+// scopes must be the ones published with it. That agreement is claimed in prose in three
+// places — fixtures/README.md, journal spec section 4.3, auth spec section 5.2 — and this is
+// what stops the two trees drifting out of it. Revocation state is not part of the claim and
+// is not checked here: the journal is authoritative for that, and the auth fixtures publish
+// their own table.
 func assertFixtureTokenMatchesAuthSpec(t *testing.T, tokenID string, row *fixtureToken) {
 	t.Helper()
 	published := loadFixtureBuiltinToken(t, tokenID)

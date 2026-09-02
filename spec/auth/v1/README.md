@@ -174,7 +174,7 @@ When a built-in token is created, a record is conditionally appended to the `_me
 }
 ```
 
-The token is `tok_admin_01` of [`fixtures/builtin_tokens.json`](fixtures/builtin_tokens.json), and `token_hash` is the hash of section 5.1 over that token's raw string — the two fixture sets describe one instance. `scopes` is an array because a token may carry more than one (section 3.4); the journal spec's section 4.3 shows `tok_writer_02` and its two.
+The token is `tok_admin_01` of [`fixtures/builtin_tokens.json`](fixtures/builtin_tokens.json), and `token_hash` is the hash of section 5.1 over that token's raw string — the two fixture sets agree on hash and scopes. They do not agree on membership or on revocation state, and are not meant to: `builtin_tokens.json` is a conformance table of tokens to authorize against, while the golden journal is authoritative for whether a token is live. Section 5.3 below revokes `tok_admin_01` on the meta stream, and `builtin_tokens.json` still publishes it with `"revoked": false`, because it is describing its own table and not this journal's rebuilt one. `scopes` is an array because a token may carry more than one (section 3.4); the journal spec's section 4.3 shows `tok_writer_02` and its two.
 
 These are journal records, so their `seq` field is a JSON string holding its exact decimal form — here and in Section 5.3 — and the normative rule is [journal specification section 1.1](../../journal/v1/README.md#11-sequence-numbers-are-json-strings), not restated here.
 

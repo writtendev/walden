@@ -42,6 +42,12 @@ var tokenHashHexRegexp = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // It is deliberately not an identity record. There is no account here, no owner, no email
 // and no expiry — a token id, a hash, and what the token may touch. The layer above walden
 // may know who holds this token; walden does not, and this record is not where that changes.
+//
+// It carries no signature in v1, which spec/journal/v1 names as the one exception to the
+// tamper-evidence of section 2.2: a party with bucket write access can append one of these
+// and a replay rebuilds it as a live grant. Giving both token record types a canonical
+// payload and a signature is WALD-104. The spec states the gap without the ticket id,
+// because it is published for reimplementers who cannot resolve one.
 type TokenCreateRecord struct {
 	Version   string   `json:"version"`
 	Stream    StreamID `json:"stream"`
@@ -60,6 +66,8 @@ type TokenCreateRecord struct {
 // against the table a server actually keys — which is the hash — and so that a revocation
 // that has drifted from the record it revokes is visible rather than silently applied. A
 // revocation carries no scopes: it withdraws a grant, it does not describe one.
+//
+// Like TokenCreateRecord it carries no signature in v1; see the note there and WALD-104.
 type TokenRevokeRecord struct {
 	Version   string   `json:"version"`
 	Stream    StreamID `json:"stream"`
@@ -88,13 +96,21 @@ func ValidateTokenID(id string) error {
 // ValidateTokenHash validates a stored token hash: "sha256:" followed by 64 lowercase
 // hexadecimal characters. Uppercase is refused rather than folded, because the hash is
 // compared byte for byte against the one a request hashes to.
+//
+// Neither refusal here quotes the value it refused. The reason this check exists is that a
+// writer may hand it a raw bearer token where the hash belongs, and a refusal that echoed it
+// would put the secret on the operator's terminal, in the server log, and in whatever
+// aggregates that log — the one place it must never reach is exactly where the refusal goes.
+// The length and the failing rule are enough to find the bug. An identifier is not a secret
+// and ValidateTokenID quotes it; a hash-shaped field may be a live credential and this does
+// not.
 func ValidateTokenHash(hash string) error {
 	if !strings.HasPrefix(hash, TokenHashPrefix) {
-		return fmt.Errorf("%w: missing prefix %q in %q", ErrInvalidTokenHash, TokenHashPrefix, hash)
+		return fmt.Errorf("%w: missing prefix %q in a %d-byte value (value withheld: it may be a raw token)", ErrInvalidTokenHash, TokenHashPrefix, len(hash))
 	}
 	hexStr := strings.TrimPrefix(hash, TokenHashPrefix)
 	if !tokenHashHexRegexp.MatchString(hexStr) {
-		return fmt.Errorf("%w: must be 64 lowercase hexadecimal characters, got %q", ErrInvalidTokenHash, hexStr)
+		return fmt.Errorf("%w: must be 64 lowercase hexadecimal characters after %q, got %d bytes that are not (value withheld: it may be a raw token)", ErrInvalidTokenHash, TokenHashPrefix, len(hexStr))
 	}
 	return nil
 }

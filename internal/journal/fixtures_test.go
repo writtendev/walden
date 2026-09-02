@@ -44,6 +44,9 @@ func fixtureKeyPath(key string) string {
 //	                               into a scratch repository, reconstructs ref state,
 //	                               and walks the section 7.5 marker path
 //	TestFixtureConditionalAppend   pins the section 11 append targets and refusals
+//	TestFixtureSequencesSurviveDoubleParsers
+//	                               reads every sequence in the tree the way a parser whose
+//	                               numbers are doubles reads it, per section 1.1
 //	TestSpecExamplesMatchFixtures  holds the spec's JSON examples to the fixtures they
 //	                               claim to quote
 //
@@ -65,16 +68,16 @@ const (
 	// fixtureSeq42 and fixtureSeqMax are the two sequences the conditional-append table
 	// pins beyond the journal's own coordinates: a small one that shows the zero padding
 	// doing its work, and the largest a 64-bit counter can reach.
-	fixtureSeq42  = uint64(42)
-	fixtureSeqMax = ^uint64(0)
+	fixtureSeq42  = journal.Seq(42)
+	fixtureSeqMax = journal.Seq(^uint64(0))
 )
 
 // loadFixtureChain replays the _meta stream up to and including maxSeq and returns the chain.
-func loadFixtureChain(t *testing.T, maxSeq uint64) *journal.SigningChain {
+func loadFixtureChain(t *testing.T, maxSeq journal.Seq) *journal.SigningChain {
 	t.Helper()
 	chain := journal.NewSigningChain()
 
-	for seq := uint64(0); seq <= maxSeq; seq++ {
+	for seq := journal.Seq(0); seq <= maxSeq; seq++ {
 		path := fixtureKeyPath(journal.TxKey(journal.MetaStreamID, seq))
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -83,7 +86,7 @@ func loadFixtureChain(t *testing.T, maxSeq uint64) *journal.SigningChain {
 		var header struct {
 			Version string           `json:"version"`
 			Stream  journal.StreamID `json:"stream"`
-			Seq     uint64           `json:"seq"`
+			Seq     journal.Seq      `json:"seq"`
 			Type    string           `json:"type"`
 		}
 		if err := json.Unmarshal(data, &header); err != nil {
@@ -192,7 +195,7 @@ func fixtureStreamRecords(t *testing.T, stream journal.StreamID) []*journal.RefT
 			t.Errorf("%s/%s: transaction key is not a 20-digit sequence: %v", stream, name, err)
 			continue
 		}
-		if seq != uint64(i) {
+		if seq != journal.Seq(i) {
 			t.Errorf("%s/%s: sequence gap, expected %d", stream, name, i)
 		}
 		data, err := os.ReadFile(filepath.Join(dir, name))
@@ -522,7 +525,7 @@ func TestFixtureReplay(t *testing.T) {
 			if rec.Seq <= marker.Sequence {
 				continue
 			}
-			if want := marker.Sequence + 1 + uint64(resumed); rec.Seq != want {
+			if want := marker.Sequence + 1 + journal.Seq(resumed); rec.Seq != want {
 				t.Fatalf("replay from the marker hit sequence %d, want %d", rec.Seq, want)
 			}
 			resumed++
@@ -632,7 +635,7 @@ func TestFixtureMarkerAndSupersededHistory(t *testing.T) {
 
 	// Superseded history is still on disk, and replay resumes at marker.sequence + 1.
 	records := fixtureStreamRecords(t, fixtureRepoStream)
-	if marker.Sequence == 0 || marker.Sequence >= uint64(len(records))-1 {
+	if marker.Sequence == 0 || marker.Sequence >= journal.Seq(len(records)-1) {
 		t.Fatalf("marker sequence %d does not leave both superseded and live transactions", marker.Sequence)
 	}
 	superseded := 0
@@ -698,7 +701,7 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		Refusals []struct {
 			Case    string           `json:"case"`
 			Stream  journal.StreamID `json:"stream"`
-			Seq     *uint64          `json:"seq"`
+			Seq     *journal.Seq     `json:"seq"`
 			Message string           `json:"message"`
 		} `json:"refusals"`
 	}
@@ -725,7 +728,7 @@ func TestFixtureConditionalAppend(t *testing.T) {
 	if len(fixture.TxKeys) == 0 {
 		t.Fatal("expected conditional append key fixtures")
 	}
-	pinned := make(map[uint64]bool, len(fixture.TxKeys))
+	pinned := make(map[journal.Seq]bool, len(fixture.TxKeys))
 	for _, tc := range fixture.TxKeys {
 		// The sequence is a decimal string, so that the largest one survives a parser
 		// that reads JSON numbers as doubles. Reject anything but its exact decimal
@@ -739,7 +742,7 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		if canonical := strconv.FormatUint(seq, 10); canonical != tc.Seq {
 			t.Errorf("tx key %q: seq %q is not the exact decimal form of %d", tc.Key, tc.Seq, seq)
 		}
-		if got := journal.TxKey(tc.Stream, seq); got != tc.Key {
+		if got := journal.TxKey(tc.Stream, journal.Seq(seq)); got != tc.Key {
 			t.Errorf("TxKey(%q, %d) = %q, fixture says %q", tc.Stream, seq, got, tc.Key)
 		}
 		if strings.TrimSpace(tc.Description) == "" {
@@ -748,12 +751,12 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		if strings.ContainsAny(tc.Description, "\n\r") {
 			t.Errorf("tx key %q description is not a single line: %q", tc.Key, tc.Description)
 		}
-		pinned[seq] = true
+		pinned[journal.Seq(seq)] = true
 	}
 
 	// Fixtures README rule 8 says the table reaches the ends of the range, so the two
 	// sequences that carry that claim are named here rather than left to the generator.
-	for _, seq := range []uint64{0, fixtureSeq42, fixtureSeqMax} {
+	for _, seq := range []journal.Seq{0, fixtureSeq42, fixtureSeqMax} {
 		if !pinned[seq] {
 			t.Errorf("the append target table pins no key at sequence %d", seq)
 		}
@@ -785,6 +788,99 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		if strings.ContainsAny(tc.Message, "\n\r") {
 			t.Errorf("refusal %q is not a single line: %q", tc.Case, tc.Message)
 		}
+	}
+}
+
+// fixtureSequences collects every value in a decoded JSON document that sits under a key
+// named "seq" or "sequence", at any depth. The whole document is searched rather than the
+// two or three places a sequence is expected, so a sequence added anywhere in the tree
+// later is held to the same rule without anyone remembering to add it here.
+func fixtureSequences(v any) []any {
+	switch node := v.(type) {
+	case map[string]any:
+		var found []any
+		for _, key := range []string{"seq", "sequence"} {
+			if value, ok := node[key]; ok {
+				found = append(found, value)
+			}
+		}
+		for _, value := range node {
+			found = append(found, fixtureSequences(value)...)
+		}
+		return found
+	case []any:
+		var found []any
+		for _, value := range node {
+			found = append(found, fixtureSequences(value)...)
+		}
+		return found
+	}
+	return nil
+}
+
+// TestFixtureSequencesSurviveDoubleParsers covers spec section 1.1: every sequence in the
+// published tree is a JSON string holding its exact decimal form, so a reader whose JSON
+// numbers are IEEE-754 doubles reads the sequence that was written rather than a rounded
+// one that no longer names its own object key.
+//
+// The tree is decoded into `any`, which is Go's double-based reading of JSON — every number
+// becomes a float64, exactly as JavaScript's JSON.parse produces — so this asks the question
+// as the reimplementation most likely to be bitten by it would ask it, and it asks it of the
+// committed bytes rather than of the encoder that wrote them. The maximum unsigned 64-bit
+// sequence is required to be somewhere in the tree, because a rule about the top of the
+// range proves nothing if nothing in the tree reaches it.
+func TestFixtureSequencesSurviveDoubleParsers(t *testing.T) {
+	root := journalFixturesDir()
+	seen := make(map[journal.Seq]bool)
+
+	for _, name := range fixtureTreeFiles(t, root) {
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", name, err)
+		}
+		var document any
+		if err := json.Unmarshal(data, &document); err != nil {
+			t.Fatalf("failed to parse %s: %v", name, err)
+		}
+
+		sequences := fixtureSequences(document)
+		if len(sequences) == 0 {
+			t.Errorf("%s carries no sequence at all, so it cannot be the journal object its key says it is", name)
+		}
+		for _, raw := range sequences {
+			text, ok := raw.(string)
+			if !ok {
+				t.Errorf("%s: sequence %v is a JSON %T, not a string, so a reader whose numbers are doubles cannot read it exactly", name, raw, raw)
+				continue
+			}
+			seq, err := journal.ParseSeqDecimal(text)
+			if err != nil {
+				t.Errorf("%s: sequence %q is not the exact decimal form of a 64-bit unsigned integer: %v", name, text, err)
+				continue
+			}
+			seen[seq] = true
+
+			// A transaction record names its own key, and the cross-check the spec asks a
+			// reader to perform is the one this encoding exists to keep working.
+			if !strings.Contains(name, "/tx/") {
+				continue
+			}
+			fromKey, err := journal.ParseSeq(strings.TrimSuffix(filepath.Base(name), ".json"))
+			if err != nil {
+				t.Errorf("%s: transaction key is not a 20-digit sequence: %v", name, err)
+				continue
+			}
+			if seq != fromKey {
+				t.Errorf("%s: record sequence %d does not match the %d in its key", name, uint64(seq), uint64(fromKey))
+			}
+		}
+	}
+
+	if !seen[fixtureSeqMax] {
+		t.Errorf("no sequence in the fixture tree reaches %d, so nothing here exercises the top of the range", uint64(fixtureSeqMax))
 	}
 }
 

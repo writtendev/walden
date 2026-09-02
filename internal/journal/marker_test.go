@@ -15,7 +15,7 @@ func TestParseMarkerValid(t *testing.T) {
 	raw := `{
 		"version": "v1",
 		"stream": "repo-beta",
-		"sequence": 42,
+		"sequence": "42",
 		"snapshot": "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db",
 		"timestamp": "2026-08-31T01:00:00Z"
 	}`
@@ -100,6 +100,23 @@ func TestParseMarkerInvalidJSON(t *testing.T) {
 		{"truncated json", []byte(`{"version": "v1", "stream": `)},
 		{"non-object json array", []byte(`["v1", "repo-alpha"]`)},
 		{"non-object json scalar", []byte(`"v1"`)},
+		// Section 1.1: the sequence is a JSON string holding its exact decimal form. A
+		// number is refused rather than coerced, and so is a string that has been rounded
+		// or reformatted — either one names a baseline that is not the one written.
+		{"sequence as a json number", []byte(`{
+			"version": "v1",
+			"stream": "repo-beta",
+			"sequence": 42,
+			"snapshot": "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db",
+			"timestamp": "2026-08-31T01:00:00Z"
+		}`)},
+		{"sequence with leading zeros", []byte(`{
+			"version": "v1",
+			"stream": "repo-beta",
+			"sequence": "042",
+			"snapshot": "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db",
+			"timestamp": "2026-08-31T01:00:00Z"
+		}`)},
 	}
 
 	for _, tc := range cases {
@@ -273,7 +290,7 @@ func TestMarkerUnknownFieldsTolerance(t *testing.T) {
 	rawWithUnknownFields := `{
 		"version": "v1",
 		"stream": "repo-alpha",
-		"sequence": 15,
+		"sequence": "15",
 		"snapshot": "2fe16eadff990410007dcbc1cd25b5f381489e774a22056cecd1fb52989006db",
 		"timestamp": "2026-08-31T01:00:00Z",
 		"compactor_version": "1.2.0",

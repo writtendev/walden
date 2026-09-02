@@ -1,7 +1,7 @@
 {
   "version": "v1",
   "stream": "repo-alpha",
-  "seq": 0,
+  "seq": "0",
   "type": "ref_update",
   "segments": [
     "db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"

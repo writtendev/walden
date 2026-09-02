@@ -1,7 +1,7 @@
 {
   "version": "v1",
   "stream": "repo-alpha",
-  "sequence": 1,
+  "sequence": "1",
   "snapshot": "3731601fba561af499185a3875c5df9f2b5e5ab71ea260a3297e12e1ddf9576c",
   "timestamp": "2026-08-31T01:00:00Z"
 }

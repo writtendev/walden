@@ -243,7 +243,7 @@ func TestFencerConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			s := streams[id%len(streams)]
 			if id%3 == 0 {
-				f.FenceStream(s, uint64(id))
+				f.FenceStream(s, journal.Seq(id))
 			}
 		}(i)
 
@@ -252,7 +252,7 @@ func TestFencerConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			s := streams[(id+1)%len(streams)]
 			if id%5 == 0 {
-				_ = f.HandleConflict(s, uint64(id))
+				_ = f.HandleConflict(s, journal.Seq(id))
 			}
 		}(i)
 	}

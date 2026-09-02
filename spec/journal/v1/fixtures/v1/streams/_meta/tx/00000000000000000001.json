@@ -1,7 +1,7 @@
 {
   "version": "v1",
   "stream": "_meta",
-  "seq": 1,
+  "seq": "1",
   "type": "token_create",
   "token_id": "tok_admin_01",
   "scope": "rwc:*",

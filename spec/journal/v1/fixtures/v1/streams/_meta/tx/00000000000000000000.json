@@ -1,7 +1,7 @@
 {
   "version": "v1",
   "stream": "_meta",
-  "seq": 0,
+  "seq": "0",
   "type": "genesis",
   "public_key": "ed25519:8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
   "timestamp": "2026-08-31T00:00:00Z"

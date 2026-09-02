@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -22,8 +23,9 @@ import (
 //
 //	WALDEN_REGENERATE_FIXTURES=1 go test ./internal/journal -run TestRegenerateFixtures
 //
-// then commit the result. Signing keys, timestamps, and git object dates are all
-// fixed, so the records reproduce byte for byte. Packfile bytes are produced by the
+// then commit the result — and if the pack digests moved, update the spec's examples
+// too; see TestRegenerateFixtures. Signing keys, timestamps, and git object dates are
+// all fixed, so the records reproduce byte for byte. Packfile bytes are produced by the
 // local git binary; the committed packs came from git 2.50.1 — not the git 2.47.2 the
 // container image pins, which these packs have nothing to do with — and a different git
 // version may pack the same objects differently, which changes the content-addressed
@@ -42,6 +44,44 @@ func fixtureKey(seedByte byte) ed25519.PrivateKey {
 		seed[i] = seedByte
 	}
 	return ed25519.NewKeyFromSeed(seed)
+}
+
+// gitEnv is the environment every git subprocess here runs in: the caller's, with the whole
+// GIT_* namespace stripped out and the handful this generator actually depends on put back.
+//
+// The scratch repositories are the unit of isolation. Each one must hold exactly the objects
+// that were put into it, out of exactly the configuration set below, or the fixture bytes
+// stop being a function of the fixture definition. An inherited GIT_OBJECT_DIRECTORY or
+// GIT_ALTERNATE_OBJECT_DIRECTORIES collapses every scratch repository into one object
+// database, so every pack inventory becomes the union of all of them and the gate fails on
+// fixtures that are perfectly correct; GIT_DIR and GIT_WORK_TREE point git at somebody else's
+// repository outright; GIT_CONFIG_COUNT smuggles in settings that GIT_CONFIG_GLOBAL does not
+// cover. Stripping the namespace is one rule rather than a denylist that is always one
+// variable short — and setting these to the empty string is not the same thing, because git
+// reads an empty GIT_WORK_TREE as set and refuses to run at all.
+//
+// GIT_EXEC_PATH is the exception: it names the git installation rather than a repository, an
+// object database or a preference, so a relocated install keeps working.
+func gitEnv() []string {
+	inherited := os.Environ()
+	env := make([]string, 0, len(inherited)+6)
+	for _, kv := range inherited {
+		name, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(name, "GIT_") && name != "GIT_EXEC_PATH" {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_AUTHOR_NAME=walden fixtures",
+		"GIT_AUTHOR_EMAIL=fixtures@walden.invalid",
+		"GIT_COMMITTER_NAME=walden fixtures",
+		"GIT_COMMITTER_EMAIL=fixtures@walden.invalid",
+		"GIT_AUTHOR_DATE="+fixtureGitDate,
+		"GIT_COMMITTER_DATE="+fixtureGitDate,
+	)
 }
 
 // gitRepo is a throwaway bare repository. The generator mints real commits and real
@@ -65,16 +105,7 @@ func (r *gitRepo) tryRun(stdin []byte, args ...string) ([]byte, error) {
 	r.t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = r.dir
-	cmd.Env = append(os.Environ(),
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_SYSTEM=/dev/null",
-		"GIT_AUTHOR_NAME=walden fixtures",
-		"GIT_AUTHOR_EMAIL=fixtures@walden.invalid",
-		"GIT_COMMITTER_NAME=walden fixtures",
-		"GIT_COMMITTER_EMAIL=fixtures@walden.invalid",
-		"GIT_AUTHOR_DATE="+fixtureGitDate,
-		"GIT_COMMITTER_DATE="+fixtureGitDate,
-	)
+	cmd.Env = gitEnv()
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
@@ -115,14 +146,71 @@ func (r *gitRepo) pack(revs ...string) []byte {
 	return r.run([]byte(strings.Join(revs, "\n")+"\n"), "pack-objects", "--stdout", "--revs")
 }
 
+// packInventory is a packfile's git-version-independent identity: every object it carries,
+// as "<oid> <type>", sorted. Two packs with the same inventory hold the same objects, however
+// differently the git that wrote them chose to encode and delta them.
+//
+// The pack is admitted by `git index-pack`, not by `git unpack-objects`, and the difference
+// is the whole point. unpack-objects forgives anything it can still read objects out of:
+// fourteen bytes of junk appended after the trailer, for one, which it silently copies to
+// its stdout and exits 0 on. Carried through resolvePack, that laundered a file that is not
+// a clean packfile into the fixture tree with a self-consistent digest, filename and
+// signature over it, and the whole suite stayed green. index-pack reads the pack as a whole
+// object rather than as a source of objects, so it refuses that ("fatal: pack has junk at
+// the end") and a truncated one with it, and the inventory this reports is therefore the
+// inventory of a packfile git considers well-formed end to end.
+//
+// The pack is handed over as a file rather than on stdin, and that is not incidental: read
+// from a pipe, git stops at the trailer and never learns that anything followed it, so the
+// junk check does not run and the corrupt pack is accepted. Given a file it knows where the
+// pack ends. Written under objects/pack, indexing it in place also puts its objects in the
+// object database, which is what cat-file below reads.
+//
+// Not `--strict`: that additionally requires every link out of the pack to resolve, and a
+// journal segment is incremental by construction — repo-alpha's second push carries a commit
+// whose parent is in the first push's segment and nowhere in this scratch repository, so
+// --strict rejects two of the five committed packs ("did not receive expected object"). The
+// connectivity question --strict asks of one pack in isolation is the wrong question; it is
+// asked correctly, of the whole replayed object database, by TestFixtureReplay's git fsck.
+func packInventory(t *testing.T, pack []byte) string {
+	t.Helper()
+	r := newGitRepo(t)
+	const inPlace = "objects/pack/pack-fixture.pack"
+	path := filepath.Join(r.dir, filepath.FromSlash(inPlace))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("failed to create %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, pack, 0o644); err != nil {
+		t.Fatalf("failed to write %s: %v", path, err)
+	}
+	if _, err := r.tryRun(nil, "index-pack", inPlace); err != nil {
+		t.Fatalf("not a packfile git accepts whole: %v", err)
+	}
+	out := r.run(nil, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)")
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
+}
+
 // fixtureWriter accumulates the object tree that will be written under fixtures/.
 //
 // Every journal object is written at the object storage key spec section 9.2 derives
 // for it, rooted at fixtures/: the fixture tree is bucket contents, not a rearrangement
 // of them, so key "v1/streams/repo-alpha/marker.json" lands at that path on disk.
+//
+// A writer with an empty against generates the tree from scratch, which is what
+// TestRegenerateFixtures wants. A writer with against set generates the tree the committed
+// fixtures under against are asserted to equal, which is what TestFixturesAreGenerated
+// wants; the difference between the two is confined to resolvePack, and explained there.
 type fixtureWriter struct {
-	t    *testing.T
-	root string
+	t       *testing.T
+	root    string
+	against string
+	claimed map[string]bool
+}
+
+func newFixtureWriter(t *testing.T, root, against string) *fixtureWriter {
+	return &fixtureWriter{t: t, root: root, against: against, claimed: make(map[string]bool)}
 }
 
 func (w *fixtureWriter) write(key string, data []byte) {
@@ -146,14 +234,130 @@ func (w *fixtureWriter) writeJSON(key string, v any) {
 	w.write(key, append(data, '\n'))
 }
 
+// resolvePack settles which bytes a packfile is stored as, and which digest names it.
+//
+// Generating, that is simply what the local git just produced, hashed. Asserting against a
+// committed tree, it is the committed packfile under the same key prefix carrying exactly
+// the objects this one carries — and the reason is that packfile bytes are not reproducible
+// across git versions. Object encoding, delta selection and compression are all a matter of
+// the packer's judgment, so the same commits packed by two gits give two byte streams, two
+// SHA-256 digests, two filenames, and — since transaction records and marker.json name their
+// packs by digest — two sets of JSON records. Regenerating the whole tree and comparing all
+// of it would therefore fail on any machine whose git is not the 2.50.1 the committed packs
+// came from, and a gate that fails for reasons unrelated to the change under review is a
+// gate people learn to switch off.
+//
+// So the packs are pinned by an equality that does hold across versions — same objects, same
+// types, nothing more and nothing less — and their bytes are then carried over from the
+// committed tree, so that everything derived from them, the digests and every record naming
+// one, is still compared byte for byte. What this deliberately cannot see is a repack: bytes
+// that change while the object set does not, with the new digest threaded through the
+// records. That is the exact shape of a legitimate git upgrade, and this test cannot tell
+// the two apart. (git changing its default object format from SHA-1 would change the object
+// IDs, not just the packing, and would fail here — correctly, since the whole tree would
+// then need regenerating.)
+//
+// The equality is what a packfile git accepts holds, not what its bytes are, so it is only
+// as strong as that acceptance: see packInventory, where the pack has to survive index-pack
+// rather than merely yield objects to unpack-objects. A repack does not escape the suite
+// entirely — TestSpecExamplesMatchFixtures notices, because two of the spec's examples quote
+// pack digests — but that is a property of those examples rather than of this matching, and
+// it is written down in both places rather than relied on quietly.
+func (w *fixtureWriter) resolvePack(prefix string, pack []byte) (string, []byte) {
+	w.t.Helper()
+	if w.against == "" {
+		return journal.ComputeSegmentHash(pack), pack
+	}
+
+	dir := filepath.Join(w.against, filepath.FromSlash(prefix))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		w.t.Fatalf("failed to read %s: %v", dir, err)
+	}
+	want := packInventory(w.t, pack)
+
+	// Every candidate is considered before one is bound, rather than the first match being
+	// taken. Two packs under one prefix can hold the same objects, and if one is named by
+	// its own digest and the other is not, it is the self-consistent one that belongs to
+	// this record. Binding whichever sorted first instead made a decoy named
+	// 0000…0.pack abort the whole test on a hash mismatch in writeSegment, before the file
+	// set walk ran — so the run said a segment was invalid and never named the stray file.
+	// Choosing the self-named candidate leaves that walk to do its job and report it.
+	var name string
+	var data []byte
+	for _, entry := range entries {
+		// Anything that is not a packfile is not a candidate. It is also a stray, which
+		// the file set assertion in TestFixturesAreGenerated reports far more clearly
+		// than a failure to index it here would.
+		if !strings.HasSuffix(entry.Name(), ".pack") || w.claimed[prefix+entry.Name()] {
+			continue
+		}
+		candidate, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			w.t.Fatalf("failed to read %s/%s: %v", dir, entry.Name(), err)
+		}
+		if packInventory(w.t, candidate) != want {
+			continue
+		}
+		selfNamed := entry.Name() == journal.ComputeSegmentHash(candidate)+".pack"
+		if name == "" || selfNamed {
+			name, data = entry.Name(), candidate
+		}
+		if selfNamed {
+			break
+		}
+	}
+	if name == "" {
+		w.t.Fatalf("no unclaimed packfile under %s holds exactly the objects the generator packed:\n%s", prefix, want)
+		return "", nil
+	}
+	w.claimed[prefix+name] = true
+	return strings.TrimSuffix(name, ".pack"), data
+}
+
 // writeSegment writes a pack segment under its own SHA-256 and returns that hash.
+//
+// Generating, the hash is this pack's, so the check can only fail on a packfile git wrote and
+// git will not read back. Asserting, the hash is a committed filename and the bytes are that
+// file's, so it fails on exactly one thing: a committed pack whose name lies about its own
+// digest.
+//
+// That is reported and the run continues, rather than aborting the test. A Fatalf here costs
+// the caller the file-set walk in TestFixturesAreGenerated — the same pathology resolvePack
+// avoids by preferring a self-named candidate: a run that says a segment is invalid and never
+// names the stray file sitting beside it. For a name that is well formed and lying — 64 hex
+// characters that are not this pack's digest — nothing after this call can be hurt by it: the
+// pack goes into a temp tree under the name it already has, and that name travels into the
+// records, where the byte comparison sees it. It may therefore add one derived record diff
+// below the real failure, which is a fair price for the operator learning both facts in one
+// run.
+//
+// A name that is not 64 hex characters at all is the sub-case this does not rescue, and the
+// comment used to claim it did. That name travels into the record too, where ValidateHash
+// rejects it — writeRefTx, SignRefTx, (*RefTransactionRecord).Validate — and writeRefTx does
+// Fatalf, so the file-set walk never runs and a stray file beside the pack still goes unnamed.
+// The refusal names the file exactly, and TestFixtureSegmentsAreContentAddressed asks the same
+// question of the committed tree and reports the same file in the same run, so the fact
+// survives; only this test's second half is lost.
 func (w *fixtureWriter) writeSegment(stream journal.StreamID, pack []byte) string {
 	w.t.Helper()
-	hash := journal.ComputeSegmentHash(pack)
-	if err := journal.ValidateSegment(pack, hash); err != nil {
-		w.t.Fatalf("generated segment for stream %s is not a valid packfile: %v", stream, err)
+	hash, data := w.resolvePack(journal.SegmentPrefix(stream), pack)
+	if err := journal.ValidateSegment(data, hash); err != nil {
+		w.t.Errorf("segment for stream %s is not a valid packfile: %v", stream, err)
 	}
-	w.write(journal.SegmentKey(stream, hash), pack)
+	w.write(journal.SegmentKey(stream, hash), data)
+	return hash
+}
+
+// writeSnapshot writes a consolidated snapshot pack under its own SHA-256 and returns that
+// hash. Non-fatal for the reason given on writeSegment.
+func (w *fixtureWriter) writeSnapshot(stream journal.StreamID, pack []byte) string {
+	w.t.Helper()
+	hash, data := w.resolvePack(journal.SnapshotPrefix(stream), pack)
+	if err := journal.ValidateSnapshot(data, hash); err != nil {
+		w.t.Errorf("snapshot for stream %s is not a valid packfile: %v", stream, err)
+	}
+	w.write(journal.SnapshotKey(stream, hash), data)
 	return hash
 }
 
@@ -166,28 +370,70 @@ func (w *fixtureWriter) writeRefTx(priv ed25519.PrivateKey, rec *journal.RefTran
 	w.writeJSON(journal.TxKey(rec.Stream, rec.Seq), rec)
 }
 
-// metaRecord is a meta-stream record that carries no signature (genesis and token mutations).
+// metaRecord is a token table mutation on the meta stream, which carries no signature.
+//
+// This is the one record shape the generator declares for itself, because token_create and
+// token_revoke have no type in the journal package to write them through. Every other record
+// in the fixture tree is written through the published struct — GenesisRecord,
+// KeyRotationRecord, RefTransactionRecord, Marker — so that an encoder change to one of them
+// moves the fixture bytes and TestFixturesAreGenerated says so. A hand-copied parallel of a
+// published type would compare the generator against itself and see nothing, so do not add
+// one here: give the record a type in the journal package instead.
+//
+// Nothing enforces that sentence. The day the journal package grows a type for these records
+// and this fork is left standing beside it, the gate quietly stops watching the encoder for
+// them and no test says a word. It is in the gap list for that reason.
 type metaRecord struct {
 	Version   string           `json:"version"`
 	Stream    journal.StreamID `json:"stream"`
 	Seq       uint64           `json:"seq"`
 	Type      string           `json:"type"`
-	PublicKey string           `json:"public_key,omitempty"`
 	TokenID   string           `json:"token_id,omitempty"`
 	Scope     string           `json:"scope,omitempty"`
 	Timestamp string           `json:"timestamp"`
 }
 
+// TestRegenerateFixtures rewrites spec/journal/v1/fixtures from the generator.
+//
+// Regenerating is two obligations, not one. This test writes the fixture tree; if the pack
+// bytes move — a different git packs the same objects differently — the digests move with
+// them, and the spec's own examples quote two of those digests, so
+// spec/journal/v1/README.md has to be updated by hand afterwards or
+// TestSpecExamplesMatchFixtures stays red. That is deliberate: the examples are prose the
+// author is answerable for, not output, and a regenerator that rewrote them would erase the
+// one signal that says a repack happened. The obligation is stated at the regeneration
+// instructions in fixtures/README.md and again in that test's failure message.
 func TestRegenerateFixtures(t *testing.T) {
 	if os.Getenv("WALDEN_REGENERATE_FIXTURES") == "" {
 		t.Skip("set WALDEN_REGENERATE_FIXTURES=1 to rewrite spec/journal/v1/fixtures")
 	}
 
+	// Everything the generator owns goes, so that a file it no longer writes cannot survive
+	// as a stray the gate then fails on until somebody deletes it by hand. That is the whole
+	// tree except the one hand-written file, which is prose about the fixtures rather than
+	// part of them.
 	root := journalFixturesDir()
-	if err := os.RemoveAll(filepath.Join(root, journal.VersionPrefix)); err != nil {
-		t.Fatalf("failed to clear the fixture bucket tree: %v", err)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("failed to read the fixture tree: %v", err)
 	}
-	w := &fixtureWriter{t: t, root: root}
+	for _, entry := range entries {
+		if entry.Name() == fixtureHandWritten {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			t.Fatalf("failed to clear the fixture tree: %v", err)
+		}
+	}
+	generateFixtures(newFixtureWriter(t, root, ""))
+}
+
+// generateFixtures emits the whole golden journal through w. It is the single definition of
+// what the fixture tree holds: TestRegenerateFixtures runs it to write the tree, and
+// TestFixturesAreGenerated runs it to assert that the committed tree is still what it writes.
+func generateFixtures(w *fixtureWriter) {
+	t := w.t
+	t.Helper()
 
 	genesisKey := fixtureKey(0x01)
 	rotatedKey := fixtureKey(0x02)
@@ -195,7 +441,9 @@ func TestRegenerateFixtures(t *testing.T) {
 	rotatedPub := journal.FormatPublicKey(rotatedKey.Public().(ed25519.PublicKey))
 
 	// --- Ruling 1: the signing identity is born with the journal and rotates inside it.
-	w.writeJSON(journal.TxKey(journal.MetaStreamID, 0), metaRecord{
+	// Written through journal.GenesisRecord, the published type, so that an encoder change
+	// to it moves these bytes rather than passing unseen.
+	w.writeJSON(journal.TxKey(journal.MetaStreamID, 0), &journal.GenesisRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       0,
@@ -303,12 +551,7 @@ func TestRegenerateFixtures(t *testing.T) {
 	// --- Compaction: a snapshot consolidating everything through seq 1, published
 	// before the marker that points at it. The segments and transactions it supersedes
 	// stay in the fixture tree on purpose; readers must ignore them, not reject them.
-	snapshot := repo.pack(c2)
-	snapshotHash := journal.ComputeSegmentHash(snapshot)
-	if err := journal.ValidateSnapshot(snapshot, snapshotHash); err != nil {
-		t.Fatalf("generated snapshot is not a valid packfile: %v", err)
-	}
-	w.write(journal.SnapshotKey(fixtureRepoStream, snapshotHash), snapshot)
+	snapshotHash := w.writeSnapshot(fixtureRepoStream, repo.pack(c2))
 
 	marker := &journal.Marker{
 		Version:   journal.VersionPrefix,

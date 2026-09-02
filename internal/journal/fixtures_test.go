@@ -3,8 +3,10 @@ package journal_test
 import (
 	"bytes"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,9 +15,14 @@ import (
 	"github.com/writtendev/walden/internal/journal"
 )
 
+// journalSpecDir returns the published journal format specification, spec/journal/v1.
+func journalSpecDir() string {
+	return filepath.Join("..", "..", "spec", "journal", "v1")
+}
+
 // journalFixturesDir returns the published golden journal under spec/journal/v1/fixtures.
 func journalFixturesDir() string {
-	return filepath.Join("..", "..", "spec", "journal", "v1", "fixtures")
+	return filepath.Join(journalSpecDir(), "fixtures")
 }
 
 // fixtureKeyPath maps an object storage key to the file that holds it. The fixture tree
@@ -29,12 +36,16 @@ func fixtureKeyPath(key string) string {
 // The golden journal is laid out as a real bucket would be, and these tests read it as
 // a reader of the specification would, between them covering the whole replay path:
 //
+//	TestFixturesAreGenerated       regenerates the tree and asserts the committed one
+//	                               against it, file set and bytes both
 //	TestFixtureMetaStream          replays _meta from genesis and chains the rotation
 //	TestFixtureRepoStreams         verifies every ref transaction's signature
 //	TestFixtureReplay              resolves the packs: unpacks every referenced segment
 //	                               into a scratch repository, reconstructs ref state,
 //	                               and walks the section 7.5 marker path
 //	TestFixtureConditionalAppend   pins the section 11 append targets and refusals
+//	TestSpecExamplesMatchFixtures  holds the spec's JSON examples to the fixtures they
+//	                               claim to quote
 //
 // Timeline of the fixture journal:
 //
@@ -50,11 +61,6 @@ func fixtureKeyPath(key string) string {
 const (
 	fixtureRepoStream   = "repo-alpha"
 	fixtureOpaqueStream = "9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4"
-
-	// fixtureMetaRecords is the number of records the _meta stream holds: genesis, a
-	// token create, the key rotation, and a token revoke. Asserted, so that a stray
-	// record appended past the end cannot go unnoticed by the partial replays below.
-	fixtureMetaRecords = 4
 
 	// fixtureSeq42 and fixtureSeqMax are the two sequences the conditional-append table
 	// pins beyond the journal's own coordinates: a small one that shows the zero padding
@@ -125,16 +131,9 @@ func loadFixtureChain(t *testing.T, maxSeq uint64) *journal.SigningChain {
 // TestFixtureMetaStream covers Ruling 1: the signing identity is born in the journal as
 // the genesis record and rotates inside it, chained to and signed by the outgoing key.
 func TestFixtureMetaStream(t *testing.T) {
-	// The partial replays below stop at a named sequence, so the stream's length has to
-	// be pinned separately: without this, a record appended past seq 3 would be ignored.
-	metaTx, err := os.ReadDir(fixtureKeyPath(journal.TxPrefix(journal.MetaStreamID)))
-	if err != nil {
-		t.Fatalf("failed to read the meta stream: %v", err)
-	}
-	if len(metaTx) != fixtureMetaRecords {
-		t.Errorf("meta stream holds %d records, want %d", len(metaTx), fixtureMetaRecords)
-	}
-
+	// The replays below stop at a named sequence, so a record appended past seq 3 is
+	// invisible to them. It is not invisible to TestFixturesAreGenerated, which pins the
+	// whole file set, so the stream's length is not asserted a second time here.
 	chain := loadFixtureChain(t, 0)
 	genesisKey := chain.ActiveKey()
 	if genesisKey == "" {
@@ -541,21 +540,18 @@ func TestFixtureReplay(t *testing.T) {
 	})
 }
 
-// fixturePackInventory is the packfile inventory the fixtures README describes, directory
-// by directory: three segments on repo-alpha, because of its four pushes the branch delete
-// carried no objects; the one consolidated snapshot compaction wrote; and the opaque
-// stream's single push. A real journal may hold a pack no transaction references — section
-// 7.3, Guarantee 2 makes superseded and orphaned packs legal, and readers must ignore them
-// rather than reject them — so this pins what this tree holds, not what a journal may hold.
-// A pack that appears or disappears here is a change to the README as much as to the bytes.
-var fixturePackInventory = map[string]int{
-	fixtureRepoStream + "/segments":   3,
-	fixtureRepoStream + "/snapshots":  1,
-	fixtureOpaqueStream + "/segments": 1,
-}
-
 // TestFixtureSegmentsAreContentAddressed covers Ruling 4: every pack segment and
 // snapshot in the journal is stored under the SHA-256 of its own verbatim bytes.
+//
+// Which packs the tree holds is TestFixturesAreGenerated's business and is not re-counted
+// here, and a packfile whose name lies about its own digest is caught there as well:
+// resolvePack carries the committed bytes forward under the committed name, and writeSegment
+// re-hashes them. What this test holds on its own is the same question asked of the committed
+// tree directly — no git binary, no generator run, no dependence on the generator being right,
+// so it still stands if writeSegment's re-hash is ever weakened, and it names the file and
+// both digests rather than reporting a segment the generator could not resolve. It is also
+// where the `^[0-9a-f]{64}\.pack$` key shape of fixtures README rules 5 and 6 is asserted as a
+// rule, rather than inferred from a file set that agrees with itself.
 func TestFixtureSegmentsAreContentAddressed(t *testing.T) {
 	root := filepath.Join(journalFixturesDir(), journal.VersionPrefix, "streams")
 	streams, err := os.ReadDir(root)
@@ -563,7 +559,6 @@ func TestFixtureSegmentsAreContentAddressed(t *testing.T) {
 		t.Fatalf("failed to read %s: %v", root, err)
 	}
 
-	found := make(map[string]int, len(fixturePackInventory))
 	for _, stream := range streams {
 		for _, kind := range []string{"segments", "snapshots"} {
 			dir := filepath.Join(root, stream.Name(), kind)
@@ -595,19 +590,7 @@ func TestFixtureSegmentsAreContentAddressed(t *testing.T) {
 				if err := journal.ValidatePackfileHeader(data); err != nil {
 					t.Errorf("%s/%s: not a real git packfile: %v", dir, name, err)
 				}
-				found[stream.Name()+"/"+kind]++
 			}
-		}
-	}
-
-	for where, want := range fixturePackInventory {
-		if found[where] != want {
-			t.Errorf("%s holds %d packfiles, want %d", where, found[where], want)
-		}
-	}
-	for where, got := range found {
-		if _, expected := fixturePackInventory[where]; !expected {
-			t.Errorf("%s holds %d packfiles the fixture inventory does not account for", where, got)
 		}
 	}
 }
@@ -828,5 +811,338 @@ func TestFixtureReimplementationGrant(t *testing.T) {
 		if !strings.Contains(text, phrase) {
 			t.Errorf("fixtures README is missing the reimplementation grant phrase %q", phrase)
 		}
+	}
+}
+
+// fixtureTreeFiles lists every file under root, as slash-separated paths relative to it.
+// Directories are not listed: git does not carry empty ones, so a directory can only reach
+// the committed tree by way of a file inside it, which this sees.
+func fixtureTreeFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to walk %s: %v", root, err)
+	}
+	sort.Strings(files)
+	return files
+}
+
+// fixtureHandWritten is the one file under fixtures/ that the generator does not produce.
+// It is prose about the tree rather than part of it, so it is named here and everything
+// else has to be accounted for by the generator.
+const fixtureHandWritten = "README.md"
+
+// TestFixturesAreGenerated asserts that the committed golden journal is exactly what the
+// generator writes today: the same files, no more and no fewer, and the same bytes in each.
+//
+// This is the gate that makes a format change visible in review. Editing a record, adding a
+// field to one, adding a stream, dropping a file, or dropping something unrelated into the
+// tree all fail here, and the only way to make the test pass again is to change the
+// generator — which is a diff a reviewer reads — and regenerate.
+//
+// The one thing it does not compare on its own terms is packfile bytes: those come from the
+// local git binary and are not reproducible across versions, so resolvePack matches each
+// generated pack to the committed pack holding the same objects and carries the committed
+// bytes forward. The reasoning, and what that costs, is documented there.
+func TestFixturesAreGenerated(t *testing.T) {
+	committed := journalFixturesDir()
+	regenerated := t.TempDir()
+	generateFixtures(newFixtureWriter(t, regenerated, committed))
+
+	generated := fixtureTreeFiles(t, regenerated)
+	expected := make(map[string]bool, len(generated)+1)
+	for _, name := range generated {
+		expected[name] = true
+	}
+	expected[fixtureHandWritten] = true
+
+	present := make(map[string]bool)
+	for _, name := range fixtureTreeFiles(t, committed) {
+		present[name] = true
+		if !expected[name] {
+			t.Errorf("fixtures hold %s, which the generator does not write", name)
+		}
+	}
+	if !present[fixtureHandWritten] {
+		t.Errorf("fixtures do not hold %s", fixtureHandWritten)
+	}
+
+	for _, name := range generated {
+		if !present[name] {
+			t.Errorf("the generator writes %s, which the fixtures do not hold", name)
+			continue
+		}
+		wantData, err := os.ReadFile(filepath.Join(regenerated, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("failed to read the regenerated %s: %v", name, err)
+		}
+		gotData, err := os.ReadFile(filepath.Join(committed, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("failed to read the committed %s: %v", name, err)
+		}
+		if bytes.Equal(gotData, wantData) {
+			continue
+		}
+		if strings.HasSuffix(name, ".json") {
+			t.Errorf("%s is not what the generator writes; regenerate the fixtures:\ngot:\n%s\nwant:\n%s", name, gotData, wantData)
+			continue
+		}
+		t.Errorf("%s is not what the generator writes; regenerate the fixtures (%d bytes committed, %d generated)", name, len(gotData), len(wantData))
+	}
+}
+
+// specJSONExamples is the number of JSON examples the format specification carries: the
+// genesis record (section 3.1), a key rotation (4.1), a ref transaction (5.1), and the
+// marker (7.2). Each quotes a fixture, and section 3.1 says so on all their behalf —
+// "Every example record in this document is a real record from that journal". Asserted,
+// so that an example cannot quietly leave the document either.
+const specJSONExamples = 4
+
+// specFixtureLink finds the fixture a spec example cites, in the prose between the end of
+// the example and whatever comes next — the field table, the next example, the next section.
+var specFixtureLink = regexp.MustCompile(`\]\((fixtures/[^)\s]+)\)`)
+
+// stripQuote removes a markdown blockquote marker from a line, and reports whether there
+// was one. CommonMark lets a fenced block sit inside a blockquote, and the block's content
+// is then its lines with that marker taken off — so this is how such a block is read back
+// out. It matters twice over: ">" is not JSON whitespace, so a quoted record example does
+// not parse until the marker is gone.
+func stripQuote(line string) (rest string, quoted bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(trimmed, ">") {
+		return line, false
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(trimmed, ">"), " "), true
+}
+
+// fenceOpener reports whether a line opens a fenced code block, and returns the fence marker
+// and the info string. Both markdown fence characters count, at any indentation, inside a
+// blockquote or out, because the question this test asks is which examples the document
+// carries — and an example does not stop being one for being written ~~~json, or for sitting
+// inside a list item, or for being quoted.
+//
+// The marker is the whole run of fence characters, not the first three. CommonMark allows a
+// longer run, and a longer run demands an at-least-as-long closer, so the length belongs to
+// the marker rather than being a detail to round off. Read as three characters, ````json
+// carries the info string "`json" — a legal json example nothing would then check — and its
+// legal closer stops being recognizable as one.
+func fenceOpener(line string) (marker, info string, ok bool) {
+	trimmed, _ := stripQuote(line)
+	trimmed = strings.TrimLeft(trimmed, " \t")
+	for _, c := range []byte{'`', '~'} {
+		run := 0
+		for run < len(trimmed) && trimmed[run] == c {
+			run++
+		}
+		if run >= 3 {
+			return trimmed[:run], strings.TrimSpace(trimmed[run:]), true
+		}
+	}
+	return "", "", false
+}
+
+// fenceCloses reports whether a line closes a block opened with marker. CommonMark's closer
+// is a run of at least as many of the same fence character as the opener, with nothing after
+// it but whitespace — so a longer run closes a shorter fence, and an info string disqualifies
+// a line from closing anything.
+func fenceCloses(line, marker string) bool {
+	trimmed, _ := stripQuote(line)
+	trimmed = strings.TrimSpace(trimmed)
+	if !strings.HasPrefix(trimmed, marker) {
+		return false
+	}
+	return strings.Trim(trimmed, marker[:1]) == ""
+}
+
+// looksLikeJSONDocument reports whether a run of text is a JSON object. The spec's untagged
+// blocks are refusal strings, key layouts and HTTP headers, none of which parse; text that
+// does parse is a record example, whatever markdown is wrapped around it.
+func looksLikeJSONDocument(block string) bool {
+	trimmed := strings.TrimSpace(block)
+	return strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed))
+}
+
+// jsonObjectEnd reports whether a JSON object begins on line i and, if so, the line it ends
+// on. The object is the shortest run of lines from i that parses, and the run stops at a blank
+// line, which no record example contains.
+//
+// Nothing about the markdown around it is consulted, and that is the point. The fence walk in
+// TestSpecExamplesMatchFixtures can only see examples that are fences; a JSON example written
+// as CommonMark's other code block — four-space indented — or tucked inside a blockquote is
+// not a fence at all, so it would otherwise pass the document without ever being counted,
+// linked or compared. This finds JSON by being JSON. Indentation is left alone because JSON
+// ignores whitespace; the blockquote marker is taken off because JSON does not ignore ">".
+func jsonObjectEnd(lines []string, i int) (int, bool) {
+	if first, _ := stripQuote(lines[i]); !strings.HasPrefix(strings.TrimSpace(first), "{") {
+		return 0, false
+	}
+	var b strings.Builder
+	for end := i; end < len(lines); end++ {
+		line, _ := stripQuote(lines[end])
+		if strings.TrimSpace(line) == "" {
+			return 0, false
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+		if looksLikeJSONDocument(b.String()) {
+			return end, true
+		}
+	}
+	return 0, false
+}
+
+// TestSpecExamplesMatchFixtures holds every JSON example in spec/journal/v1/README.md to the
+// fixture it links, byte for byte. The document claims the examples are real records from
+// the golden journal, and that claim is worth exactly as much as its enforcement: the two
+// agreed when they were written and agreed at review, which is how they will drift.
+//
+// The document is read twice. The first pass walks its fenced blocks and holds every ```json
+// one to its fixture; the second sweeps everything the first did not claim and finds JSON by
+// parsing it, so an example written as an indented code block, inside a blockquote, or under
+// any other fence tag is caught rather than passing unseen. What neither pass covers is an
+// example that is neither: not carried by a ```json fence, and not parseable as a JSON object
+// from some line of its own through an unbroken run of lines, once one level of blockquote
+// marker is off.
+//
+// Being incomplete is one way to land there — a fragment, a record with an ellipsis through
+// it, one split by a blank line, one quoted twice over — but completeness is not the boundary,
+// and reading only that list would suggest it is. A whole record escapes just as readily
+// whenever the line its object opens on does not itself begin with "{" after one blockquote
+// strip: inline in a prose sentence, on one line in a table cell, or prefixed line by line
+// inside a ```diff fence. All of those are illustrations rather than records, and section
+// 3.1's claim is about records.
+//
+// It is also, as things stand, the only test that sees a repack. TestFixturesAreGenerated
+// matches packs by their object set and carries the committed bytes forward, so new pack
+// bytes for the same objects pass it; but two of these four examples — the ref transaction
+// of section 5.1 and the marker of section 7.2 — quote pack digests, and those move. That
+// detection is a side effect of which records the spec chose to illustrate, not a property
+// of this test, and it would disappear if either example were replaced with one that names
+// no pack. It is written down here and in the gap list rather than relied on quietly.
+func TestSpecExamplesMatchFixtures(t *testing.T) {
+	specPath := filepath.Join(journalSpecDir(), "README.md")
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", specPath, err)
+	}
+	lines := strings.Split(string(data), "\n")
+
+	// carried marks every line a ```json fence accounts for. What is left over is swept
+	// below for JSON the fence walk cannot see.
+	carried := make([]bool, len(lines))
+	examples := 0
+	for i := 0; i < len(lines); i++ {
+		marker, info, ok := fenceOpener(lines[i])
+		if !ok {
+			continue
+		}
+		_, quoted := stripQuote(lines[i])
+		start := i + 1
+		end := start
+		for end < len(lines) && !fenceCloses(lines[end], marker) {
+			end++
+		}
+		if end == len(lines) {
+			t.Fatalf("%s:%d: unterminated fenced block", specPath, i+1)
+		}
+		body := make([]string, 0, end-start)
+		for _, line := range lines[start:end] {
+			if quoted {
+				line, _ = stripQuote(line)
+			}
+			body = append(body, line)
+		}
+		block := strings.Join(body, "\n") + "\n"
+		i = end
+
+		// A block that is not tagged json is prose, a key layout, or a refusal string, and
+		// none of this test's business. If it holds a JSON document anyway it is an example
+		// wearing the wrong fence, and the sweep below is what says so.
+		if info != "json" {
+			continue
+		}
+		for j := start - 1; j <= end; j++ {
+			carried[j] = true
+		}
+		example := block
+		examples++
+
+		link := ""
+		for j := end + 1; j < len(lines); j++ {
+			line := lines[j]
+			if _, _, isFence := fenceOpener(line); isFence {
+				break
+			}
+			if strings.HasPrefix(line, "#") || strings.HasPrefix(line, "|") {
+				break
+			}
+			if m := specFixtureLink.FindStringSubmatch(line); m != nil {
+				link = m[1]
+				break
+			}
+		}
+		if link == "" {
+			t.Errorf("%s:%d: this json example cites no fixture, so nothing holds it to one", specPath, start)
+			continue
+		}
+
+		fixture, err := os.ReadFile(filepath.Join(journalSpecDir(), filepath.FromSlash(link)))
+		if err != nil {
+			t.Errorf("%s:%d: cites %s, which is not in the fixture tree: %v", specPath, start, link, err)
+			continue
+		}
+		if string(fixture) != example {
+			t.Errorf("%s:%d: the example and %s have drifted apart.\n"+
+				"If you have just regenerated the fixtures, this is the second half of that job: the\n"+
+				"examples are copied into the specification by hand, so paste the fixture over the\n"+
+				"example and review the diff — a changed pack digest here means your git packs these\n"+
+				"objects differently, which is a real change to a published artifact.\n"+
+				"spec:\n%s\nfixture:\n%s", specPath, start, link, example, fixture)
+		}
+	}
+
+	// Everything above reads fences, so everything above is blind to a JSON example that is
+	// not one: an untagged or mis-tagged fence, four-space indentation, a block the document
+	// quotes rather than fences. This sweeps what the fence walk did not claim and finds JSON
+	// by parsing it, so no shape of markdown gets an example past the link check.
+	//
+	// The question widened on the way here, and a future author should know it was meant to.
+	// The check this replaced asked whether a whole fence body was a JSON document; this asks
+	// it of every unclaimed line, so JSON that is only part of a block fires too. The case
+	// that will actually come up is an HTTP example carrying a record body — a natural
+	// addition to section 11, which already fences one ```http request — and there is no way
+	// to write it that this gate accepts: left as http it reports the message below, and
+	// fenced json instead it must then cite a fixture, which a block holding a request line
+	// and headers can never match byte for byte. That is the rule working, not failing: any
+	// JSON object in this document is a record held to a fixture. An example of that shape
+	// cannot be added without changing the rule.
+	for i := 0; i < len(lines); i++ {
+		if carried[i] {
+			continue
+		}
+		end, ok := jsonObjectEnd(lines, i)
+		if !ok {
+			continue
+		}
+		t.Errorf("%s:%d: this JSON document is not inside a ```json fence, so nothing holds it to a fixture", specPath, i+1)
+		i = end
+	}
+
+	if examples != specJSONExamples {
+		t.Errorf("the specification carries %d json examples, want %d", examples, specJSONExamples)
 	}
 }

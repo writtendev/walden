@@ -811,9 +811,10 @@ func TestJournalStringHidesSecret(t *testing.T) {
 // ErrProviderUnsupported, and one marked cas=true does not.
 //
 // This test used to bind the table to journal.ProviderSupportMatrix as well.
-// That matrix is gone (WALD-79): a hostname is not a capability, so CAS is
-// settled by the boot probe against the real bucket (WALD-23), and spec §11.2
-// is documentation rather than something Go re-derives. What remains here is
+// That matrix is gone (WALD-79): a hostname is not a capability, so CAS will be
+// settled by the boot probe against the real bucket (WALD-23) — until then
+// there is no CAS enforcement — and spec §11.2 is documentation rather than
+// something Go re-derives. What remains here is
 // the half that was never table-against-table — that the code refuses what it
 // says it refuses.
 func TestProviderHostsRefuseWithoutCAS(t *testing.T) {

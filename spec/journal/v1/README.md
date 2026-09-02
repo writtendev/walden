@@ -60,7 +60,8 @@ The server's signing identity is born with the journal and lives in it:
   - **Private Key:** Stored locally on server disk alongside the token store; never written to object storage.
 
 ### 2.2 Security Model and Honest Boundaries
-- **Tamper-Evidence, Not Server Trust:** Journal signing provides **tamper-evidence of the history, not protection from a malicious server.** A server that holds the signing key and wishes to lie can sign its lies. Signing guarantees that once written, history in object storage cannot be altered, forged, or spliced by unauthorized third parties or storage providers without failing cryptographic verification.
+- **Tamper-Evidence, Not Server Trust:** Journal signing provides **tamper-evidence of the history, not protection from a malicious server.** A server that holds the signing key and wishes to lie can sign its lies. Signing guarantees that once written, history in object storage cannot be altered, forged, or spliced by unauthorized third parties or storage providers without failing cryptographic verification — with the one exception named immediately below.
+- **One Named Exception — Token Records Are Unsigned in v1:** The guarantee above holds for every record this format signs: key rotations chain to genesis, and ref transactions verify against the key that was active when they were written. It does **not** hold for the `token_create` and `token_revoke` records of sections 4.3 and 4.4, which carry no signature in v1. A third party who can write to the bucket can append a `token_create` and a replay rebuilds it as a live grant — a working credential, because the hash the record names is the value a server looks a request up by — without failing any check this specification defines. That is a different party from the malicious server conceded above: the exception covers exactly the party the guarantee otherwise excludes, so it is named here rather than left for a reader to discover in section 4.5. The gap is decided and tracked as WALD-104, which gives both record types a canonical payload and a signature and makes a forged or tampered token record fail verification like any other record. Until that lands, tamper-evidence for the token table rests on the bucket's own access control and not on this signing identity.
 - **Permanent Private Key Loss:** Losing the private signing key is an unrecoverable-for-signing state. The server can no longer accept new writes or append new records. Existing history in the bucket remains permanently readable, verifiable from genesis forward, and fully restorable.
 
 ---
@@ -253,7 +254,7 @@ This is the golden journal's own revocation, byte for byte:
 | `stream` | string | MUST be `"_meta"`. |
 | `seq` | string | Strictly monotonic sequence number ($k \ge 1$) in exact decimal form (section 1.1). |
 | `type` | string | MUST be `"token_revoke"`. |
-| `token_id` | string | The identifier of the token being revoked. A reader matches on this field. |
+| `token_id` | string | The identifier of the token being revoked, under the same rules section 4.3 states for it. A reader matches on this field. |
 | `token_hash` | string | The same `sha256:<64-lowercase-hex>` the creating record carried for that identifier, repeated here. |
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of revocation. |
 
@@ -266,12 +267,15 @@ A revocation carries no `scopes`. It withdraws a grant; it does not describe one
 A reader replaying `_meta` from genesis forward holds the token table when it reaches the head. The rules are the whole of it:
 
 1. **Start empty.** A journal with no token records rebuilds to no tokens.
-2. **`token_create`** inserts a row: `token_id` → (`token_hash`, `scopes`), live. A record naming a `token_id` the table already holds is a reused identifier, which this format forbids; the reader refuses (section 8.1, rule 10).
-3. **`token_revoke`** finds the row named by `token_id` and marks it revoked. An identifier the table does not hold is unchainable, exactly as an unchainable rotation is: the reader refuses (rule 11), and does not create the row. A `token_hash` that disagrees with the one the row carries is likewise refused (rule 12).
-4. **Rows are never removed.** The journal is append-only, and what a replay rebuilds is the history of a token rather than a snapshot of a mutable file. A revoked row is kept, revoked.
-5. **The table is the whole identity model.** There are no accounts, owners, or expiries to rebuild, because there are none to record. A row is a hash to look a request up by and the scopes to answer it with.
+2. **A record that violates its own field rules never reaches the table.** The constraints stated in the field tables of sections 4.3 and 4.4 are normative — the `token_id` character class and 255-byte cap, `token_hash` as `sha256:<64-lowercase-hex>`, and, for a creation, a `scopes` array carrying at least one entry with no entry empty and none repeated. A record violating any of them is refused before it is applied (section 8.1, rule 13); the reader does not apply it, and does not repair it.
+3. **`token_create`** inserts a row: `token_id` → (`token_hash`, `scopes`), live. A record naming a `token_id` the table already holds is a reused identifier, which this format forbids; the reader refuses (section 8.1, rule 10).
+4. **`token_revoke`** finds the row named by `token_id` and marks it revoked. An identifier the table does not hold is unchainable, exactly as an unchainable rotation is: the reader refuses (rule 11), and does not create the row. A `token_hash` that disagrees with the one the row carries is likewise refused (rule 12).
+5. **Rows are never removed.** The journal is append-only, and what a replay rebuilds is the history of a token rather than a snapshot of a mutable file. A revoked row is kept, revoked.
+6. **The table is the whole identity model.** There are no accounts, owners, or expiries to rebuild, because there are none to record. A row is a hash to look a request up by and the scopes to answer it with.
 
-**These records carry no signature, and that boundary is stated rather than papered over.** Like the genesis record and unlike a key rotation, a token record is unsigned in v1, so tamper-evidence for the token table rests on the storage bucket's own access control rather than on the journal's signing identity: a party who can append to `_meta` in the bucket can append a token record, and a replay accepts it. This is the same honest boundary section 2.2 draws around signing generally — signing is tamper-evidence of history, not protection from whoever can write. Closing it means defining a canonical payload and a signature for these records, which is a change to what a v1 record *is*, not a field that can be added quietly to one.
+**These records carry no signature in v1, and that is an exception to the guarantee of section 2.2 rather than an instance of it.** A key rotation and a ref transaction are signed and chain to the genesis key; a token record is not. So the guarantee section 2.2 makes — that written history cannot be altered, forged, or spliced by an unauthorized third party or a storage provider without failing verification — does not reach the token table. A party who can append to `_meta` in the bucket can append a `token_create` naming a hash of their own choosing and the scopes `rwc:*`, and a replay following the rules above rebuilds it as a live grant. Nothing in the algorithm of section 8 catches it, because there is no signature to check. What that grant is worth is the point: `token_hash` is the value a server keys its table by, so the forger holds a raw token that authorizes, not merely a misleading row in a table. The bucket's own access control is the whole of the defence here, which is a weaker claim than section 2.2's, and it is stated in both places so that a reimplementer cannot infer the stronger one.
+
+**The gap is decided and tracked, not left open.** WALD-104 gives both record types a canonical signing payload and a signature, integrates them with the signing chain of section 2, and makes a replay refuse a token record that fails verification instead of applying it. Closing it that way changes what a v1 token record *is* — a canonical payload and a new field — rather than adding something quietly to one, which is why it lands as its own change with its own regenerated fixtures rather than here.
 
 ---
 
@@ -630,6 +634,7 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │    │     ActiveKey = new_public_key                    │
 │    │     LastMetaSeq = seq                             │
 │    ├── type == "token_create" or "token_revoke":       │
+│    │     Verify record fields (sections 4.3, 4.4)      │
 │    │     Apply to the token table (section 4.5)        │
 │    │     LastMetaSeq = seq                             │
 │    └── other meta records:                             │
@@ -704,6 +709,11 @@ Every reader or recovery engine verifying a journal MUST execute the following d
     ```
     refusal: replay failed: token revoke at seq <N> disagrees with the hash recorded for token <token-id>
     ```
+13. **Malformed Token Record:** If a `token_create` or `token_revoke` violates any field rule of section 4.3 or 4.4 — the `token_id` character class or 255-byte cap, the `token_hash` format, or a `scopes` array that is empty, holds an empty string, or repeats one — the record is refused before it is applied to the token table (section 4.5, rule 2), with `<reason>` naming the field rule that failed:
+    ```
+    refusal: replay failed: invalid token record at seq <N> (<reason>)
+    ```
+    A `token_hash` that is not `sha256:<64-lowercase-hex>` is refused under this rule and not repaired, which is also what keeps a raw bearer token out of the journal: a record carrying one where the hash belongs does not parse as a hash, and a writer that emits it is refused rather than publishing the secret.
 
 ---
 

@@ -376,10 +376,10 @@ func (w *fixtureWriter) writeRefTx(priv ed25519.PrivateKey, rec *journal.RefTran
 // copied in, so the hashes in the golden journal are real digests of real tokens for the
 // same reason every other hash in the tree is.
 //
-// The raw tokens the two token_create records below are minted from are the ones
-// spec/auth/v1/fixtures/builtin_tokens.json publishes for tok_admin_01 and tok_writer_02,
-// so the two published fixture sets describe one instance rather than two unrelated ones,
-// and the hash in the journal is the hash the token store would look up.
+// The raw tokens the two token_create records below are minted from are read out of
+// spec/auth/v1/fixtures/builtin_tokens.json rather than typed here, so the two published
+// fixture sets describe one instance rather than two unrelated ones, and the hash in the
+// journal is the hash the token store would look up.
 func fixtureTokenHash(rawToken string) string {
 	sum := sha256.Sum256([]byte(rawToken))
 	return journal.TokenHashPrefix + hex.EncodeToString(sum[:])
@@ -457,14 +457,19 @@ func generateFixtures(w *fixtureWriter) {
 	// The token table lives on the meta stream too: an admin token minted at seq 1, revoked
 	// at seq 3, and the narrower token that replaces it at seq 4. Written through the
 	// published types, like every other record here, so that an encoder change moves these
-	// bytes rather than passing unseen.
+	// bytes rather than passing unseen. The two tokens are the ones spec/auth/v1 publishes
+	// under these identifiers, read from that file so that the journal cannot come to
+	// describe a different instance from the one the auth fixtures describe.
+	adminToken := loadFixtureBuiltinToken(t, fixtureAdminTokenID)
+	writerToken := loadFixtureBuiltinToken(t, fixtureWriterTokenID)
+
 	w.writeToken(1, &journal.TokenCreateRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       1,
 		Type:      journal.RecordTypeTokenCreate,
-		TokenID:   "tok_admin_01",
-		TokenHash: fixtureTokenHash(fixtureAdminToken),
+		TokenID:   fixtureAdminTokenID,
+		TokenHash: fixtureTokenHash(adminToken.RawToken),
 		Scopes:    []string{"rwc:*"},
 		Timestamp: "2026-08-31T00:01:00Z",
 	})
@@ -488,8 +493,8 @@ func generateFixtures(w *fixtureWriter) {
 		Stream:    journal.MetaStreamID,
 		Seq:       3,
 		Type:      journal.RecordTypeTokenRevoke,
-		TokenID:   "tok_admin_01",
-		TokenHash: fixtureTokenHash(fixtureAdminToken),
+		TokenID:   fixtureAdminTokenID,
+		TokenHash: fixtureTokenHash(adminToken.RawToken),
 		Timestamp: "2026-08-31T00:08:00Z",
 	})
 
@@ -501,8 +506,8 @@ func generateFixtures(w *fixtureWriter) {
 		Stream:    journal.MetaStreamID,
 		Seq:       4,
 		Type:      journal.RecordTypeTokenCreate,
-		TokenID:   "tok_writer_02",
-		TokenHash: fixtureTokenHash(fixtureWriterToken),
+		TokenID:   fixtureWriterTokenID,
+		TokenHash: fixtureTokenHash(writerToken.RawToken),
 		Scopes:    []string{"rw:blog-*", "r:docs"},
 		Timestamp: "2026-08-31T00:09:00Z",
 	})

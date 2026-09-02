@@ -71,13 +71,12 @@ const (
 	// fixtureMetaHeadSeq is the last sequence on the meta stream of the golden journal.
 	fixtureMetaHeadSeq = journal.Seq(4)
 
-	// fixtureAdminToken and fixtureWriterToken are the raw built-in tokens the journal's two
-	// token_create records mint, and the tokens spec/auth/v1/fixtures/builtin_tokens.json
-	// publishes under tok_admin_01 and tok_writer_02. They are raw tokens in a published
-	// fixture rather than secrets: a walden that ever hashes to one of these has been handed
-	// the fixture on purpose.
-	fixtureAdminToken  = "walden_sec_admin_0123456789abcdef"
-	fixtureWriterToken = "walden_sec_writer_0123456789abcdef"
+	// fixtureAdminTokenID and fixtureWriterTokenID name the two built-in tokens the journal's
+	// token_create records mint. The tokens themselves are not restated here: they are read
+	// out of spec/auth/v1/fixtures/builtin_tokens.json, which is the fixture set that
+	// publishes them (see loadFixtureBuiltinToken).
+	fixtureAdminTokenID  = "tok_admin_01"
+	fixtureWriterTokenID = "tok_writer_02"
 
 	// fixtureSeq42 and fixtureSeqMax are the two sequences the conditional-append table
 	// pins beyond the journal's own coordinates: a small one that shows the zero padding
@@ -85,6 +84,53 @@ const (
 	fixtureSeq42  = journal.Seq(42)
 	fixtureSeqMax = journal.Seq(^uint64(0))
 )
+
+// fixtureBuiltinToken is one built-in token as spec/auth/v1/fixtures/builtin_tokens.json
+// publishes it. The raw token is in a published fixture rather than a secret: a walden that
+// ever hashes to one of these has been handed the fixture on purpose.
+type fixtureBuiltinToken struct {
+	TokenID   string   `json:"token_id"`
+	RawToken  string   `json:"raw_token"`
+	TokenHash string   `json:"token_hash"`
+	Scopes    []string `json:"scopes"`
+}
+
+// loadFixtureBuiltinToken returns the token the auth fixtures publish under tokenID.
+//
+// The golden journal's token_create records mint these tokens, and both the generator and
+// the replay test take the raw token from here rather than restating it. That is the whole
+// point of reading the file: fixtures/README.md and spec section 4.3 both claim in print
+// that the two published fixture sets describe one instance rather than two, and a claim
+// held up by the same literal typed into two trees is a claim nothing is watching. Rotate a
+// raw token in builtin_tokens.json and this tree stops agreeing with it, loudly, in the same
+// commit.
+//
+// The file lives under spec/auth/v1 and this test reads its bytes; internal/journal itself
+// does not import internal/auth, and must not.
+func loadFixtureBuiltinToken(t *testing.T, tokenID string) fixtureBuiltinToken {
+	t.Helper()
+	path := filepath.Join("..", "..", "spec", "auth", "v1", "fixtures", "builtin_tokens.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read the published built-in tokens %s: %v", path, err)
+	}
+	var fixture struct {
+		Tokens []fixtureBuiltinToken `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatalf("failed to parse %s: %v", path, err)
+	}
+	for _, token := range fixture.Tokens {
+		if token.TokenID == tokenID {
+			if token.RawToken == "" {
+				t.Fatalf("%s publishes no raw token for %s, which the golden journal mints", path, tokenID)
+			}
+			return token
+		}
+	}
+	t.Fatalf("%s publishes no token %s, which the golden journal mints", path, tokenID)
+	return fixtureBuiltinToken{}
+}
 
 // loadFixtureChain replays the _meta stream up to and including maxSeq and returns the chain.
 func loadFixtureChain(t *testing.T, maxSeq journal.Seq) *journal.SigningChain {
@@ -922,31 +968,47 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 		t.Fatalf("the rebuilt token table holds %d tokens, want 2", len(table))
 	}
 
-	admin, ok := table["tok_admin_01"]
+	// The rebuilt rows are held against the tokens spec/auth/v1 publishes under the same two
+	// identifiers, read from that file rather than restated here, so that the printed claim
+	// that the two fixture sets describe one instance is a claim a test can fail.
+	admin, ok := table[fixtureAdminTokenID]
 	if !ok {
-		t.Fatal("the rebuilt token table lost tok_admin_01")
+		t.Fatalf("the rebuilt token table lost %s", fixtureAdminTokenID)
 	}
 	if !admin.revoked {
-		t.Error("tok_admin_01 is revoked on the meta stream but came back live")
+		t.Errorf("%s is revoked on the meta stream but came back live", fixtureAdminTokenID)
 	}
-	if got, want := admin.hash, fixtureTokenHash(fixtureAdminToken); got != want {
-		t.Errorf("tok_admin_01 hash = %q, want the hash of its raw token %q", got, want)
-	}
+	assertFixtureTokenMatchesAuthSpec(t, fixtureAdminTokenID, admin)
 
 	// The two-scope case: a single scope field cannot carry this token at all, which is why
 	// the record has an array. Both scopes survive the round trip, in the order written.
-	writer, ok := table["tok_writer_02"]
+	writer, ok := table[fixtureWriterTokenID]
 	if !ok {
-		t.Fatal("the rebuilt token table lost tok_writer_02")
+		t.Fatalf("the rebuilt token table lost %s", fixtureWriterTokenID)
 	}
 	if writer.revoked {
-		t.Error("tok_writer_02 is never revoked on the meta stream but came back revoked")
+		t.Errorf("%s is never revoked on the meta stream but came back revoked", fixtureWriterTokenID)
 	}
-	if got, want := writer.hash, fixtureTokenHash(fixtureWriterToken); got != want {
-		t.Errorf("tok_writer_02 hash = %q, want the hash of its raw token %q", got, want)
-	}
+	assertFixtureTokenMatchesAuthSpec(t, fixtureWriterTokenID, writer)
 	if got, want := strings.Join(writer.scopes, ","), "rw:blog-*,r:docs"; got != want {
-		t.Errorf("tok_writer_02 scopes = %q, want %q", got, want)
+		t.Errorf("%s scopes = %q, want %q", fixtureWriterTokenID, got, want)
+	}
+}
+
+// assertFixtureTokenMatchesAuthSpec holds one row rebuilt from the golden journal to the
+// token spec/auth/v1/fixtures/builtin_tokens.json publishes under the same identifier: the
+// hash in the journal must be the real SHA-256 of the raw token published there, and the
+// scopes must be the ones published with it. Both fixture trees are quoted in prose as one
+// instance — fixtures/README.md, journal spec section 4.3, auth spec section 5.2 — and this
+// is what stops them drifting into two.
+func assertFixtureTokenMatchesAuthSpec(t *testing.T, tokenID string, row *fixtureToken) {
+	t.Helper()
+	published := loadFixtureBuiltinToken(t, tokenID)
+	if got, want := row.hash, fixtureTokenHash(published.RawToken); got != want {
+		t.Errorf("%s hash in the golden journal = %q, want the SHA-256 of the raw token spec/auth/v1/fixtures/builtin_tokens.json publishes for it, %q", tokenID, got, want)
+	}
+	if got, want := strings.Join(row.scopes, ","), strings.Join(published.Scopes, ","); got != want {
+		t.Errorf("%s scopes in the golden journal = %q, want the scopes spec/auth/v1/fixtures/builtin_tokens.json publishes for it, %q", tokenID, got, want)
 	}
 }
 

@@ -378,7 +378,7 @@ func (w *fixtureWriter) writeRefTx(priv ed25519.PrivateKey, rec *journal.RefTran
 //
 // The raw tokens the two token_create records below are minted from are read out of
 // spec/auth/v1/fixtures/builtin_tokens.json rather than typed here, so the two published
-// fixture sets describe one instance rather than two unrelated ones, and the hash in the
+// fixture sets agree on hash and scopes under those identifiers, and the hash in the
 // journal is the hash the token store would look up.
 func fixtureTokenHash(rawToken string) string {
 	sum := sha256.Sum256([]byte(rawToken))

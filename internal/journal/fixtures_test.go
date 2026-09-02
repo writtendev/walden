@@ -975,7 +975,7 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 
 	// The rebuilt rows are held against the tokens spec/auth/v1 publishes under the same two
 	// identifiers, read from that file rather than restated here, so that the printed claim
-	// that the two fixture sets describe one instance is a claim a test can fail.
+	// that the two fixture sets agree on hash and scopes is a claim a test can fail.
 	admin, ok := table[fixtureAdminTokenID]
 	if !ok {
 		t.Fatalf("the rebuilt token table lost %s", fixtureAdminTokenID)

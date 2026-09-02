@@ -42,7 +42,7 @@ const (
 )
 
 // RefuseStreamFenced returns a single-line operator-facing refusal when a writer is fenced out by a conflict.
-func RefuseStreamFenced(stream StreamID, seq uint64) error {
+func RefuseStreamFenced(stream StreamID, seq Seq) error {
 	if stream == MetaStreamID {
 		return refusal.RefuseWithCause(
 			"refusal: meta operation failed",
@@ -93,13 +93,13 @@ func RefuseCASNotSupported() error {
 // Fencing is strictly isolated per stream: fencing stream A leaves stream B and _meta unaffected.
 type Fencer struct {
 	mu     sync.RWMutex
-	fenced map[StreamID]uint64
+	fenced map[StreamID]Seq
 }
 
 // NewFencer creates an empty Fencer tracker.
 func NewFencer() *Fencer {
 	return &Fencer{
-		fenced: make(map[StreamID]uint64),
+		fenced: make(map[StreamID]Seq),
 	}
 }
 
@@ -115,7 +115,7 @@ func (f *Fencer) IsFenced(stream StreamID) bool {
 }
 
 // FenceStream permanently marks a stream as fenced on this instance at the given sequence.
-func (f *Fencer) FenceStream(stream StreamID, seq uint64) {
+func (f *Fencer) FenceStream(stream StreamID, seq Seq) {
 	if f == nil {
 		return
 	}
@@ -127,7 +127,7 @@ func (f *Fencer) FenceStream(stream StreamID, seq uint64) {
 }
 
 // FencedSeq returns the sequence number that caused the stream to be fenced, if fenced.
-func (f *Fencer) FencedSeq(stream StreamID) (uint64, bool) {
+func (f *Fencer) FencedSeq(stream StreamID) (Seq, bool) {
 	if f == nil {
 		return 0, false
 	}
@@ -163,7 +163,7 @@ func (f *Fencer) CheckWritable(stream StreamID) error {
 }
 
 // HandleConflict transitions the stream to fenced at sequence seq and returns RefuseStreamFenced.
-func (f *Fencer) HandleConflict(stream StreamID, seq uint64) error {
+func (f *Fencer) HandleConflict(stream StreamID, seq Seq) error {
 	f.FenceStream(stream, seq)
 	return RefuseStreamFenced(stream, seq)
 }
@@ -175,7 +175,7 @@ func (f *Fencer) Reset() {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.fenced = make(map[StreamID]uint64)
+	f.fenced = make(map[StreamID]Seq)
 }
 
 // ProviderStatus indicates the level of CAS support by an S3-compatible storage provider.

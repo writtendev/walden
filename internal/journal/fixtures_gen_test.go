@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -386,7 +385,7 @@ func (w *fixtureWriter) writeRefTx(priv ed25519.PrivateKey, rec *journal.RefTran
 type metaRecord struct {
 	Version   string           `json:"version"`
 	Stream    journal.StreamID `json:"stream"`
-	Seq       uint64           `json:"seq"`
+	Seq       journal.Seq      `json:"seq"`
 	Type      string           `json:"type"`
 	TokenID   string           `json:"token_id,omitempty"`
 	Scope     string           `json:"scope,omitempty"`
@@ -611,8 +610,12 @@ type conditionalPutFixture struct {
 // that reads numbers as IEEE doubles — JavaScript's, and every parser built on it — turns
 // 18446744073709551615 into 18446744073709552000 and derives a key that does not match the
 // one beside it, failing a conformant reader against a correct fixture. A string is read
-// exactly by every conformant parser. This is a choice about the fixture table only;
-// journal records encode their own `seq` as a JSON number, as spec section 5.1 defines.
+// exactly by every conformant parser. Journal records encode their own `seq` the same way
+// and for the same reason, so no sequence anywhere in the fixture tree is a JSON number.
+//
+// The row is held as a string rather than a journal.Seq so that the check on the other
+// side — in TestFixtureConditionalAppend — reads the bytes the fixture carries and parses
+// them itself, rather than through the decoder this change is here to pin.
 type txKeyFixture struct {
 	Stream      journal.StreamID `json:"stream"`
 	Seq         string           `json:"seq"`
@@ -621,10 +624,10 @@ type txKeyFixture struct {
 }
 
 // txKeyRow builds one append-target row from the sequence a writer would hold in hand.
-func txKeyRow(stream journal.StreamID, seq uint64, description string) txKeyFixture {
+func txKeyRow(stream journal.StreamID, seq journal.Seq, description string) txKeyFixture {
 	return txKeyFixture{
 		Stream:      stream,
-		Seq:         strconv.FormatUint(seq, 10),
+		Seq:         seq.String(),
 		Key:         journal.TxKey(stream, seq),
 		Description: description,
 	}
@@ -633,13 +636,13 @@ func txKeyRow(stream journal.StreamID, seq uint64, description string) txKeyFixt
 type fencingRefusableFixture struct {
 	Case    string           `json:"case"`
 	Stream  journal.StreamID `json:"stream,omitempty"`
-	Seq     *uint64          `json:"seq,omitempty"`
+	Seq     *journal.Seq     `json:"seq,omitempty"`
 	Message string           `json:"message"`
 }
 
 func buildConditionalAppendFixture() conditionalAppendFixture {
-	seq3 := uint64(3)
-	seq7 := uint64(7)
+	seq3 := journal.Seq(3)
+	seq7 := journal.Seq(7)
 	return conditionalAppendFixture{
 		Version:     journal.VersionPrefix,
 		Description: "Conditional append targets and fencing refusals for journal format v1 (spec README section 11)",

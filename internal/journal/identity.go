@@ -37,7 +37,7 @@ const (
 type GenesisRecord struct {
 	Version   string   `json:"version"`
 	Stream    StreamID `json:"stream"`
-	Seq       uint64   `json:"seq"`
+	Seq       Seq      `json:"seq"`
 	Type      string   `json:"type"`
 	PublicKey string   `json:"public_key"`
 	Timestamp string   `json:"timestamp"`
@@ -47,7 +47,7 @@ type GenesisRecord struct {
 type KeyRotationRecord struct {
 	Version      string   `json:"version"`
 	Stream       StreamID `json:"stream"`
-	Seq          uint64   `json:"seq"`
+	Seq          Seq      `json:"seq"`
 	Type         string   `json:"type"`
 	OldPublicKey string   `json:"old_public_key"`
 	NewPublicKey string   `json:"new_public_key"`
@@ -113,7 +113,7 @@ func ParseSignature(s string) ([]byte, error) {
 }
 
 // CanonicalRotationPayload returns the deterministic canonical bytes to sign/verify for a KeyRotationRecord.
-func CanonicalRotationPayload(stream StreamID, seq uint64, oldKey, newKey, timestamp string) []byte {
+func CanonicalRotationPayload(stream StreamID, seq Seq, oldKey, newKey, timestamp string) []byte {
 	return []byte(fmt.Sprintf("walden-key-rotation:v1\nstream:%s\nseq:%d\nold_public_key:%s\nnew_public_key:%s\ntimestamp:%s\n",
 		stream, seq, oldKey, newKey, timestamp))
 }
@@ -169,7 +169,7 @@ func VerifyRotation(r *KeyRotationRecord, expectedActiveKey string) error {
 // SigningChain tracks the active server signing key verified from genesis forward.
 type SigningChain struct {
 	activeKey   string
-	lastMetaSeq uint64
+	lastMetaSeq Seq
 	initialized bool
 }
 
@@ -184,7 +184,7 @@ func (c *SigningChain) ActiveKey() string {
 }
 
 // LastMetaSeq returns the last processed meta sequence number.
-func (c *SigningChain) LastMetaSeq() uint64 {
+func (c *SigningChain) LastMetaSeq() Seq {
 	return c.lastMetaSeq
 }
 
@@ -236,7 +236,7 @@ func (c *SigningChain) ApplyRotation(r *KeyRotationRecord) error {
 }
 
 // AdvanceMetaSeq records non-rotation meta records to keep the sequence contiguous.
-func (c *SigningChain) AdvanceMetaSeq(seq uint64) error {
+func (c *SigningChain) AdvanceMetaSeq(seq Seq) error {
 	if !c.initialized {
 		return fmt.Errorf("%w: cannot advance meta sequence before genesis", ErrGenesisMissing)
 	}

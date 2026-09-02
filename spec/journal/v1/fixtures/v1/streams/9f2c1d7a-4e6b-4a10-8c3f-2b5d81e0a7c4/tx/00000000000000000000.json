@@ -1,7 +1,7 @@
 {
   "version": "v1",
   "stream": "9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4",
-  "seq": 0,
+  "seq": "0",
   "type": "ref_update",
   "segments": [
     "b57e002c347f2488844f25584abf312c4293c730ca8082efd680e67930084cbd"

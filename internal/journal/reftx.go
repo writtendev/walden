@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -41,7 +40,7 @@ const ZeroOID64 = "0000000000000000000000000000000000000000000000000000000000000
 type RefTransactionRecord struct {
 	Version   string      `json:"version"`
 	Stream    StreamID    `json:"stream"`
-	Seq       uint64      `json:"seq"`
+	Seq       Seq         `json:"seq"`
 	Type      string      `json:"type"`
 	Segments  []string    `json:"segments"`
 	Updates   []RefUpdate `json:"updates"`
@@ -222,14 +221,14 @@ func (r *RefTransactionRecord) Validate() error {
 
 // CanonicalRefUpdatePayload returns the deterministic canonical byte payload to sign/verify for a RefTransactionRecord.
 // Ref names are embedded as exact byte sequences without Unicode normalization.
-func CanonicalRefUpdatePayload(stream StreamID, seq uint64, timestamp string, segments []string, updates []RefUpdate) []byte {
+func CanonicalRefUpdatePayload(stream StreamID, seq Seq, timestamp string, segments []string, updates []RefUpdate) []byte {
 	var sb strings.Builder
 	sb.WriteString("walden-ref-update:v1\n")
 	sb.WriteString("stream:")
 	sb.WriteString(string(stream))
 	sb.WriteByte('\n')
 	sb.WriteString("seq:")
-	sb.WriteString(strconv.FormatUint(seq, 10))
+	sb.WriteString(seq.String())
 	sb.WriteByte('\n')
 	sb.WriteString("timestamp:")
 	sb.WriteString(timestamp)

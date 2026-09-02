@@ -309,7 +309,7 @@ func TestUnchainableRotationErrors(t *testing.T) {
 
 func TestCanonicalRotationPayloadDeterministic(t *testing.T) {
 	stream := journal.StreamID("_meta")
-	seq := uint64(1)
+	seq := journal.Seq(1)
 	oldKey := "ed25519:" + hex.EncodeToString(make([]byte, 32))
 	newKey := "ed25519:" + hex.EncodeToString(make([]byte, 32))
 	timestamp := "2026-08-31T00:00:00Z"

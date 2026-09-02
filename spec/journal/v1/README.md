@@ -31,6 +31,19 @@ Every repository is modeled as an independent stream. The server instance's own 
  └─────────────────────────────┘               └─────────────────────────────┘
 ```
 
+### 1.1 Sequence Numbers Are JSON Strings
+
+Wherever a sequence number appears in a JSON document of this format — `seq` in a record, `sequence` in `marker.json` — it is encoded as a **JSON string holding its exact decimal form**, never as a JSON number: `"seq": "3"`.
+
+The reason, stated once here so that nobody tidies it back to a number: RFC 8259 does not fix numeric precision and notes that interoperability is best inside the IEEE-754 double range, and many readers — JavaScript's `JSON.parse` and everything built on it — decode every JSON number as a double, which represents integers exactly only up to 2^53. A number-encoded sequence near the top of the documented range comes back rounded (`18446744073709551615` reads back as `18446744073709552000`), so the record disagrees with the sequence in its own object key and a reader that cross-checks the two rejects a valid record. A string is read exactly by every conformant parser. This is the same convention protobuf's canonical JSON mapping applies to `int64` and `uint64`.
+
+Normative rules:
+
+1. **Exact decimal form.** The string MUST match `^(0|[1-9][0-9]*)$` and MUST denote a value in `0` to `18446744073709551615`. No leading zeros, no sign, no whitespace, no exponent, no grouping — nothing a re-encoding would introduce.
+2. **Writers** MUST emit the exact decimal form. **Readers** MUST refuse any other encoding, a JSON number included, rather than coercing it: a rounded or reformatted sequence derives the wrong object key, which is the failure this rule exists to prevent.
+3. **The object key is unaffected.** `tx/<seq>.json` is still the 20-digit zero-padded decimal of section 9.2, and a record's sequence MUST still equal the sequence in its key.
+4. **The canonical signing payloads are unaffected.** Sections 4.2 and 5.3 serialize the sequence as decimal text on a `seq:<seq>` line and always have. Signatures cover that text, not the JSON encoding, so this rule changes no signature and re-signs no history.
+
 ---
 
 ## 2. Server Signing Identity (Ruling 1)
@@ -65,7 +78,7 @@ The genesis record establishes the root of trust for the entire journal instance
 {
   "version": "v1",
   "stream": "_meta",
-  "seq": 0,
+  "seq": "0",
   "type": "genesis",
   "public_key": "ed25519:8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
   "timestamp": "2026-08-31T00:00:00Z"
@@ -81,7 +94,7 @@ implementation can check itself against the example and the fixture at once.
 | :--- | :--- | :--- |
 | `version` | string | Format version; MUST be `"v1"`. |
 | `stream` | string | MUST be `"_meta"`. |
-| `seq` | integer | MUST be `0`. |
+| `seq` | string | Sequence number in exact decimal form (section 1.1); MUST be `"0"`. |
 | `type` | string | MUST be `"genesis"`. |
 | `public_key` | string | Formatted Ed25519 public key (`ed25519:<64-hex>`). |
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of journal initialization. |
@@ -106,7 +119,7 @@ Signing keys can be rotated without out-of-band coordination by appending a `key
 {
   "version": "v1",
   "stream": "_meta",
-  "seq": 2,
+  "seq": "2",
   "type": "key_rotation",
   "old_public_key": "ed25519:8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
   "new_public_key": "ed25519:8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
@@ -122,7 +135,7 @@ This is the golden journal's own rotation record, byte for byte:
 | :--- | :--- | :--- |
 | `version` | string | Format version; MUST be `"v1"`. |
 | `stream` | string | MUST be `"_meta"`. |
-| `seq` | integer | Strictly monotonic sequence number ($k \ge 1$). |
+| `seq` | string | Strictly monotonic sequence number ($k \ge 1$) in exact decimal form (section 1.1). |
 | `type` | string | MUST be `"key_rotation"`. |
 | `old_public_key` | string | Currently active public key in the verifier's chain (`ed25519:<64-hex>`). |
 | `new_public_key` | string | New public key to activate (`ed25519:<64-hex>`), distinct from `old_public_key`. |
@@ -139,7 +152,7 @@ old_public_key:<old_public_key>\n
 new_public_key:<new_public_key>\n
 timestamp:<timestamp>\n
 ```
-Each line terminates with a newline (`\n`, `0x0A`).
+Each line terminates with a newline (`\n`, `0x0A`). `<seq>` is the decimal sequence number with no leading zeros — the same text the JSON string carries, and unchanged by the encoding rule of section 1.1.
 
 ---
 
@@ -156,7 +169,7 @@ The ref-transaction record is the atomic unit of repository history in walden. E
 {
   "version": "v1",
   "stream": "repo-alpha",
-  "seq": 0,
+  "seq": "0",
   "type": "ref_update",
   "segments": [
     "db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"
@@ -183,7 +196,7 @@ the genesis record declares.
 | :--- | :--- | :--- |
 | `version` | string | Format version; MUST be `"v1"`. |
 | `stream` | string | Stream identifier (`<stream-id>`). |
-| `seq` | integer | Strictly monotonic unsigned 64-bit sequence number ($k \ge 0$). |
+| `seq` | string | Strictly monotonic unsigned 64-bit sequence number ($k \ge 0$) in exact decimal form (section 1.1). |
 | `type` | string | MUST be `"ref_update"`. |
 | `segments` | array of strings | List of zero or more 64-character lowercase hexadecimal SHA-256 digests of newly written packfiles. May be empty (`[]`) for operations not introducing new objects (e.g. branch deletion, fast-forward to existing commit, tag deletion). |
 | `updates` | array of objects | List of one or more ref update triples defining atomic ref transitions. MUST NOT contain duplicate ref names within the same transaction. |
@@ -222,7 +235,7 @@ update:<ref-2> <old_oid-2> <new_oid-2>\n
 
 1. **Header Line:** `walden-ref-update:v1\n`
 2. **Stream Line:** `stream:<stream>\n` where `<stream>` is the exact stream ID string.
-3. **Sequence Line:** `seq:<seq>\n` where `<seq>` is the decimal sequence number with no leading zeros (e.g. `0`, `1`, `42`).
+3. **Sequence Line:** `seq:<seq>\n` where `<seq>` is the decimal sequence number with no leading zeros (e.g. `0`, `1`, `42`) — the same text the JSON string carries, so the encoding rule of section 1.1 leaves signatures untouched.
 4. **Timestamp Line:** `timestamp:<timestamp>\n` where `<timestamp>` is the RFC 3339 UTC timestamp string.
 5. **Segment Lines:** For each SHA-256 hash in `segments` (in array order), a line formatted as `segment:<lowercase-64-hex>\n`. If `segments` is empty, zero segment lines are emitted.
 6. **Update Lines:** For each update triple in `updates` (in array order), a line formatted as `update:<ref> <lowercase-old_oid> <lowercase-new_oid>\n`.
@@ -330,7 +343,7 @@ A background task periodically consolidates all reachable Git objects across his
 {
   "version": "v1",
   "stream": "repo-alpha",
-  "sequence": 1,
+  "sequence": "1",
   "snapshot": "3731601fba561af499185a3875c5df9f2b5e5ab71ea260a3297e12e1ddf9576c",
   "timestamp": "2026-08-31T01:00:00Z"
 }
@@ -346,7 +359,7 @@ meaning in the other.
 | :--- | :--- | :--- |
 | `version` | string | Format version; MUST be `"v1"`. |
 | `stream` | string | Stream identifier matching `^[a-zA-Z0-9._-]+$` (max 255 bytes). |
-| `sequence` | integer | Strictly non-negative unsigned 64-bit sequence number ($k \ge 0$) representing the latest ref transaction fully incorporated into the snapshot pack. |
+| `sequence` | string | Unsigned 64-bit sequence number ($k \ge 0$) in exact decimal form (section 1.1), representing the latest ref transaction fully incorporated into the snapshot pack. |
 | `snapshot` | string | Exactly 64 lowercase hexadecimal characters representing the SHA-256 digest of the consolidated snapshot packfile bytes verbatim (`^[0-9a-f]{64}$`). |
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp when the snapshot was generated and published (e.g. `"2026-08-31T01:00:00Z"`). |
 

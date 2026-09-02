@@ -53,14 +53,64 @@ func ValidateStreamID(stream StreamID) error {
 	return nil
 }
 
-// FormatSeq formats a 64-bit unsigned sequence number as a 20-digit zero-padded decimal string.
-// This guarantees that UTF-8 / ASCII lexicographical ordering matches numerical sequence order.
-func FormatSeq(seq uint64) string {
-	return fmt.Sprintf("%020d", seq)
+// Seq is a journal sequence number: the second half of the (stream-id, seq)
+// coordinate, and a 64-bit unsigned integer.
+//
+// In JSON it is a string holding its exact decimal form, not a number. JSON
+// numbers are IEEE-754 doubles in many readers — JavaScript's among them — which
+// represent integers exactly only up to 2^53, so a number-encoded sequence near
+// the top of the range comes back rounded and no longer agrees with the sequence
+// in its own object key. A string is read exactly by every conformant parser.
+type Seq uint64
+
+// String returns the exact decimal form of a sequence number: no leading zeros,
+// no sign, no whitespace.
+func (s Seq) String() string {
+	return strconv.FormatUint(uint64(s), 10)
 }
 
-// ParseSeq parses a 20-digit zero-padded sequence string into a uint64.
-func ParseSeq(s string) (uint64, error) {
+// MarshalJSON encodes a sequence number as a JSON string holding its exact decimal form.
+func (s Seq) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + s.String() + `"`), nil
+}
+
+// UnmarshalJSON decodes a sequence number from a JSON string holding its exact
+// decimal form. A JSON number is refused, and so is a string that is not the
+// exact decimal form of the value it names: a rounded or reformatted sequence
+// derives the wrong object key, so it is refused rather than silently accepted.
+func (s *Seq) UnmarshalJSON(data []byte) error {
+	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
+		return fmt.Errorf("%w: sequence must be a JSON string holding its decimal form, got %s", ErrInvalidSeq, data)
+	}
+	seq, err := ParseSeqDecimal(string(data[1 : len(data)-1]))
+	if err != nil {
+		return err
+	}
+	*s = seq
+	return nil
+}
+
+// ParseSeqDecimal parses the exact decimal form of a sequence number: no leading
+// zeros, no sign, no whitespace, nothing a re-encoding would introduce.
+func ParseSeqDecimal(s string) (Seq, error) {
+	seq, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrInvalidSeq, err)
+	}
+	if strconv.FormatUint(seq, 10) != s {
+		return 0, fmt.Errorf("%w: %q is not the exact decimal form of %d", ErrInvalidSeq, s, seq)
+	}
+	return Seq(seq), nil
+}
+
+// FormatSeq formats a 64-bit unsigned sequence number as a 20-digit zero-padded decimal string.
+// This guarantees that UTF-8 / ASCII lexicographical ordering matches numerical sequence order.
+func FormatSeq(seq Seq) string {
+	return fmt.Sprintf("%020d", uint64(seq))
+}
+
+// ParseSeq parses a 20-digit zero-padded sequence string into a sequence number.
+func ParseSeq(s string) (Seq, error) {
 	if len(s) != 20 {
 		return 0, fmt.Errorf("%w: sequence string must be exactly 20 digits, got %q", ErrInvalidSeq, s)
 	}
@@ -73,7 +123,7 @@ func ParseSeq(s string) (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%w: %w", ErrInvalidSeq, err)
 	}
-	return seq, nil
+	return Seq(seq), nil
 }
 
 // StreamPrefix returns the base object prefix for a stream: "v1/streams/<stream-id>/".
@@ -87,8 +137,8 @@ func TxPrefix(stream StreamID) string {
 }
 
 // TxKey returns the object storage key for a transaction: "v1/streams/<stream-id>/tx/<seq>.json".
-func TxKey(stream StreamID, seq uint64) string {
-	return fmt.Sprintf("%s/streams/%s/tx/%020d.json", VersionPrefix, stream, seq)
+func TxKey(stream StreamID, seq Seq) string {
+	return fmt.Sprintf("%s/streams/%s/tx/%020d.json", VersionPrefix, stream, uint64(seq))
 }
 
 // SegmentPrefix returns the segment listing prefix for a stream: "v1/streams/<stream-id>/segments/".
@@ -135,5 +185,5 @@ type RefUpdate struct {
 // Journal represents the write-ahead append-only log interface.
 type Journal interface {
 	// AppendRefTx conditionally appends a ref transaction to the specified stream.
-	AppendRefTx(ctx context.Context, stream StreamID, expectedSeq uint64, segments []string, updates []RefUpdate) (uint64, error)
+	AppendRefTx(ctx context.Context, stream StreamID, expectedSeq Seq, segments []string, updates []RefUpdate) (Seq, error)
 }

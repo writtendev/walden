@@ -186,7 +186,7 @@ func TestValidateRefUpdate(t *testing.T) {
 
 func TestCanonicalRefUpdatePayload(t *testing.T) {
 	stream := journal.StreamID("repo-alpha")
-	seq := uint64(0)
+	seq := journal.Seq(0)
 	timestamp := "2026-08-31T00:02:00Z"
 	segments := []string{
 		"4a49646b96dbca4f1eb8699ef7cefdcae68fefc6ee7ae6305a3f25c7e1ef5638",
@@ -451,7 +451,7 @@ func TestUnknownFieldsToleranceAndForwardCompatibility(t *testing.T) {
 	jsonWithExtraFields := `{
 		"version": "v1",
 		"stream": "repo-alpha",
-		"seq": 0,
+		"seq": "0",
 		"type": "ref_update",
 		"segments": [
 			"4a49646b96dbca4f1eb8699ef7cefdcae68fefc6ee7ae6305a3f25c7e1ef5638"
@@ -479,6 +479,60 @@ func TestUnknownFieldsToleranceAndForwardCompatibility(t *testing.T) {
 	// Verification MUST succeed because unknown fields are ignored and do not alter the canonical v1 payload
 	if err := journal.VerifyRefTx(&parsedRec, formattedPub); err != nil {
 		t.Fatalf("VerifyRefTx failed on record with unknown fields: %v", err)
+	}
+}
+
+// TestRefTxSeqEncoding covers spec section 1.1 at the record: `seq` is written as a JSON
+// string holding its exact decimal form, and a record encoding it any other way is refused
+// on parse rather than coerced into a sequence that is not the one its key names.
+func TestRefTxSeqEncoding(t *testing.T) {
+	rec := &journal.RefTransactionRecord{
+		Version: "v1",
+		Stream:  "repo-alpha",
+		Seq:     journal.Seq(^uint64(0)),
+		Type:    "ref_update",
+		Segments: []string{
+			"4a49646b96dbca4f1eb8699ef7cefdcae68fefc6ee7ae6305a3f25c7e1ef5638",
+		},
+		Updates: []journal.RefUpdate{
+			{
+				Ref:    "refs/heads/main",
+				OldOID: "0000000000000000000000000000000000000000",
+				NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+			},
+		},
+		Timestamp: "2026-08-31T00:02:00Z",
+	}
+
+	data, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	if !strings.Contains(string(data), `"seq":"18446744073709551615"`) {
+		t.Errorf("record does not carry seq as a decimal string: %s", data)
+	}
+
+	var parsed journal.RefTransactionRecord
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if parsed.Seq != rec.Seq {
+		t.Errorf("seq round-tripped to %d, want %d", uint64(parsed.Seq), uint64(rec.Seq))
+	}
+
+	// The two encodings a reader must refuse: a JSON number, which loses precision at this
+	// end of the range, and the rounded value such a reader produces from one.
+	for _, encoded := range []string{`18446744073709551615`, `"18446744073709552000"`} {
+		var refused journal.RefTransactionRecord
+		body := strings.Replace(string(data), `"18446744073709551615"`, encoded, 1)
+		err := json.Unmarshal([]byte(body), &refused)
+		if err == nil {
+			t.Errorf("expected seq %s to be refused, got %d", encoded, uint64(refused.Seq))
+			continue
+		}
+		if !errors.Is(err, journal.ErrInvalidSeq) {
+			t.Errorf("expected ErrInvalidSeq for seq %s, got %v", encoded, err)
+		}
 	}
 }
 

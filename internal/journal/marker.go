@@ -39,7 +39,7 @@ var (
 type Marker struct {
 	Version   string   `json:"version"`
 	Stream    StreamID `json:"stream"`
-	Sequence  uint64   `json:"sequence"`
+	Sequence  Seq      `json:"sequence"`
 	Snapshot  string   `json:"snapshot"`
 	Timestamp string   `json:"timestamp"`
 }

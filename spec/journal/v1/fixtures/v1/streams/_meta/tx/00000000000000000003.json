@@ -1,7 +1,7 @@
 {
   "version": "v1",
   "stream": "_meta",
-  "seq": 3,
+  "seq": "3",
   "type": "token_revoke",
   "token_id": "tok_admin_01",
   "timestamp": "2026-08-31T00:08:00Z"

@@ -163,7 +163,7 @@ When a built-in token is created, a record is conditionally appended to the `_me
 {
   "version": "v1",
   "stream": "_meta",
-  "seq": 1,
+  "seq": "1",
   "type": "token_create",
   "token_id": "tok_admin_01",
   "token_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -178,7 +178,7 @@ Revoking a token appends a `token_revoke` record to the `_meta` stream:
 {
   "version": "v1",
   "stream": "_meta",
-  "seq": 2,
+  "seq": "2",
   "type": "token_revoke",
   "token_id": "tok_admin_01",
   "timestamp": "2026-08-31T01:00:00Z"

@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -607,8 +608,11 @@ type signedCapability struct {
 // Payload is optional, and is a pointer so that "absent" and "empty" are distinguishable. The
 // two forgeries — a payload swapped under a good signature, and a signature from an untrusted
 // key — print no payload, because what is inside them is the forgery rather than a claim
-// anyone should copy out. Where a refused capability does print one, checkPayloadMatchesToken
-// holds it to the token beside it.
+// anyone should copy out. The other two — expired and not yet valid — do print one, and that
+// is the whole of what a reader gets to read without decoding base64 by hand. Which of the
+// four is which is pinned by checkRefusedCapability's caller rather than left to whatever the
+// fixture happens to carry; where a payload is printed, checkPayloadMatchesToken holds it to
+// the token beside it.
 type refusedCapability struct {
 	Payload         *auth.CapabilityPayload `json:"payload"`
 	CompactToken    string                  `json:"compact_token"`
@@ -676,9 +680,20 @@ func checkPayloadMatchesToken(t *testing.T, name, compactToken string, printed *
 
 // checkRefusedCapability verifies that a capability the fixture marks refused is refused, for
 // the reason it names and with the error the package documents.
-func checkRefusedCapability(t *testing.T, name string, c refusedCapability, pubKey ed25519.PublicKey, evalTime time.Time, want error) {
+//
+// wantPayload is whether this refusal is one of the two that publish their claims in the clear.
+// Checking only "if a payload is present, it matches the token" would leave the presence itself
+// unpinned: deleting the payload from the expired capability would leave a published case that
+// is a base64 blob and a refusal name, with nothing a reimplementation can read to see what was
+// being refused, and the suite would stay green.
+func checkRefusedCapability(t *testing.T, name string, c refusedCapability, wantPayload bool, pubKey ed25519.PublicKey, evalTime time.Time, want error) {
 	t.Helper()
-	if c.Payload != nil {
+	switch {
+	case c.Payload != nil && !wantPayload:
+		t.Errorf("%s prints a payload; a forgery publishes none, because what is inside it is the forgery rather than a claim anyone should copy out", name)
+	case c.Payload == nil && wantPayload:
+		t.Errorf("%s prints no payload; the claims it was refused for are the one part of this case a reader can read without decoding the token by hand", name)
+	case c.Payload != nil:
 		checkPayloadMatchesToken(t, name, c.CompactToken, c.Payload)
 	}
 	_, _, err := auth.ParseAndVerifyCapability(c.CompactToken, pubKey, evalTime)
@@ -764,11 +779,12 @@ func TestCapabilityTokensFixture(t *testing.T) {
 
 	// The four capabilities verification must refuse, one per reason: past its expiry, before
 	// its activation, a payload swapped under a good signature, and a signature from a key
-	// this server does not trust.
-	checkRefusedCapability(t, "expired capability", fixture.ExpiredCapability, pubKey, evalTime, auth.ErrExpired)
-	checkRefusedCapability(t, "future capability", fixture.FutureCapability, pubKey, evalTime, auth.ErrNotYetValid)
-	checkRefusedCapability(t, "tampered capability", fixture.TamperedCapability, pubKey, evalTime, auth.ErrInvalidSignature)
-	checkRefusedCapability(t, "wrong key capability", fixture.WrongKeyCapability, pubKey, evalTime, auth.ErrInvalidSignature)
+	// this server does not trust. The first two are refused for what their claims say, so they
+	// print those claims; the last two are refused for the signature, so they print nothing.
+	checkRefusedCapability(t, "expired capability", fixture.ExpiredCapability, true, pubKey, evalTime, auth.ErrExpired)
+	checkRefusedCapability(t, "future capability", fixture.FutureCapability, true, pubKey, evalTime, auth.ErrNotYetValid)
+	checkRefusedCapability(t, "tampered capability", fixture.TamperedCapability, false, pubKey, evalTime, auth.ErrInvalidSignature)
+	checkRefusedCapability(t, "wrong key capability", fixture.WrongKeyCapability, false, pubKey, evalTime, auth.ErrInvalidSignature)
 }
 
 // specJSONExamples pins every JSON example spec/auth/v1/README.md carries, in document order,
@@ -776,42 +792,71 @@ func TestCapabilityTokensFixture(t *testing.T) {
 // reimplementation grant: someone will write an implementation from the prose alone, so an
 // example that has drifted from the fixtures is not a cosmetic defect.
 //
-// The journal specification's examples are whole fixture files and cite the file each one
-// quotes, so its gate follows the link. The auth fixtures are case tables, and an example here
-// is one record out of a table — there is no file to link — so the citation lives in this
-// table instead. An example added to the document without a row added here fails for having no
-// pin; a row without an example fails for the same reason from the other side.
+// Sections 5.2 and 5.3 are whole records of the *journal* format, written by the fixture
+// generator in spec/journal/v1 and quoted here because the token table is journaled to the meta
+// stream. Each is a file, and the document cites the file it is, so those two are held to the
+// file the prose links — the link is followed rather than trusted, the way spec/journal/v1's
+// own gate follows its citations. A citation edited to name a different record fails even
+// though that record exists, which is the failure that matters: the link resolves, so a reader
+// following it gets no signal that the document is showing them something else.
 //
-// Two of the four are records of the *journal* format, written by the fixture generator in
-// spec/journal/v1. They are quoted here because the token table is journaled to the meta
-// stream, and holding them to the golden journal is what keeps the two published documents
-// describing the same record.
+// Sections 6.2 and 6.3 are one record out of a case table rather than a file: 6.2's envelope is
+// assembled from two fields of one capability in capability_tokens.json, and 6.3's payload is
+// one of those two. Section 6.2 does cite the file it is drawn from, but following that
+// citation yields the whole six-capability table rather than the example, so there is no file
+// either of them can be held to and the citation lives in this table instead. An example added
+// to the document without a row added here fails for having no pin; a row without an example
+// fails for the same reason from the other side.
 var specJSONExamples = []struct {
 	name string
-	want func(t *testing.T) []byte
+	// want is the bytes the example must equal. link is the fixture the prose beneath the
+	// example cites, relative to spec/auth/v1, or "" if it cites none.
+	want func(t *testing.T, link string) []byte
 }{
-	{"section 5.2, the token_create meta record", func(t *testing.T) []byte {
-		return readJournalFixture(t, journal.TxKey(journal.MetaStreamID, 1))
-	}},
-	{"section 5.3, the token_revoke meta record", func(t *testing.T) []byte {
-		return readJournalFixture(t, journal.TxKey(journal.MetaStreamID, 3))
-	}},
-	{"section 6.2, the structured JSON envelope", func(t *testing.T) []byte {
+	{"section 5.2, the token_create meta record", readLinkedFixture},
+	{"section 5.3, the token_revoke meta record", readLinkedFixture},
+	{"section 6.2, the structured JSON envelope", func(t *testing.T, _ string) []byte {
 		return marshalExample(t, capabilityEnvelope(readCapabilityFixture(t).ValidCapability))
 	}},
-	{"section 6.3, the capability payload", func(t *testing.T) []byte {
+	{"section 6.3, the capability payload", func(t *testing.T, _ string) []byte {
 		return marshalExample(t, readCapabilityFixture(t).ValidCapability.Payload)
 	}},
 }
 
-// readJournalFixture reads one record of the golden journal, addressed by its object storage
-// key the way spec/journal/v1's own tests address it.
-func readJournalFixture(t *testing.T, key string) []byte {
+// specFixtureLink finds the fixture an example cites, in the prose between the end of the
+// example and whatever comes next. spec/journal/v1's links are all relative to its own tree;
+// the two here reach across into it, so the leading path is part of what is captured and the
+// link is resolved against spec/auth/v1.
+var specFixtureLink = regexp.MustCompile(`\]\(([^)\s]*fixtures/[^)\s]+)\)`)
+
+// exampleFixtureLink returns the fixture cited in the prose that follows an example, searching
+// from the line after its closing fence to whatever comes next — the next fence, the next
+// heading, the field table. Same walk as spec/journal/v1's gate: a link further down the
+// document than that belongs to something else.
+func exampleFixtureLink(lines []string, end int) string {
+	for j := end + 1; j < len(lines); j++ {
+		line := lines[j]
+		if spectest.IsFence(line) || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "|") {
+			return ""
+		}
+		if m := specFixtureLink.FindStringSubmatch(line); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// readLinkedFixture reads the file an example cites. An example pinned this way and citing
+// nothing has no pin at all, so the missing link is the failure rather than a skip.
+func readLinkedFixture(t *testing.T, link string) []byte {
 	t.Helper()
-	path := filepath.Join("..", "..", "spec", "journal", "v1", "fixtures", filepath.FromSlash(key))
+	if link == "" {
+		t.Fatal("this example is pinned to the fixture it cites, and it cites none")
+	}
+	path := filepath.Join(authSpecDir(), filepath.FromSlash(link))
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("failed to read the journal fixture %s: %v", key, err)
+		t.Fatalf("failed to read the cited fixture %s: %v", link, err)
 	}
 	return data
 }
@@ -847,7 +892,8 @@ func TestSpecExamplesMatchFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read %s: %v", specPath, err)
 	}
-	examples, stray, err := spectest.JSONExamples(strings.Split(string(data), "\n"))
+	lines := strings.Split(string(data), "\n")
+	examples, stray, err := spectest.JSONExamples(lines)
 	if err != nil {
 		t.Fatalf("failed to read the examples of %s: %v", specPath, err)
 	}
@@ -861,7 +907,7 @@ func TestSpecExamplesMatchFixtures(t *testing.T) {
 	}
 	for i, example := range examples {
 		pinned := specJSONExamples[i]
-		want := pinned.want(t)
+		want := pinned.want(t, exampleFixtureLink(lines, example.End))
 		if example.Body != string(want) {
 			t.Errorf("%s:%d: the example and the fixture it quotes (%s) have drifted apart.\n"+
 				"The examples are copied into the specification by hand, so paste the fixture over\n"+

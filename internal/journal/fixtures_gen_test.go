@@ -3,6 +3,8 @@ package journal_test
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -369,27 +371,29 @@ func (w *fixtureWriter) writeRefTx(priv ed25519.PrivateKey, rec *journal.RefTran
 	w.writeJSON(journal.TxKey(rec.Stream, rec.Seq), rec)
 }
 
-// metaRecord is a token table mutation on the meta stream, which carries no signature.
+// fixtureTokenHash is the storage hash of a raw built-in token, "sha256:<64-hex>", as
+// spec/auth/v1 section 5.1 defines it. It is computed here from the raw token rather than
+// copied in, so the hashes in the golden journal are real digests of real tokens for the
+// same reason every other hash in the tree is.
 //
-// This is the one record shape the generator declares for itself, because token_create and
-// token_revoke have no type in the journal package to write them through. Every other record
-// in the fixture tree is written through the published struct — GenesisRecord,
-// KeyRotationRecord, RefTransactionRecord, Marker — so that an encoder change to one of them
-// moves the fixture bytes and TestFixturesAreGenerated says so. A hand-copied parallel of a
-// published type would compare the generator against itself and see nothing, so do not add
-// one here: give the record a type in the journal package instead.
-//
-// Nothing enforces that sentence. The day the journal package grows a type for these records
-// and this fork is left standing beside it, the gate quietly stops watching the encoder for
-// them and no test says a word. It is in the gap list for that reason.
-type metaRecord struct {
-	Version   string           `json:"version"`
-	Stream    journal.StreamID `json:"stream"`
-	Seq       journal.Seq      `json:"seq"`
-	Type      string           `json:"type"`
-	TokenID   string           `json:"token_id,omitempty"`
-	Scope     string           `json:"scope,omitempty"`
-	Timestamp string           `json:"timestamp"`
+// The raw tokens the two token_create records below are minted from are read out of
+// spec/auth/v1/fixtures/builtin_tokens.json rather than typed here, so the two published
+// fixture sets agree on hash and scopes under those identifiers, and the hash in the
+// journal is the hash the token store would look up.
+func fixtureTokenHash(rawToken string) string {
+	sum := sha256.Sum256([]byte(rawToken))
+	return journal.TokenHashPrefix + hex.EncodeToString(sum[:])
+}
+
+// writeToken validates and writes a token table mutation on the meta stream. Token records
+// carry no signature, so their own Validate is the only gate between the generator and the
+// fixture tree — which is why it is called here rather than left to the reading tests.
+func (w *fixtureWriter) writeToken(seq journal.Seq, rec interface{ Validate() error }) {
+	w.t.Helper()
+	if err := rec.Validate(); err != nil {
+		w.t.Fatalf("failed to validate _meta seq %d: %v", seq, err)
+	}
+	w.writeJSON(journal.TxKey(journal.MetaStreamID, seq), rec)
 }
 
 // TestRegenerateFixtures rewrites spec/journal/v1/fixtures from the generator.
@@ -450,13 +454,23 @@ func generateFixtures(w *fixtureWriter) {
 		PublicKey: genesisPub,
 		Timestamp: "2026-08-31T00:00:00Z",
 	})
-	w.writeJSON(journal.TxKey(journal.MetaStreamID, 1), metaRecord{
+	// The token table lives on the meta stream too: an admin token minted at seq 1, revoked
+	// at seq 3, and the narrower token that replaces it at seq 4. Written through the
+	// published types, like every other record here, so that an encoder change moves these
+	// bytes rather than passing unseen. The two tokens are the ones spec/auth/v1 publishes
+	// under these identifiers, read from that file so that the journal cannot come to
+	// describe a different instance from the one the auth fixtures describe.
+	adminToken := loadFixtureBuiltinToken(t, fixtureAdminTokenID)
+	writerToken := loadFixtureBuiltinToken(t, fixtureWriterTokenID)
+
+	w.writeToken(1, &journal.TokenCreateRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       1,
-		Type:      "token_create",
-		TokenID:   "tok_admin_01",
-		Scope:     "rwc:*",
+		Type:      journal.RecordTypeTokenCreate,
+		TokenID:   fixtureAdminTokenID,
+		TokenHash: fixtureTokenHash(adminToken.RawToken),
+		Scopes:    []string{"rwc:*"},
 		Timestamp: "2026-08-31T00:01:00Z",
 	})
 
@@ -474,13 +488,28 @@ func generateFixtures(w *fixtureWriter) {
 	}
 	w.writeJSON(journal.TxKey(journal.MetaStreamID, rotation.Seq), rotation)
 
-	w.writeJSON(journal.TxKey(journal.MetaStreamID, 3), metaRecord{
+	w.writeToken(3, &journal.TokenRevokeRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       3,
-		Type:      "token_revoke",
-		TokenID:   "tok_admin_01",
+		Type:      journal.RecordTypeTokenRevoke,
+		TokenID:   fixtureAdminTokenID,
+		TokenHash: fixtureTokenHash(adminToken.RawToken),
 		Timestamp: "2026-08-31T00:08:00Z",
+	})
+
+	// A token carrying more than one scope, which is the case a single scope field cannot
+	// hold: spec/auth/v1 section 3.4 opens "a token may carry one or more scopes", and this
+	// is that sentence as bytes on the meta stream.
+	w.writeToken(4, &journal.TokenCreateRecord{
+		Version:   journal.VersionPrefix,
+		Stream:    journal.MetaStreamID,
+		Seq:       4,
+		Type:      journal.RecordTypeTokenCreate,
+		TokenID:   fixtureWriterTokenID,
+		TokenHash: fixtureTokenHash(writerToken.RawToken),
+		Scopes:    []string{"rw:blog-*", "r:docs"},
+		Timestamp: "2026-08-31T00:09:00Z",
 	})
 
 	// --- Rulings 3 and 4: real commits, real packfiles, real ref transitions.

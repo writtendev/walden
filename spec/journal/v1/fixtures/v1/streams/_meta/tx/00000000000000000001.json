@@ -4,6 +4,9 @@
   "seq": "1",
   "type": "token_create",
   "token_id": "tok_admin_01",
-  "scope": "rwc:*",
+  "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
+  "scopes": [
+    "rwc:*"
+  ],
   "timestamp": "2026-08-31T00:01:00Z"
 }

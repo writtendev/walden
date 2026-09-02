@@ -158,7 +158,7 @@ Built-in tokens are minted by the CLI (`walden token create`):
   ```
 
 ### 5.2 Meta Stream Record (`token_create`)
-When a built-in token is created, a record is conditionally appended to the `_meta` stream in the journal:
+When a built-in token is created, a record is conditionally appended to the `_meta` stream in the journal, so that replaying the journal onto an empty disk brings the token table back with the repositories. The record is defined normatively by the [journal specification, section 4.3](../../journal/v1/README.md#43-token-creation-records-token_create); this is the golden journal's own record, byte for byte:
 ```json
 {
   "version": "v1",
@@ -166,24 +166,29 @@ When a built-in token is created, a record is conditionally appended to the `_me
   "seq": "1",
   "type": "token_create",
   "token_id": "tok_admin_01",
-  "token_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "scopes": ["rwc:*"],
+  "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
+  "scopes": [
+    "rwc:*"
+  ],
   "timestamp": "2026-08-31T00:01:00Z"
 }
 ```
 
+The token is `tok_admin_01` of [`fixtures/builtin_tokens.json`](fixtures/builtin_tokens.json), and `token_hash` is the hash of section 5.1 over that token's raw string — the two fixture sets agree on hash and scopes. They do not agree on membership or on revocation state, and are not meant to: `builtin_tokens.json` is a conformance table of tokens to authorize against, while the golden journal is authoritative for whether a token is live. Section 5.3 below revokes `tok_admin_01` on the meta stream, and `builtin_tokens.json` still publishes it with `"revoked": false`, because it is describing its own table and not this journal's rebuilt one. `scopes` is an array because a token may carry more than one (section 3.4); the journal spec's section 4.3 shows `tok_writer_02` and its two.
+
 These are journal records, so their `seq` field is a JSON string holding its exact decimal form — here and in Section 5.3 — and the normative rule is [journal specification section 1.1](../../journal/v1/README.md#11-sequence-numbers-are-json-strings), not restated here.
 
 ### 5.3 Token Revocation (`token_revoke`)
-Revoking a token appends a `token_revoke` record to the `_meta` stream:
+Revoking a token appends a `token_revoke` record to the `_meta` stream, defined normatively by the [journal specification, section 4.4](../../journal/v1/README.md#44-token-revocation-records-token_revoke). Again the golden journal's own record, which revokes the token created above:
 ```json
 {
   "version": "v1",
   "stream": "_meta",
-  "seq": "2",
+  "seq": "3",
   "type": "token_revoke",
   "token_id": "tok_admin_01",
-  "timestamp": "2026-08-31T01:00:00Z"
+  "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
+  "timestamp": "2026-08-31T00:08:00Z"
 }
 ```
 

@@ -1,0 +1,13 @@
+{
+  "version": "v1",
+  "stream": "_meta",
+  "seq": "4",
+  "type": "token_create",
+  "token_id": "tok_writer_02",
+  "token_hash": "sha256:5453e0186b8b6f1d4852424e8ae33ecf685ce338a44862fc8db2acddc7b40d2a",
+  "scopes": [
+    "rw:blog-*",
+    "r:docs"
+  ],
+  "timestamp": "2026-08-31T00:09:00Z"
+}

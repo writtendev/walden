@@ -2,7 +2,7 @@
 
 > **Status:** Published Specification (v1)  
 > **Milestone:** M1 · Journal format v1  
-> **Rulings & Topics Covered:** Ruling 1 of 5 (Signing Identity & Genesis), Ruling 2 of 5 (Stream Model & Key Layout), Ruling 3 of 5 (Ref-Transaction Records & Payload Canonicalization), Ruling 4 of 5 (Pack Segments & Content Addressing), Ruling 5 of 5 (Conditional Append, Per-Stream Fencing & CAS Requirement), Compaction Snapshots & Replay-from-Here Marker (`marker.json`)
+> **Rulings & Topics Covered:** Ruling 1 of 5 (Signing Identity & Genesis), Ruling 2 of 5 (Stream Model & Key Layout), Ruling 3 of 5 (Ref-Transaction Records & Payload Canonicalization), Ruling 4 of 5 (Pack Segments & Content Addressing), Ruling 5 of 5 (Conditional Append, Per-Stream Fencing & CAS Requirement), Meta Stream Token Records (`token_create`, `token_revoke`), Compaction Snapshots & Replay-from-Here Marker (`marker.json`)
 
 ---
 
@@ -28,6 +28,7 @@ Every repository is modeled as an independent stream. The server instance's own 
  │ seq 1: Second push ref tx   │               │ seq 1: Token create (rwc:*) │
  │ seq 2: Branch delete ref tx │               │ seq 2: Key rotation (...)   │
  │ seq 3: Force-push ref tx    │               │ seq 3: Token revoke         │
+ │                             │               │ seq 4: Token create (rw, r) │
  └─────────────────────────────┘               └─────────────────────────────┘
 ```
 
@@ -59,7 +60,8 @@ The server's signing identity is born with the journal and lives in it:
   - **Private Key:** Stored locally on server disk alongside the token store; never written to object storage.
 
 ### 2.2 Security Model and Honest Boundaries
-- **Tamper-Evidence, Not Server Trust:** Journal signing provides **tamper-evidence of the history, not protection from a malicious server.** A server that holds the signing key and wishes to lie can sign its lies. Signing guarantees that once written, history in object storage cannot be altered, forged, or spliced by unauthorized third parties or storage providers without failing cryptographic verification.
+- **Tamper-Evidence, Not Server Trust:** Journal signing provides **tamper-evidence of the history, not protection from a malicious server.** A server that holds the signing key and wishes to lie can sign its lies. Signing guarantees that once written, history in object storage cannot be altered, forged, or spliced by unauthorized third parties or storage providers without failing cryptographic verification — with the one exception named immediately below.
+- **One Named Exception — Token Records Are Unsigned in v1:** The guarantee above holds for every record this format signs: key rotations chain to genesis, and ref transactions verify against the key that was active when they were written. It does **not** hold for the `token_create` and `token_revoke` records of sections 4.3 and 4.4, which carry no signature in v1. A third party who can write to the bucket can append a `token_create` and a replay rebuilds it as a live grant — a working credential, because the hash the record names is the value a server looks a request up by — without failing any check this specification defines. That is a different party from the malicious server conceded above: the exception covers exactly the party the guarantee otherwise excludes, so it is named here rather than left for a reader to discover in section 4.5. Closing the gap means giving both record types a canonical payload and a signature, so that a forged or tampered token record fails verification like any other record; that is a format change, and this document does not define it. Until such a change lands, tamper-evidence for the token table rests on the bucket's own access control and not on this signing identity.
 - **Permanent Private Key Loss:** Losing the private signing key is an unrecoverable-for-signing state. The server can no longer accept new writes or append new records. Existing history in the bucket remains permanently readable, verifiable from genesis forward, and fully restorable.
 
 ---
@@ -106,7 +108,13 @@ implementation can check itself against the example and the fixture at once.
 
 ---
 
-## 4. Key Rotation Records (`_meta`, `seq >= 1`)
+## 4. Meta Stream Records (`_meta`, `seq >= 1`)
+
+Past genesis, the meta stream carries the instance's own configuration state and nothing else: rotations of the server signing key, and mutations of the token table. No repository history is ever written here, and none of these records is ever written to a repository stream.
+
+Every record in this section opens with the same four fields the genesis record opens with — `version`, `stream` (always `"_meta"`), `seq`, `type` — and is appended under the conditional-append rules of section 11 like any other record. Sequence `0` belongs to genesis, so these records begin at `1`.
+
+### 4.1 Key Rotation Records (`key_rotation`)
 
 Signing keys can be rotated without out-of-band coordination by appending a `key_rotation` record to the `_meta` stream.
 
@@ -114,7 +122,7 @@ Signing keys can be rotated without out-of-band coordination by appending a `key
 - **Stream:** `_meta`
 - **Type:** `"key_rotation"`
 
-### 4.1 JSON Schema and Field Specification
+#### JSON Schema and Field Specification
 ```json
 {
   "version": "v1",
@@ -142,7 +150,7 @@ This is the golden journal's own rotation record, byte for byte:
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of rotation. |
 | `signature` | string | Ed25519 signature generated by the private key of `old_public_key` over the canonical payload. |
 
-### 4.2 Canonical Signing Payload
+### 4.2 Canonical Signing Payload (Key Rotation)
 The signature is computed over deterministic UTF-8 bytes structured as follows:
 ```
 walden-key-rotation:v1\n
@@ -153,6 +161,119 @@ new_public_key:<new_public_key>\n
 timestamp:<timestamp>\n
 ```
 Each line terminates with a newline (`\n`, `0x0A`). `<seq>` is the decimal sequence number with no leading zeros — the same text the JSON string carries, and unchanged by the encoding rule of section 1.1.
+
+### 4.3 Token Creation Records (`token_create`)
+
+A built-in token is minted by the server's own CLI, and the server stores its hash — never the raw token. The local token store is a cache like every other local file, so the mutation is appended to the meta stream as well: a reader that replays `_meta` holds the whole token table when it reaches the head. That is what makes a restore onto an empty disk restore the tokens too, rather than restoring every repository and locking the operator out of them.
+
+- **Location:** `v1/streams/_meta/tx/<seq>.json` (where `<seq> >= 1`)
+- **Stream:** `_meta`
+- **Type:** `"token_create"`
+
+```json
+{
+  "version": "v1",
+  "stream": "_meta",
+  "seq": "1",
+  "type": "token_create",
+  "token_id": "tok_admin_01",
+  "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
+  "scopes": [
+    "rwc:*"
+  ],
+  "timestamp": "2026-08-31T00:01:00Z"
+}
+```
+
+This is the golden journal's own token creation record, byte for byte:
+[`fixtures/v1/streams/_meta/tx/00000000000000000001.json`](fixtures/v1/streams/_meta/tx/00000000000000000001.json).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `version` | string | Format version; MUST be `"v1"`. |
+| `stream` | string | MUST be `"_meta"`. |
+| `seq` | string | Strictly monotonic sequence number ($k \ge 1$) in exact decimal form (section 1.1). |
+| `type` | string | MUST be `"token_create"`. |
+| `token_id` | string | Stable identifier for the token, matching `^[a-zA-Z0-9._-]+$` (max 255 bytes) — the same character class a stream ID uses, so it is safe unescaped in a key, a log line, and a one-line refusal. Unique within the journal: an identifier is never reused. |
+| `token_hash` | string | The stored hash of the raw bearer token, `sha256:<64-lowercase-hex>`. Lowercase is required, not folded, because the value is compared byte for byte against the hash a request produces. |
+| `scopes` | array of strings | One or more scope strings the token was minted with, in the order minted. Each MUST be a non-empty string, and no string may repeat. |
+| `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of token creation. |
+
+**The raw token is not here, and cannot be derived from what is.** The journal carries the hash the server compares against; a bucket, a backup of it, or a replay of it grants nobody a token they did not already hold.
+
+**Scope strings are opaque to the journal.** They are stored verbatim and returned verbatim, and this format assigns them no meaning: the vocabulary — the `<actions>:<pattern>` grammar, the glob rules, what `rwc:*` grants — is [the token specification](../../auth/v1/README.md), section 3. A reimplementation of *this* format can carry a token table faithfully without implementing that grammar at all; it needs the grammar only to answer requests with the table.
+
+A token may carry more than one scope, and the array is what makes that expressible. The golden journal's second token is that case:
+
+```json
+{
+  "version": "v1",
+  "stream": "_meta",
+  "seq": "4",
+  "type": "token_create",
+  "token_id": "tok_writer_02",
+  "token_hash": "sha256:5453e0186b8b6f1d4852424e8ae33ecf685ce338a44862fc8db2acddc7b40d2a",
+  "scopes": [
+    "rw:blog-*",
+    "r:docs"
+  ],
+  "timestamp": "2026-08-31T00:09:00Z"
+}
+```
+
+Byte for byte, again:
+[`fixtures/v1/streams/_meta/tx/00000000000000000004.json`](fixtures/v1/streams/_meta/tx/00000000000000000004.json).
+It is the same token the auth specification publishes as `tok_writer_02`, hash and scopes included; those are the whole of the agreement between the two fixture sets.
+
+### 4.4 Token Revocation Records (`token_revoke`)
+
+Revoking a token appends a `token_revoke` record naming the token that is being withdrawn.
+
+- **Location:** `v1/streams/_meta/tx/<seq>.json` (where `<seq> >= 1`)
+- **Stream:** `_meta`
+- **Type:** `"token_revoke"`
+
+```json
+{
+  "version": "v1",
+  "stream": "_meta",
+  "seq": "3",
+  "type": "token_revoke",
+  "token_id": "tok_admin_01",
+  "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
+  "timestamp": "2026-08-31T00:08:00Z"
+}
+```
+
+This is the golden journal's own revocation, byte for byte:
+[`fixtures/v1/streams/_meta/tx/00000000000000000003.json`](fixtures/v1/streams/_meta/tx/00000000000000000003.json).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `version` | string | Format version; MUST be `"v1"`. |
+| `stream` | string | MUST be `"_meta"`. |
+| `seq` | string | Strictly monotonic sequence number ($k \ge 1$) in exact decimal form (section 1.1). |
+| `type` | string | MUST be `"token_revoke"`. |
+| `token_id` | string | The identifier of the token being revoked, under the same rules section 4.3 states for it. A reader matches on this field. |
+| `token_hash` | string | The same `sha256:<64-lowercase-hex>` the creating record carried for that identifier, repeated here. |
+| `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of revocation. |
+
+The record names the token twice on purpose. The identifier is what a reader matches on; the hash is what a *server* keys its table by, so repeating it lets a revocation be applied — and read by a human — against the table as it is actually held. Repeating it also makes disagreement visible: a revocation whose hash is not the one recorded for that identifier does not describe the token it claims to, and a reader refuses it rather than revoking something on a guess.
+
+A revocation carries no `scopes`. It withdraws a grant; it does not describe one.
+
+### 4.5 Rebuilding the Token Table
+
+A reader replaying `_meta` from genesis forward holds the token table when it reaches the head. The rules are the whole of it:
+
+1. **Start empty.** A journal with no token records rebuilds to no tokens.
+2. **A record that violates its own field rules never reaches the table.** The constraints stated in the field tables of sections 4.3 and 4.4 are normative — the `token_id` character class and 255-byte cap, `token_hash` as `sha256:<64-lowercase-hex>`, and, for a creation, a `scopes` array carrying at least one entry with no entry empty and none repeated. A record violating any of them is refused before it is applied (section 8.1, rule 13); the reader does not apply it, and does not repair it.
+3. **`token_create`** inserts a row: `token_id` → (`token_hash`, `scopes`), live. A record naming a `token_id` the table already holds is a reused identifier, which this format forbids; the reader refuses (section 8.1, rule 10).
+4. **`token_revoke`** finds the row named by `token_id` and marks it revoked. An identifier the table does not hold is unchainable, exactly as an unchainable rotation is: the reader refuses (rule 11), and does not create the row. A `token_hash` that disagrees with the one the row carries is likewise refused (rule 12).
+5. **Rows are never removed.** The journal is append-only, and what a replay rebuilds is the history of a token rather than a snapshot of a mutable file. A revoked row is kept, revoked.
+6. **The table is the whole identity model.** There are no accounts, owners, or expiries to rebuild, because there are none to record. A row is a hash to look a request up by and the scopes to answer it with.
+
+**These records carry no signature in v1, and that is an exception to the guarantee of section 2.2 rather than an instance of it.** A key rotation and a ref transaction are signed and chain to the genesis key; a token record is not. So the guarantee section 2.2 makes — that written history cannot be altered, forged, or spliced by an unauthorized third party or a storage provider without failing verification — does not reach the token table. A party who can append to `_meta` in the bucket can append a `token_create` naming a hash of their own choosing and the scopes `rwc:*`, and a replay following the rules above rebuilds it as a live grant. Nothing in the algorithm of section 8 catches it, because there is no signature to check. What that grant is worth is the point: `token_hash` is the value a server keys its table by, so the forger holds a raw token that authorizes, not merely a misleading row in a table. The bucket's own access control is the whole of the defence here, which is a weaker claim than section 2.2's, and it is stated in both places so that a reimplementer cannot infer the stronger one.
 
 ---
 
@@ -510,7 +631,11 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │    │     Verify signature with ActiveKey over payload  │
 │    │     ActiveKey = new_public_key                    │
 │    │     LastMetaSeq = seq                             │
-│    └── other meta records (e.g. token mutations):      │
+│    ├── type == "token_create" or "token_revoke":       │
+│    │     Verify record fields (sections 4.3, 4.4)      │
+│    │     Apply to the token table (section 4.5)        │
+│    │     LastMetaSeq = seq                             │
+│    └── other meta records:                             │
 │          Verify contiguous sequence                    │
 │          LastMetaSeq = seq                             │
 └───────────────────────────┬────────────────────────────┘
@@ -570,6 +695,23 @@ Every reader or recovery engine verifying a journal MUST execute the following d
    refusal: replay failed: snapshot hash mismatch for <sha256> on stream <id> (computed <actual>) (snapshot pack in object storage is corrupt)
    ```
 9. **Never Guess:** Readers MUST never skip unverified, unchainable, or missing records. Partial or guessed recovery is strictly prohibited.
+10. **Reused Token Identifier:** If a `token_create` names a `token_id` the rebuilt table already holds:
+    ```
+    refusal: replay failed: token create at seq <N> reuses token id <token-id>
+    ```
+11. **Unknown Token Revoked:** If a `token_revoke` names a `token_id` the rebuilt table does not hold, the revocation does not chain to a creation:
+    ```
+    refusal: replay failed: token revoke at seq <N> names unknown token <token-id>
+    ```
+12. **Token Hash Disagreement:** If a `token_revoke` carries a `token_hash` that is not the one recorded for that `token_id`:
+    ```
+    refusal: replay failed: token revoke at seq <N> disagrees with the hash recorded for token <token-id>
+    ```
+13. **Malformed Token Record:** If a `token_create` or `token_revoke` violates any field rule of section 4.3 or 4.4 — the `token_id` character class or 255-byte cap, the `token_hash` format, or a `scopes` array that is empty, holds an empty string, or repeats one — the record is refused before it is applied to the token table (section 4.5, rule 2), with `<reason>` naming the field rule that failed:
+    ```
+    refusal: replay failed: invalid token record at seq <N> (<reason>)
+    ```
+    A `token_hash` that is not `sha256:<64-lowercase-hex>` is refused under this rule and not repaired, which is also what keeps a raw bearer token out of the journal: a record carrying one where the hash belongs does not parse as a hash, and a writer that emits it is refused rather than publishing the secret.
 
 ---
 
@@ -787,6 +929,6 @@ To materialize or restore a repository stream from the journal:
 
 ## 13. Reimplementation Grant
 
-This specification is published with an unconditional reimplementation grant. Anyone may implement this signing identity model, genesis record, key rotation protocol, ref-transaction record format, pack segment content addressing, stream layout, and reader/writer semantics in any programming language, for any purpose, without restriction and without asking.
+This specification is published with an unconditional reimplementation grant. Anyone may implement this signing identity model, genesis record, key rotation protocol, token table records, ref-transaction record format, pack segment content addressing, stream layout, and reader/writer semantics in any programming language, for any purpose, without restriction and without asking.
 
-A complete golden journal covering every ruling in this document — genesis and rotation, both stream shapes, all four ref-transaction cases, real content-addressed packfiles, post-compaction snapshot and marker state, and the conditional-append targets and refusals of Section 11 — is published alongside it in [`fixtures/`](fixtures/) under the same grant.
+A complete golden journal covering every ruling in this document — genesis, rotation and a token table created and revoked, both stream shapes, all four ref-transaction cases, real content-addressed packfiles, post-compaction snapshot and marker state, and the conditional-append targets and refusals of Section 11 — is published alongside it in [`fixtures/`](fixtures/) under the same grant.

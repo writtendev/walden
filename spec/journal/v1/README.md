@@ -39,7 +39,7 @@ The reason, stated once here so that nobody tidies it back to a number: RFC 8259
 
 Normative rules:
 
-1. **Exact decimal form.** The string MUST match `^(0|[1-9][0-9]*)$` and MUST denote a value in `0` to `18446744073709551615`. No leading zeros, no sign, no whitespace, no exponent, no grouping — nothing a re-encoding would introduce.
+1. **Exact decimal form.** The string MUST match `^(0|[1-9][0-9]*)$` and MUST denote a value in `0` to `18446744073709551615`. No leading zeros, no sign, no whitespace, no exponent, no grouping — nothing a re-encoding would introduce. The constraint is on the encoded form: the characters between the quotes in the serialized JSON MUST themselves match that regex, so no escape sequence is permitted even where it would decode to a digit (`"\u0033"` is refused, not read as `3`).
 2. **Writers** MUST emit the exact decimal form. **Readers** MUST refuse any other encoding, a JSON number included, rather than coercing it: a rounded or reformatted sequence derives the wrong object key, which is the failure this rule exists to prevent.
 3. **The object key is unaffected.** `tx/<seq>.json` is still the 20-digit zero-padded decimal of section 9.2, and a record's sequence MUST still equal the sequence in its key.
 4. **The canonical signing payloads are unaffected.** Sections 4.2 and 5.3 serialize the sequence as decimal text on a `seq:<seq>` line and always have. Signatures cover that text, not the JSON encoding, so this rule changes no signature and re-signs no history.

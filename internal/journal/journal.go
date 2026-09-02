@@ -78,6 +78,14 @@ func (s Seq) MarshalJSON() ([]byte, error) {
 // decimal form. A JSON number is refused, and so is a string that is not the
 // exact decimal form of the value it names: a rounded or reformatted sequence
 // derives the wrong object key, so it is refused rather than silently accepted.
+//
+// This catches a malformed sequence but not an absent one: encoding/json never
+// calls UnmarshalJSON for a key that is missing, so a record with no "seq" at all
+// decodes to sequence 0 and passes Validate. Validate cannot close that gap
+// either — 0 is a legitimate sequence, so telling absent from zero means retyping
+// the field as *Seq. That is deliberately left open here rather than half-closed:
+// no production path parses these records yet, and WALD-97 rewrites marker parsing
+// to verify a signature, which is where presence gets settled.
 func (s *Seq) UnmarshalJSON(data []byte) error {
 	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
 		return fmt.Errorf("%w: sequence must be a JSON string holding its decimal form, got %s", ErrInvalidSeq, data)

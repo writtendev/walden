@@ -172,6 +172,8 @@ When a built-in token is created, a record is conditionally appended to the `_me
 }
 ```
 
+These are journal records, so their `seq` field is a JSON string holding its exact decimal form — here and in Section 5.3 — and the normative rule is [journal specification section 1.1](../../journal/v1/README.md#11-sequence-numbers-are-json-strings), not restated here.
+
 ### 5.3 Token Revocation (`token_revoke`)
 Revoking a token appends a `token_revoke` record to the `_meta` stream:
 ```json

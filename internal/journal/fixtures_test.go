@@ -722,17 +722,6 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		t.Errorf("conflict code = %q, want %q", fixture.ConditionalPut.ConflictCode, journal.CodePreconditionFailed)
 	}
 
-	// Section 11.2 requires the same conflict response of every supported provider, so
-	// the code and status the fixture pins are the ones the whole matrix agrees on.
-	for _, provider := range journal.ProviderSupportMatrix {
-		if provider.Status != journal.ProviderSupported {
-			continue
-		}
-		if provider.ConflictStatus != fixture.ConditionalPut.ConflictStatus {
-			t.Errorf("provider %s conflicts with status %d, fixture says %d", provider.Name, provider.ConflictStatus, fixture.ConditionalPut.ConflictStatus)
-		}
-	}
-
 	if len(fixture.TxKeys) == 0 {
 		t.Fatal("expected conditional append key fixtures")
 	}

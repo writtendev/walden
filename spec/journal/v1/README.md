@@ -623,7 +623,9 @@ If an object storage provider does not natively support atomic conditional write
 
 ### 11.2 S3-Compatible Provider Support Matrix
 
-The following matrix documents the compatibility of major S3-compatible object storage providers with walden's compare-and-swap requirement:
+The following matrix documents the compatibility of major S3-compatible object storage providers with walden's compare-and-swap requirement.
+
+**This table is documentation, not enforcement.** It exists so an operator can choose a provider before deploying. Walden decides whether a bucket may hold a journal by probing that bucket at boot — a conditional PUT of a sentinel key, twice, requiring `412` on the second — because a hostname is not a capability: it cannot see a proxy in front of the bucket, a gateway that drops the header, or a build too old to honour the precondition. That last case is the common one, since MinIO, Ceph RGW, and Garage are version-gated rather than vendor-gated and run under operator-chosen hostnames. An implementation should not re-derive a compiled-in provider table from this section; probe instead.
 
 | Provider | Conditional Header Mechanism | Conflict Response Status & Code | Support Status | Notes & Compatibility Details |
 | :--- | :--- | :--- | :---: | :--- |

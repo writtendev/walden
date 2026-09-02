@@ -1016,9 +1016,15 @@ func jsonObjectEnd(lines []string, i int) (int, bool) {
 // any other fence tag is caught rather than passing unseen. What neither pass covers is an
 // example that is neither: not carried by a ```json fence, and not parseable as a JSON object
 // from some line of its own through an unbroken run of lines, once one level of blockquote
-// marker is off — a fragment, a record with an ellipsis through it, one split by a blank line,
-// one quoted twice over. Those are illustrations rather than records, and section 3.1's claim
-// is about records.
+// marker is off.
+//
+// Being incomplete is one way to land there — a fragment, a record with an ellipsis through
+// it, one split by a blank line, one quoted twice over — but completeness is not the boundary,
+// and reading only that list would suggest it is. A whole record escapes just as readily
+// whenever the line its object opens on does not itself begin with "{" after one blockquote
+// strip: inline in a prose sentence, on one line in a table cell, or prefixed line by line
+// inside a ```diff fence. All of those are illustrations rather than records, and section
+// 3.1's claim is about records.
 //
 // It is also, as things stand, the only test that sees a repack. TestFixturesAreGenerated
 // matches packs by their object set and carries the committed bytes forward, so new pack
@@ -1113,6 +1119,17 @@ func TestSpecExamplesMatchFixtures(t *testing.T) {
 	// not one: an untagged or mis-tagged fence, four-space indentation, a block the document
 	// quotes rather than fences. This sweeps what the fence walk did not claim and finds JSON
 	// by parsing it, so no shape of markdown gets an example past the link check.
+	//
+	// The question widened on the way here, and a future author should know it was meant to.
+	// The check this replaced asked whether a whole fence body was a JSON document; this asks
+	// it of every unclaimed line, so JSON that is only part of a block fires too. The case
+	// that will actually come up is an HTTP example carrying a record body — a natural
+	// addition to section 11, which already fences one ```http request — and there is no way
+	// to write it that this gate accepts: left as http it reports the message below, and
+	// fenced json instead it must then cite a fixture, which a block holding a request line
+	// and headers can never match byte for byte. That is the rule working, not failing: any
+	// JSON object in this document is a record held to a fixture. An example of that shape
+	// cannot be added without changing the rule.
 	for i := 0; i < len(lines); i++ {
 		if carried[i] {
 			continue

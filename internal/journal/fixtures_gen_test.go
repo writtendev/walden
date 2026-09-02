@@ -325,11 +325,20 @@ func (w *fixtureWriter) resolvePack(prefix string, pack []byte) (string, []byte)
 // That is reported and the run continues, rather than aborting the test. A Fatalf here costs
 // the caller the file-set walk in TestFixturesAreGenerated — the same pathology resolvePack
 // avoids by preferring a self-named candidate: a run that says a segment is invalid and never
-// names the stray file sitting beside it. Nothing after this call can be hurt by a bad hash:
-// the pack goes into a temp tree under the name it already has, and that name travels into the
+// names the stray file sitting beside it. For a name that is well formed and lying — 64 hex
+// characters that are not this pack's digest — nothing after this call can be hurt by it: the
+// pack goes into a temp tree under the name it already has, and that name travels into the
 // records, where the byte comparison sees it. It may therefore add one derived record diff
 // below the real failure, which is a fair price for the operator learning both facts in one
 // run.
+//
+// A name that is not 64 hex characters at all is the sub-case this does not rescue, and the
+// comment used to claim it did. That name travels into the record too, where ValidateHash
+// rejects it — writeRefTx, SignRefTx, (*RefTransactionRecord).Validate — and writeRefTx does
+// Fatalf, so the file-set walk never runs and a stray file beside the pack still goes unnamed.
+// The refusal names the file exactly, and TestFixtureSegmentsAreContentAddressed asks the same
+// question of the committed tree and reports the same file in the same run, so the fact
+// survives; only this test's second half is lost.
 func (w *fixtureWriter) writeSegment(stream journal.StreamID, pack []byte) string {
 	w.t.Helper()
 	hash, data := w.resolvePack(journal.SegmentPrefix(stream), pack)

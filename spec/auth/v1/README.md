@@ -239,8 +239,10 @@ Alternatively, Walden accepts a structured JSON envelope string:
 }
 ```
 
-The envelope above and the compact token of the previous section carry the same capability:
-both are [`valid_capability`](fixtures/capability_tokens.json) of the golden fixtures.
+The envelope above is the `payload` and `signature` of
+[`valid_capability`](fixtures/capability_tokens.json) in the golden fixtures. That same
+fixture's `compact_token` field is the identical capability written in the compact format
+of this section; walden accepts either.
 
 ### 6.3 Capability Payload Schema
 ```json

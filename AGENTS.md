@@ -79,6 +79,9 @@ Code review is mechanical against these rules:
   githttp       — smart HTTP handlers, execs git upload-pack/receive-pack
   auth          — token verification, built-in and delegated modes
   config        — the five-knob configuration surface
+  refusal       — the one-line operator-facing refusal convention
+  spectest      — reads the JSON examples out of a published spec, for
+                  the fixture conformance gates (test support only)
 ```
 
 `config` imports nothing internal; no package imports another in a

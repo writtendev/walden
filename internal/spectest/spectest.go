@@ -11,6 +11,7 @@ package spectest
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -26,6 +27,10 @@ type Example struct {
 }
 
 // ErrUnterminatedFence reports a fenced block that the document never closes.
+//
+// It is always returned wrapped in an error naming the line the unclosed fence opens on.
+// These documents run to hundreds of lines and a caller can only name the file, so without
+// the line the recovery is to find the fence by hand.
 var ErrUnterminatedFence = errors.New("unterminated fenced block")
 
 // JSONExamples returns every ```json fenced block of a specification document, in document
@@ -59,7 +64,7 @@ func JSONExamples(lines []string) (examples []Example, stray []int, err error) {
 			end++
 		}
 		if end == len(lines) {
-			return nil, nil, ErrUnterminatedFence
+			return nil, nil, fmt.Errorf("%w opened on line %d", ErrUnterminatedFence, i+1)
 		}
 		body := make([]string, 0, end-start)
 		for _, line := range lines[start:end] {

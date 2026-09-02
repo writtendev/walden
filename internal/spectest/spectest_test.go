@@ -84,9 +84,17 @@ func TestJSONExamples(t *testing.T) {
 // TestJSONExamplesUnterminatedFence covers the one failure the reader reports rather than
 // working around: a document whose fence is never closed is malformed, and a gate reading it
 // would otherwise silently drop everything after the opener.
+//
+// The line the fence opens on is part of the error, not decoration. A caller only knows the
+// document's path, so the line is the whole difference between naming the defect and sending
+// a maintainer through an 800-line file looking for it.
 func TestJSONExamplesUnterminatedFence(t *testing.T) {
-	_, _, err := spectest.JSONExamples(strings.Split("```json\n{\n  \"a\": 1\n}\n", "\n"))
+	doc := "intro\n\nsome prose\n\n```json\n{\n  \"a\": 1\n}\n"
+	_, _, err := spectest.JSONExamples(strings.Split(doc, "\n"))
 	if !errors.Is(err, spectest.ErrUnterminatedFence) {
-		t.Errorf("expected ErrUnterminatedFence, got %v", err)
+		t.Fatalf("expected ErrUnterminatedFence, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "line 5") {
+		t.Errorf("error %q does not name line 5, where the fence opens", err)
 	}
 }

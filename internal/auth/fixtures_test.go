@@ -27,26 +27,30 @@ import (
 //
 //	TestFixtureTree                the fixtures directory holds exactly these files, and the
 //	                               fixtures README names every one of them
-//	the case counts below          how many cases each file carries, pinned to a literal
-//	the executed counters          every case runs, and the number that ran is compared
-//	                               against that literal, rather than a loop being trusted to
-//	                               have had anything to iterate over
-//	readFixture                    every field of every fixture is read by the test that runs
-//	                               it; a field nothing reads is refused
+//	the case counts below          how many cases each file carries, pinned to a literal, so
+//	                               a table cannot be emptied or quietly shrunk
+//	the pinned answer tables       what each case is supposed to mean, written out in this
+//	                               file rather than recomputed from the fixture, so a case
+//	                               whose fields were edited fails instead of carrying the
+//	                               expectation along with it
+//	readFixture                    a fixture may carry no field the struct that reads it does
+//	                               not have, so a table cannot grow a column nothing reads
 //	TestSpecExamplesMatchFixtures  the specification's own JSON examples are the fixture
 //	                               records they quote, byte for byte
 //
 // Between them: a fixture file cannot be added, deleted or emptied, a case cannot be dropped
-// or skipped past, and a field no test reads cannot be introduced, without a test failing.
-// That is what fixtures/README.md promises anyone reimplementing this format — "MUST pass all
-// test cases defined in these fixture files without modification" — and until this gate it
-// was promised by prose alone: emptying a file's cases to [] left the package green.
+// or edited, and a field no test reads cannot be introduced, without a test failing. That is
+// what fixtures/README.md promises anyone reimplementing this format — "MUST pass all test
+// cases defined in these fixture files without modification" — and until this gate it was
+// promised by prose alone: emptying a file's cases to [] left the package green.
+//
+// Each count below is named in the failure message that checks it, so a case added on purpose
+// says which constant to bump.
 const (
 	identifierCases      = 20
 	scopeParsingCases    = 15
 	scopeEvaluationCases = 19
 	builtinTokenCases    = 4
-	capabilityCases      = 6
 )
 
 // fixtureVersion is the format version every fixture in this directory declares. The auth
@@ -197,7 +201,7 @@ func TestIdentifiersFixture(t *testing.T) {
 	checkDescription(t, "identifiers.json", fixture.Description)
 
 	if len(fixture.Cases) != identifierCases {
-		t.Fatalf("identifiers.json carries %d cases, want %d", len(fixture.Cases), identifierCases)
+		t.Fatalf("identifiers.json carries %d cases, want %d; if a case was added on purpose, bump identifierCases", len(fixture.Cases), identifierCases)
 	}
 
 	known := make(map[string]bool, len(identifierViolations))
@@ -205,7 +209,6 @@ func TestIdentifiersFixture(t *testing.T) {
 		known[name] = false
 	}
 
-	ran := 0
 	for _, tc := range fixture.Cases {
 		checkDescription(t, "identifier case "+tc.Identifier, tc.Description)
 		err := auth.ValidateRepo(tc.Identifier)
@@ -232,10 +235,6 @@ func TestIdentifiersFixture(t *testing.T) {
 				}
 			}
 		}
-		ran++
-	}
-	if ran != identifierCases {
-		t.Errorf("%d identifier cases ran, want %d", ran, identifierCases)
 	}
 	for _, name := range identifierViolations {
 		if !known[name] {
@@ -269,13 +268,12 @@ func TestScopesFixture(t *testing.T) {
 	checkDescription(t, "scopes.json", fixture.Description)
 
 	if len(fixture.ScopeParsing) != scopeParsingCases {
-		t.Fatalf("scopes.json carries %d parsing cases, want %d", len(fixture.ScopeParsing), scopeParsingCases)
+		t.Fatalf("scopes.json carries %d parsing cases, want %d; if a case was added on purpose, bump scopeParsingCases", len(fixture.ScopeParsing), scopeParsingCases)
 	}
 	if len(fixture.Evaluations) != scopeEvaluationCases {
-		t.Fatalf("scopes.json carries %d evaluation cases, want %d", len(fixture.Evaluations), scopeEvaluationCases)
+		t.Fatalf("scopes.json carries %d evaluation cases, want %d; if a case was added on purpose, bump scopeEvaluationCases", len(fixture.Evaluations), scopeEvaluationCases)
 	}
 
-	parsed := 0
 	for _, tc := range fixture.ScopeParsing {
 		checkDescription(t, "scope case "+tc.Scope, tc.Description)
 		scope, err := auth.ParseScope(tc.Scope)
@@ -283,12 +281,18 @@ func TestScopesFixture(t *testing.T) {
 			if err == nil {
 				t.Errorf("scope parsing %q (%s): expected error, got nil", tc.Scope, tc.Description)
 			}
-			parsed++
+			// A refused scope parses to nothing, so the three fields describing what it
+			// parsed to must be absent. Checking only that an error came back leaves a
+			// refused case free to publish a pattern and an action set no implementation
+			// can reach, which is worse than saying nothing: it is a claim, in a
+			// conformance fixture, that is not merely unchecked but false.
+			if len(tc.Actions) != 0 || tc.CanonicalActions != "" || tc.Pattern != "" {
+				t.Errorf("scope parsing %q is invalid but carries actions %v, canonical_actions %q and pattern %q", tc.Scope, tc.Actions, tc.CanonicalActions, tc.Pattern)
+			}
 			continue
 		}
 		if err != nil {
 			t.Errorf("scope parsing %q (%s): expected valid, got: %v", tc.Scope, tc.Description, err)
-			parsed++
 			continue
 		}
 		if scope.Pattern != tc.Pattern {
@@ -316,13 +320,8 @@ func TestScopesFixture(t *testing.T) {
 		if granted != scope.Actions {
 			t.Errorf("scope %q lists actions %v, which parse to %q", tc.Scope, tc.Actions, scope.Actions.String())
 		}
-		parsed++
-	}
-	if parsed != scopeParsingCases {
-		t.Errorf("%d scope parsing cases ran, want %d", parsed, scopeParsingCases)
 	}
 
-	evaluated := 0
 	for _, tc := range fixture.Evaluations {
 		checkDescription(t, "evaluation on "+tc.Repo, tc.Description)
 		scopes, err := auth.ParseScopes(tc.Scopes)
@@ -332,11 +331,63 @@ func TestScopesFixture(t *testing.T) {
 		if got := auth.Allows(scopes, auth.Action(tc.Action), tc.Repo); got != tc.Allowed {
 			t.Errorf("evaluation %v on repo %q action %q (%s): got %v, want %v", tc.Scopes, tc.Repo, tc.Action, tc.Description, got, tc.Allowed)
 		}
-		evaluated++
 	}
-	if evaluated != scopeEvaluationCases {
-		t.Errorf("%d scope evaluation cases ran, want %d", evaluated, scopeEvaluationCases)
-	}
+}
+
+// probeRepos and probeActions are the matrix every fixture token is put through. The three
+// repositories straddle the fixture's globs: blog-alpha is matched by a wildcard scope, docs is
+// named outright by another, and metrics-collector is reached by neither.
+var (
+	probeRepos   = []string{"blog-alpha", "docs", "metrics-collector"}
+	probeActions = []auth.Action{auth.ActionRead, auth.ActionWrite, auth.ActionCreate}
+)
+
+// builtinTokenExpectations is what spec/auth/v1's built-in token table means, written out here
+// rather than read back off the fixture.
+//
+// That distinction is the whole test. Asking the authorizer to agree with auth.Allows over the
+// fixture's own scopes asserts only that two halves of this package agree with each other,
+// which they do for any scope string at all — including one edited by mistake, and including
+// one that hands out create on every repository. So the token IDs, the raw tokens, the scopes,
+// whether the token is revoked, and the answer to every probe are all literals here, the way
+// scopes.json's own evaluations block is a literal in the fixture. Editing builtin_tokens.json
+// now moves the fixture away from this table instead of moving the expectation with it.
+//
+// grants is, for each repository of probeRepos and in that order, the actions the token must
+// allow there, written as a scope's action string: "" for none, through "rwc" for all three. A
+// revoked token grants nothing whatever its scopes say, so its row is empty across the board.
+var builtinTokenExpectations = []struct {
+	tokenID  string
+	rawToken string
+	scopes   []string
+	revoked  bool
+	grants   []string
+}{
+	{
+		tokenID:  "tok_admin_01",
+		rawToken: "walden_sec_admin_0123456789abcdef",
+		scopes:   []string{"rwc:*"},
+		grants:   []string{"rwc", "rwc", "rwc"},
+	},
+	{
+		tokenID:  "tok_writer_02",
+		rawToken: "walden_sec_writer_0123456789abcdef",
+		scopes:   []string{"rw:blog-*", "r:docs"},
+		grants:   []string{"rw", "r", ""},
+	},
+	{
+		tokenID:  "tok_reader_03",
+		rawToken: "walden_sec_reader_0123456789abcdef",
+		scopes:   []string{"r:*"},
+		grants:   []string{"r", "r", "r"},
+	},
+	{
+		tokenID:  "tok_revoked_04",
+		rawToken: "walden_sec_revoked_0123456789abcdef",
+		scopes:   []string{"rwc:*"},
+		revoked:  true,
+		grants:   []string{"", "", ""},
+	},
 }
 
 func TestBuiltinTokensFixture(t *testing.T) {
@@ -356,21 +407,33 @@ func TestBuiltinTokensFixture(t *testing.T) {
 	checkDescription(t, "builtin_tokens.json", fixture.Description)
 
 	if len(fixture.Tokens) != builtinTokenCases {
-		t.Fatalf("builtin_tokens.json carries %d tokens, want %d", len(fixture.Tokens), builtinTokenCases)
+		t.Fatalf("builtin_tokens.json carries %d tokens, want %d; if a token was added on purpose, bump builtinTokenCases and give it a row in builtinTokenExpectations", len(fixture.Tokens), builtinTokenCases)
+	}
+	if len(builtinTokenExpectations) != builtinTokenCases {
+		t.Fatalf("builtinTokenExpectations covers %d tokens, want %d", len(builtinTokenExpectations), builtinTokenCases)
 	}
 
 	ctx := context.Background()
 	store := auth.NewMemoryTokenStore()
 	authorizer := auth.NewBuiltinAuthorizer(store)
 
-	type loaded struct {
-		raw     string
-		scopes  []auth.Scope
-		revoked bool
-	}
-	tokens := make([]loaded, 0, len(fixture.Tokens))
-
-	for _, tok := range fixture.Tokens {
+	// The fixture is held to the pinned table field by field before anything is asked of the
+	// authorizer, so an edited token fails saying which field moved rather than only as a
+	// surprising answer three loops down.
+	for i, tok := range fixture.Tokens {
+		want := builtinTokenExpectations[i]
+		if tok.TokenID != want.tokenID {
+			t.Fatalf("builtin_tokens.json token %d is %q, want %q", i, tok.TokenID, want.tokenID)
+		}
+		if tok.RawToken != want.rawToken {
+			t.Errorf("token %s: raw_token = %q, want %q", tok.TokenID, tok.RawToken, want.rawToken)
+		}
+		if strings.Join(tok.Scopes, " ") != strings.Join(want.scopes, " ") {
+			t.Errorf("token %s: scopes = %v, want %v", tok.TokenID, tok.Scopes, want.scopes)
+		}
+		if tok.Revoked != want.revoked {
+			t.Errorf("token %s: revoked = %v, want %v", tok.TokenID, tok.Revoked, want.revoked)
+		}
 		if computed := auth.HashToken(tok.RawToken); computed != tok.TokenHash {
 			t.Errorf("token %s hash mismatch: computed %q, want %q", tok.TokenID, computed, tok.TokenHash)
 		}
@@ -384,43 +447,41 @@ func TestBuiltinTokensFixture(t *testing.T) {
 			Scopes:    scopes,
 			Revoked:   tok.Revoked,
 		})
-		tokens = append(tokens, loaded{raw: tok.RawToken, scopes: scopes, revoked: tok.Revoked})
 	}
 
-	// Every token in the table is presented to the authorizer over the same probe matrix: a
-	// live token must decide each probe exactly as its own scopes do, and a revoked one must
-	// refuse every probe whatever its scopes say. That is section 3.4 asked through the store
-	// — hash the bearer token, find the record, evaluate its scopes — rather than of the scope
-	// evaluator directly, which is the half of this file the other tests do not reach.
-	probeRepos := []string{"blog-alpha", "docs", "metrics-collector"}
-	probeActions := []auth.Action{auth.ActionRead, auth.ActionWrite, auth.ActionCreate}
-
-	ran := 0
-	for _, tok := range tokens {
-		for _, repo := range probeRepos {
+	// Every token is then presented to the authorizer over the probe matrix and held to the
+	// pinned answers. That is section 3.4 asked through the store — hash the bearer token,
+	// find the record, evaluate its scopes — rather than of the scope evaluator directly,
+	// which is the half of this file the other tests do not reach. The refusal is pinned as
+	// well as the verdict: a live token denied a repository is forbidden, a revoked one is
+	// unauthorized whatever its scopes say, and the two are not interchangeable.
+	for _, want := range builtinTokenExpectations {
+		if len(want.grants) != len(probeRepos) {
+			t.Fatalf("token %s pins %d probe answers, want one per probe repository (%d)", want.tokenID, len(want.grants), len(probeRepos))
+		}
+		for i, repo := range probeRepos {
 			for _, action := range probeActions {
-				ok, err := authorizer.Authorize(ctx, tok.raw, action, repo)
-				if tok.revoked {
-					if ok || !errors.Is(err, auth.ErrUnauthorized) {
-						t.Errorf("revoked token on %s %q: got ok=%v, err=%v, want unauthorized", action, repo, ok, err)
+				ok, err := authorizer.Authorize(ctx, want.rawToken, action, repo)
+				switch {
+				case strings.Contains(want.grants[i], string(action)):
+					if !ok || err != nil {
+						t.Errorf("token %s, action %q on %q: got ok=%v, err=%v, want allowed", want.tokenID, action, repo, ok, err)
 					}
-					continue
-				}
-				want := auth.Allows(tok.scopes, action, repo)
-				if ok != want {
-					t.Errorf("token on %s %q: got ok=%v, err=%v, want %v", action, repo, ok, err, want)
+				case want.revoked:
+					if ok || !errors.Is(err, auth.ErrUnauthorized) {
+						t.Errorf("revoked token %s, action %q on %q: got ok=%v, err=%v, want unauthorized", want.tokenID, action, repo, ok, err)
+					}
+				default:
+					if ok || !errors.Is(err, auth.ErrForbidden) {
+						t.Errorf("token %s, action %q on %q: got ok=%v, err=%v, want forbidden", want.tokenID, action, repo, ok, err)
+					}
 				}
 			}
 		}
-		ran++
-	}
-	if ran != builtinTokenCases {
-		t.Errorf("%d built-in token cases ran, want %d", ran, builtinTokenCases)
 	}
 
-	// Two literals, so that the probe matrix above is not the only thing saying what the
-	// fixture tokens mean: the admin token reads any repository, and the revoked one reads
-	// nothing.
+	// One repository from outside the probe matrix, so the three names above are not the only
+	// ones the fixture's wildcards are ever asked about.
 	ok, err := authorizer.Authorize(ctx, "walden_sec_admin_0123456789abcdef", auth.ActionRead, "my-repo")
 	if !ok || err != nil {
 		t.Errorf("expected admin token read allowed, got ok=%v, err=%v", ok, err)
@@ -542,12 +603,22 @@ type signedCapability struct {
 // refusedCapability is a capability verification must refuse, and the refusal it must give.
 // expected_refusal names the refusal's category — the "<what>" of the single line, section 7's
 // left-hand column — because the rest of the line carries the evaluation time.
+//
+// Payload is optional, and is a pointer so that "absent" and "empty" are distinguishable. The
+// two forgeries — a payload swapped under a good signature, and a signature from an untrusted
+// key — print no payload, because what is inside them is the forgery rather than a claim
+// anyone should copy out. Where a refused capability does print one, checkPayloadMatchesToken
+// holds it to the token beside it.
 type refusedCapability struct {
-	Payload         auth.CapabilityPayload `json:"payload"`
-	CompactToken    string                 `json:"compact_token"`
-	ExpectedRefusal string                 `json:"expected_refusal"`
+	Payload         *auth.CapabilityPayload `json:"payload"`
+	CompactToken    string                  `json:"compact_token"`
+	ExpectedRefusal string                  `json:"expected_refusal"`
 }
 
+// capabilityFixture is the whole of capability_tokens.json. The capabilities are named struct
+// fields rather than an array, so no count needs pinning: readFixture refuses a capability
+// added to the file that this struct does not name, and one removed from it decodes to the
+// zero value, whose signature verifies against nothing.
 type capabilityFixture struct {
 	Version            string            `json:"version"`
 	Description        string            `json:"description"`
@@ -573,10 +644,43 @@ func capabilityEnvelope(c signedCapability) auth.CapabilityEnvelope {
 	}
 }
 
+// checkPayloadMatchesToken asserts that the payload a fixture prints is the payload the
+// compact token beside it actually carries.
+//
+// The token is what verification reads; the payload field is what a person reimplementing this
+// format reads, and it is what section 6.3's example in the specification is copied from. Left
+// unchecked the two are free to disagree, and a published capability whose printed claims are
+// not the claims inside it misleads everyone who reads the spec rather than running it. The
+// comparison is over the encoded bytes, which is also what pins the payload segment's field
+// order and its use of RawURLEncoding.
+func checkPayloadMatchesToken(t *testing.T, name, compactToken string, printed *auth.CapabilityPayload) {
+	t.Helper()
+	parts := strings.Split(compactToken, ".")
+	if len(parts) != 3 {
+		t.Errorf("%s: compact token is not v1.<payload-base64url>.<signature-base64url>", name)
+		return
+	}
+	carried, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Errorf("%s: failed to base64url decode the compact token's payload segment: %v", name, err)
+		return
+	}
+	want, err := json.Marshal(printed)
+	if err != nil {
+		t.Fatalf("%s: failed to marshal the payload field: %v", name, err)
+	}
+	if !bytes.Equal(carried, want) {
+		t.Errorf("%s: the payload field and the compact token carry different capabilities.\npayload field:\n%s\ninside the token:\n%s", name, want, carried)
+	}
+}
+
 // checkRefusedCapability verifies that a capability the fixture marks refused is refused, for
 // the reason it names and with the error the package documents.
 func checkRefusedCapability(t *testing.T, name string, c refusedCapability, pubKey ed25519.PublicKey, evalTime time.Time, want error) {
 	t.Helper()
+	if c.Payload != nil {
+		checkPayloadMatchesToken(t, name, c.CompactToken, c.Payload)
+	}
 	_, _, err := auth.ParseAndVerifyCapability(c.CompactToken, pubKey, evalTime)
 	if err == nil {
 		t.Errorf("expected %s to be refused", name)
@@ -608,8 +712,6 @@ func TestCapabilityTokensFixture(t *testing.T) {
 		t.Fatalf("failed to parse evaluation time: %v", err)
 	}
 
-	verified := 0
-
 	// The two signed capabilities: the canonical payload of section 6.4 is the byte sequence
 	// the signature covers, so it is rebuilt and the signature checked against it directly,
 	// then the compact token is put through verification the way a request would be.
@@ -621,6 +723,7 @@ func TestCapabilityTokensFixture(t *testing.T) {
 		{"admin capability", fixture.AdminCapability},
 	} {
 		name, c := signed.name, signed.c
+		checkPayloadMatchesToken(t, name, c.CompactToken, &c.Payload)
 		canonical := string(auth.CanonicalCapabilityPayload(&c.Payload))
 		if canonical != c.CanonicalPayload {
 			t.Errorf("%s canonical payload mismatch:\ngot:\n%s\nwant:\n%s", name, canonical, c.CanonicalPayload)
@@ -657,7 +760,6 @@ func TestCapabilityTokensFixture(t *testing.T) {
 		if _, _, err := auth.ParseAndVerifyCapability(string(envelope), pubKey, evalTime); err != nil {
 			t.Errorf("%s: ParseAndVerifyCapability failed on the JSON envelope: %v", name, err)
 		}
-		verified++
 	}
 
 	// The four capabilities verification must refuse, one per reason: past its expiry, before
@@ -667,11 +769,6 @@ func TestCapabilityTokensFixture(t *testing.T) {
 	checkRefusedCapability(t, "future capability", fixture.FutureCapability, pubKey, evalTime, auth.ErrNotYetValid)
 	checkRefusedCapability(t, "tampered capability", fixture.TamperedCapability, pubKey, evalTime, auth.ErrInvalidSignature)
 	checkRefusedCapability(t, "wrong key capability", fixture.WrongKeyCapability, pubKey, evalTime, auth.ErrInvalidSignature)
-	verified += 4
-
-	if verified != capabilityCases {
-		t.Errorf("%d capabilities ran, want %d", verified, capabilityCases)
-	}
 }
 
 // specJSONExamples pins every JSON example spec/auth/v1/README.md carries, in document order,
@@ -760,7 +857,7 @@ func TestSpecExamplesMatchFixtures(t *testing.T) {
 	}
 
 	if len(examples) != len(specJSONExamples) {
-		t.Fatalf("the specification carries %d json examples, want %d", len(examples), len(specJSONExamples))
+		t.Fatalf("the specification carries %d json examples, want %d; if an example was added on purpose, add the row that pins it to specJSONExamples", len(examples), len(specJSONExamples))
 	}
 	for i, example := range examples {
 		pinned := specJSONExamples[i]

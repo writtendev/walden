@@ -44,6 +44,8 @@ func fixtureKeyPath(key string) string {
 //	                               into a scratch repository, reconstructs ref state,
 //	                               and walks the section 7.5 marker path
 //	TestFixtureConditionalAppend   pins the section 11 append targets and refusals
+//	TestFixtureTokenTableReplay    rebuilds the token table from the meta stream alone, as
+//	                               a restore onto an empty disk has to
 //	TestFixtureSequencesSurviveDoubleParsers
 //	                               reads every sequence in the tree the way a parser whose
 //	                               numbers are doubles reads it, per section 1.1
@@ -53,17 +55,29 @@ func fixtureKeyPath(key string) string {
 // Timeline of the fixture journal:
 //
 //	_meta      seq 0  genesis, public key K0
-//	_meta      seq 1  token_create
+//	_meta      seq 1  token_create tok_admin_01, one scope
 //	repo-alpha seq 0  first push into an empty repository        signed K0
 //	repo-alpha seq 1  fast-forward main, create feature          signed K0
 //	repo-alpha seq 2  delete feature, no segments                signed K0
 //	<opaque>   seq 0  first push on an opaque stream identifier  signed K0
 //	_meta      seq 2  key_rotation K0 -> K1, signed by K0
 //	repo-alpha seq 3  force update of main                       signed K1
-//	_meta      seq 3  token_revoke
+//	_meta      seq 3  token_revoke tok_admin_01
+//	_meta      seq 4  token_create tok_writer_02, two scopes
 const (
 	fixtureRepoStream   = "repo-alpha"
 	fixtureOpaqueStream = "9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4"
+
+	// fixtureMetaHeadSeq is the last sequence on the meta stream of the golden journal.
+	fixtureMetaHeadSeq = journal.Seq(4)
+
+	// fixtureAdminToken and fixtureWriterToken are the raw built-in tokens the journal's two
+	// token_create records mint, and the tokens spec/auth/v1/fixtures/builtin_tokens.json
+	// publishes under tok_admin_01 and tok_writer_02. They are raw tokens in a published
+	// fixture rather than secrets: a walden that ever hashes to one of these has been handed
+	// the fixture on purpose.
+	fixtureAdminToken  = "walden_sec_admin_0123456789abcdef"
+	fixtureWriterToken = "walden_sec_writer_0123456789abcdef"
 
 	// fixtureSeq42 and fixtureSeqMax are the two sequences the conditional-append table
 	// pins beyond the journal's own coordinates: a small one that shows the zero padding
@@ -553,7 +567,7 @@ func TestFixtureReplay(t *testing.T) {
 // tree directly — no git binary, no generator run, no dependence on the generator being right,
 // so it still stands if writeSegment's re-hash is ever weakened, and it names the file and
 // both digests rather than reporting a segment the generator could not resolve. It is also
-// where the `^[0-9a-f]{64}\.pack$` key shape of fixtures README rules 5 and 6 is asserted as a
+// where the `^[0-9a-f]{64}\.pack$` key shape of fixtures README rules 6 and 7 is asserted as a
 // rule, rather than inferred from a file set that agrees with itself.
 func TestFixtureSegmentsAreContentAddressed(t *testing.T) {
 	root := filepath.Join(journalFixturesDir(), journal.VersionPrefix, "streams")
@@ -754,7 +768,7 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		pinned[journal.Seq(seq)] = true
 	}
 
-	// Fixtures README rule 8 says the table reaches the ends of the range, so the two
+	// Fixtures README rule 9 says the table reaches the ends of the range, so the two
 	// sequences that carry that claim are named here rather than left to the generator.
 	for _, seq := range []journal.Seq{0, fixtureSeq42, fixtureSeqMax} {
 		if !pinned[seq] {
@@ -788,6 +802,151 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		if strings.ContainsAny(tc.Message, "\n\r") {
 			t.Errorf("refusal %q is not a single line: %q", tc.Case, tc.Message)
 		}
+	}
+}
+
+// fixtureToken is one row of a token table rebuilt from the meta stream: the hash a bearer
+// token is looked up by, what it may touch, and whether it still may.
+type fixtureToken struct {
+	hash    string
+	scopes  []string
+	revoked bool
+}
+
+// TestFixtureTokenTableReplay covers the promise ARCHITECTURE.md's Auth section makes for
+// built-in tokens: they are "journaled to the meta stream, so restore restores your tokens
+// too". A restore holds the journal and nothing else — the local token store died with the
+// disk — so this rebuilds the table from the meta records alone and asserts that what comes
+// back is a table a server could serve from: a hash to look a request up by, and the scopes
+// to answer it with.
+//
+// It walks the whole stream rather than the records it expects, so a token record appended
+// later is replayed here too, and a type nobody taught this loop about is reported rather
+// than skipped.
+func TestFixtureTokenTableReplay(t *testing.T) {
+	dir := fixtureKeyPath(journal.TxPrefix(journal.MetaStreamID))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("failed to read the meta stream: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+
+	chain := journal.NewSigningChain()
+	table := make(map[string]*fixtureToken, len(names))
+
+	for i, name := range names {
+		seq := journal.Seq(i)
+		path := filepath.Join(dir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", path, err)
+		}
+		var header struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(data, &header); err != nil {
+			t.Fatalf("failed to parse %s: %v", path, err)
+		}
+
+		switch header.Type {
+		case journal.RecordTypeGenesis:
+			var genesis journal.GenesisRecord
+			if err := json.Unmarshal(data, &genesis); err != nil {
+				t.Fatalf("failed to parse %s: %v", path, err)
+			}
+			if err := chain.ApplyGenesis(&genesis); err != nil {
+				t.Fatalf("ApplyGenesis failed on %s: %v", path, err)
+			}
+		case journal.RecordTypeKeyRotation:
+			var rotation journal.KeyRotationRecord
+			if err := json.Unmarshal(data, &rotation); err != nil {
+				t.Fatalf("failed to parse %s: %v", path, err)
+			}
+			if err := chain.ApplyRotation(&rotation); err != nil {
+				t.Fatalf("ApplyRotation failed on %s: %v", path, err)
+			}
+		case journal.RecordTypeTokenCreate:
+			var rec journal.TokenCreateRecord
+			if err := json.Unmarshal(data, &rec); err != nil {
+				t.Fatalf("failed to parse %s: %v", path, err)
+			}
+			if err := rec.Validate(); err != nil {
+				t.Fatalf("%s: Validate failed: %v", path, err)
+			}
+			if rec.Seq != seq {
+				t.Errorf("%s: record seq = %d does not match its key", path, rec.Seq)
+			}
+			if _, exists := table[rec.TokenID]; exists {
+				t.Errorf("%s: token create at seq %d reuses token id %s", path, rec.Seq, rec.TokenID)
+			}
+			table[rec.TokenID] = &fixtureToken{hash: rec.TokenHash, scopes: rec.Scopes}
+			if err := chain.AdvanceMetaSeq(rec.Seq); err != nil {
+				t.Fatalf("AdvanceMetaSeq failed on %s: %v", path, err)
+			}
+		case journal.RecordTypeTokenRevoke:
+			var rec journal.TokenRevokeRecord
+			if err := json.Unmarshal(data, &rec); err != nil {
+				t.Fatalf("failed to parse %s: %v", path, err)
+			}
+			if err := rec.Validate(); err != nil {
+				t.Fatalf("%s: Validate failed: %v", path, err)
+			}
+			if rec.Seq != seq {
+				t.Errorf("%s: record seq = %d does not match its key", path, rec.Seq)
+			}
+			existing, exists := table[rec.TokenID]
+			switch {
+			case !exists:
+				t.Errorf("%s: token revoke at seq %d names unknown token %s", path, rec.Seq, rec.TokenID)
+			case existing.hash != rec.TokenHash:
+				t.Errorf("%s: token revoke at seq %d disagrees with the hash recorded for token %s", path, rec.Seq, rec.TokenID)
+			default:
+				existing.revoked = true
+			}
+			if err := chain.AdvanceMetaSeq(rec.Seq); err != nil {
+				t.Fatalf("AdvanceMetaSeq failed on %s: %v", path, err)
+			}
+		default:
+			t.Errorf("%s: unknown meta record type %q", path, header.Type)
+		}
+	}
+
+	if chain.LastMetaSeq() != fixtureMetaHeadSeq {
+		t.Errorf("the meta replay ended at seq %d, want %d", chain.LastMetaSeq(), fixtureMetaHeadSeq)
+	}
+	if len(table) != 2 {
+		t.Fatalf("the rebuilt token table holds %d tokens, want 2", len(table))
+	}
+
+	admin, ok := table["tok_admin_01"]
+	if !ok {
+		t.Fatal("the rebuilt token table lost tok_admin_01")
+	}
+	if !admin.revoked {
+		t.Error("tok_admin_01 is revoked on the meta stream but came back live")
+	}
+	if got, want := admin.hash, fixtureTokenHash(fixtureAdminToken); got != want {
+		t.Errorf("tok_admin_01 hash = %q, want the hash of its raw token %q", got, want)
+	}
+
+	// The two-scope case: a single scope field cannot carry this token at all, which is why
+	// the record has an array. Both scopes survive the round trip, in the order written.
+	writer, ok := table["tok_writer_02"]
+	if !ok {
+		t.Fatal("the rebuilt token table lost tok_writer_02")
+	}
+	if writer.revoked {
+		t.Error("tok_writer_02 is never revoked on the meta stream but came back revoked")
+	}
+	if got, want := writer.hash, fixtureTokenHash(fixtureWriterToken); got != want {
+		t.Errorf("tok_writer_02 hash = %q, want the hash of its raw token %q", got, want)
+	}
+	if got, want := strings.Join(writer.scopes, ","), "rw:blog-*,r:docs"; got != want {
+		t.Errorf("tok_writer_02 scopes = %q, want %q", got, want)
 	}
 }
 
@@ -991,11 +1150,12 @@ func TestFixturesAreGenerated(t *testing.T) {
 }
 
 // specJSONExamples is the number of JSON examples the format specification carries: the
-// genesis record (section 3.1), a key rotation (4.1), a ref transaction (5.1), and the
-// marker (7.2). Each quotes a fixture, and section 3.1 says so on all their behalf —
-// "Every example record in this document is a real record from that journal". Asserted,
-// so that an example cannot quietly leave the document either.
-const specJSONExamples = 4
+// genesis record (section 3.1), a key rotation (4.1), two token creations and a revocation
+// (4.3 and 4.4), a ref transaction (5.1), and the marker (7.2). Each quotes a fixture, and
+// section 3.1 says so on all their behalf — "Every example record in this document is a real
+// record from that journal". Asserted, so that an example cannot quietly leave the document
+// either.
+const specJSONExamples = 7
 
 // specFixtureLink finds the fixture a spec example cites, in the prose between the end of
 // the example and whatever comes next — the field table, the next example, the next section.

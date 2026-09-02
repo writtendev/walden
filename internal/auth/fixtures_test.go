@@ -179,6 +179,105 @@ func TestBuiltinTokensFixture(t *testing.T) {
 	}
 }
 
+// TestBuiltinTokensJournalRoundTrip holds the journal's token records to the tokens this
+// specification publishes: every token in builtin_tokens.json is minted into a
+// journal.TokenCreateRecord, put through the encoding it is published in, and read back into
+// the store the server actually serves from. It is the same trip a restore makes — mint,
+// journal, replay — and it is asked of the published tokens rather than of one convenient
+// example, so a record shape that cannot carry tok_writer_02's two scopes fails here.
+func TestBuiltinTokensJournalRoundTrip(t *testing.T) {
+	data, err := os.ReadFile(fixturesPath("builtin_tokens.json"))
+	if err != nil {
+		t.Fatalf("failed to read builtin_tokens.json: %v", err)
+	}
+	var fixture struct {
+		Tokens []struct {
+			TokenID   string   `json:"token_id"`
+			RawToken  string   `json:"raw_token"`
+			TokenHash string   `json:"token_hash"`
+			Scopes    []string `json:"scopes"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatalf("failed to unmarshal builtin tokens fixture: %v", err)
+	}
+	if len(fixture.Tokens) == 0 {
+		t.Fatal("builtin_tokens.json publishes no tokens, so this proves nothing")
+	}
+
+	ctx := context.Background()
+	store := auth.NewMemoryTokenStore()
+	multiScope := 0
+
+	for seq, tok := range fixture.Tokens {
+		rec := &journal.TokenCreateRecord{
+			Version:   journal.VersionPrefix,
+			Stream:    journal.MetaStreamID,
+			Seq:       journal.Seq(seq + 1),
+			Type:      journal.RecordTypeTokenCreate,
+			TokenID:   tok.TokenID,
+			TokenHash: auth.HashToken(tok.RawToken),
+			Scopes:    tok.Scopes,
+			Timestamp: "2026-08-31T00:01:00Z",
+		}
+		if err := rec.Validate(); err != nil {
+			t.Fatalf("token %s does not make a valid journal record: %v", tok.TokenID, err)
+		}
+
+		encoded, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatalf("failed to encode the journal record for token %s: %v", tok.TokenID, err)
+		}
+		var replayed journal.TokenCreateRecord
+		if err := json.Unmarshal(encoded, &replayed); err != nil {
+			t.Fatalf("failed to decode the journal record for token %s: %v", tok.TokenID, err)
+		}
+
+		// What a replay holds after reading the record has to be enough to serve from: the
+		// hash the request is looked up by, and scopes the authorizer can answer with.
+		if replayed.TokenHash != tok.TokenHash {
+			t.Errorf("token %s replayed hash %q, want the published %q", tok.TokenID, replayed.TokenHash, tok.TokenHash)
+		}
+		scopes, err := auth.ParseScopes(replayed.Scopes)
+		if err != nil {
+			t.Fatalf("scopes replayed for token %s do not parse: %v", tok.TokenID, err)
+		}
+		if len(scopes) != len(tok.Scopes) {
+			t.Errorf("token %s replayed %d scopes, want %d", tok.TokenID, len(scopes), len(tok.Scopes))
+		}
+		if len(tok.Scopes) > 1 {
+			multiScope++
+		}
+		if err := store.SaveToken(ctx, &auth.TokenRecord{
+			TokenID:   replayed.TokenID,
+			TokenHash: replayed.TokenHash,
+			Scopes:    scopes,
+		}); err != nil {
+			t.Fatalf("failed to save the replayed token %s: %v", tok.TokenID, err)
+		}
+	}
+
+	if multiScope == 0 {
+		t.Fatal("no published token carries more than one scope, so nothing here exercises the array")
+	}
+
+	// tok_writer_02 is the token a single scope field cannot hold. Both of its scopes have to
+	// survive the trip, and they are only proven to have survived by being enforced: the
+	// second scope grants read on docs, and nothing else the token carries does.
+	authorizer := auth.NewBuiltinAuthorizer(store)
+	ok, err := authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.ActionRead, "docs")
+	if !ok || err != nil {
+		t.Errorf("the second scope of tok_writer_02 did not survive the journal: ok=%v, err=%v", ok, err)
+	}
+	ok, err = authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.ActionWrite, "blog-notes")
+	if !ok || err != nil {
+		t.Errorf("the first scope of tok_writer_02 did not survive the journal: ok=%v, err=%v", ok, err)
+	}
+	if ok, _ := authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.ActionWrite, "docs"); ok {
+		t.Error("tok_writer_02 came back with write on docs, which neither of its scopes grants")
+	}
+}
+
 func TestCapabilityTokensFixture(t *testing.T) {
 	data, err := os.ReadFile(fixturesPath("capability_tokens.json"))
 	if err != nil {

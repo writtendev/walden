@@ -4,5 +4,6 @@
   "seq": "3",
   "type": "token_revoke",
   "token_id": "tok_admin_01",
+  "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
   "timestamp": "2026-08-31T00:08:00Z"
 }

@@ -316,22 +316,37 @@ func (w *fixtureWriter) resolvePack(prefix string, pack []byte) (string, []byte)
 }
 
 // writeSegment writes a pack segment under its own SHA-256 and returns that hash.
+//
+// Generating, the hash is this pack's, so the check can only fail on a packfile git wrote and
+// git will not read back. Asserting, the hash is a committed filename and the bytes are that
+// file's, so it fails on exactly one thing: a committed pack whose name lies about its own
+// digest.
+//
+// That is reported and the run continues, rather than aborting the test. A Fatalf here costs
+// the caller the file-set walk in TestFixturesAreGenerated — the same pathology resolvePack
+// avoids by preferring a self-named candidate: a run that says a segment is invalid and never
+// names the stray file sitting beside it. Nothing after this call can be hurt by a bad hash:
+// the pack goes into a temp tree under the name it already has, and that name travels into the
+// records, where the byte comparison sees it. It may therefore add one derived record diff
+// below the real failure, which is a fair price for the operator learning both facts in one
+// run.
 func (w *fixtureWriter) writeSegment(stream journal.StreamID, pack []byte) string {
 	w.t.Helper()
 	hash, data := w.resolvePack(journal.SegmentPrefix(stream), pack)
 	if err := journal.ValidateSegment(data, hash); err != nil {
-		w.t.Fatalf("segment for stream %s is not a valid packfile: %v", stream, err)
+		w.t.Errorf("segment for stream %s is not a valid packfile: %v", stream, err)
 	}
 	w.write(journal.SegmentKey(stream, hash), data)
 	return hash
 }
 
-// writeSnapshot writes a consolidated snapshot pack under its own SHA-256 and returns that hash.
+// writeSnapshot writes a consolidated snapshot pack under its own SHA-256 and returns that
+// hash. Non-fatal for the reason given on writeSegment.
 func (w *fixtureWriter) writeSnapshot(stream journal.StreamID, pack []byte) string {
 	w.t.Helper()
 	hash, data := w.resolvePack(journal.SnapshotPrefix(stream), pack)
 	if err := journal.ValidateSnapshot(data, hash); err != nil {
-		w.t.Fatalf("snapshot for stream %s is not a valid packfile: %v", stream, err)
+		w.t.Errorf("snapshot for stream %s is not a valid packfile: %v", stream, err)
 	}
 	w.write(journal.SnapshotKey(stream, hash), data)
 	return hash
@@ -355,6 +370,10 @@ func (w *fixtureWriter) writeRefTx(priv ed25519.PrivateKey, rec *journal.RefTran
 // moves the fixture bytes and TestFixturesAreGenerated says so. A hand-copied parallel of a
 // published type would compare the generator against itself and see nothing, so do not add
 // one here: give the record a type in the journal package instead.
+//
+// Nothing enforces that sentence. The day the journal package grows a type for these records
+// and this fork is left standing beside it, the gate quietly stops watching the encoder for
+// them and no test says a word. It is in the gap list for that reason.
 type metaRecord struct {
 	Version   string           `json:"version"`
 	Stream    journal.StreamID `json:"stream"`

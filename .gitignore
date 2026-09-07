@@ -31,3 +31,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+.agents/skills/
+.claude/worktrees/
+.claude/settings.local.json

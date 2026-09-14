@@ -111,13 +111,19 @@ func (m *MemoryTokenStore) GetTokenByHash(ctx context.Context, hash string) (*To
 	return &cp, nil
 }
 
-// GetTokenByID retrieves a token record by its token ID.
+// GetTokenByID retrieves a token record by its token ID, refusing under ErrTokenNotFound if
+// no record carries it — see that sentinel's doc comment in auth.go.
 func (m *MemoryTokenStore) GetTokenByID(ctx context.Context, tokenID string) (*TokenRecord, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	rec, ok := m.byID[tokenID]
 	if !ok || rec == nil {
-		return nil, nil
+		return nil, refusal.RefuseWithCause(
+			"token lookup refused",
+			fmt.Sprintf("no token with id %q exists", tokenID),
+			"verify the token id with 'walden token list'",
+			ErrTokenNotFound,
+		)
 	}
 	cp := *rec
 	if rec.Scopes != nil {

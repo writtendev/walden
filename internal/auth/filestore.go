@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/refusal"
 )
 
@@ -293,7 +294,8 @@ func (s *FileTokenStore) GetTokenByHash(ctx context.Context, hash string) (*Toke
 	return nil, nil
 }
 
-// GetTokenByID returns the token record with the given token ID, or nil if none exists.
+// GetTokenByID returns the token record with the given token ID, refusing under
+// ErrTokenNotFound if no record carries it — see that sentinel's doc comment in auth.go.
 func (s *FileTokenStore) GetTokenByID(ctx context.Context, tokenID string) (*TokenRecord, error) {
 	table, err := s.load()
 	if err != nil {
@@ -304,7 +306,12 @@ func (s *FileTokenStore) GetTokenByID(ctx context.Context, tokenID string) (*Tok
 			return dt.toRecord(s.path)
 		}
 	}
-	return nil, nil
+	return nil, refusal.RefuseWithCause(
+		"token lookup refused",
+		fmt.Sprintf("no token with id %q exists", tokenID),
+		"verify the token id with 'walden token list'",
+		ErrTokenNotFound,
+	)
 }
 
 // ListTokens returns every token record in the table.
@@ -329,9 +336,23 @@ func (s *FileTokenStore) ListTokens(ctx context.Context) ([]*TokenRecord, error)
 // create, never an upsert a caller must infer from success alone. record.CreatedAt is
 // persisted as given; CreateToken never calls time.Now, so a future meta-stream journal
 // writer (WALD-33) can stamp both records from the same instant.
+//
+// record.TokenHash must already be a storage hash ("sha256:<64-hex>") — CreateToken rejects
+// anything else via journal.ValidateTokenHash, the same rule a token_create record enforces,
+// rather than trusting the caller to have hashed it. "Raw tokens never touch disk" is a
+// property this store holds itself to, not one it merely assumes of its callers; the refusal
+// withholds the value, since a rejected hash may be a live raw token.
 func (s *FileTokenStore) CreateToken(ctx context.Context, record *TokenRecord) error {
 	if record == nil {
 		return refusal.Refuse("token create refused", "record is nil", "pass a non-nil token record")
+	}
+	if err := journal.ValidateTokenHash(record.TokenHash); err != nil {
+		return refusal.RefuseWithCause(
+			"token create refused",
+			err.Error(),
+			"pass the sha256:<64-hex> storage hash from HashToken, not the raw token",
+			journal.ErrInvalidTokenHash,
+		)
 	}
 
 	lock, err := acquireStoreLock(s.lockPath)
@@ -373,6 +394,14 @@ func (s *FileTokenStore) CreateToken(ctx context.Context, record *TokenRecord) e
 // (ErrTokenAlreadyRevoked) rather than treated as a no-op — see that sentinel's doc comment
 // in auth.go. RevokeToken never calls time.Now; at is the caller's, for the same journaling
 // reason CreateToken takes CreatedAt as given.
+//
+// Two records sharing a token_id is a damaged store — CreateToken refuses that shape under
+// its own lock, so it can only arise from something editing tokens.json by hand — and
+// RevokeToken refuses under ErrStoreUnavailable rather than silently acting on the first
+// match and reporting success while a second record with the same id keeps authenticating.
+// This check lives here rather than in load: load runs on every unlocked read (GetTokenByHash
+// included, on the request path), where paying a uniqueness scan is a worse trade than
+// catching the shape at the one mutation that can act on it wrongly.
 func (s *FileTokenStore) RevokeToken(ctx context.Context, tokenID string, at time.Time) error {
 	lock, err := acquireStoreLock(s.lockPath)
 	if err != nil {
@@ -385,11 +414,26 @@ func (s *FileTokenStore) RevokeToken(ctx context.Context, tokenID string, at tim
 		return err
 	}
 
+	match := -1
+	matches := 0
 	for i := range table.Tokens {
-		if table.Tokens[i].TokenID != tokenID {
-			continue
+		if table.Tokens[i].TokenID == tokenID {
+			match = i
+			matches++
 		}
-		if table.Tokens[i].Revoked {
+	}
+
+	if matches > 1 {
+		return refusal.RefuseWithCause(
+			"token revoke refused",
+			fmt.Sprintf("%s carries %d records with token id %q", s.path, matches, tokenID),
+			"restore tokens.json from backup; it will not be recreated automatically",
+			ErrStoreUnavailable,
+		)
+	}
+
+	if matches == 1 {
+		if table.Tokens[match].Revoked {
 			return refusal.RefuseWithCause(
 				"token revoke refused",
 				fmt.Sprintf("token id %q is already revoked", tokenID),
@@ -398,8 +442,8 @@ func (s *FileTokenStore) RevokeToken(ctx context.Context, tokenID string, at tim
 			)
 		}
 		revokedAt := at.UTC()
-		table.Tokens[i].Revoked = true
-		table.Tokens[i].RevokedAt = &revokedAt
+		table.Tokens[match].Revoked = true
+		table.Tokens[match].RevokedAt = &revokedAt
 		return s.save(table)
 	}
 

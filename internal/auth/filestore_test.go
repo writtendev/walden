@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/writtendev/walden/internal/auth"
+	"github.com/writtendev/walden/internal/journal"
 )
 
 // TestFileTokenStoreFixtureRoundTrip loads the published builtin_tokens.json into a
@@ -606,4 +607,83 @@ func TestFileTokenStoreConcurrent(t *testing.T) {
 			t.Fatalf("ListTokens returned %d tokens, want %d (a concurrent writer lost its update)", len(tokens), numWriters)
 		}
 	})
+}
+
+// TestFileTokenStoreRefusesUnhashedTokenHash proves CreateToken enforces "raw tokens never
+// touch disk" itself rather than trusting the caller to have called HashToken: a raw
+// walden_-prefixed string passed as TokenHash is refused under journal.ErrInvalidTokenHash,
+// nothing is written to the data directory, and the refusal withholds the value (it may be a
+// live credential) rather than quoting it back.
+func TestFileTokenStoreRefusesUnhashedTokenHash(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := auth.NewFileTokenStore(dir)
+
+	rawToken, _, err := auth.GenerateToken()
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	scopes, _ := auth.ParseScopes([]string{"rwc:*"})
+
+	err = store.CreateToken(ctx, &auth.TokenRecord{
+		TokenID:   "tok_raw_hash",
+		TokenHash: rawToken,
+		Scopes:    scopes,
+		CreatedAt: time.Now().UTC(),
+	})
+	checkSingleLineRefusal(t, err, journal.ErrInvalidTokenHash)
+	if strings.Contains(err.Error(), rawToken) {
+		t.Errorf("refusal echoes the raw token: %q", err.Error())
+	}
+
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatalf("ReadDir: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Errorf("data directory has %d entries after a refused CreateToken, want 0: %v", len(entries), entries)
+	}
+}
+
+// TestFileTokenStoreRevokeRefusesDuplicateTokenID plants two well-formed records sharing a
+// token_id (with distinct hashes, as a hand-edited or restored tokens.json might) and asserts
+// RevokeToken refuses under ErrStoreUnavailable rather than silently revoking the first match
+// and reporting success while the second keeps authenticating.
+func TestFileTokenStoreRevokeRefusesDuplicateTokenID(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	tokensPath := filepath.Join(dir, "tokens.json")
+	hashA := auth.HashToken("walden_dup_id_a")
+	hashB := auth.HashToken("walden_dup_id_b")
+	data := fmt.Sprintf(`{"version":"v1","tokens":[
+		{"token_id":"tok_dup_id","token_hash":%q,"scopes":["rwc:*"],"created_at":"2026-01-01T00:00:00Z","revoked":false},
+		{"token_id":"tok_dup_id","token_hash":%q,"scopes":["rwc:*"],"created_at":"2026-01-01T00:00:00Z","revoked":false}
+	]}`, hashA, hashB)
+	if err := os.WriteFile(tokensPath, []byte(data), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	store := auth.NewFileTokenStore(dir)
+
+	err := store.RevokeToken(ctx, "tok_dup_id", time.Now().UTC())
+	checkSingleLineRefusal(t, err, auth.ErrStoreUnavailable)
+	if !strings.Contains(err.Error(), tokensPath) {
+		t.Errorf("refusal %q does not name %s", err.Error(), tokensPath)
+	}
+
+	// Neither record must have been touched: a refused revoke must not leave one hash
+	// revoked and the other live, which would be worse than doing nothing.
+	recA, err := store.GetTokenByHash(ctx, hashA)
+	if err != nil {
+		t.Fatalf("GetTokenByHash(A): %v", err)
+	}
+	if recA == nil || recA.Revoked {
+		t.Errorf("record A = %+v, want present and unrevoked", recA)
+	}
+	recB, err := store.GetTokenByHash(ctx, hashB)
+	if err != nil {
+		t.Fatalf("GetTokenByHash(B): %v", err)
+	}
+	if recB == nil || recB.Revoked {
+		t.Errorf("record B = %+v, want present and unrevoked", recB)
+	}
 }

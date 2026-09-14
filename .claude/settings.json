@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "writtendev": {
+      "source": {
+        "source": "github",
+        "repo": "writtendev/meta"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "studio@writtendev": true
+  }
+}

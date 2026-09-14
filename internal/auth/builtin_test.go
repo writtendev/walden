@@ -113,55 +113,55 @@ func TestBuiltinAuthorizer(t *testing.T) {
 	})
 
 	// Admin token
-	ok, err := authorizer.Authorize(ctx, "walden_admin", auth.ActionRead, "my-repo")
-	if !ok || err != nil {
-		t.Errorf("expected admin read to succeed, got ok=%v, err=%v", ok, err)
+	err := authorizer.Authorize(ctx, "walden_admin", auth.Actions{Read: true}, "my-repo")
+	if err != nil {
+		t.Errorf("expected admin read to succeed, got err=%v", err)
 	}
-	ok, err = authorizer.Authorize(ctx, "walden_admin", auth.ActionWrite, "my-repo")
-	if !ok || err != nil {
-		t.Errorf("expected admin write to succeed, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_admin", auth.Actions{Write: true}, "my-repo")
+	if err != nil {
+		t.Errorf("expected admin write to succeed, got err=%v", err)
 	}
-	ok, err = authorizer.Authorize(ctx, "walden_admin", auth.ActionCreate, "my-repo")
-	if !ok || err != nil {
-		t.Errorf("expected admin create to succeed, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_admin", auth.Actions{Create: true}, "my-repo")
+	if err != nil {
+		t.Errorf("expected admin create to succeed, got err=%v", err)
 	}
 
 	// Reader token
-	ok, err = authorizer.Authorize(ctx, "walden_reader", auth.ActionRead, "blog-posts")
-	if !ok || err != nil {
-		t.Errorf("expected reader read on blog-posts to succeed, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_reader", auth.Actions{Read: true}, "blog-posts")
+	if err != nil {
+		t.Errorf("expected reader read on blog-posts to succeed, got err=%v", err)
 	}
-	ok, err = authorizer.Authorize(ctx, "walden_reader", auth.ActionWrite, "blog-posts")
-	if ok || !errors.Is(err, auth.ErrForbidden) {
-		t.Errorf("expected forbidden for reader write, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_reader", auth.Actions{Write: true}, "blog-posts")
+	if !errors.Is(err, auth.ErrForbidden) {
+		t.Errorf("expected forbidden for reader write, got err=%v", err)
 	}
-	ok, err = authorizer.Authorize(ctx, "walden_reader", auth.ActionRead, "other-repo")
-	if ok || !errors.Is(err, auth.ErrForbidden) {
-		t.Errorf("expected forbidden for reader on other-repo, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_reader", auth.Actions{Read: true}, "other-repo")
+	if !errors.Is(err, auth.ErrForbidden) {
+		t.Errorf("expected forbidden for reader on other-repo, got err=%v", err)
 	}
 
 	// Revoked token
-	ok, err = authorizer.Authorize(ctx, "walden_revoked", auth.ActionRead, "my-repo")
-	if ok || !errors.Is(err, auth.ErrUnauthorized) {
-		t.Errorf("expected unauthorized for revoked token, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_revoked", auth.Actions{Read: true}, "my-repo")
+	if !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected unauthorized for revoked token, got err=%v", err)
 	}
 
 	// Nonexistent token
-	ok, err = authorizer.Authorize(ctx, "walden_unknown", auth.ActionRead, "my-repo")
-	if ok || !errors.Is(err, auth.ErrUnauthorized) {
-		t.Errorf("expected unauthorized for unknown token, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_unknown", auth.Actions{Read: true}, "my-repo")
+	if !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected unauthorized for unknown token, got err=%v", err)
 	}
 
 	// Empty token
-	ok, err = authorizer.Authorize(ctx, "", auth.ActionRead, "my-repo")
-	if ok || !errors.Is(err, auth.ErrUnauthorized) {
-		t.Errorf("expected unauthorized for empty token, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "", auth.Actions{Read: true}, "my-repo")
+	if !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected unauthorized for empty token, got err=%v", err)
 	}
 
 	// Invalid repo ID
-	ok, err = authorizer.Authorize(ctx, "walden_admin", auth.ActionRead, "repo/with/slash")
-	if ok || !errors.Is(err, auth.ErrInvalidRepo) {
-		t.Errorf("expected invalid repo error, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_admin", auth.Actions{Read: true}, "repo/with/slash")
+	if !errors.Is(err, auth.ErrInvalidRepo) {
+		t.Errorf("expected invalid repo error, got err=%v", err)
 	}
 }
 
@@ -201,7 +201,7 @@ func TestMemoryTokenStoreConcurrent(t *testing.T) {
 					rec.Scopes[0].Pattern = "mutated"
 				}
 
-				_, _ = authorizer.Authorize(ctx, rawToken, auth.ActionRead, "repo-alpha")
+				_ = authorizer.Authorize(ctx, rawToken, auth.Actions{Read: true}, "repo-alpha")
 
 				// List
 				_, _ = store.ListTokens(ctx)
@@ -222,8 +222,8 @@ func TestBuiltinAuthorizerNilStore(t *testing.T) {
 	authorizer := auth.NewBuiltinAuthorizer(nil)
 
 	// NewBuiltinAuthorizer(nil) initializes an empty MemoryTokenStore
-	ok, err := authorizer.Authorize(ctx, "walden_nonexistent", auth.ActionRead, "repo-alpha")
-	if ok || !errors.Is(err, auth.ErrUnauthorized) {
-		t.Errorf("expected unauthorized for nonexistent token with default store, got ok=%v, err=%v", ok, err)
+	err := authorizer.Authorize(ctx, "walden_nonexistent", auth.Actions{Read: true}, "repo-alpha")
+	if !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected unauthorized for nonexistent token with default store, got err=%v", err)
 	}
 }

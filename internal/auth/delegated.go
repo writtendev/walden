@@ -445,10 +445,11 @@ func decodeSignatureBytes(sigStr string) ([]byte, error) {
 	return nil, errors.New("invalid signature encoding")
 }
 
-// Authorize validates the capability token against the trusted public key and checks permissions.
-func (d *DelegatedAuthorizer) Authorize(ctx context.Context, token string, action Action, repo string) (bool, error) {
+// Authorize validates the capability token against the trusted public key and checks
+// whether it grants every action in required on repo.
+func (d *DelegatedAuthorizer) Authorize(ctx context.Context, token string, required Actions, repo string) error {
 	if d == nil || len(d.pubKey) == 0 {
-		return false, refusal.RefuseWithCause(
+		return refusal.RefuseWithCause(
 			"unauthorized",
 			"delegated capability auth is not enabled on this server",
 			"configure WALDEN_AUTH_TRUST or use a built-in token",
@@ -456,18 +457,22 @@ func (d *DelegatedAuthorizer) Authorize(ctx context.Context, token string, actio
 		)
 	}
 
+	if err := checkRequired(required); err != nil {
+		return err
+	}
+
 	if err := CheckRepoAndToken(token, repo); err != nil {
-		return false, err
+		return err
 	}
 
 	_, scopes, err := ParseAndVerifyCapability(token, d.pubKey, d.nowFunc())
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	if !Allows(scopes, action, repo) {
-		return false, ForbiddenRefusal(action, repo)
+	if action, missing := Missing(scopes, required, repo); missing {
+		return ForbiddenRefusal(action, repo)
 	}
 
-	return true, nil
+	return nil
 }

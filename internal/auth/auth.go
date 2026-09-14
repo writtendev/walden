@@ -23,10 +23,17 @@ var (
 	ErrInvalidSignature = errors.New("invalid signature")
 )
 
-// Authorizer determines if a token is authorized to perform an action on a repository.
+// Authorizer is walden's single authorization decision point: may this token perform this
+// set of actions on this repository? Both auth modes implement it, and every caller asks
+// the whole question at once — a push that may create a repository requests
+// Actions{Write: true, Create: true} in one call, rather than composing two answers itself
+// and re-implementing spec/auth/v1 §3.4's rule outside this package.
 type Authorizer interface {
-	// Authorize checks whether the given token permits the action on the repository.
-	Authorize(ctx context.Context, token string, action Action, repo string) (bool, error)
+	// Authorize reports whether token grants every action in required on repo. nil means
+	// yes; any non-nil error is a single-line refusal carrying one of this package's Err
+	// sentinels (suitable for errors.Is). required must not be empty — that is a caller
+	// mistake, not something any scope could grant, and is refused rather than guessed at.
+	Authorize(ctx context.Context, token string, required Actions, repo string) error
 }
 
 // NewAuthorizer creates the single Authorizer for this server's configuration.
@@ -76,6 +83,22 @@ func CheckRepoAndToken(token, repo string) error {
 			"missing authentication token",
 			"provide token via Bearer header or HTTP Basic auth",
 			ErrUnauthorized,
+		)
+	}
+	return nil
+}
+
+// checkRequired refuses an empty required action set. Both Authorize implementations call
+// this before resolving a token: asking to authorize nothing is a caller's programming
+// error, not a question any scope could answer yes to, so it is refused rather than treated
+// as a trivially granted request.
+func checkRequired(required Actions) error {
+	if required.IsEmpty() {
+		return refusal.RefuseWithCause(
+			"invalid scope",
+			"required action set is empty",
+			"pass at least one of Actions{Read: true}, {Write: true}, {Create: true}",
+			ErrInvalidScope,
 		)
 	}
 	return nil

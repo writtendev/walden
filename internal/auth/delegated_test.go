@@ -160,27 +160,27 @@ func TestDelegatedAuthorizer(t *testing.T) {
 	ctx := context.Background()
 
 	// Allowed read
-	ok, err := authorizer.Authorize(ctx, token, auth.ActionRead, "blog-posts")
-	if !ok || err != nil {
-		t.Errorf("expected allowed read, got ok=%v, err=%v", ok, err)
+	err := authorizer.Authorize(ctx, token, auth.Actions{Read: true}, "blog-posts")
+	if err != nil {
+		t.Errorf("expected allowed read, got err=%v", err)
 	}
 
 	// Allowed write
-	ok, err = authorizer.Authorize(ctx, token, auth.ActionWrite, "blog-posts")
-	if !ok || err != nil {
-		t.Errorf("expected allowed write, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, token, auth.Actions{Write: true}, "blog-posts")
+	if err != nil {
+		t.Errorf("expected allowed write, got err=%v", err)
 	}
 
 	// Forbidden create
-	ok, err = authorizer.Authorize(ctx, token, auth.ActionCreate, "blog-posts")
-	if ok || !errors.Is(err, auth.ErrForbidden) {
-		t.Errorf("expected forbidden create, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, token, auth.Actions{Create: true}, "blog-posts")
+	if !errors.Is(err, auth.ErrForbidden) {
+		t.Errorf("expected forbidden create, got err=%v", err)
 	}
 
 	// Forbidden repo
-	ok, err = authorizer.Authorize(ctx, token, auth.ActionRead, "other-repo")
-	if ok || !errors.Is(err, auth.ErrForbidden) {
-		t.Errorf("expected forbidden on other repo, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, token, auth.Actions{Read: true}, "other-repo")
+	if !errors.Is(err, auth.ErrForbidden) {
+		t.Errorf("expected forbidden on other repo, got err=%v", err)
 	}
 }
 
@@ -536,8 +536,8 @@ func TestDelegatedNilGuards(t *testing.T) {
 
 	// 4. DelegatedAuthorizer with nil / empty key
 	nilAuth := auth.NewDelegatedAuthorizer(nil)
-	ok, err := nilAuth.Authorize(context.Background(), "v1.a.b", auth.ActionRead, "repo-alpha")
-	if ok || !errors.Is(err, auth.ErrUnauthorized) {
-		t.Errorf("expected unauthorized for nil DelegatedAuthorizer, got ok=%v, err=%v", ok, err)
+	err = nilAuth.Authorize(context.Background(), "v1.a.b", auth.Actions{Read: true}, "repo-alpha")
+	if !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected unauthorized for nil DelegatedAuthorizer, got err=%v", err)
 	}
 }

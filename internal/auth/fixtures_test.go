@@ -462,19 +462,19 @@ func TestBuiltinTokensFixture(t *testing.T) {
 		}
 		for i, repo := range probeRepos {
 			for _, action := range probeActions {
-				ok, err := authorizer.Authorize(ctx, want.rawToken, action, repo)
+				err := authorizer.Authorize(ctx, want.rawToken, onlyAction(action), repo)
 				switch {
 				case strings.Contains(want.grants[i], string(action)):
-					if !ok || err != nil {
-						t.Errorf("token %s, action %q on %q: got ok=%v, err=%v, want allowed", want.tokenID, action, repo, ok, err)
+					if err != nil {
+						t.Errorf("token %s, action %q on %q: got err=%v, want allowed", want.tokenID, action, repo, err)
 					}
 				case want.revoked:
-					if ok || !errors.Is(err, auth.ErrUnauthorized) {
-						t.Errorf("revoked token %s, action %q on %q: got ok=%v, err=%v, want unauthorized", want.tokenID, action, repo, ok, err)
+					if !errors.Is(err, auth.ErrUnauthorized) {
+						t.Errorf("revoked token %s, action %q on %q: got err=%v, want unauthorized", want.tokenID, action, repo, err)
 					}
 				default:
-					if ok || !errors.Is(err, auth.ErrForbidden) {
-						t.Errorf("token %s, action %q on %q: got ok=%v, err=%v, want forbidden", want.tokenID, action, repo, ok, err)
+					if !errors.Is(err, auth.ErrForbidden) {
+						t.Errorf("token %s, action %q on %q: got err=%v, want forbidden", want.tokenID, action, repo, err)
 					}
 				}
 			}
@@ -483,13 +483,13 @@ func TestBuiltinTokensFixture(t *testing.T) {
 
 	// One repository from outside the probe matrix, so the three names above are not the only
 	// ones the fixture's wildcards are ever asked about.
-	ok, err := authorizer.Authorize(ctx, "walden_sec_admin_0123456789abcdef", auth.ActionRead, "my-repo")
-	if !ok || err != nil {
-		t.Errorf("expected admin token read allowed, got ok=%v, err=%v", ok, err)
+	err := authorizer.Authorize(ctx, "walden_sec_admin_0123456789abcdef", auth.Actions{Read: true}, "my-repo")
+	if err != nil {
+		t.Errorf("expected admin token read allowed, got err=%v", err)
 	}
-	ok, err = authorizer.Authorize(ctx, "walden_sec_revoked_0123456789abcdef", auth.ActionRead, "my-repo")
-	if ok || !errors.Is(err, auth.ErrUnauthorized) {
-		t.Errorf("expected unauthorized for revoked token, got ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_sec_revoked_0123456789abcdef", auth.Actions{Read: true}, "my-repo")
+	if !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected unauthorized for revoked token, got err=%v", err)
 	}
 }
 
@@ -579,15 +579,15 @@ func TestBuiltinTokensJournalRoundTrip(t *testing.T) {
 	// survive the trip, and they are only proven to have survived by being enforced: the
 	// second scope grants read on docs, and nothing else the token carries does.
 	authorizer := auth.NewBuiltinAuthorizer(store)
-	ok, err := authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.ActionRead, "docs")
-	if !ok || err != nil {
-		t.Errorf("the second scope of tok_writer_02 did not survive the journal: ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.Actions{Read: true}, "docs")
+	if err != nil {
+		t.Errorf("the second scope of tok_writer_02 did not survive the journal: err=%v", err)
 	}
-	ok, err = authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.ActionWrite, "blog-notes")
-	if !ok || err != nil {
-		t.Errorf("the first scope of tok_writer_02 did not survive the journal: ok=%v, err=%v", ok, err)
+	err = authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.Actions{Write: true}, "blog-notes")
+	if err != nil {
+		t.Errorf("the first scope of tok_writer_02 did not survive the journal: err=%v", err)
 	}
-	if ok, _ := authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.ActionWrite, "docs"); ok {
+	if err := authorizer.Authorize(ctx, "walden_sec_writer_0123456789abcdef", auth.Actions{Write: true}, "docs"); err == nil {
 		t.Error("tok_writer_02 came back with write on docs, which neither of its scopes grants")
 	}
 }

@@ -298,3 +298,19 @@ func Allows(scopes []Scope, action Action, repo string) bool {
 	}
 	return false
 }
+
+// Missing evaluates a required set of actions against scopes for repo, in canonical r, w, c
+// order, and returns the first one no scope grants. ok is false when every required action
+// is granted, in which case action is the zero value.
+//
+// This is the set evaluator both Authorizer implementations call instead of composing
+// several Allows calls themselves: a push needing {Write, Create} is one Missing call, not
+// two Allows calls a caller stitches into a rule of its own.
+func Missing(scopes []Scope, required Actions, repo string) (action Action, ok bool) {
+	for _, a := range [...]Action{ActionRead, ActionWrite, ActionCreate} {
+		if required.Has(a) && !Allows(scopes, a, repo) {
+			return a, true
+		}
+	}
+	return "", false
+}

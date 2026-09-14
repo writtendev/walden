@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/config"
 	"github.com/writtendev/walden/internal/githttp"
 	"github.com/writtendev/walden/internal/refusal"
@@ -114,6 +115,26 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		}
 		return nil
 	}
+
+	if cfg.AuthTrustKey == "" {
+		if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+			return refusal.RefuseWithCause(
+				"token store unavailable",
+				fmt.Sprintf("cannot create data directory %s: %s", cfg.DataDir, err.Error()),
+				"verify the data directory path and permissions",
+				auth.ErrStoreUnavailable,
+			)
+		}
+		tokenStore := auth.NewFileTokenStore(cfg.DataDir)
+		adminToken, err := auth.EnsureAdminToken(ctx, tokenStore)
+		if err != nil {
+			return err
+		}
+		if adminToken != "" {
+			fmt.Fprintf(stdout, "admin token: %s\n", adminToken)
+		}
+	}
+
 	fmt.Fprintf(stdout, "walden server starting on %s (data: %s, git: %s)\n", cfg.ListenAddr, cfg.DataDir, gitVer)
 	return nil
 }

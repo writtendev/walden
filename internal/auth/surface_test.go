@@ -22,10 +22,12 @@ const authImportPath = "github.com/writtendev/walden/internal/auth"
 // authSurfaceAllowlist is every auth.X identifier a non-test file outside internal/auth may
 // reference: the Authorizer contract itself, the vocabulary needed to build a request
 // (Action, Actions, and their constants), the two ways to obtain an Authorizer, the store
-// interface a caller wires in, the repo-identifier validator WALD-37 reuses, and the
-// sentinel errors a caller matches against with errors.Is. Everything else — ParseScope,
-// Scope, Allows, Missing, MatchGlob, HashToken, TokenRecord, ParseAndVerifyCapability, and
-// so on — is an authorization detail, reachable only from inside this package.
+// interface and file-backed constructor a caller wires in (TokenStore, NewFileTokenStore), the
+// first-boot admin token primitives (AdminTokenID, EnsureAdminToken), the repo-identifier
+// validator WALD-37 reuses, and the sentinel errors a caller matches against with errors.Is
+// (including ErrStoreUnavailable). Everything else — ParseScope, Scope, Allows, Missing,
+// MatchGlob, HashToken, TokenRecord, ParseAndVerifyCapability, and so on — is an authorization
+// detail, reachable only from inside this package.
 var authSurfaceAllowlist = map[string]bool{
 	"Authorizer":    true,
 	"NewAuthorizer": true,
@@ -37,6 +39,10 @@ var authSurfaceAllowlist = map[string]bool{
 	"TokenStore":    true,
 	"ValidateRepo":  true,
 
+	"AdminTokenID":      true,
+	"EnsureAdminToken":  true,
+	"NewFileTokenStore": true,
+
 	"ErrUnauthorized":     true,
 	"ErrForbidden":        true,
 	"ErrInvalidRepo":      true,
@@ -46,6 +52,7 @@ var authSurfaceAllowlist = map[string]bool{
 	"ErrNotYetValid":      true,
 	"ErrInvalidSignature": true,
 	"ErrCreateForbidden":  true,
+	"ErrStoreUnavailable": true,
 }
 
 // checkAuthSurface inspects one already-parsed file for references to internal/auth
@@ -131,6 +138,9 @@ func checkAuthSurface(file *ast.File) []string {
 //
 // ValidateRepo is allowed on purpose: WALD-37 makes store.RepoPath call it, and that is the
 // published validator being used, not an authorization detail being reached around.
+// AdminTokenID, EnsureAdminToken, NewFileTokenStore, and ErrStoreUnavailable are allowed
+// so cmd/walden can initialize the store and ensure the first-boot admin token on startup
+// in built-in auth mode without violating the authorization detail boundary guard.
 //
 // Like the dependency-guard allowlist in .github/workflows/ci.yml, authSurfaceAllowlist is
 // edited deliberately, in the commit that needs the new entry — not expanded on the way to

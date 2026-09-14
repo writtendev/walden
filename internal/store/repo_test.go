@@ -237,3 +237,231 @@ func TestCreateRepoAtomicPublishOnGitFailure(t *testing.T) {
 		t.Errorf("RepoExists after failed create = true, want false")
 	}
 }
+
+// TestCreateRepoIgnoresGitTemplateDir asserts that the environment CreateRepo builds for
+// `git init` is an explicit allowlist, not the server's own environment with a couple of
+// GIT_CONFIG_* variables denied. An operator-set GIT_TEMPLATE_DIR pointing at a template
+// that ships a `config` file carrying core.hooksPath must not reach the created repository —
+// if it did, the published repo's pre-receive would point wherever that hooksPath says, and
+// walden's own hook would never run, acknowledging pushes with no journal append.
+func TestCreateRepoIgnoresGitTemplateDir(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+
+	tplDir := t.TempDir()
+	const maliciousConfig = "[core]\n\thooksPath = /nonexistent/hooks\n"
+	if err := os.WriteFile(filepath.Join(tplDir, "config"), []byte(maliciousConfig), 0o644); err != nil {
+		t.Fatalf("WriteFile template config: %v", err)
+	}
+	t.Setenv("GIT_TEMPLATE_DIR", tplDir)
+
+	if err := s.CreateRepo(ctx, "templated"); err != nil {
+		t.Fatalf("CreateRepo: %v", err)
+	}
+
+	path, err := s.RepoPath("templated")
+	if err != nil {
+		t.Fatalf("RepoPath: %v", err)
+	}
+	config, err := os.ReadFile(filepath.Join(path, "config"))
+	if err != nil {
+		t.Fatalf("ReadFile(config): %v", err)
+	}
+	if strings.Contains(string(config), "hooksPath") {
+		t.Errorf("published repo's config carries the template's hooksPath, so GIT_TEMPLATE_DIR leaked through:\n%s", config)
+	}
+}
+
+// TestCreateRepoGitNotFoundIncludesUnderlyingError asserts that when `git init` cannot even
+// start — here, no "git" on PATH — and therefore writes nothing to stderr, the refusal still
+// names a cause instead of falling back to refusal's "unspecified reason". That fallback is
+// indistinguishable from a cancelled context or a non-executable git binary, none of which
+// tell an operator anything.
+func TestCreateRepoGitNotFoundIncludesUnderlyingError(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+
+	// A directory with no "git" binary in it: cmd.Run's own Start error, not
+	// stderr, is the only source of a cause here.
+	t.Setenv("PATH", t.TempDir())
+
+	err := s.CreateRepo(ctx, "nogit")
+	if err == nil {
+		t.Fatalf("CreateRepo = nil, want error")
+	}
+	if !errors.Is(err, store.ErrStoreUnavailable) {
+		t.Errorf("CreateRepo error = %v, want errors.Is store.ErrStoreUnavailable", err)
+	}
+	if strings.Contains(err.Error(), "unspecified reason") {
+		t.Errorf("CreateRepo error = %q, want the underlying exec error as the cause, not the empty-stderr fallback", err.Error())
+	}
+	if !strings.Contains(err.Error(), "git") {
+		t.Errorf("CreateRepo error = %q, want it to name git as the executable that could not run", err.Error())
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+}
+
+// TestCreateRepoMakesHooksDirWithoutRelyingOnGit asserts that CreateRepo creates hooks/
+// itself rather than depending on `git init --bare` to have supplied it via a template. A
+// fake "git" stands in for a real one that mirrors an image whose git template ships no
+// hooks/ at all: `git init --bare` on such an image produces no hooks/ directory, and
+// without this fix every repository creation would fail there, naming a directory that was
+// never created as the thing to check permissions on.
+func TestCreateRepoMakesHooksDirWithoutRelyingOnGit(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+
+	fakeGitDir := t.TempDir()
+	// Mimics `git init --bare --initial-branch=main <dir>` on an image whose
+	// template ships no hooks/: a minimal bare layout, deliberately missing
+	// hooks/, exactly what git init itself would leave with an empty or
+	// absent template directory.
+	script := `#!/bin/sh
+set -e
+dir="$4"
+mkdir -p "$dir/objects" "$dir/refs/heads" "$dir/refs/tags"
+echo "ref: refs/heads/main" > "$dir/HEAD"
+cat > "$dir/config" <<'EOF'
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+EOF
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(fakeGitDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile fake git: %v", err)
+	}
+	// The fake "git" is a shell script that calls mkdir/cat/echo itself, so
+	// PATH needs real directories behind it for those to resolve — fakeGitDir
+	// leads so it is what "git" itself resolves to.
+	t.Setenv("PATH", fakeGitDir+":/usr/bin:/bin")
+
+	if err := s.CreateRepo(ctx, "notemplate"); err != nil {
+		t.Fatalf("CreateRepo: %v", err)
+	}
+
+	path, err := s.RepoPath("notemplate")
+	if err != nil {
+		t.Fatalf("RepoPath: %v", err)
+	}
+	hook := filepath.Join(path, "hooks", "pre-receive")
+	info, err := os.Stat(hook)
+	if err != nil {
+		t.Fatalf("Stat(%q): %v, want CreateRepo to have made hooks/ itself", hook, err)
+	}
+	if info.Mode()&0o111 == 0 {
+		t.Errorf("hooks/pre-receive is not executable: mode %v", info.Mode())
+	}
+}
+
+// TestHookIsRunnable exercises the check that stands between a dangling hooks/pre-receive
+// and a published repository whose pre-receive git silently never runs: a bare repo created
+// by a process whose own binary has been unlinked out from under it (os.Executable returns
+// "/path (deleted)" on Linux after an in-place upgrade) would otherwise publish a hook
+// symlink that resolves to nothing, and git accepts a push through it without complaint —
+// acknowledging it with no journal append.
+func TestHookIsRunnable(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("dangling-symlink-refused", func(t *testing.T) {
+		link := filepath.Join(dir, "dangling")
+		if err := os.Symlink(filepath.Join(dir, "does-not-exist"), link); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+		if err := store.HookIsRunnableForTest(link); err == nil {
+			t.Fatalf("HookIsRunnableForTest(%q) = nil, want error for a dangling symlink", link)
+		}
+	})
+
+	t.Run("non-executable-target-refused", func(t *testing.T) {
+		target := filepath.Join(dir, "not-executable")
+		if err := os.WriteFile(target, []byte("not a binary"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		link := filepath.Join(dir, "to-non-executable")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+		if err := store.HookIsRunnableForTest(link); err == nil {
+			t.Fatalf("HookIsRunnableForTest(%q) = nil, want error for a non-executable target", link)
+		}
+	})
+
+	t.Run("runnable-target-accepted", func(t *testing.T) {
+		target := filepath.Join(dir, "runnable")
+		if err := os.WriteFile(target, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		link := filepath.Join(dir, "to-runnable")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+		if err := store.HookIsRunnableForTest(link); err != nil {
+			t.Errorf("HookIsRunnableForTest(%q) = %v, want nil for an executable target", link, err)
+		}
+	})
+}
+
+// TestClassifyRenameFailure asserts that only the genuine "a concurrent creator already
+// published a directory here" race is reported as store.ErrRepoExists; any other rename
+// failure — a plain file occupying the destination, which fails with ENOTDIR rather than
+// ENOTEMPTY — is reported as store.ErrStoreUnavailable instead of the contradictory
+// "already exists" story that TestCreateRepoTwiceRefusesSecond and RepoExists would then
+// disagree about.
+func TestClassifyRenameFailure(t *testing.T) {
+	t.Run("non-empty-directory-is-already-exists", func(t *testing.T) {
+		dir := t.TempDir()
+		src := filepath.Join(dir, "src")
+		if err := os.Mkdir(src, 0o755); err != nil {
+			t.Fatalf("Mkdir(src): %v", err)
+		}
+		dst := filepath.Join(dir, "dst")
+		if err := os.Mkdir(dst, 0o755); err != nil {
+			t.Fatalf("Mkdir(dst): %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dst, "occupied"), []byte("x"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		renameErr := os.Rename(src, dst)
+		if renameErr == nil {
+			t.Fatalf("os.Rename(src, dst) = nil, want ENOTEMPTY (test setup did not reproduce the race)")
+		}
+
+		err := store.ClassifyRenameFailureForTest(renameErr, "racer")
+		if !errors.Is(err, store.ErrRepoExists) {
+			t.Errorf("ClassifyRenameFailureForTest = %v, want errors.Is store.ErrRepoExists", err)
+		}
+	})
+
+	t.Run("file-at-destination-is-store-unavailable-not-already-exists", func(t *testing.T) {
+		dir := t.TempDir()
+		src := filepath.Join(dir, "src")
+		if err := os.Mkdir(src, 0o755); err != nil {
+			t.Fatalf("Mkdir(src): %v", err)
+		}
+		blocked := filepath.Join(dir, "blocked")
+		if err := os.WriteFile(blocked, []byte("not a directory"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		renameErr := os.Rename(src, blocked)
+		if renameErr == nil {
+			t.Fatalf("os.Rename(src, blocked) = nil, want ENOTDIR (test setup did not reproduce the condition)")
+		}
+
+		err := store.ClassifyRenameFailureForTest(renameErr, "blocked")
+		if errors.Is(err, store.ErrRepoExists) {
+			t.Errorf("ClassifyRenameFailureForTest(%v) = %v, want it NOT to claim ErrRepoExists for a non-directory at the destination", renameErr, err)
+		}
+		if !errors.Is(err, store.ErrStoreUnavailable) {
+			t.Errorf("ClassifyRenameFailureForTest(%v) = %v, want errors.Is store.ErrStoreUnavailable", renameErr, err)
+		}
+	})
+}

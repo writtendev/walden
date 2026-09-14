@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
@@ -62,10 +63,15 @@ func (s *Store) RepoExists(ctx context.Context, repo string) (bool, error) {
 // every failure path removes the temporary directory.
 //
 // walden never writes a repository layout itself — the real git binary does,
-// via `git init --bare`, per AGENTS.md's "wrap git" rule. GIT_CONFIG_GLOBAL
-// and GIT_CONFIG_SYSTEM are pinned to /dev/null for that invocation so the
-// personal git configuration of whatever account walden runs under cannot
-// change what a walden repository is.
+// via `git init --bare`, per AGENTS.md's "wrap git" rule. That invocation
+// gets an explicit allowlist environment — PATH plus GIT_CONFIG_GLOBAL and
+// GIT_CONFIG_SYSTEM pinned to /dev/null — rather than the server's own
+// environment with a few variables denied. An inherited environment plus
+// denials is incomplete: GIT_TEMPLATE_DIR can still smuggle a hooksPath into
+// the published repository's config, and GIT_CONFIG_COUNT/KEY_n/VALUE_n
+// bypass the config-file neutralisation entirely. An allowlist keeps the
+// child's inputs enumerable on one screen and closes both, and anything
+// else besides, by construction.
 func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 	path, err := s.RepoPath(repo)
 	if err != nil {
@@ -103,15 +109,44 @@ func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 		}
 	}()
 
+	env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"}
+	if p := os.Getenv("PATH"); p != "" {
+		env = append(env, "PATH="+p)
+	}
+
 	cmd := exec.CommandContext(ctx, "git", "init", "--bare", "--initial-branch=main", tmp)
-	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	cmd.Env = env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		// git's stderr is the informative cause when it wrote one. When it
+		// didn't — git missing from PATH, git not executable, a cancelled
+		// context — cmd.Run's own error is the only thing that says why, and
+		// falling through to refusal's "unspecified reason" would tell the
+		// operator nothing.
+		cause := strings.TrimSpace(stderr.String())
+		if cause == "" {
+			cause = err.Error()
+		}
 		return refusal.RefuseWithCause(
 			"repository creation failed",
-			strings.TrimSpace(stderr.String()),
+			cause,
 			"verify git is installed and the data directory is writable",
+			ErrStoreUnavailable,
+		)
+	}
+
+	// git only creates hooks/ because the default template ships one; an
+	// absent or stripped template (and now GIT_TEMPLATE_DIR is out of the
+	// allowlist above, so an operator-set one no longer reaches this exec
+	// either) leaves --bare with no hooks/ at all. walden depends on that
+	// directory, so it makes it, rather than depending on git's template.
+	hooksDir := filepath.Join(tmp, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o700); err != nil {
+		return refusal.RefuseWithCause(
+			"repository creation failed",
+			err.Error(),
+			"verify the data directory is writable",
 			ErrStoreUnavailable,
 		)
 	}
@@ -129,7 +164,8 @@ func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 			ErrStoreUnavailable,
 		)
 	}
-	if err := os.Symlink(exe, filepath.Join(tmp, "hooks", "pre-receive")); err != nil {
+	hookPath := filepath.Join(hooksDir, "pre-receive")
+	if err := os.Symlink(exe, hookPath); err != nil {
 		return refusal.RefuseWithCause(
 			"repository creation failed",
 			err.Error(),
@@ -138,15 +174,64 @@ func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 		)
 	}
 
-	// A concurrent creator that won the race makes this rename fail onto a
-	// non-empty directory. That is refused as "already exists" rather than
-	// clobbering whatever the winner published.
+	// git accepts a push whose pre-receive is a dangling symlink silently:
+	// no error, no hook run, ref moved. A repository published in that state
+	// acknowledges pushes it never journals — PHILOSOPHY's first promise
+	// failing with no signal. Stat follows the symlink, so this also catches
+	// os.Executable's Linux "/path (deleted)" result after an in-place
+	// binary upgrade, with no need to special-case that string.
+	if err := hookIsRunnable(hookPath); err != nil {
+		return refusal.RefuseWithCause(
+			"repository creation failed",
+			fmt.Sprintf("hooks/pre-receive does not resolve to a runnable file: %v", err),
+			"verify the walden binary path is stable and executable",
+			ErrStoreUnavailable,
+		)
+	}
+
 	if err := os.Rename(tmp, path); err != nil {
-		return repoExistsRefusal(repo)
+		return classifyRenameFailure(err, repo)
 	}
 	publish = true
 
 	return nil
+}
+
+// hookIsRunnable reports whether hookPath resolves — following symlinks —
+// to a file that exists and is executable. It is the one check that stands
+// between a dangling hooks/pre-receive and a published repository that
+// silently never journals a push.
+func hookIsRunnable(hookPath string) error {
+	info, err := os.Stat(hookPath)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory", hookPath)
+	}
+	if info.Mode()&0o111 == 0 {
+		return fmt.Errorf("%s is not executable", hookPath)
+	}
+	return nil
+}
+
+// classifyRenameFailure turns a failed publish rename into a refusal. The
+// race this package documents — a concurrent creator already published a
+// directory at path — fails with ENOTEMPTY or EEXIST and is reported as
+// ErrRepoExists. Anything else (a plain file occupying path, a permissions
+// problem) does not describe "already exists" and is reported as
+// ErrStoreUnavailable with the rename's own error as the cause instead of
+// wearing that story.
+func classifyRenameFailure(err error, repo string) error {
+	if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, fs.ErrExist) {
+		return repoExistsRefusal(repo)
+	}
+	return refusal.RefuseWithCause(
+		"repository creation failed",
+		err.Error(),
+		"verify the repository path is accessible",
+		ErrStoreUnavailable,
+	)
 }
 
 func repoExistsRefusal(repo string) error {

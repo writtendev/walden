@@ -156,6 +156,27 @@ Same binary, same code path; the only difference is where the yes/no comes
 from. The token format and scope vocabulary are part of the published
 interface.
 
+The two modes are mutually exclusive. When `WALDEN_AUTH_TRUST` is set the
+delegated verifier is the only thing that can answer yes, and the built-in
+token store is not consulted — a built-in token presented to a delegated
+instance is refused exactly as an unknown one is. Two simultaneous sources
+of yes would be a third mode wearing the other two as a disguise, and would
+double the surface on which a mistake is worst.
+
+Exclusivity governs who can grant, not who can revoke. `walden token create`
+refuses under a trust key, because it would mint a credential that cannot
+authenticate. `walden token list` and `walden token revoke` keep working,
+because built-in tokens outlive the switch: they remain in the meta stream,
+and unsetting the trust key re-arms every one of them. Listing is read-only
+and revocation only ever narrows, so neither adds a way to say yes — and
+without them an operator rolling back during an incident has no way to see,
+or to defuse, what is about to come back.
+
+Migrating between modes is therefore a flag day, deliberately. That is the
+price of a mental model that fits in one sentence, and it is paid by an
+operator who changes a knob on purpose rather than by a reader trying to
+work out which of two answers applied.
+
 ## Configuration surface
 
 The complete list. A sixth knob requires amending this document, which is

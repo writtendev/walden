@@ -75,7 +75,12 @@ Flags for serve:
   --journal URL         S3 URL for write-ahead journal (default: off, env: WALDEN_JOURNAL)
   --auth-trust KEY      Public key for delegated token verification (default: off, env: WALDEN_AUTH_TRUST)
   --listen ADDR         HTTP listen address (default: :8470, env: WALDEN_LISTEN_ADDR)
-  --print-config        Print resolved configuration and exit`)
+  --print-config        Print resolved configuration and exit
+
+Commands for token:
+  create [flags]        Create a new authentication token
+  list [flags]          List existing tokens
+  revoke [flags] <id>   Revoke an authentication token`)
 }
 
 func runServe(args []string, stdout, stderr io.Writer) error {
@@ -137,19 +142,6 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 
 	fmt.Fprintf(stdout, "walden server starting on %s (data: %s, git: %s)\n", cfg.ListenAddr, cfg.DataDir, gitVer)
 	return nil
-}
-
-func runToken(args []string, stdout, stderr io.Writer) error {
-	if len(args) == 0 {
-		return refusal.Refuse("missing token subcommand", "no action specified", "expected create, list, or revoke")
-	}
-	switch args[0] {
-	case "create", "list", "revoke":
-		fmt.Fprintf(stdout, "walden token %s: not yet implemented\n", args[0])
-		return nil
-	default:
-		return refusal.Refuse("unknown token subcommand", args[0], "expected create, list, or revoke")
-	}
 }
 
 func runPreReceive(args []string, stdout, stderr io.Writer) error {

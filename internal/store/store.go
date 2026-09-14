@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +87,8 @@ func (s *Store) RepoPath(repo string) (string, error) {
 		)
 	}
 
-	if _, err := os.Lstat(path); err == nil {
+	switch _, err := os.Lstat(path); {
+	case err == nil:
 		resolved, err := filepath.EvalSymlinks(path)
 		if err != nil {
 			return "", refusal.RefuseWithCause(
@@ -104,6 +106,21 @@ func (s *Store) RepoPath(repo string) (string, error) {
 				ErrInvalidRepo,
 			)
 		}
+	case errors.Is(err, fs.ErrNotExist):
+		// Nothing at path yet, so there is no symlink to resolve.
+	default:
+		// Lstat failed for a reason other than "does not exist" — an
+		// unsearchable data directory, a permission or ACL denial, an NFS
+		// hiccup. That is an operator fault, not license to assume nothing
+		// is there: the symlink check above is the only containment check
+		// on this path, so an unverifiable Lstat must refuse rather than
+		// silently skip it.
+		return "", refusal.RefuseWithCause(
+			"repository path unavailable",
+			err.Error(),
+			"verify the repository path is accessible",
+			ErrStoreUnavailable,
+		)
 	}
 
 	return path, nil

@@ -42,12 +42,12 @@ func mountAuthorizers(t *testing.T, scope string) map[string]authPair {
 
 	const builtinToken = "walden_create_test_token"
 	tokenStore := auth.NewMemoryTokenStore()
-	if err := tokenStore.SaveToken(ctx, &auth.TokenRecord{
+	if err := tokenStore.CreateToken(ctx, &auth.TokenRecord{
 		TokenID:   "tok_create_test",
 		TokenHash: auth.HashToken(builtinToken),
 		Scopes:    scopes,
 	}); err != nil {
-		t.Fatalf("SaveToken: %v", err)
+		t.Fatalf("CreateToken: %v", err)
 	}
 
 	now := time.Now().UTC()

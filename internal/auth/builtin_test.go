@@ -53,8 +53,8 @@ func TestMemoryTokenStore(t *testing.T) {
 		CreatedAt: time.Now().UTC(),
 	}
 
-	if err := store.SaveToken(ctx, rec); err != nil {
-		t.Fatalf("SaveToken failed: %v", err)
+	if err := store.CreateToken(ctx, rec); err != nil {
+		t.Fatalf("CreateToken failed: %v", err)
 	}
 
 	got, err := store.GetTokenByHash(ctx, rec.TokenHash)
@@ -70,7 +70,7 @@ func TestMemoryTokenStore(t *testing.T) {
 		t.Errorf("ListTokens got %d items, err %v", len(list), err)
 	}
 
-	if err := store.RevokeToken(ctx, "tok_01"); err != nil {
+	if err := store.RevokeToken(ctx, "tok_01", time.Now().UTC()); err != nil {
 		t.Fatalf("RevokeToken failed: %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestMemoryTokenStore(t *testing.T) {
 		t.Errorf("expected token to be revoked, got %+v", revoked)
 	}
 
-	err = store.RevokeToken(ctx, "nonexistent")
+	err = store.RevokeToken(ctx, "nonexistent", time.Now().UTC())
 	if err == nil {
 		t.Errorf("expected error revoking nonexistent token")
 	}
@@ -91,21 +91,21 @@ func TestBuiltinAuthorizer(t *testing.T) {
 	authorizer := auth.NewBuiltinAuthorizer(store)
 
 	adminScopes, _ := auth.ParseScopes([]string{"rwc:*"})
-	store.SaveToken(ctx, &auth.TokenRecord{
+	store.CreateToken(ctx, &auth.TokenRecord{
 		TokenID:   "tok_admin",
 		TokenHash: auth.HashToken("walden_admin"),
 		Scopes:    adminScopes,
 	})
 
 	readerScopes, _ := auth.ParseScopes([]string{"r:blog-*"})
-	store.SaveToken(ctx, &auth.TokenRecord{
+	store.CreateToken(ctx, &auth.TokenRecord{
 		TokenID:   "tok_reader",
 		TokenHash: auth.HashToken("walden_reader"),
 		Scopes:    readerScopes,
 	})
 
 	revokedScopes, _ := auth.ParseScopes([]string{"rwc:*"})
-	store.SaveToken(ctx, &auth.TokenRecord{
+	store.CreateToken(ctx, &auth.TokenRecord{
 		TokenID:   "tok_revoked",
 		TokenHash: auth.HashToken("walden_revoked"),
 		Scopes:    revokedScopes,
@@ -186,8 +186,9 @@ func TestMemoryTokenStoreConcurrent(t *testing.T) {
 			scopes, _ := auth.ParseScopes([]string{"rwc:*"})
 
 			for i := 0; i < iterations; i++ {
-				// Save
-				_ = store.SaveToken(ctx, &auth.TokenRecord{
+				// Create (a duplicate after the first iteration, which CreateToken refuses;
+				// the point here is exercising concurrent access, not the create itself)
+				_ = store.CreateToken(ctx, &auth.TokenRecord{
 					TokenID:   tokenID,
 					TokenHash: tokenHash,
 					Scopes:    scopes,
@@ -208,7 +209,7 @@ func TestMemoryTokenStoreConcurrent(t *testing.T) {
 
 				// Revoke
 				if i%2 == 0 {
-					_ = store.RevokeToken(ctx, tokenID)
+					_ = store.RevokeToken(ctx, tokenID, time.Now().UTC())
 				}
 			}
 		}()
@@ -226,4 +227,68 @@ func TestBuiltinAuthorizerNilStore(t *testing.T) {
 	if !errors.Is(err, auth.ErrUnauthorized) {
 		t.Errorf("expected unauthorized for nonexistent token with default store, got err=%v", err)
 	}
+}
+
+// TestGetTokenByIDNotFound proves both TokenStore implementations refuse an unknown token ID
+// under ErrTokenNotFound rather than returning (nil, nil). ErrTokenNotFound's doc comment
+// names GetTokenByID as a path that returns it, and WALD-53's CLI is the caller about to
+// build an errors.Is branch on that promise — a (nil, nil) return would make that branch
+// unreachable and the next line a nil dereference.
+func TestGetTokenByIDNotFound(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("MemoryTokenStore", func(t *testing.T) {
+		store := auth.NewMemoryTokenStore()
+
+		rec, err := store.GetTokenByID(ctx, "tok_missing")
+		checkSingleLineRefusal(t, err, auth.ErrTokenNotFound)
+		if rec != nil {
+			t.Errorf("GetTokenByID(unknown) = %+v, want nil", rec)
+		}
+
+		scopes, _ := auth.ParseScopes([]string{"rwc:*"})
+		if err := store.CreateToken(ctx, &auth.TokenRecord{
+			TokenID:   "tok_known",
+			TokenHash: auth.HashToken("walden_get_by_id_known"),
+			Scopes:    scopes,
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("CreateToken: %v", err)
+		}
+		got, err := store.GetTokenByID(ctx, "tok_known")
+		if err != nil {
+			t.Fatalf("GetTokenByID(known): %v", err)
+		}
+		if got == nil || got.TokenID != "tok_known" {
+			t.Errorf("GetTokenByID(known) = %+v, want tok_known", got)
+		}
+	})
+
+	t.Run("FileTokenStore", func(t *testing.T) {
+		dir := t.TempDir()
+		store := auth.NewFileTokenStore(dir)
+
+		rec, err := store.GetTokenByID(ctx, "tok_missing")
+		checkSingleLineRefusal(t, err, auth.ErrTokenNotFound)
+		if rec != nil {
+			t.Errorf("GetTokenByID(unknown) = %+v, want nil", rec)
+		}
+
+		scopes, _ := auth.ParseScopes([]string{"rwc:*"})
+		if err := store.CreateToken(ctx, &auth.TokenRecord{
+			TokenID:   "tok_known",
+			TokenHash: auth.HashToken("walden_get_by_id_known_file"),
+			Scopes:    scopes,
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("CreateToken: %v", err)
+		}
+		got, err := store.GetTokenByID(ctx, "tok_known")
+		if err != nil {
+			t.Fatalf("GetTokenByID(known): %v", err)
+		}
+		if got == nil || got.TokenID != "tok_known" {
+			t.Errorf("GetTokenByID(known) = %+v, want tok_known", got)
+		}
+	})
 }

@@ -23,13 +23,18 @@ const (
 )
 
 // TokenRecord represents a built-in token's stored metadata and permissions.
+//
+// It carries no json tags of its own. A FileTokenStore's on-disk encoding is written out
+// explicitly as its own unexported type in filestore.go, so there is exactly one place a
+// token record is turned into bytes, rather than this struct's tags and a store's encoding
+// silently needing to agree.
 type TokenRecord struct {
-	TokenID   string     `json:"token_id"`
-	TokenHash string     `json:"token_hash"`
-	Scopes    []Scope    `json:"scopes"`
-	CreatedAt time.Time  `json:"created_at"`
-	Revoked   bool       `json:"revoked"`
-	RevokedAt *time.Time `json:"revoked_at,omitempty"`
+	TokenID   string
+	TokenHash string
+	Scopes    []Scope
+	CreatedAt time.Time
+	Revoked   bool
+	RevokedAt *time.Time
 }
 
 // HashToken computes the deterministic storage hash for a raw bearer token: "sha256:<64-hex>".
@@ -49,12 +54,30 @@ func GenerateToken() (rawToken, tokenHash string, err error) {
 	return rawToken, tokenHash, nil
 }
 
-// TokenStore defines the storage interface for built-in token records.
+// TokenStore defines the storage interface for built-in token records. Its mutation
+// vocabulary is one-to-one with the meta stream's token_create and token_revoke records
+// (internal/journal/token.go), so a later journaling layer (WALD-33) can append the matching
+// record and then call the matching mutation without either being rebuilt or re-read:
+//
+//   - CreateToken and RevokeToken are the only two mutations, and there is no upsert. A
+//     create is always a create; a revoke only ever narrows. A journaling layer never has to
+//     classify what just happened.
+//   - Both take their timestamp as an input (CreateToken persists record.CreatedAt as given;
+//     RevokeToken takes at) rather than reading the clock, so the journal record and the
+//     disk record can carry the same instant.
+//   - GetTokenByID makes a revoke addressable before it happens: a token_revoke record names
+//     the token by id and hash, so a writer can build that record before mutating disk.
 type TokenStore interface {
 	GetTokenByHash(ctx context.Context, hash string) (*TokenRecord, error)
-	SaveToken(ctx context.Context, record *TokenRecord) error
-	RevokeToken(ctx context.Context, tokenID string) error
+	GetTokenByID(ctx context.Context, tokenID string) (*TokenRecord, error)
 	ListTokens(ctx context.Context) ([]*TokenRecord, error)
+	// CreateToken adds a new token record, refusing (ErrTokenExists) rather than overwriting
+	// when a record already exists with the same TokenID or TokenHash.
+	CreateToken(ctx context.Context, record *TokenRecord) error
+	// RevokeToken marks the token identified by tokenID as revoked at the given instant.
+	// It refuses an unknown tokenID (ErrTokenNotFound) and an already-revoked one
+	// (ErrTokenAlreadyRevoked) rather than treating either as a no-op.
+	RevokeToken(ctx context.Context, tokenID string, at time.Time) error
 }
 
 // MemoryTokenStore is a thread-safe in-memory implementation of TokenStore.
@@ -88,13 +111,54 @@ func (m *MemoryTokenStore) GetTokenByHash(ctx context.Context, hash string) (*To
 	return &cp, nil
 }
 
-// SaveToken saves or updates a token record.
-func (m *MemoryTokenStore) SaveToken(ctx context.Context, record *TokenRecord) error {
+// GetTokenByID retrieves a token record by its token ID, refusing under ErrTokenNotFound if
+// no record carries it — see that sentinel's doc comment in auth.go.
+func (m *MemoryTokenStore) GetTokenByID(ctx context.Context, tokenID string) (*TokenRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	rec, ok := m.byID[tokenID]
+	if !ok || rec == nil {
+		return nil, refusal.RefuseWithCause(
+			"token lookup refused",
+			fmt.Sprintf("no token with id %q exists", tokenID),
+			"verify the token id with 'walden token list'",
+			ErrTokenNotFound,
+		)
+	}
+	cp := *rec
+	if rec.Scopes != nil {
+		cp.Scopes = make([]Scope, len(rec.Scopes))
+		copy(cp.Scopes, rec.Scopes)
+	}
+	return &cp, nil
+}
+
+// CreateToken adds a new token record. It refuses rather than overwrites when a record
+// already exists with the same TokenID or TokenHash, so a create is always a create — never
+// an upsert a caller must infer from success alone. record.CreatedAt is persisted as given;
+// CreateToken never calls time.Now.
+func (m *MemoryTokenStore) CreateToken(ctx context.Context, record *TokenRecord) error {
 	if record == nil {
-		return nil
+		return refusal.Refuse("token create refused", "record is nil", "pass a non-nil token record")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, exists := m.byID[record.TokenID]; exists {
+		return refusal.RefuseWithCause(
+			"token create refused",
+			fmt.Sprintf("token id %q already exists", record.TokenID),
+			"choose a different token id",
+			ErrTokenExists,
+		)
+	}
+	if _, exists := m.byHash[record.TokenHash]; exists {
+		return refusal.RefuseWithCause(
+			"token create refused",
+			"a token with this hash already exists",
+			"generate a new token rather than reusing a hash",
+			ErrTokenExists,
+		)
+	}
 	cp := *record
 	if record.Scopes != nil {
 		cp.Scopes = make([]Scope, len(record.Scopes))
@@ -105,27 +169,39 @@ func (m *MemoryTokenStore) SaveToken(ctx context.Context, record *TokenRecord) e
 	return nil
 }
 
-// RevokeToken marks a token as revoked by its token ID.
-func (m *MemoryTokenStore) RevokeToken(ctx context.Context, tokenID string) error {
+// RevokeToken marks a token as revoked by its token ID, at the given instant. Revoking an
+// unknown token ID is refused (ErrTokenNotFound); revoking an already-revoked token is
+// refused too (ErrTokenAlreadyRevoked) rather than treated as a no-op — see the sentinel's
+// doc comment in auth.go. RevokeToken never calls time.Now; at is the caller's, for the same
+// journaling reason CreateToken takes CreatedAt as given.
+func (m *MemoryTokenStore) RevokeToken(ctx context.Context, tokenID string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rec, ok := m.byID[tokenID]
 	if !ok || rec == nil {
 		return refusal.RefuseWithCause(
-			"token not found",
-			fmt.Sprintf("no token with ID %q exists", tokenID),
-			"verify token ID with 'walden token list'",
-			ErrUnauthorized,
+			"token revoke refused",
+			fmt.Sprintf("no token with id %q exists", tokenID),
+			"verify token id with 'walden token list'",
+			ErrTokenNotFound,
 		)
 	}
-	now := time.Now().UTC()
+	if rec.Revoked {
+		return refusal.RefuseWithCause(
+			"token revoke refused",
+			fmt.Sprintf("token id %q is already revoked", tokenID),
+			"no action needed; the token is already inactive",
+			ErrTokenAlreadyRevoked,
+		)
+	}
+	revokedAt := at.UTC()
 	updated := *rec
 	if rec.Scopes != nil {
 		updated.Scopes = make([]Scope, len(rec.Scopes))
 		copy(updated.Scopes, rec.Scopes)
 	}
 	updated.Revoked = true
-	updated.RevokedAt = &now
+	updated.RevokedAt = &revokedAt
 	m.byID[tokenID] = &updated
 	m.byHash[rec.TokenHash] = &updated
 	return nil

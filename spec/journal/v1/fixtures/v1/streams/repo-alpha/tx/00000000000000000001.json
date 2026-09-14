@@ -22,8 +22,13 @@
       "ref": "refs/tags/v0.1",
       "old_oid": "0000000000000000000000000000000000000000",
       "new_oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
+    },
+    {
+      "ref": "refs/heads/café",
+      "old_oid": "0000000000000000000000000000000000000000",
+      "new_oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
     }
   ],
   "timestamp": "2026-08-31T00:03:00Z",
-  "signature": "ed25519:65d5baec22c8472bf3ee0d1d357f9ca0e7538eed06fb659925da053880df94f00384957946e64299107bcc43b2de955d1687dacf6d2e66ed54185edd843e2c0b"
+  "signature": "ed25519:96cdb35a8e24d946b852a6cc82493aa47e0e90ea6cd49e117b6066c5f09766b8ee38e9bf2099d5b790428f238e0c3e939b74845b4af6cceea8ab7ae0fc1e850b"
 }

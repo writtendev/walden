@@ -58,14 +58,18 @@ func fixtureKeyPath(key string) string {
 //
 //	_meta      seq 0  genesis, public key K0
 //	_meta      seq 1  token_create tok_admin_01, one scope
-//	repo-alpha seq 0  first push into an empty repository        signed K0
-//	repo-alpha seq 1  fast-forward main, create feature          signed K0
-//	repo-alpha seq 2  delete feature, no segments                signed K0
-//	<opaque>   seq 0  first push on an opaque stream identifier  signed K0
+//	repo-alpha seq 0  first push into an empty repository                    signed K0
+//	repo-alpha seq 1  fast-forward main, create feature, tag v0.1, and the   signed K0
+//	                  non-ASCII fixtureDecomposedRef (never touched again)
+//	repo-alpha seq 2  delete feature, no segments                            signed K0
+//	<opaque>   seq 0  first push on an opaque stream identifier              signed K0
 //	_meta      seq 2  key_rotation K0 -> K1, signed by K0
-//	repo-alpha seq 3  force update of main                       signed K1
+//	repo-alpha seq 3  force update of main                                   signed K1
 //	_meta      seq 3  token_revoke tok_admin_01
 //	_meta      seq 4  token_create tok_writer_02, two scopes
+//	repo-alpha seq 4  main advances again, past the marker baseline          signed K1
+//	repo-alpha  —     marker.json: snapshot through seq 3, refs fixtureDecomposedRef,
+//	                  refs/heads/main and refs/tags/v0.1, key_epoch_floor 1, signed K1
 const (
 	fixtureRepoStream   = "repo-alpha"
 	fixtureOpaqueStream = "9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4"
@@ -341,11 +345,20 @@ func TestFixtureRepoStreams(t *testing.T) {
 		t.Errorf("repo-alpha seq 0 carries %d segments, want 1", len(alpha[0].Segments))
 	}
 
-	// seq 1: one transaction moving two refs and creating a tag that is never
-	// touched again — the ref recoverable only because the marker below carries
-	// the ref set rather than just a replay-from sequence (WALD-97).
-	if len(alpha[1].Updates) != 3 {
-		t.Errorf("repo-alpha seq 1 has %d updates, want 3", len(alpha[1].Updates))
+	// seq 1: one transaction moving two refs, creating a tag, and creating a fourth,
+	// deliberately non-ASCII ref (fixtureDecomposedRef) — none of the last two ever
+	// touched again, recoverable only because the marker below carries the ref set
+	// rather than just a replay-from sequence (WALD-97). fixtureDecomposedRef is also
+	// where section 5.2's byte-preservation invariant is exercised (WALD-89); see
+	// TestFixtureNonASCIIRefBreaksOnNormalization.
+	if len(alpha[1].Updates) != 4 {
+		t.Errorf("repo-alpha seq 1 has %d updates, want 4", len(alpha[1].Updates))
+	}
+	if got := alpha[1].Updates[3].Ref; got != fixtureDecomposedRef {
+		t.Errorf("repo-alpha seq 1 updates[3].ref = %q, want the decomposed non-ASCII ref", got)
+	}
+	if got, want := alpha[1].Updates[3].NewOID, alpha[0].Updates[0].NewOID; got != want {
+		t.Errorf("repo-alpha seq 1 updates[3].new_oid = %q, want %q (c1, the commit main started this push at)", got, want)
 	}
 
 	// seq 2: a branch delete introduces no objects, so segments is empty.
@@ -572,8 +585,11 @@ func TestFixtureReplay(t *testing.T) {
 		if got, want := alpha.refs["refs/tags/v0.1"], records[1].Updates[2].NewOID; got != want {
 			t.Errorf("replayed refs/tags/v0.1 = %q, want %q", got, want)
 		}
-		if len(alpha.refs) != 2 {
-			t.Errorf("replayed repo-alpha holds %d refs, want refs/heads/main and refs/tags/v0.1: %v", len(alpha.refs), alpha.refs)
+		if got, want := alpha.refs[fixtureDecomposedRef], records[1].Updates[3].NewOID; got != want {
+			t.Errorf("replayed %s = %q, want %q", fixtureDecomposedRef, got, want)
+		}
+		if len(alpha.refs) != 3 {
+			t.Errorf("replayed repo-alpha holds %d refs, want refs/heads/main, refs/tags/v0.1, and %s: %v", len(alpha.refs), fixtureDecomposedRef, alpha.refs)
 		}
 
 		// seq 3 is a force update: its new tip is not a descendant of the tip it
@@ -889,6 +905,108 @@ func TestFixtureMarkerSeedsEpochFloorAgainstForgedRecord(t *testing.T) {
 	unseeded := loadFixtureChain(t, fixtureMetaHeadSeq)
 	if err := unseeded.VerifyRefTx(forged); err != nil {
 		t.Errorf("expected the forged record to verify on an unseeded chain (demonstrating the defect), got %v", err)
+	}
+}
+
+// TestFixtureNonASCIIRefBreaksOnNormalization turns spec section 5.2's "permanently
+// breaks signature verification" from prose into an assertion (WALD-89).
+//
+// repo-alpha's seq 1 record creates fixtureDecomposedRef, and the marker's ref set
+// carries it too — the same non-NFC-invariant byte sequence, signed on two independent
+// surfaces: a ref transaction's canonical payload and the marker's. Swapping it for
+// fixturePrecomposedRef — the identical rendered glyph, a different byte sequence —
+// must break both signatures and nothing else: the swapped ref is still non-empty,
+// still a valid ref name, still sorts first in the marker's set and still appears only
+// once in each array, so a Validate error here would mean this test is exercising the
+// wrong thing.
+func TestFixtureNonASCIIRefBreaksOnNormalization(t *testing.T) {
+	root := journalFixturesDir()
+	for _, name := range fixtureTreeFiles(t, root) {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("failed to read %s: %v", name, err)
+		}
+		if bytes.Contains(data, []byte(fixturePrecomposedRef)) {
+			t.Errorf("%s carries the precomposed ref %q; only the decomposed form belongs in the fixture tree (the two collide as loose refs on a normalization-insensitive filesystem)", name, fixturePrecomposedRef)
+		}
+	}
+
+	recordPath := fixtureKeyPath(journal.TxKey(fixtureRepoStream, 1))
+	recordData, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", recordPath, err)
+	}
+	if !bytes.Contains(recordData, []byte(fixtureDecomposedRef)) {
+		t.Errorf("%s does not carry the decomposed ref %q", recordPath, fixtureDecomposedRef)
+	}
+	var record journal.RefTransactionRecord
+	if err := json.Unmarshal(recordData, &record); err != nil {
+		t.Fatalf("failed to parse %s: %v", recordPath, err)
+	}
+	if len(record.Updates) != 4 {
+		t.Fatalf("repo-alpha seq 1 has %d updates, want 4", len(record.Updates))
+	}
+	if got := record.Updates[3].Ref; got != fixtureDecomposedRef {
+		t.Fatalf("repo-alpha seq 1 updates[3].ref = %q, want %q byte for byte", got, fixtureDecomposedRef)
+	}
+
+	markerPath := fixtureKeyPath(journal.MarkerKey(fixtureRepoStream))
+	markerData, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", markerPath, err)
+	}
+	if !bytes.Contains(markerData, []byte(fixtureDecomposedRef)) {
+		t.Errorf("%s does not carry the decomposed ref %q", markerPath, fixtureDecomposedRef)
+	}
+	marker, err := journal.ParseMarker(markerData)
+	if err != nil {
+		t.Fatalf("ParseMarker failed on the golden marker: %v", err)
+	}
+	if len(marker.Refs) == 0 || marker.Refs[0].Ref != fixtureDecomposedRef {
+		t.Fatalf("marker refs[0].ref = %q, want %q byte for byte (sorted first)", marker.Refs[0].Ref, fixtureDecomposedRef)
+	}
+
+	// Sanity: both verify as committed, before either is tampered with.
+	recordChain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	if err := recordChain.VerifyRefTx(&record); err != nil {
+		t.Fatalf("repo-alpha seq 1 fails signature verification before any tampering: %v", err)
+	}
+	markerChain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	if err := markerChain.VerifyMarker(marker); err != nil {
+		t.Fatalf("the golden marker fails signature verification before any tampering: %v", err)
+	}
+
+	// The demonstration: swap the decomposed ref for its precomposed NFC form and
+	// nothing else. The array stays sorted (the swapped ref still sorts before every
+	// other ref name here) and otherwise valid, so what breaks is the signature.
+	tamperedRecord := record
+	tamperedUpdates := append([]journal.RefUpdate(nil), record.Updates...)
+	tamperedUpdates[3].Ref = fixturePrecomposedRef
+	tamperedRecord.Updates = tamperedUpdates
+	if err := tamperedRecord.Validate(); err != nil {
+		t.Fatalf("swapping the ref made the record invalid, which is not the failure this test is after: %v", err)
+	}
+	tamperedRecordChain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	err = tamperedRecordChain.VerifyRefTx(&tamperedRecord)
+	if err == nil {
+		t.Error("swapping repo-alpha seq 1's decomposed ref for its precomposed NFC form did not break the record's signature")
+	} else if !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("expected ErrSignatureMismatch after swapping the record's ref, got %v", err)
+	}
+
+	tamperedMarker := *marker
+	tamperedRefs := append([]journal.MarkerRef(nil), marker.Refs...)
+	tamperedRefs[0].Ref = fixturePrecomposedRef
+	tamperedMarker.Refs = tamperedRefs
+	if err := tamperedMarker.Validate(); err != nil {
+		t.Fatalf("swapping the ref made the marker invalid, which is not the failure this test is after: %v", err)
+	}
+	tamperedMarkerChain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	err = tamperedMarkerChain.VerifyMarker(&tamperedMarker)
+	if err == nil {
+		t.Error("swapping the marker's decomposed ref for its precomposed NFC form did not break the marker's signature")
+	} else if !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("expected ErrSignatureMismatch after swapping the marker's ref, got %v", err)
 	}
 }
 

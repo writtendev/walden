@@ -29,6 +29,12 @@ func NewHandler(authorizer auth.Authorizer, repoStore *store.Store) *Handler {
 }
 
 func (h *Handler) registerRoutes() {
+	h.mux.HandleFunc("GET /{repo}/info/refs", h.handleInfoRefs)
+	// Registered without a method so it, not the "/" catch-all below,
+	// answers every non-GET request to this path: see the comment on
+	// handleInfoRefsMethodNotAllowed for why this can't be left to the
+	// mux's own method-mismatch handling.
+	h.mux.HandleFunc("/{repo}/info/refs", h.handleInfoRefsMethodNotAllowed)
 	h.mux.HandleFunc("/", h.handleRequest)
 }
 

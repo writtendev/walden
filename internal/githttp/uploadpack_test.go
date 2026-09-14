@@ -34,7 +34,8 @@ func TestUploadPackRealClient(t *testing.T) {
 	s := store.New(t.TempDir())
 	wantSHA := newBareRepoWithCommit(t, s, "repo")
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	for _, tt := range []struct {
@@ -46,7 +47,7 @@ func TestUploadPackRealClient(t *testing.T) {
 		{"protocol-v2", []string{"-c", "protocol.version=2"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			lsArgs := append(append([]string{}, tt.args...), "ls-remote", server.URL+"/repo")
+			lsArgs := append(append([]string{}, tt.args...), "ls-remote", authURL(server.URL, tok)+"/repo")
 			cmd := exec.Command("git", lsArgs...)
 			cmd.Dir = t.TempDir()
 			cmd.Env = gitClientEnv()
@@ -59,7 +60,7 @@ func TestUploadPackRealClient(t *testing.T) {
 			}
 
 			dest := filepath.Join(t.TempDir(), "clone")
-			cloneArgs := append(append([]string{}, tt.args...), "clone", "-q", server.URL+"/repo", dest)
+			cloneArgs := append(append([]string{}, tt.args...), "clone", "-q", authURL(server.URL, tok)+"/repo", dest)
 			cmd = exec.Command("git", cloneArgs...)
 			cmd.Dir = t.TempDir()
 			cmd.Env = gitClientEnv()
@@ -105,7 +106,7 @@ func TestUploadPackGzipInflate(t *testing.T) {
 	s := store.New(t.TempDir())
 	wantSHA := newBareRepoWithCommit(t, s, "repo")
 
-	real := githttp.NewHandler(nil, s, "")
+	real, tok := newTestHandler(t, s, "")
 	forceGzip := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/git-upload-pack") {
 			real.ServeHTTP(w, r)
@@ -137,7 +138,7 @@ func TestUploadPackGzipInflate(t *testing.T) {
 	defer server.Close()
 
 	dest := filepath.Join(t.TempDir(), "clone")
-	cmd := exec.Command("git", "clone", "-q", server.URL+"/repo", dest)
+	cmd := exec.Command("git", "clone", "-q", authURL(server.URL, tok)+"/repo", dest)
 	cmd.Dir = t.TempDir()
 	cmd.Env = gitClientEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -168,7 +169,8 @@ func TestUploadPackMemoryStaysFlat(t *testing.T) {
 	s := store.New(t.TempDir())
 	seedLargeBlob(t, s, "big", blobSize)
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	runtime.GC()
@@ -176,7 +178,7 @@ func TestUploadPackMemoryStaysFlat(t *testing.T) {
 	runtime.ReadMemStats(&before)
 
 	dest := filepath.Join(t.TempDir(), "clone")
-	cmd := exec.Command("git", "clone", "-q", server.URL+"/big", dest)
+	cmd := exec.Command("git", "clone", "-q", authURL(server.URL, tok)+"/big", dest)
 	cmd.Dir = t.TempDir()
 	cmd.Env = gitClientEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -206,13 +208,14 @@ func TestUploadPackMemoryStaysFlat(t *testing.T) {
 func TestUploadPackRefusals(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	authorizer, tok := newTestAuthorizer(t, "rw:*")
+	h := githttp.NewHandler(authorizer, s, "")
 
 	// A data directory that cannot be resolved at all, for the 500 case
 	// — the same technique internal/store's own
 	// TestStoreRepoPathUnresolvableDataDir uses.
 	badStore := store.New(filepath.Join(t.TempDir(), "does-not-exist"))
-	hBadDataDir := githttp.NewHandler(nil, badStore, "")
+	hBadDataDir := githttp.NewHandler(authorizer, badStore, "")
 
 	tests := []struct {
 		name        string
@@ -236,6 +239,7 @@ func TestUploadPackRefusals(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer "+tok)
 			req.Header.Set("Content-Type", tt.contentType)
 			if tt.encoding != "" {
 				req.Header.Set("Content-Encoding", tt.encoding)
@@ -296,6 +300,7 @@ func captureRawUploadPackRequest(t *testing.T, s *store.Store, repo string) ([]b
 
 	var captured []byte
 	var proto string
+	authorizer, tok := newTestAuthorizer(t, "rwc:*")
 	recorder := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-upload-pack") {
 			b, err := io.ReadAll(r.Body)
@@ -307,13 +312,13 @@ func captureRawUploadPackRequest(t *testing.T, s *store.Store, repo string) ([]b
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		githttp.NewHandler(nil, s, "").ServeHTTP(w, r)
+		githttp.NewHandler(authorizer, s, "").ServeHTTP(w, r)
 	})
 	server := httptest.NewServer(recorder)
 	defer server.Close()
 
 	dest := filepath.Join(t.TempDir(), "clone")
-	cmd := exec.Command("git", "clone", "-q", server.URL+"/"+repo, dest)
+	cmd := exec.Command("git", "clone", "-q", authURL(server.URL, tok)+"/"+repo, dest)
 	cmd.Dir = t.TempDir()
 	cmd.Env = gitClientEnv()
 	_, _ = cmd.CombinedOutput()
@@ -336,7 +341,8 @@ func TestUploadPackStreamingDoesNotHangOnDeadBody(t *testing.T) {
 	newBareRepoWithCommit(t, s, "target")
 	raw, proto := captureRawUploadPackRequest(t, s, "target")
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)
@@ -353,6 +359,7 @@ func TestUploadPackStreamingDoesNotHangOnDeadBody(t *testing.T) {
 	// Content-Length is declared to be 100 bytes larger than what is actually sent.
 	request := "POST /target/git-upload-pack HTTP/1.1\r\n" +
 		"Host: " + u.Host + "\r\n" +
+		"Authorization: Bearer " + tok + "\r\n" +
 		"Content-Type: application/x-git-upload-pack-request\r\n"
 	if proto != "" {
 		request += "Git-Protocol: " + proto + "\r\n"

@@ -80,7 +80,11 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request) {
 	// resolution so that once it lands, an unauthenticated client cannot
 	// use a 404 to probe which repositories exist.
 	required := auth.Actions{Read: true}
-	_ = required
+	token := credentialFromRequest(r)
+	if err := h.authorize(r.Context(), token, required, repo); err != nil {
+		writeAuthRefusal(w, "upload-pack", repo, err)
+		return
+	}
 
 	if ct := r.Header.Get("Content-Type"); !isUploadPackContentType(ct) {
 		writeRefusal(w, http.StatusUnsupportedMediaType, refusal.Refuse(

@@ -35,10 +35,17 @@ import (
 // proceeds against the winner's repository instead of being told to retry the exact push that
 // just failed. Any other CreateRepo error still refuses.
 //
-// ensureRepoForPush has no caller yet: WALD-52 wires it into
-// POST /{repo}/git-receive-pack once that handler has a token to pass it. It is fully
-// exercised by its own tests here.
+// ensureRepoForPush is called by POST /{repo}/git-receive-pack to authorize the push and,
+// if the repository does not yet exist, create it. It is fully exercised by its own
+// tests here.
 func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (string, error) {
+	if h.auth == nil {
+		return "", refusal.Refuse(
+			"server misconfigured",
+			"authorizer is not configured",
+			"contact the operator",
+		)
+	}
 	exists, err := h.store.RepoExists(ctx, repo)
 	if err != nil {
 		return "", err

@@ -79,10 +79,15 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 		writeRefusal(w, http.StatusForbidden, err)
 		return
 	}
-	// action is the auth.Action this request requires. WALD-52 owns the
-	// 401 challenge and the actual authorization check; this is the one
-	// obvious insertion point for it, before the exec below.
-	_ = action
+	token := credentialFromRequest(r)
+	required := auth.Actions{
+		Read:  action == auth.ActionRead,
+		Write: action == auth.ActionWrite,
+	}
+	if err := h.authorize(r.Context(), token, required, repo); err != nil {
+		writeAuthRefusal(w, "info/refs", repo, err)
+		return
+	}
 
 	path, ok := h.resolveRepoDir(w, "info/refs", repo)
 	if !ok {

@@ -59,7 +59,8 @@ func TestSubprocessKillsGrandchild(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)
@@ -73,8 +74,8 @@ func TestSubprocessKillsGrandchild(t *testing.T) {
 	}
 
 	reqBody := "0000"
-	req := fmt.Sprintf("POST /repo/git-upload-pack HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-		u.Host, len(reqBody), reqBody)
+	req := fmt.Sprintf("POST /repo/git-upload-pack HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		u.Host, tok, len(reqBody), reqBody)
 	if _, err := conn.Write([]byte(req)); err != nil {
 		t.Fatalf("write req: %v", err)
 	}
@@ -141,7 +142,8 @@ func TestSubprocessLeakSoak(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)
@@ -154,7 +156,7 @@ func TestSubprocessLeakSoak(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		req := fmt.Sprintf("POST /repo/git-upload-pack HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: 4\r\nConnection: close\r\n\r\n0000", u.Host)
+		req := fmt.Sprintf("POST /repo/git-upload-pack HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: 4\r\nConnection: close\r\n\r\n0000", u.Host, tok)
 		if _, err := conn.Write([]byte(req)); err != nil {
 			t.Fatalf("write req: %v", err)
 		}

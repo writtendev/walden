@@ -109,7 +109,7 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	// obvious insertion point for it, before the exec below.
 	_ = action
 
-	path, ok := h.resolveRepoDir(w, repo)
+	path, ok := h.resolveRepoDir(w, "info/refs", repo)
 	if !ok {
 		return
 	}

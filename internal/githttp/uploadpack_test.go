@@ -1,7 +1,10 @@
 package githttp_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/rand"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -68,6 +71,80 @@ func TestUploadPackRealClient(t *testing.T) {
 	}
 }
 
+// TestUploadPackGzipInflate proves the Content-Encoding: gzip branch
+// actually inflates the request body before handing it to git's stdin,
+// rather than streaming the still-compressed bytes straight through — a
+// regression TestUploadPackRealClient cannot catch, because git only
+// gzips a request body once it crosses git's own internal size
+// threshold, and that fixture's single-branch, single-commit repo never
+// gets close (a real clone against it sends 182 uncompressed bytes on
+// its git-upload-pack POST). Reaching that threshold with a real client
+// takes hundreds of refs — expensive to fixture and slow to run just to
+// pin one branch of requestBodyReader.
+//
+// Instead, a thin handler sits in front of the real one: it lets a real
+// `git clone`'s request through untouched except for gzip-compressing
+// its git-upload-pack body itself and setting Content-Encoding: gzip —
+// the client never knows its request was recompressed in flight. That
+// drives the exact same code this endpoint would run against a
+// gzip-choosing real client (a real client's own protocol bytes,
+// genuinely inflated by requestBodyReader, fed to a real git
+// upload-pack, and validated by a real git clone), without needing a
+// large fixture. If the gzip branch ever regressed to streaming the
+// still-compressed bytes raw (or closed the reader before git could
+// read it), git upload-pack would choke on the compressed stream and
+// the clone below would fail outright — confirmed by temporarily
+// reverting requestBodyReader's gzip branch to "return r.Body, true"
+// and observing this test fail with a git protocol error.
+func TestUploadPackGzipInflate(t *testing.T) {
+	s := store.New(t.TempDir())
+	wantSHA := newBareRepoWithCommit(t, s, "repo")
+
+	real := githttp.NewHandler(nil, s)
+	forceGzip := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/git-upload-pack") {
+			real.ServeHTTP(w, r)
+			return
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		var compressed bytes.Buffer
+		gz := gzip.NewWriter(&compressed)
+		if _, err := gz.Write(body); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := gz.Close(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		r.Body = io.NopCloser(&compressed)
+		r.ContentLength = int64(compressed.Len())
+		r.Header.Set("Content-Encoding", "gzip")
+		real.ServeHTTP(w, r)
+	})
+	server := httptest.NewServer(forceGzip)
+	defer server.Close()
+
+	dest := filepath.Join(t.TempDir(), "clone")
+	cmd := exec.Command("git", "clone", "-q", server.URL+"/repo", dest)
+	cmd.Dir = t.TempDir()
+	cmd.Env = gitClientEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clone through gzip-forcing proxy: %v\n%s", err, out)
+	}
+
+	gotSHA := strings.TrimSpace(runGit(t, dest, "rev-parse", "HEAD"))
+	if gotSHA != wantSHA {
+		t.Errorf("cloned HEAD = %q, want %q", gotSHA, wantSHA)
+	}
+}
+
 // TestUploadPackMemoryStaysFlat is the ticket's other headline claim: a
 // large clone holds process memory flat. It serves a repo containing one
 // large, incompressible blob, clones it as a real subprocess (so
@@ -107,8 +184,12 @@ func TestUploadPackMemoryStaysFlat(t *testing.T) {
 
 	delta := after.TotalAlloc - before.TotalAlloc
 	// An order of magnitude below the payload, generously rounded so
-	// this is a real regression detector, not a flake.
-	const threshold = blobSize / 4
+	// this is a real regression detector, not a flake. Measured on this
+	// handler the actual delta is ~515 KiB against a 16 MiB blob, so a
+	// blobSize/10 threshold (1.6 MiB) still leaves ~3x headroom above
+	// the real number while catching several MiB of accidental
+	// per-request buffering that a looser bar would miss.
+	const threshold = blobSize / 10
 	if delta > threshold {
 		t.Errorf("server-side TotalAlloc grew by %d bytes cloning a %d-byte blob; want well under %d (streaming, not buffering)", delta, blobSize, threshold)
 	}

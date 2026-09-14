@@ -134,7 +134,7 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path, ok := h.resolveRepoDir(w, repo)
+	path, ok := h.resolveRepoDir(w, "upload-pack", repo)
 	if !ok {
 		return
 	}

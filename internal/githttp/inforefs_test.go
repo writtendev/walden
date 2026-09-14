@@ -291,9 +291,9 @@ func TestInfoRefsRefusals(t *testing.T) {
 // mux assumption produced: relying on net/http.ServeMux to auto-refuse a
 // non-GET method for "GET /{repo}/info/refs" doesn't hold once the "/"
 // catch-all is also registered (it swallows the request instead). This
-// asserts the explicit handleInfoRefsMethodNotAllowed registration keeps
-// the refusal in place: a POST here must get 405 and a single-line body,
-// never the catch-all's bare 200.
+// asserts the explicit methodNotAllowed registration keeps the refusal
+// in place: a POST here must get 405 and a single-line body, never the
+// catch-all's bare 200.
 func TestInfoRefsPostMethodNotAllowed(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")

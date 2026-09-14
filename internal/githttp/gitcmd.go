@@ -31,12 +31,15 @@ func gitEnv(wantV2 bool) []string {
 }
 
 // resolveRepoDir resolves repo to its bare repository directory on disk.
-// On success it returns the path and true. On failure it writes a
-// one-line refusal to w — mapping store.ErrStoreUnavailable to 500,
-// every other RepoPath refusal to 400, a missing repository to 404, and
-// any other stat error to 500 — and returns false, telling the caller to
-// stop.
-func (h *Handler) resolveRepoDir(w http.ResponseWriter, repo string) (string, bool) {
+// route names the calling endpoint (e.g. "info/refs" or "upload-pack")
+// for the operator log only: these refusals are deliberately path-free
+// on the wire, so the log line is the only place an operator can tell
+// which endpoint produced a given 500. On success it returns the path
+// and true. On failure it writes a one-line refusal to w — mapping
+// store.ErrStoreUnavailable to 500, every other RepoPath refusal to
+// 400, a missing repository to 404, and any other stat error to 500 —
+// and returns false, telling the caller to stop.
+func (h *Handler) resolveRepoDir(w http.ResponseWriter, route, repo string) (string, bool) {
 	path, err := h.store.RepoPath(repo)
 	if err != nil {
 		// store.RepoPath already distinguishes caller fault (a bad
@@ -53,7 +56,7 @@ func (h *Handler) resolveRepoDir(w http.ResponseWriter, repo string) (string, bo
 			// the wire to an unauthenticated client — PHILOSOPHY.md's
 			// refusal convention is scoped to the operator, and this
 			// route has no authentication in front of it yet.
-			log.Printf("githttp: repo path for %q: %v", repo, err)
+			log.Printf("githttp: %s: repo path for %q: %v", route, repo, err)
 			writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
 				"repository unavailable",
 				"the server could not resolve the repository path",
@@ -78,7 +81,7 @@ func (h *Handler) resolveRepoDir(w http.ResponseWriter, repo string) (string, bo
 		}
 		// As above: log the full stat error (it names the absolute
 		// repository path) and send the client a fixed one-liner.
-		log.Printf("githttp: stat repository path for %q: %v", repo, err)
+		log.Printf("githttp: %s: stat repository path for %q: %v", route, repo, err)
 		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
 			"repository unavailable",
 			"the server could not access the repository",

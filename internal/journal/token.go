@@ -32,6 +32,10 @@ var ErrInvalidTokenID = errors.New("invalid token id")
 // ErrInvalidTokenHash indicates a stored token hash that is not "sha256:<64-lowercase-hex>".
 var ErrInvalidTokenHash = errors.New("invalid token hash")
 
+// ErrInvalidTokenScope indicates a scope string that cannot appear in a token record because
+// it could break the Canonical Token Creation Signing Payload's line-per-entry framing.
+var ErrInvalidTokenScope = errors.New("invalid token scope")
+
 var tokenIDRegexp = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 var tokenHashHexRegexp = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -121,6 +125,27 @@ func ValidateTokenHash(hash string) error {
 	return nil
 }
 
+// ValidateTokenScope validates a single entry of a TokenCreateRecord's scopes array: it must
+// contain no ASCII control character (0x00-0x1F or 0x7F).
+//
+// The Canonical Token Creation Signing Payload (below) frames scopes one per line, each
+// prefixed "scope:" and terminated by "\n" — the same idiom CanonicalRefUpdatePayload uses
+// for ref names one "update:" line at a time. That idiom is safe there only because
+// ValidateRefName refuses every control character, so a ref name can never smuggle in the
+// "\n" the framing uses as its delimiter. Scopes had no equivalent: a scope string containing
+// "\nscope:" could splice a second line into the payload, so a signature minted over one
+// scope would verify unchanged for a record naming two, the second being whatever text
+// followed the embedded delimiter. Banning control characters here closes that the same way
+// ValidateRefName closes it for ref names — in the data, not in a caller.
+func ValidateTokenScope(scope string) error {
+	for i := 0; i < len(scope); i++ {
+		if b := scope[i]; b <= 0x1F || b == 0x7F {
+			return fmt.Errorf("%w: contains control character (byte 0x%02x): %q", ErrInvalidTokenScope, b, scope)
+		}
+	}
+	return nil
+}
+
 // Validate validates that a TokenCreateRecord is well-formed.
 func (r *TokenCreateRecord) Validate() error {
 	if r == nil {
@@ -142,6 +167,9 @@ func (r *TokenCreateRecord) Validate() error {
 	for i, scope := range r.Scopes {
 		if scope == "" {
 			return fmt.Errorf("%w: scopes[%d] cannot be empty", ErrInvalidTokenRecord, i)
+		}
+		if err := ValidateTokenScope(scope); err != nil {
+			return fmt.Errorf("%w: scopes[%d]: %w", ErrInvalidTokenRecord, i, err)
 		}
 		if seen[scope] {
 			return fmt.Errorf("%w: duplicate scope %q", ErrInvalidTokenRecord, scope)
@@ -211,6 +239,14 @@ func validateTokenTimestamp(timestamp string) error {
 // ValidateTokenHash already refuses a non-lowercase hash outright rather than folding it —
 // lowercasing here would be a no-op that manufactures a second instance of the same defect.
 // token_id, each scope string, and timestamp are likewise written verbatim.
+//
+// One "scope:" line is emitted per entry of scopes, so this framing is unambiguous only
+// because ValidateTokenScope (enforced by TokenCreateRecord.Validate, which both
+// SignTokenCreate and VerifyTokenCreate call before ever reaching this function) refuses a
+// scope containing a control character — in particular the "\n" this framing delimits on.
+// This function itself does not re-check that; it trusts its caller the same way
+// CanonicalRefUpdatePayload trusts ValidateRefName to have already refused a ref name
+// carrying the same character.
 func CanonicalTokenCreatePayload(stream StreamID, seq Seq, tokenID, tokenHash string, scopes []string, timestamp string) []byte {
 	var sb strings.Builder
 	sb.WriteString("walden-token-create:v1\n")

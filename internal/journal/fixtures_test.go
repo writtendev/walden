@@ -1462,6 +1462,37 @@ func TestFixtureTokenMissingSignatureRefusedAtParse(t *testing.T) {
 	}
 }
 
+// TestFixtureTokenCreateMissingSignatureRefusedAtParse is
+// TestFixtureTokenMissingSignatureRefusedAtParse's counterpart for ParseTokenCreate: the
+// shadow-struct absent-field check is defined identically for both parsers, but only the
+// revoke side had a test exercising it.
+func TestFixtureTokenCreateMissingSignatureRefusedAtParse(t *testing.T) {
+	data, err := os.ReadFile(fixtureKeyPath(journal.TxKey(journal.MetaStreamID, 1)))
+	if err != nil {
+		t.Fatalf("failed to read meta fixture: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("failed to parse meta fixture: %v", err)
+	}
+	delete(raw, "signature")
+	stripped, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("failed to marshal the stripped fixture: %v", err)
+	}
+
+	_, err = journal.ParseTokenCreate(stripped)
+	if err == nil {
+		t.Fatal("ParseTokenCreate accepted a record with no signature field")
+	}
+	if !errors.Is(err, journal.ErrInvalidTokenRecord) {
+		t.Errorf("error = %v, want ErrInvalidTokenRecord", err)
+	}
+	if !strings.Contains(err.Error(), `"signature"`) {
+		t.Errorf("error does not name the missing field: %v", err)
+	}
+}
+
 // fixtureSequences collects every value in a decoded JSON document that sits under a key
 // named "seq" or "sequence", at any depth. The whole document is searched rather than the
 // two or three places a sequence is expected, so a sequence added anywhere in the tree

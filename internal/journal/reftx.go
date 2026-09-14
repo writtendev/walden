@@ -315,6 +315,11 @@ func VerifyRefTx(r *RefTransactionRecord, activePublicKey string) error {
 // it is refused rather than a reason to fall back to the active key, and an
 // epoch lower than one already verified on this stream is refused too, or a
 // retired key would go on validating records forever.
+//
+// VerifyRefTx mutates c: on success it raises c's per-stream floor to
+// r.KeyEpoch. A SigningChain carries the state of exactly one replay and is
+// not safe for concurrent use — drive it from a single goroutine; do not
+// call VerifyRefTx on the same chain from more than one goroutine at a time.
 func (c *SigningChain) VerifyRefTx(r *RefTransactionRecord) error {
 	if c == nil || !c.initialized {
 		return fmt.Errorf("%w: cannot verify ref transaction before genesis", ErrGenesisMissing)

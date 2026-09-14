@@ -232,16 +232,28 @@ func (e *Epoch) UnmarshalJSON(data []byte) error {
 // forward: keys[0] is the genesis key (epoch 0), and keys[i] is the key
 // activated by the i'th rotation record. The active key is always the last
 // element.
+//
+// A SigningChain carries the state of one replay, not a read-only view of
+// the chain: VerifyRefTx advances lastEpoch as it verifies each ref
+// transaction. It is not safe for concurrent use — a chain must be driven
+// by a single goroutine end to end, never shared across goroutines
+// verifying in parallel.
 type SigningChain struct {
 	keys        []string
 	lastMetaSeq Seq
 	initialized bool
 
-	// lastEpoch is reader-side replay state, not part of the chain itself: the
-	// highest key_epoch verified so far on each repository stream, so that a
-	// verified record can never be followed by one naming an earlier epoch
-	// (WALD-96) — a retired key would otherwise go on validating records
-	// forever.
+	// lastEpoch is reader-side replay state, not part of the chain itself:
+	// the highest key_epoch this replay has verified so far on each
+	// repository stream, so that a verified record can never be followed by
+	// one naming an earlier epoch on the same stream within this replay
+	// (WALD-96). The floor is per stream and starts empty for a stream this
+	// replay has not yet walked: it does not carry across a marker-resumed
+	// replay's baseline, and it protects nothing on a stream — new or old —
+	// that has not itself carried a record above epoch 0 in this replay
+	// (spec section 8, section 8.1 rule 15; closing either gap needs
+	// WALD-97's marker work or a floor that is not scoped per stream,
+	// neither of which this map provides).
 	lastEpoch map[StreamID]Epoch
 }
 

@@ -109,3 +109,19 @@ func TestExclusiveModes(t *testing.T) {
 		t.Errorf("built-in mode accepted a capability token: ok=%v, err=%v", ok, err)
 	}
 }
+
+// TestCheckRepoAndTokenOrdering pins that CheckRepoAndToken validates the
+// repo identifier before it does any token work. An invalid identifier with
+// an empty token must fail as ErrInvalidRepo, not ErrUnauthorized — otherwise
+// a later edit could quietly swap the two checks and identifier validation
+// would stop happening before authentication work, which is the property
+// WALD-37 requires.
+func TestCheckRepoAndTokenOrdering(t *testing.T) {
+	err := auth.CheckRepoAndToken("", "repo/sub")
+	if !errors.Is(err, auth.ErrInvalidRepo) {
+		t.Errorf("expected ErrInvalidRepo for invalid repo with empty token, got %v", err)
+	}
+	if errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("expected repo validation to precede the token check, got ErrUnauthorized: %v", err)
+	}
+}

@@ -299,8 +299,9 @@ func checkSingleLineRefusal(t *testing.T, err error, want error) {
 
 // TestFileTokenStoreRefusals covers every refusal the plan calls out by name: a duplicate
 // CreateToken (by id, and separately by hash), RevokeToken on an unknown id, RevokeToken on
-// an already-revoked token, and a truncated tokens.json — each pinned to its sentinel via
-// errors.Is, and the truncated file proven not to be read as an empty table.
+// an already-revoked token, a truncated tokens.json, and the four malformed-but-parseable
+// shapes (null, {}, a null tokens array, and an unrecognised version) — each pinned to its
+// sentinel via errors.Is, and none of the five read as an empty table.
 func TestFileTokenStoreRefusals(t *testing.T) {
 	ctx := context.Background()
 
@@ -402,6 +403,124 @@ func TestFileTokenStoreRefusals(t *testing.T) {
 		})
 		checkSingleLineRefusal(t, err, auth.ErrStoreUnavailable)
 	})
+
+	// These four all decode without a JSON error and leave the table zero-valued or
+	// carrying a nil Tokens slice — the exact shapes that used to come back as a silent
+	// empty table. A missing file is the one legitimately empty case and is asserted
+	// separately below, so the fix has to tell "absent" from "malformed" apart rather than
+	// refusing everything a stat can't find.
+	malformed := []struct {
+		name string
+		data string
+	}{
+		{"null", `null`},
+		{"empty object", `{}`},
+		{"null tokens array", `{"version":"v1","tokens":null}`},
+		{"unrecognised version", `{"version":"v99","tokens":[]}`},
+	}
+	for _, tc := range malformed {
+		t.Run("malformed tokens.json ("+tc.name+") is not read as empty", func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "tokens.json"), []byte(tc.data), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			store := auth.NewFileTokenStore(dir)
+
+			if _, err := store.ListTokens(ctx); err == nil {
+				t.Error("ListTokens over a malformed file returned nil error, want a refusal")
+			} else {
+				checkSingleLineRefusal(t, err, auth.ErrStoreUnavailable)
+			}
+
+			// The decisive check, same as the truncated case above: a malformed table must
+			// never be treated as an empty one that CreateToken can happily append to.
+			scopes, _ := auth.ParseScopes([]string{"rwc:*"})
+			err := store.CreateToken(ctx, &auth.TokenRecord{
+				TokenID:   "tok_after_" + strings.ReplaceAll(tc.name, " ", "_"),
+				TokenHash: auth.HashToken("walden_after_" + tc.name),
+				Scopes:    scopes,
+				CreatedAt: time.Now().UTC(),
+			})
+			checkSingleLineRefusal(t, err, auth.ErrStoreUnavailable)
+		})
+	}
+
+	t.Run("missing tokens.json is still an empty table", func(t *testing.T) {
+		dir := t.TempDir()
+		store := auth.NewFileTokenStore(dir)
+
+		tokens, err := store.ListTokens(ctx)
+		if err != nil {
+			t.Fatalf("ListTokens over a fresh data directory: %v", err)
+		}
+		if len(tokens) != 0 {
+			t.Fatalf("ListTokens over a fresh data directory = %d tokens, want 0", len(tokens))
+		}
+
+		scopes, _ := auth.ParseScopes([]string{"rwc:*"})
+		if err := store.CreateToken(ctx, &auth.TokenRecord{
+			TokenID:   "tok_first",
+			TokenHash: auth.HashToken("walden_first"),
+			Scopes:    scopes,
+			CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatalf("CreateToken over a fresh data directory: %v", err)
+		}
+	})
+}
+
+// TestFileTokenStoreCorruptScopeNamesFile checks that a scope string on disk that ParseScopes
+// rejects surfaces as a corrupted store naming tokens.json, not as ErrInvalidScope blaming
+// input the operator never supplied — and that errors.Is(err, ErrStoreUnavailable) catches it
+// like every other corrupt-store path.
+func TestFileTokenStoreCorruptScopeNamesFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	tokensPath := filepath.Join(dir, "tokens.json")
+	if err := os.WriteFile(tokensPath, []byte(`{"version":"v1","tokens":[{"token_id":"tok_bad_scope","token_hash":"sha256:`+strings.Repeat("0", 64)+`","scopes":["!!!"],"created_at":"2026-01-01T00:00:00Z","revoked":false}]}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	store := auth.NewFileTokenStore(dir)
+
+	_, err := store.ListTokens(ctx)
+	checkSingleLineRefusal(t, err, auth.ErrStoreUnavailable)
+	if errors.Is(err, auth.ErrInvalidScope) {
+		t.Errorf("corrupt on-disk scope refused under ErrInvalidScope, want it to read as a damaged store: %v", err)
+	}
+	if !strings.Contains(err.Error(), tokensPath) {
+		t.Errorf("refusal %q does not name %s", err.Error(), tokensPath)
+	}
+}
+
+// TestFileTokenStoreSaveDoesNotInheritStaleTmpMode plants a tokens.json.tmp at a looser mode
+// before a mutation and asserts the resulting tokens.json still comes out 0600 — os.OpenFile's
+// mode argument only applies when it creates the file, so a save that reused a pre-existing
+// tmp used to carry that tmp's mode straight through the rename.
+func TestFileTokenStoreSaveDoesNotInheritStaleTmpMode(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tokens.json.tmp"), []byte("stale"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	store := auth.NewFileTokenStore(dir)
+
+	scopes, _ := auth.ParseScopes([]string{"rwc:*"})
+	if err := store.CreateToken(ctx, &auth.TokenRecord{
+		TokenID:   "tok_stale_tmp",
+		TokenHash: auth.HashToken("walden_stale_tmp"),
+		Scopes:    scopes,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	info, err := os.Stat(filepath.Join(dir, "tokens.json"))
+	if err != nil {
+		t.Fatalf("Stat tokens.json: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Errorf("tokens.json mode = %o, want 0600 (planted a 0644 tokens.json.tmp beforehand)", got)
+	}
 }
 
 // TestFileTokenStoreConcurrent mirrors TestMemoryTokenStoreConcurrent against the file store,

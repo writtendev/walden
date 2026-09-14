@@ -72,11 +72,20 @@ type diskTable struct {
 }
 
 // toRecord converts a disk-encoded token into the TokenRecord shape the rest of the package
-// works with, parsing its scopes back into the published vocabulary.
-func (d diskToken) toRecord() (*TokenRecord, error) {
+// works with, parsing its scopes back into the published vocabulary. path is the tokens.json
+// path this record was read from, purely so a parse failure can be wrapped as a corrupted
+// store naming the file — a scope string an operator never typed must not refuse under
+// ErrInvalidScope blaming input, and it is the one corrupt-store path errors.Is(err,
+// ErrStoreUnavailable) would otherwise miss.
+func (d diskToken) toRecord(path string) (*TokenRecord, error) {
 	scopes, err := ParseScopes(d.Scopes)
 	if err != nil {
-		return nil, err
+		return nil, refusal.RefuseWithCause(
+			"token store corrupted",
+			fmt.Sprintf("%s carries token %q with an unparseable scope: %s", path, d.TokenID, err.Error()),
+			"restore tokens.json from backup; it will not be recreated automatically",
+			ErrStoreUnavailable,
+		)
 	}
 	return &TokenRecord{
 		TokenID:   d.TokenID,
@@ -142,6 +151,27 @@ func (s *FileTokenStore) load() (*diskTable, error) {
 			ErrStoreUnavailable,
 		)
 	}
+	// A decoded table that is not recognisably a table is corruption, not an empty table:
+	// `null`, `{}`, and an unrecognised version all decode above with no error and a
+	// zero-valued table, and `{"tokens":null}` decodes with a nil Tokens even under a
+	// recognised version. Only the missing-file case above is legitimately empty; anything
+	// that made it this far came from a file that exists and must decode to the real shape.
+	if table.Version != tokensFileVersion {
+		return nil, refusal.RefuseWithCause(
+			"token store corrupted",
+			fmt.Sprintf("%s carries unrecognised version %q, want %q", s.path, table.Version, tokensFileVersion),
+			"restore tokens.json from backup; it will not be recreated automatically",
+			ErrStoreUnavailable,
+		)
+	}
+	if table.Tokens == nil {
+		return nil, refusal.RefuseWithCause(
+			"token store corrupted",
+			fmt.Sprintf("%s has no tokens array", s.path),
+			"restore tokens.json from backup; it will not be recreated automatically",
+			ErrStoreUnavailable,
+		)
+	}
 	return &table, nil
 }
 
@@ -170,6 +200,21 @@ func (s *FileTokenStore) save(table *diskTable) error {
 		return refusal.RefuseWithCause(
 			"token store unavailable",
 			fmt.Sprintf("cannot create %s: %s", tmpPath, err.Error()),
+			"verify the data directory is writable",
+			ErrStoreUnavailable,
+		)
+	}
+	// OpenFile's mode argument only applies when it creates the file: a tokens.json.tmp left
+	// behind by an operator, a backup tool, or an earlier crash is instead reused at its
+	// existing mode, and that mode would ride the rename into tokens.json itself. Chmod makes
+	// the final mode 0600 unconditionally, regardless of whether this file was just created or
+	// already existed.
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return refusal.RefuseWithCause(
+			"token store unavailable",
+			fmt.Sprintf("cannot set permissions on %s: %s", tmpPath, err.Error()),
 			"verify the data directory is writable",
 			ErrStoreUnavailable,
 		)
@@ -242,7 +287,7 @@ func (s *FileTokenStore) GetTokenByHash(ctx context.Context, hash string) (*Toke
 	}
 	for _, dt := range table.Tokens {
 		if dt.TokenHash == hash {
-			return dt.toRecord()
+			return dt.toRecord(s.path)
 		}
 	}
 	return nil, nil
@@ -256,7 +301,7 @@ func (s *FileTokenStore) GetTokenByID(ctx context.Context, tokenID string) (*Tok
 	}
 	for _, dt := range table.Tokens {
 		if dt.TokenID == tokenID {
-			return dt.toRecord()
+			return dt.toRecord(s.path)
 		}
 	}
 	return nil, nil
@@ -270,7 +315,7 @@ func (s *FileTokenStore) ListTokens(ctx context.Context) ([]*TokenRecord, error)
 	}
 	records := make([]*TokenRecord, 0, len(table.Tokens))
 	for _, dt := range table.Tokens {
-		rec, err := dt.toRecord()
+		rec, err := dt.toRecord(s.path)
 		if err != nil {
 			return nil, err
 		}

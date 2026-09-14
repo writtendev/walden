@@ -94,3 +94,45 @@ fixtures — see ARCHITECTURE.md) lands with the journal format work.
 go build ./...
 go test ./...
 ```
+
+## Dispatch
+
+The `studio` pipeline — `dispatch`, `implement-ticket`,
+`adversarial-review`, `merge-queue` — reads this section and nothing
+else for its repo-specific configuration. A field left out is a field
+those skills refuse to guess: they say which one is missing and stop.
+
+| Field        | Value                                 |
+| ------------ | ------------------------------------- |
+| Linear team  | `WALD`                                |
+| Base branch  | `main`                                |
+| Worktrees    | `.claude/worktrees/`                  |
+| Run manifest | `.claude/worktrees/run-manifest.json` |
+
+Both paths are already in `.gitignore`. Per-run state is local to the
+machine that ran it and is not committed.
+
+**Check command.** An implementer or fixer runs this and passes it
+before pushing:
+
+```
+go build ./... && go vet ./... && test -z "$(gofmt -l .)" && go test -race ./...
+```
+
+Wider than `## Build and test` above, deliberately. That one is what a
+person runs while working; this is what CI gates on, so that a local
+pass and a green pull request mean the same thing. The formatting
+check is spelled `test -z` rather than a bare `gofmt -l .` because
+`gofmt -l` lists the offending files and still exits zero — chained
+with `&&` it would never fail, and unformatted code would reach CI
+with the check reporting success.
+
+**Review invariants.** `## Mechanical review rules` above is the
+review contract. A reviewer works against those six rules and reports
+findings in their terms.
+
+They are deliberately not restated here. This file is the single
+source — `## This file` says as much, and CLAUDE.md and GEMINI.md are
+one-line imports for that reason. A second copy of the rules under a
+second heading is the same drift in miniature, and the copy that goes
+stale is the one a reviewer would be reading.

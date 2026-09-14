@@ -1127,3 +1127,61 @@ func TestRefNameRawBytePreservationNonUTF8(t *testing.T) {
 		t.Fatalf("canonical payload did not preserve exact raw bytes:\npayload:\n%s\nexpected substring:\n%s", string(payload), expectedSub)
 	}
 }
+
+// TestZeroValueSigningChainVerifyRefTx pins a regression: SigningChain was
+// zero-value-safe before WALD-96, and the epoch-floor map it added
+// (lastEpoch) must not break that. A chain built as `var c journal.SigningChain`
+// and initialized by ApplyGenesis directly (bypassing NewSigningChain, the
+// only place that used to allocate the map) must still verify a well-signed
+// record instead of panicking with "assignment to entry in nil map".
+func TestZeroValueSigningChainVerifyRefTx(t *testing.T) {
+	priv, pub := deterministicKeypair(0x01)
+
+	var chain journal.SigningChain
+	genesis := &journal.GenesisRecord{
+		Version:   "v1",
+		Stream:    journal.MetaStreamID,
+		Seq:       0,
+		Type:      "genesis",
+		PublicKey: journal.FormatPublicKey(pub),
+		Timestamp: "2026-08-31T00:00:00Z",
+	}
+	if err := chain.ApplyGenesis(genesis); err != nil {
+		t.Fatalf("ApplyGenesis failed: %v", err)
+	}
+
+	tx := &journal.RefTransactionRecord{
+		Version: "v1",
+		Stream:  "repo-alpha",
+		Seq:     0,
+		Type:    "ref_update",
+		Updates: []journal.RefUpdate{
+			{
+				Ref:    "refs/heads/main",
+				OldOID: journal.ZeroOID40,
+				NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+			},
+		},
+		Timestamp: "2026-08-31T00:01:00Z",
+	}
+	if err := journal.SignRefTx(priv, tx); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+
+	// Must not panic (previously: "assignment to entry in nil map").
+	if err := chain.VerifyRefTx(tx); err != nil {
+		t.Fatalf("zero-value SigningChain.VerifyRefTx failed: %v", err)
+	}
+
+	// A second record on the same stream exercises the read side of the
+	// lazily-allocated map too.
+	tx2 := *tx
+	tx2.Seq = 1
+	tx2.Timestamp = "2026-08-31T00:02:00Z"
+	if err := journal.SignRefTx(priv, &tx2); err != nil {
+		t.Fatalf("SignRefTx(tx2) failed: %v", err)
+	}
+	if err := chain.VerifyRefTx(&tx2); err != nil {
+		t.Fatalf("zero-value SigningChain.VerifyRefTx(tx2) failed: %v", err)
+	}
+}

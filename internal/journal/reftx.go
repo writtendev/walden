@@ -332,6 +332,9 @@ func (c *SigningChain) VerifyRefTx(r *RefTransactionRecord) error {
 	if err := VerifyRefTx(r, key); err != nil {
 		return err
 	}
+	if c.lastEpoch == nil {
+		c.lastEpoch = make(map[StreamID]Epoch)
+	}
 	c.lastEpoch[r.Stream] = r.KeyEpoch
 	return nil
 }

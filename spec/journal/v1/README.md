@@ -34,7 +34,7 @@ Every repository is modeled as an independent stream. The server instance's own 
 
 ### 1.1 Sequence Numbers Are JSON Strings
 
-Wherever a sequence number appears in a JSON document of this format — `seq` in a record, `sequence` in `marker.json` — it is encoded as a **JSON string holding its exact decimal form**, never as a JSON number: `"seq": "3"`.
+Wherever a sequence number appears in a JSON document of this format — `seq` in a record, `sequence` in `marker.json` — it is encoded as a **JSON string holding its exact decimal form**, never as a JSON number: `"seq": "3"`. The same rule covers `key_epoch` (section 5.1): it is not itself a sequence — it indexes the signing key chain, not a position in a stream — but it is another 64-bit integer this format writes, and RFC 8259's precision problem applies to it exactly as it does to a sequence number, for exactly the same reason.
 
 The reason, stated once here so that nobody tidies it back to a number: RFC 8259 does not fix numeric precision and notes that interoperability is best inside the IEEE-754 double range, and many readers — JavaScript's `JSON.parse` and everything built on it — decode every JSON number as a double, which represents integers exactly only up to 2^53. A number-encoded sequence near the top of the documented range comes back rounded (`18446744073709551615` reads back as `18446744073709552000`), so the record disagrees with the sequence in its own object key and a reader that cross-checks the two rejects a valid record. A string is read exactly by every conformant parser. This is the same convention protobuf's canonical JSON mapping applies to `int64` and `uint64`.
 
@@ -320,7 +320,7 @@ in the chain — the genesis key, since this record predates any rotation.
 | `stream` | string | Stream identifier (`<stream-id>`). |
 | `seq` | string | Strictly monotonic unsigned 64-bit sequence number ($k \ge 0$) in exact decimal form (section 1.1). |
 | `type` | string | MUST be `"ref_update"`. |
-| `key_epoch` | string | Index into the signing key chain, in exact decimal form (section 1.1), naming the key that signed this record. `0` is the genesis key; each `key_rotation` record on `_meta` increments it by one. A hint, not authority: section 8 verifies the chain from genesis and trusts the named key only because it is already in that verified chain. |
+| `key_epoch` | string | Index into the signing key chain, in exact decimal form (section 1.1), naming the key that signed this record. `0` is the genesis key; each `key_rotation` record on `_meta` increments it by one. A hint, not authority: section 8 verifies the chain from genesis and trusts the named key only because it is already in that verified chain. A record with no `key_epoch` at all is read as epoch `0`, identically to an explicit `"key_epoch": "0"`; a writer producing v1 records MUST always emit the field explicitly rather than relying on this default. |
 | `segments` | array of strings | List of zero or more 64-character lowercase hexadecimal SHA-256 digests of newly written packfiles. May be empty (`[]`) for operations not introducing new objects (e.g. branch deletion, fast-forward to existing commit, tag deletion). |
 | `updates` | array of objects | List of one or more ref update triples defining atomic ref transitions. MUST NOT contain duplicate ref names within the same transaction. |
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of transaction creation (e.g. `"2026-08-31T00:02:00Z"`). |
@@ -674,7 +674,9 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 
 Step 3 excludes `_meta` from the stream sweep: `_meta` carries `genesis`, `key_rotation`, `token_create`, and `token_revoke` records, never `ref_update`, and step 2 already replays it in full. `_meta` itself matches `^[a-zA-Z0-9._-]+$` — the same pattern a repository stream ID matches — so a reader that does not exclude it by name would otherwise try to verify meta records as ref transactions and fail on the first one (see section 9.1).
 
-`record.key_epoch` is a hint, not authority: it selects a position in `Chain`, and `Chain` is trusted only because step 2 verified it from genesis forward. An epoch outside `Chain` (rule 14) or lower than one already verified on that same stream (rule 15) is refused outright — never a reason to fall back to `Chain[-1]` or to any other key. The per-stream floor is what stops a retired key from validating a record inserted after a later one on the same stream, which is the entire reason a key is rotated in the first place.
+`record.key_epoch` is a hint, not authority: it selects a position in `Chain`, and `Chain` is trusted only because step 2 verified it from genesis forward. An epoch outside `Chain` (rule 14) is refused outright — never a reason to fall back to `Chain[-1]` or to any other key.
+
+Rule 15's floor is real, but only over the records a given replay actually walks — it is **not** a guarantee that survives a marker baseline. `LastEpoch` starts at `0` for every replay of a stream, including one resuming from `marker.json` at baseline `S` (section 7): such a replay begins at `S + 1` and never sees the records at or before `S`, so it has no way to learn the highest epoch they carried, and `marker.json` itself carries no epoch to seed the floor from (section 7.2). On a stream compacted past a key rotation, that means a record forged at `S + 1` or later with a leaked, already-retired key's epoch clears rule 15 exactly as a genuine low-epoch record would have before compaction — the floor a fresh replay starts from is always `0`, regardless of what the stream's full history actually reached. Within one continuous replay from genesis (no marker, or a marker at `S = -1`), rule 15 delivers the non-decreasing guarantee as stated; a replay that resumes from a marker at `S >= 0` delivers it only for records after `S`, and a reader that needs the guarantee to hold across the baseline cannot get it from this section. Closing that gap means carrying the floor forward in `marker.json` itself, which is a marker format change out of this section's scope (tracked as WALD-97).
 
 ### 8.1 Verification Failure Rules
 1. **Unchainable Rotation:** If `record.old_public_key != Chain[-1]` (the currently active key, the last element of `Chain`), the rotation does not chain to genesis. The reader MUST abort immediately with a single-line error:
@@ -731,11 +733,11 @@ Step 3 excludes `_meta` from the stream sweep: `_meta` carries `genesis`, `key_r
     ```
     refusal: replay failed: ref update on stream <id> at seq <N> names unknown key epoch <E>
     ```
-15. **Key Epoch Regression:** If a `ref_update` record's `key_epoch` is lower than the `key_epoch` already verified on a prior record of the *same stream*, the reader MUST abort immediately with a single-line error:
+15. **Key Epoch Regression:** If a `ref_update` record's `key_epoch` is lower than the `key_epoch` already verified *in this replay* on a prior record of the *same stream*, the reader MUST abort immediately with a single-line error:
     ```
     refusal: replay failed: ref update on stream <id> at seq <N> names key epoch <E> below epoch <F> already seen on this stream
     ```
-    Without this check a retired key, still present earlier in `Chain`, would go on validating any record naming its epoch forever — exactly the outcome key rotation exists to end.
+    Without this check a retired key, still present earlier in `Chain`, would go on validating any record naming its epoch forever within the replay — exactly the outcome key rotation exists to end. "Already seen on this stream" means seen by `LastEpoch` in this replay (step 3), which starts at `0` regardless of the stream's history before the replay's baseline — see the caveat under step 3 above. This rule cannot, by itself, stop a retired key from validating a record placed after the baseline of a resumed replay; that requires the floor itself to survive the marker (WALD-97).
 
 ---
 

@@ -11,7 +11,7 @@
 Walden answers exactly one authorization question before serving any Git HTTP request:
 > **"Does this token grant action $A$ on repository $R$?"**
 
-Walden defines two complementary, interoperable authentication modes using the same underlying scope vocabulary and repository identifier rules:
+Walden defines two mutually exclusive authentication modes, which share the same underlying scope vocabulary and repository identifier rules. Exactly one mode is active on a given server, selected by whether `WALDEN_AUTH_TRUST` is configured:
 
 1. **Built-in Mode (Default):** Static bearer tokens minted by the server's CLI (`walden token create`), stored hashed (SHA-256) in a local store and journaled to the `_meta` stream.
 2. **Delegated Mode:** Ephemeral capability tokens minted by an external authority, signed with Ed25519 against a single trusted public key (`WALDEN_AUTH_TRUST`). Verified purely locally with zero network calls, zero callbacks, and zero external dependencies.

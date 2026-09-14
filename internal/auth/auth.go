@@ -29,9 +29,23 @@ type Authorizer interface {
 	Authorize(ctx context.Context, token string, action Action, repo string) (bool, error)
 }
 
-// NewAuthorizer creates an Authorizer based on the configuration.
-// If trustKey is non-empty, delegated capability auth is enabled using the Ed25519 public key.
-// Otherwise, built-in token authentication is used against the provided TokenStore.
+// NewAuthorizer creates the single Authorizer for this server's configuration.
+//
+// The two modes are mutually exclusive, per ARCHITECTURE.md's auth section: a
+// non-empty trustKey selects delegated capability verification against that
+// Ed25519 public key, an empty one selects built-in tokens against store, and
+// the mode not selected is never consulted. In particular a capability token
+// that fails to verify does not fall back to the built-in store. A server that
+// could answer yes from either source would be a third mode wearing the other
+// two as a disguise, and would double the surface on which an authorization
+// mistake is worst.
+//
+// store is still accepted under a trust key, and is deliberately not dropped
+// from the signature there: exclusivity governs who can grant, not who can
+// revoke, so `walden token list` and `walden token revoke` keep working in
+// delegated mode. It is simply never wired to the returned Authorizer.
+//
+// TestExclusiveModes pins the behaviour rather than the branch.
 func NewAuthorizer(trustKey string, store TokenStore) (Authorizer, error) {
 	if strings.TrimSpace(trustKey) != "" {
 		pubKey, err := journal.ParsePublicKey(trustKey)

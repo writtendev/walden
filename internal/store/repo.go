@@ -19,17 +19,30 @@ import (
 //
 // RepoPath resolves the identifier first, so the identifier and containment
 // refusals from WALD-37 are returned unchanged and never reach the
-// filesystem check below. A directory at the resolved path is true;
-// fs.ErrNotExist is false, nil. Any other Stat failure, or a file (not a
-// directory) sitting at the path, is an operator-fault refusal wrapping
-// ErrStoreUnavailable — never reported as "does not exist", which would send
-// a caller into CreateRepo for a second, more confusing failure.
+// filesystem check below. The rest of the classification is statRepoPath's:
+// see it for what a directory, a missing path, and anything else (including
+// a non-directory sitting at the path) each mean.
 func (s *Store) RepoExists(ctx context.Context, repo string) (bool, error) {
 	path, err := s.RepoPath(repo)
 	if err != nil {
 		return false, err
 	}
+	return statRepoPath(path)
+}
 
+// statRepoPath classifies what is at path in the one place both RepoExists
+// and CreateRepo consult, so the two can never again disagree about what the
+// same path means — which is exactly what let a plain file at a repo's path
+// wear "already exists" out of CreateRepo while RepoExists correctly refused
+// it as storage unavailable (PR #35 round 3).
+//
+// A directory is (true, nil). fs.ErrNotExist is (false, nil). Any other Stat
+// failure, or a file (not a directory) sitting at the path, is an
+// operator-fault refusal wrapping ErrStoreUnavailable — never reported as
+// "does not exist" (which would send a caller into CreateRepo for a second,
+// more confusing failure) and never as ErrRepoExists (which would tell a
+// caller to push to a repository that cannot be pushed to).
+func statRepoPath(path string) (bool, error) {
 	info, err := os.Stat(path)
 	switch {
 	case err == nil:
@@ -78,18 +91,21 @@ func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 		return err
 	}
 
-	switch _, statErr := os.Stat(path); {
-	case statErr == nil:
+	switch exists, statErr := statRepoPath(path); {
+	case statErr != nil:
+		// A non-directory at path, or any other Stat failure, comes back
+		// here as ErrStoreUnavailable — the same refusal RepoExists gives
+		// for the identical condition, never ErrRepoExists. That agreement
+		// is what lets ensureRepoForPush's "lost race is success" swallow
+		// (errors.Is(err, store.ErrRepoExists)) treat ErrRepoExists as
+		// exactly what it claims to be: a repository directory already
+		// published here, not a file an operator or a colliding write left
+		// behind.
+		return statErr
+	case exists:
 		return repoExistsRefusal(repo)
-	case errors.Is(statErr, fs.ErrNotExist):
-		// Nothing there yet; proceed.
 	default:
-		return refusal.RefuseWithCause(
-			"repository storage unavailable",
-			statErr.Error(),
-			"verify the repository path is accessible",
-			ErrStoreUnavailable,
-		)
+		// Nothing there yet; proceed.
 	}
 
 	root := filepath.Dir(path)

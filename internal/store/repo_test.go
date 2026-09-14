@@ -182,6 +182,57 @@ func TestRepoExistsNonDirectory(t *testing.T) {
 	}
 }
 
+// TestCreateRepoNonDirectoryAgreesWithRepoExists is PR #35 round 3's finding: CreateRepo's
+// top-of-function Stat had no IsDir check, unlike RepoExists twenty lines above, so a plain
+// file at a repository's resolved path made CreateRepo report ErrRepoExists — telling a
+// caller to "push to the existing repository instead of creating it" — while RepoExists on
+// the identical path correctly refused as ErrStoreUnavailable. That contradiction is what let
+// ensureRepoForPush's round-2 "lost race is success" swallow (errors.Is(err,
+// store.ErrRepoExists)) turn a wrong refusal into a silent success: see
+// TestEnsureRepoForPushRefusesLostRaceToNonDirectory in internal/githttp. CreateRepo and
+// RepoExists must agree on both the sentinel and the rendered message for the same path.
+func TestCreateRepoNonDirectoryAgreesWithRepoExists(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+
+	path, err := s.RepoPath("blocked")
+	if err != nil {
+		t.Fatalf("RepoPath: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("not a repo"), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+
+	createErr := s.CreateRepo(ctx, "blocked")
+	if createErr == nil {
+		t.Fatalf("CreateRepo(%q) = nil, want error", "blocked")
+	}
+	if errors.Is(createErr, store.ErrRepoExists) {
+		t.Errorf("CreateRepo(%q) = %v, want it NOT to claim ErrRepoExists for a non-directory at the path", "blocked", createErr)
+	}
+	if !errors.Is(createErr, store.ErrStoreUnavailable) {
+		t.Errorf("CreateRepo(%q) = %v, want errors.Is store.ErrStoreUnavailable", "blocked", createErr)
+	}
+	if strings.Contains(createErr.Error(), "\n") {
+		t.Errorf("refusal is not a single line: %q", createErr.Error())
+	}
+
+	_, existsErr := s.RepoExists(ctx, "blocked")
+	if existsErr == nil {
+		t.Fatalf("RepoExists(%q) = nil, want error", "blocked")
+	}
+	if !errors.Is(existsErr, store.ErrStoreUnavailable) {
+		t.Errorf("RepoExists(%q) = %v, want errors.Is store.ErrStoreUnavailable", "blocked", existsErr)
+	}
+
+	// The whole point: the two call sites must tell the same story about the same file at
+	// the same path, not merely the same sentinel.
+	if createErr.Error() != existsErr.Error() {
+		t.Errorf("CreateRepo and RepoExists disagree about the same non-directory path:\nCreateRepo:  %v\nRepoExists:  %v", createErr, existsErr)
+	}
+}
+
 // TestCreateRepoAtomicPublishOnGitFailure makes the atomic-publish claim real rather than
 // asserted in prose: it forces `git init` itself to fail (a fake "git" on PATH that exits
 // non-zero, found and run in place of the real binary) after CreateRepo has already created

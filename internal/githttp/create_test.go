@@ -236,6 +236,64 @@ func TestEnsureRepoForPushRefusesReadOnlyExistingRepo(t *testing.T) {
 	}
 }
 
+// raceAuthorizer wraps a real Authorizer and runs before immediately prior to delegating to
+// it, so a test can inject a filesystem change at the exact point ensureRepoForPush has
+// already established RepoExists = false but has not yet reached CreateRepo — the window
+// PR #35's round 3 review found unprotected: CreateRepo's own top-of-function Stat had no
+// IsDir check, so a plain file appearing in that window made CreateRepo report ErrRepoExists,
+// which ensureRepoForPush's round-2 "lost race is success" swallow then treated as a win.
+type raceAuthorizer struct {
+	auth.Authorizer
+	before func()
+}
+
+func (r *raceAuthorizer) Authorize(ctx context.Context, token string, required auth.Actions, repo string) error {
+	if r.before != nil {
+		r.before()
+	}
+	return r.Authorizer.Authorize(ctx, token, required, repo)
+}
+
+// TestEnsureRepoForPushRefusesLostRaceToNonDirectory pins PR #35 round 3's finding directly
+// against ensureRepoForPush, not just against store.CreateRepo in isolation: a non-directory
+// planted at the repository's path in the window between RepoExists reporting false and
+// CreateRepo's own check must make ensureRepoForPush refuse, never silently return that path
+// as if a concurrent creator had merely won a legitimate race.
+func TestEnsureRepoForPushRefusesLostRaceToNonDirectory(t *testing.T) {
+	ctx := context.Background()
+	for name, p := range mountAuthorizers(t, "rwc:*") {
+		t.Run(name, func(t *testing.T) {
+			s := store.New(t.TempDir())
+
+			path, err := s.RepoPath("racer")
+			if err != nil {
+				t.Fatalf("RepoPath: %v", err)
+			}
+
+			wrapped := &raceAuthorizer{
+				Authorizer: p.authorizer,
+				before: func() {
+					if err := os.WriteFile(path, []byte("not a repo"), 0o644); err != nil {
+						t.Fatalf("WriteFile(%q): %v", path, err)
+					}
+				},
+			}
+			h := NewHandler(wrapped, s)
+
+			gotPath, err := h.ensureRepoForPush(ctx, p.token, "racer")
+			if err == nil {
+				t.Fatalf("ensureRepoForPush = (%q, nil), want a refusal: CreateRepo found a non-directory at the path, not a lost creation race", gotPath)
+			}
+			if errors.Is(err, store.ErrRepoExists) {
+				t.Errorf("ensureRepoForPush error = %v, treated a non-directory at the path as a lost creation race and swallowed it as success", err)
+			}
+			if !errors.Is(err, store.ErrStoreUnavailable) {
+				t.Errorf("ensureRepoForPush error = %v, want errors.Is store.ErrStoreUnavailable", err)
+			}
+		})
+	}
+}
+
 // TestEnsureRepoForPushConcurrentCreatorsAllSucceed drives the race PR #35's round-2 review
 // found rather than reasoning about it: several rwc:* pushes reaching the same missing
 // repository at once. Before the fix, store.CreateRepo's ErrRepoExists passed straight

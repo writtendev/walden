@@ -209,3 +209,35 @@ func TestAuthorizeRefusesEmptyRequired(t *testing.T) {
 		}
 	}
 }
+
+// TestForbiddenRefusalCreateSentinel pins WALD-40's addition to WALD-50's single decision
+// point: ForbiddenRefusal's cause carries auth.ErrCreateForbidden precisely when the missing
+// action is create, and only then. A write-only refusal still satisfies errors.Is against
+// auth.ErrForbidden, as every caller and test already relies on, but not against the new
+// sentinel. Neither case changes the rendered "forbidden" line: Refusal.Err is only ever
+// consulted by errors.Is, never printed.
+func TestForbiddenRefusalCreateSentinel(t *testing.T) {
+	createErr := auth.ForbiddenRefusal(auth.ActionCreate, "repo-alpha")
+	if !errors.Is(createErr, auth.ErrForbidden) {
+		t.Errorf("create refusal = %v, want errors.Is auth.ErrForbidden", createErr)
+	}
+	if !errors.Is(createErr, auth.ErrCreateForbidden) {
+		t.Errorf("create refusal = %v, want errors.Is auth.ErrCreateForbidden", createErr)
+	}
+	wantCreate := `forbidden: token does not grant action "c" on repository "repo-alpha" (request scope 'c:repo-alpha' from administrator or issuer)`
+	if createErr.Error() != wantCreate {
+		t.Errorf("create refusal = %q, want %q", createErr.Error(), wantCreate)
+	}
+
+	writeErr := auth.ForbiddenRefusal(auth.ActionWrite, "repo-alpha")
+	if !errors.Is(writeErr, auth.ErrForbidden) {
+		t.Errorf("write refusal = %v, want errors.Is auth.ErrForbidden", writeErr)
+	}
+	if errors.Is(writeErr, auth.ErrCreateForbidden) {
+		t.Errorf("write refusal = %v, incorrectly matches errors.Is auth.ErrCreateForbidden", writeErr)
+	}
+	wantWrite := `forbidden: token does not grant action "w" on repository "repo-alpha" (request scope 'w:repo-alpha' from administrator or issuer)`
+	if writeErr.Error() != wantWrite {
+		t.Errorf("write refusal = %q, want %q", writeErr.Error(), wantWrite)
+	}
+}

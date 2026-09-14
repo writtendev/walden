@@ -264,6 +264,25 @@ func TestNoSecretInOutputGrid(t *testing.T) {
 			wantLog:    `unusable Authorization header (scheme "Negotiate")`,
 		},
 		{
+			name:       "bare token without scheme",
+			authHeader: canary,
+			wantStatus: http.StatusUnauthorized,
+			wantSubstr: "unauthorized:",
+			wantLog:    "unusable Authorization header (missing scheme delimiter)",
+		},
+		{
+			name:       "bearer tab separated canary",
+			authHeader: "Bearer\t" + canary,
+			wantStatus: http.StatusUnauthorized,
+			wantSubstr: "unauthorized:",
+		},
+		{
+			name:       "basic tab separated canary",
+			authHeader: "Basic\t" + base64.StdEncoding.EncodeToString([]byte("walden:"+canary)),
+			wantStatus: http.StatusUnauthorized,
+			wantSubstr: "unauthorized:",
+		},
+		{
 			name:       "known canary token with scope r:other-repo",
 			authHeader: "Bearer " + canary,
 			authorizer: func(t *testing.T) auth.Authorizer {

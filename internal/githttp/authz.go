@@ -21,20 +21,33 @@ const authChallenge = `Basic realm="walden"`
 // header per spec/auth/v1 §6.1. It accepts Bearer <token> and Basic <b64>
 // (extracting the password and ignoring any username). It never reads credentials
 // from URLs or query strings. If the header is absent, it returns "". If the
-// header is present but unusable (unknown scheme, malformed base64, or no colon),
-// it logs an operator warning with the scheme token only and returns "".
+// header is present but unusable (missing scheme delimiter, unknown scheme,
+// malformed base64, or no colon), it logs an operator warning without quoting
+// unvalidated secrets and returns "".
 func credentialFromRequest(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
-	authHdr := r.Header.Get("Authorization")
-	if authHdr == "" {
+	rawHdr := r.Header.Get("Authorization")
+	if rawHdr == "" {
 		return ""
 	}
 
-	scheme, param, _ := strings.Cut(authHdr, " ")
-	scheme = strings.TrimSpace(scheme)
-	param = strings.TrimSpace(param)
+	authHdr := strings.TrimLeft(rawHdr, " \t")
+	route := requestRoute(r)
+	if authHdr == "" {
+		log.Printf("githttp: %s: unusable Authorization header (missing scheme delimiter)", route)
+		return ""
+	}
+
+	idx := strings.IndexAny(authHdr, " \t")
+	if idx < 0 {
+		log.Printf("githttp: %s: unusable Authorization header (missing scheme delimiter)", route)
+		return ""
+	}
+
+	scheme := authHdr[:idx]
+	param := strings.TrimSpace(authHdr[idx+1:])
 
 	if strings.EqualFold(scheme, "Bearer") {
 		if param != "" {
@@ -50,9 +63,31 @@ func credentialFromRequest(r *http.Request) string {
 		}
 	}
 
-	route := requestRoute(r)
+	if !isToken(scheme) {
+		log.Printf("githttp: %s: unusable Authorization header (invalid scheme)", route)
+		return ""
+	}
+
 	log.Printf("githttp: %s: unusable Authorization header (scheme %q)", route, scheme)
 	return ""
+}
+
+// isToken reports whether s is a valid HTTP token (RFC 9110 §5.6.2) of bounded length.
+func isToken(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+			c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+			c == '`' || c == '|' || c == '~' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // requestRoute extracts a normalized route name ("info/refs", "upload-pack",

@@ -101,6 +101,48 @@ func TestCredentialFromRequest(t *testing.T) {
 			wantToken:  "",
 			wantLog:    `githttp: info/refs: unusable Authorization header (scheme "Basic")`,
 		},
+		{
+			name:       "bare token without delimiter",
+			authHeader: "bare_token_value",
+			path:       "/repo/info/refs",
+			wantToken:  "",
+			wantLog:    `githttp: info/refs: unusable Authorization header (missing scheme delimiter)`,
+		},
+		{
+			name:       "bare token with leading whitespace",
+			authHeader: "   bare_token_value",
+			path:       "/repo/git-upload-pack",
+			wantToken:  "",
+			wantLog:    `githttp: upload-pack: unusable Authorization header (missing scheme delimiter)`,
+		},
+		{
+			name:       "whitespace only header",
+			authHeader: "   \t  ",
+			path:       "/repo/git-upload-pack",
+			wantToken:  "",
+			wantLog:    `githttp: upload-pack: unusable Authorization header (missing scheme delimiter)`,
+		},
+		{
+			name:       "bearer tab separated",
+			authHeader: "Bearer\ttest_tab_token",
+			path:       "/repo/info/refs",
+			wantToken:  "test_tab_token",
+			wantLog:    "",
+		},
+		{
+			name:       "basic tab separated",
+			authHeader: "Basic\t" + base64.StdEncoding.EncodeToString([]byte("walden:test_tab_basic")),
+			path:       "/repo/git-receive-pack",
+			wantToken:  "test_tab_basic",
+			wantLog:    "",
+		},
+		{
+			name:       "invalid scheme characters",
+			authHeader: "invalid@scheme param",
+			path:       "/repo/info/refs",
+			wantToken:  "",
+			wantLog:    `githttp: info/refs: unusable Authorization header (invalid scheme)`,
+		},
 	}
 
 	for _, tt := range tests {

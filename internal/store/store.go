@@ -17,7 +17,17 @@ import (
 var (
 	ErrRepoNotFound = errors.New("repository not found")
 	ErrRepoExists   = errors.New("repository already exists")
-	ErrInvalidRepo  = errors.New("invalid repository name")
+	// ErrInvalidRepo marks a caller-fault refusal: the identifier failed
+	// the published syntax rules, or a syntactically valid identifier's
+	// path escapes the data directory.
+	ErrInvalidRepo = errors.New("invalid repository name")
+	// ErrStoreUnavailable marks an operator-fault refusal: the data
+	// directory, or a repository's on-disk path within it, could not be
+	// resolved. This is independent of whether the caller's identifier is
+	// valid, so it never aliases ErrInvalidRepo — a missing or unreadable
+	// data directory is a server misconfiguration, not a bad repository
+	// name.
+	ErrStoreUnavailable = errors.New("repository storage unavailable")
 )
 
 // Store manages bare git repositories under a base data directory.
@@ -50,19 +60,19 @@ func (s *Store) RepoPath(repo string) (string, error) {
 	root, err := filepath.Abs(s.dataDir)
 	if err != nil {
 		return "", refusal.RefuseWithCause(
-			"invalid repository path",
+			"data directory unavailable",
 			err.Error(),
 			"verify the data directory is configured correctly",
-			ErrInvalidRepo,
+			ErrStoreUnavailable,
 		)
 	}
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
 		return "", refusal.RefuseWithCause(
-			"invalid repository path",
+			"data directory unavailable",
 			err.Error(),
 			"verify the data directory exists and is accessible",
-			ErrInvalidRepo,
+			ErrStoreUnavailable,
 		)
 	}
 
@@ -80,10 +90,10 @@ func (s *Store) RepoPath(repo string) (string, error) {
 		resolved, err := filepath.EvalSymlinks(path)
 		if err != nil {
 			return "", refusal.RefuseWithCause(
-				"invalid repository path",
+				"repository path unavailable",
 				err.Error(),
 				"verify the repository path is accessible",
-				ErrInvalidRepo,
+				ErrStoreUnavailable,
 			)
 		}
 		if !pathWithinRoot(resolved, root) {
@@ -102,7 +112,8 @@ func (s *Store) RepoPath(repo string) (string, error) {
 // pathWithinRoot reports whether path is root itself or a descendant of it.
 // Both arguments must already be absolute and symlink-resolved.
 func pathWithinRoot(path, root string) bool {
-	return path == root || strings.HasPrefix(path, root+string(os.PathSeparator))
+	prefix := strings.TrimSuffix(root, string(os.PathSeparator)) + string(os.PathSeparator)
+	return path == root || strings.HasPrefix(path, prefix)
 }
 
 // RepositoryManager defines the operations on local repository storage.

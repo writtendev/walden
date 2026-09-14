@@ -79,3 +79,41 @@ func TestStoreRepoPath(t *testing.T) {
 		}
 	})
 }
+
+// TestStoreRepoPathUnresolvableDataDir asserts that a missing or unreadable
+// data directory — a server misconfiguration, not a caller fault — is
+// refused with store.ErrStoreUnavailable, and specifically not with
+// store.ErrInvalidRepo, even though the identifier itself is valid.
+func TestStoreRepoPathUnresolvableDataDir(t *testing.T) {
+	s := store.New(filepath.Join(t.TempDir(), "does-not-exist"))
+
+	got, err := s.RepoPath("my-repo")
+	if err == nil {
+		t.Fatalf("RepoPath(%q) = %q, want error", "my-repo", got)
+	}
+	if !errors.Is(err, store.ErrStoreUnavailable) {
+		t.Errorf("RepoPath(%q): expected error matching %v, got %v", "my-repo", store.ErrStoreUnavailable, err)
+	}
+	if errors.Is(err, store.ErrInvalidRepo) {
+		t.Errorf("RepoPath(%q): error incorrectly also matches store.ErrInvalidRepo: %v", "my-repo", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("RepoPath(%q): refusal contains newline: %q", "my-repo", err.Error())
+	}
+}
+
+// TestStoreRepoPathRootDataDir asserts that a data directory of "/" still
+// resolves a valid identifier instead of refusing it: pathWithinRoot must
+// not build a prefix of "//" out of a root that is already "/".
+func TestStoreRepoPathRootDataDir(t *testing.T) {
+	s := store.New(string(os.PathSeparator))
+
+	got, err := s.RepoPath("my-repo")
+	if err != nil {
+		t.Fatalf("RepoPath(%q): unexpected error: %v", "my-repo", err)
+	}
+	want := string(os.PathSeparator) + "my-repo.git"
+	if got != want {
+		t.Errorf("RepoPath(%q) = %q, want %q", "my-repo", got, want)
+	}
+}

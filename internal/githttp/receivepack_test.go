@@ -1,16 +1,22 @@
 package githttp_test
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/writtendev/walden/internal/githttp"
 	"github.com/writtendev/walden/internal/store"
@@ -427,8 +433,10 @@ func captureRawReceivePackRequest(t *testing.T, work string) []byte {
 // receive-pack body (see handleReceivePack's comment for the evidence),
 // so this test constructs the case by hand: capture the exact bytes a real
 // `git push` sends, gzip-compress them, and POST that directly with
-// Content-Encoding: gzip. A server that matches git-http-backend accepts
-// it and the ref moves.
+// Content-Encoding: gzip (and, per round-1's minor finding, its legacy
+// alias x-gzip — the same encoding under the spelling git-http-backend's
+// own binary also lists, so it must be accepted identically). A server
+// that matches git-http-backend accepts either and the ref moves.
 func TestReceivePackGzipInflate(t *testing.T) {
 	work, sha := newWorkTreeWithCommit(t)
 	raw := captureRawReceivePackRequest(t, work)
@@ -441,37 +449,42 @@ func TestReceivePackGzipInflate(t *testing.T) {
 	if err := gz.Close(); err != nil {
 		t.Fatalf("gzip.Close: %v", err)
 	}
+	compressedBytes := compressed.Bytes()
 
-	s := store.New(t.TempDir())
-	barePath := newEmptyBareRepo(t, s, "target")
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
-	defer server.Close()
+	for _, encoding := range []string{"gzip", "x-gzip"} {
+		t.Run(encoding, func(t *testing.T) {
+			s := store.New(t.TempDir())
+			barePath := newEmptyBareRepo(t, s, "target")
+			server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+			defer server.Close()
 
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/target/git-receive-pack", &compressed)
-	if err != nil {
-		t.Fatalf("http.NewRequest: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
-	req.Header.Set("Content-Encoding", "gzip")
+			req, err := http.NewRequest(http.MethodPost, server.URL+"/target/git-receive-pack", bytes.NewReader(compressedBytes))
+			if err != nil {
+				t.Fatalf("http.NewRequest: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
+			req.Header.Set("Content-Encoding", encoding)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("POST gzip-encoded push: %v", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read response body: %v", err)
-	}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("POST %s-encoded push: %v", encoding, err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response body: %v", err)
+			}
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, body)
-	}
-	if !bytes.Contains(body, []byte("unpack ok")) {
-		t.Errorf("response does not contain %q: %q", "unpack ok", body)
-	}
-	if got := revParse(t, barePath, "refs/heads/main"); got != sha {
-		t.Errorf("after gzip-encoded push, refs/heads/main = %q, want %q", got, sha)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, body)
+			}
+			if !bytes.Contains(body, []byte("unpack ok")) {
+				t.Errorf("response does not contain %q: %q", "unpack ok", body)
+			}
+			if got := revParse(t, barePath, "refs/heads/main"); got != sha {
+				t.Errorf("after %s-encoded push, refs/heads/main = %q, want %q", encoding, got, sha)
+			}
+		})
 	}
 }
 
@@ -496,5 +509,140 @@ func TestReceivePackInvalidGzip(t *testing.T) {
 	body := strings.TrimRight(rec.Body.String(), "\n")
 	if strings.Contains(body, "\n") {
 		t.Errorf("body contains an embedded newline: %q", body)
+	}
+}
+
+// TestReceivePackCleanRefusalDoesNotHangOnDeadBody reproduces round-1's
+// medium finding: git can exit with no output at all before the request
+// body has finished arriving, and the refusal handleReceivePack has
+// already composed for that case must still reach the client promptly.
+// Before the fix, cmd.Wait() blocked forever in that shape, because
+// os/exec's stdin-copy goroutine was itself blocked reading the request
+// body — a client that announces a Content-Length and then simply stops
+// sending, without closing the connection, never unblocks it on its own.
+//
+// The data directory holds "notarepo" as a plain, empty directory (an
+// interrupted `git init`, or any half-materialised repository) rather
+// than a real bare repository, so os.Stat is satisfied but `git
+// receive-pack` fails immediately with no output — exactly round-1's own
+// reproduction. The proof is that the refusal still arrives well within
+// this test's bound rather than only once the client stops being silent,
+// and (on Linux, where /proc lets this be checked) that no git child is
+// left behind waiting to be reaped.
+func TestReceivePackCleanRefusalDoesNotHangOnDeadBody(t *testing.T) {
+	s := store.New(t.TempDir())
+	notARepo, err := s.RepoPath("notarepo")
+	if err != nil {
+		t.Fatalf("RepoPath(%q): %v", "notarepo", err)
+	}
+	if err := os.MkdirAll(notARepo, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", notARepo, err)
+	}
+
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", server.URL, err)
+	}
+
+	conn, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		t.Fatalf("dial %s: %v", u.Host, err)
+	}
+	defer conn.Close()
+
+	request := "POST /notarepo/git-receive-pack HTTP/1.1\r\n" +
+		"Host: " + u.Host + "\r\n" +
+		"Content-Type: application/x-git-receive-pack-request\r\n" +
+		"Content-Length: 1000000\r\n" +
+		"Connection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatalf("write request headers: %v", err)
+	}
+	// A handful of bytes toward the declared Content-Length, then
+	// silence: the client neither finishes the body nor closes the
+	// connection, matching round-1's own reproduction exactly.
+	if _, err := conn.Write([]byte("dead")); err != nil {
+		t.Fatalf("write partial body: %v", err)
+	}
+
+	// Round-1's reproduction saw no response after 10s of this. A fixed
+	// handler returns in well under a second once git has exited; this
+	// bound is generous, not load-bearing.
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("did not receive a response within 5s -- this is the hang this test guards against: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, http.StatusInternalServerError, body)
+	}
+	trimmed := strings.TrimRight(string(body), "\n")
+	if trimmed == "" || strings.Contains(trimmed, "\n") {
+		t.Errorf("expected a non-empty, one-line refusal body, got %q", trimmed)
+	}
+
+	if runtime.GOOS != "linux" {
+		return // survivingGitChildren (inforefs_test.go) reads /proc, Linux-only.
+	}
+	// Give the handler a moment to run its deferred reap after the
+	// response above was already written.
+	time.Sleep(500 * time.Millisecond)
+	if survivors := survivingGitChildren(t); len(survivors) > 0 {
+		t.Errorf("%d git child(ren) survived: %v", len(survivors), survivors)
+	}
+}
+
+// TestReceivePackEmptyBodyDoesNotDoubleWait reproduces round-1's minor
+// finding: a bare flush-pkt request body ("0000", with no commands at
+// all) is a well-formed receive-pack request that real git answers with
+// exit 0 and zero bytes of stdout. That lands exactly on the branch
+// br.Peek(1) fails but wait() has already succeeded, and without
+// inforefs.go's "if peekErr == nil" guard on the trailing wait() call,
+// cmd.Wait() was called a second time -- returning os/exec's "Wait was
+// already called" and logging it as though git had failed a request that
+// actually succeeded. The response was already correct before this fix;
+// what this test pins down is that the log stays quiet, since a bogus
+// failure log for a successful push is the kind of thing an operator
+// chases for twenty minutes.
+func TestReceivePackEmptyBodyDoesNotDoubleWait(t *testing.T) {
+	s := store.New(t.TempDir())
+	newEmptyBareRepo(t, s, "repo")
+	h := githttp.NewHandler(nil, s, "")
+
+	var logs bytes.Buffer
+	prevOutput := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevOutput)
+		log.SetFlags(prevFlags)
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/repo/git-receive-pack", strings.NewReader("0000"))
+	req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body = %q, want empty: a bare flush-pkt push produces no output", rec.Body.String())
+	}
+
+	if got := logs.String(); strings.Contains(got, "Wait was already called") {
+		t.Errorf("log contains a spurious double-Wait failure for a request that succeeded: %q", got)
 	}
 }

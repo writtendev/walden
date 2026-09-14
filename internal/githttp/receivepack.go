@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/refusal"
@@ -24,6 +25,22 @@ import (
 // client always sends exactly this value for this route, so accepting
 // anything looser would be guessing at a client this repo has not seen.
 const receivePackContentType = "application/x-git-receive-pack-request"
+
+// receivePackWaitDelay bounds how long cmd.Wait may block after git's own
+// exit and pipe closures have otherwise settled, mirroring
+// uploadPackWaitDelay (WALD-38, uploadpack.go) so the two handlers that
+// pipe a request body into git's stdin are consistent. On its own this
+// does not fix the clean-500 hang below: os/exec's WaitDelay forcibly
+// closes only the pipe end *it* owns (the write end feeding git's
+// stdin), and the stdin-copy goroutine here is blocked reading from the
+// request body, upstream of that pipe — closing the far end does not
+// unblock a Read already in flight (confirmed against go1.25's os/exec
+// source and by reproducing it standalone before writing the real fix
+// below). It still earns its place as the same bound WALD-38 uses for
+// the case WaitDelay does cover — the copy goroutine stuck writing once
+// the child is already gone — so a future change to how stdin is fed
+// here does not silently lose that protection.
+const receivePackWaitDelay = 5 * time.Second
 
 // handleReceivePackMethodNotAllowed refuses any method other than POST for
 // /{repo}/git-receive-pack with a one-line 405.
@@ -97,14 +114,20 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	// reference server accepts one, and inflating one costs a
 	// gzip.NewReader from the standard library — a small, permanent
 	// accommodation is preferable to a 415 that would blame a client
-	// for doing something git-http-backend itself allows. Anything
-	// other than absent, "identity", or "gzip" is still refused: those
-	// remain unrecognized, not merely unlikely.
+	// for doing something git-http-backend itself allows. "x-gzip" is
+	// accepted alongside "gzip" for the same reason: `strings` on the
+	// same git-http-backend binary lists "x-gzip" right next to
+	// "Content-Encoding: gzip" in its gzip-decompression path — it is
+	// the legacy spelling of the identical encoding, not a distinct one,
+	// and refusing it would be the same class of mistake this decision
+	// exists to avoid. Anything other than absent, "identity", "gzip",
+	// or "x-gzip" is still refused: those remain unrecognized, not
+	// merely unlikely.
 	var body io.Reader = r.Body
 	switch enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))); enc {
 	case "", "identity":
 		// body already set to r.Body.
-	case "gzip":
+	case "gzip", "x-gzip":
 		gz, err := gzip.NewReader(r.Body)
 		if err != nil {
 			writeRefusal(w, http.StatusBadRequest, refusal.RefuseWithCause(
@@ -257,6 +280,7 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.CommandContext(r.Context(), "git", "receive-pack", "--stateless-rpc", path)
 	cmd.Env = env
 	cmd.Stdin = body
+	cmd.WaitDelay = receivePackWaitDelay
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -313,6 +337,27 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	br := bufio.NewReader(stdout)
 	_, peekErr := br.Peek(1)
 	if peekErr != nil {
+		// git has already exited (that is what made the peek fail) and
+		// the refusal below is composed and ready — but cmd.Wait() will
+		// not return until the stdin-copy goroutine os/exec started for
+		// cmd.Stdin (body: r.Body, or a gzip.Reader wrapping it)
+		// finishes, and that goroutine is blocked in a Read on r.Body
+		// whenever the client announced a Content-Length and simply
+		// stopped sending without closing the connection. git exiting
+		// does not unblock it, and neither does receivePackWaitDelay
+		// above: os/exec only forces closed the pipe end it owns once
+		// its delay elapses, and a Read already parked in r.Body is
+		// upstream of that pipe (proven both by reading go1.25's
+		// os/exec source and by reproducing the hang standalone). The
+		// one thing that does reach a Read already in flight on the
+		// request body is a deadline on the request itself: setting one
+		// in the past turns that Read into an immediate error, which
+		// finishes the copy goroutine and lets Wait return right away
+		// instead of waiting out however long the client stays silent.
+		// SetReadDeadline's error is deliberately ignored — if this
+		// ResponseWriter cannot support it, wait() below falls back to
+		// receivePackWaitDelay's bound rather than hanging forever.
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 		if waitErr := wait(); waitErr != nil {
 			log.Printf("githttp: receive-pack: git receive-pack %q: %v (%s)", repo, waitErr, strings.TrimSpace(stderrBuf.String()))
 			writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
@@ -348,12 +393,20 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := wait(); err != nil {
-		// Exactly the headline promise: git's non-zero exit (a declined
-		// push, a hook rejection) is logged here and never gates the
-		// response already sent above.
-		log.Printf("githttp: receive-pack: git receive-pack %q exited with error after streaming: %v (%s)", repo, err, strings.TrimSpace(stderrBuf.String()))
+	if peekErr == nil {
+		if err := wait(); err != nil {
+			// Exactly the headline promise: git's non-zero exit (a
+			// declined push, a hook rejection) is logged here and never
+			// gates the response already sent above.
+			log.Printf("githttp: receive-pack: git receive-pack %q exited with error after streaming: %v (%s)", repo, err, strings.TrimSpace(stderrBuf.String()))
+		}
 	}
+	// When peekErr != nil, wait() was already called above (either in
+	// the peek branch directly, or by falling through after it
+	// succeeded with no output) — calling it again here would hit
+	// os/exec's "Wait was already called" and log a git failure that
+	// never happened, exactly mirroring handleInfoRefs's identical
+	// guard in inforefs.go.
 }
 
 // flushWriter wraps an http.ResponseWriter so every Write is flushed

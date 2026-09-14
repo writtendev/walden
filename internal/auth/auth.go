@@ -21,6 +21,28 @@ var (
 	ErrExpired          = errors.New("capability expired")
 	ErrNotYetValid      = errors.New("capability not yet valid")
 	ErrInvalidSignature = errors.New("invalid signature")
+
+	// ErrTokenExists marks a TokenStore.CreateToken refusal: a record already exists with the
+	// given TokenID or TokenHash. CreateToken never overwrites, so a create is always a
+	// create -- never an upsert a caller must infer from success alone.
+	ErrTokenExists = errors.New("token already exists")
+	// ErrTokenNotFound marks a TokenStore refusal (RevokeToken, GetTokenByID) naming a token
+	// ID no record carries.
+	ErrTokenNotFound = errors.New("token not found")
+	// ErrTokenAlreadyRevoked marks a TokenStore.RevokeToken refusal: the named token is
+	// already revoked. Per PHILOSOPHY.md's "detect it, say so plainly, and stop", a second
+	// revoke refuses rather than succeeding as a no-op -- a silent no-op would tell an
+	// operator their action had an effect it did not have. A caller that wants
+	// retry-friendly behavior matches this sentinel with errors.Is and treats it as
+	// already-satisfied; that is the caller's decision to make, not the store's to make for
+	// it.
+	ErrTokenAlreadyRevoked = errors.New("token already revoked")
+	// ErrStoreUnavailable marks an operator-fault TokenStore refusal: the token file could
+	// not be read or written, or exists but is not valid JSON in the expected shape. A
+	// corrupt or malformed tokens.json is refused loudly under this sentinel rather than
+	// silently treated as an empty table, which would invalidate every token without saying
+	// so.
+	ErrStoreUnavailable = errors.New("token store unavailable")
 )
 
 // Authorizer is walden's single authorization decision point: may this token perform this

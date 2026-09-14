@@ -64,12 +64,12 @@ func TestExclusiveModes(t *testing.T) {
 	newStore := func() auth.TokenStore {
 		t.Helper()
 		store := auth.NewMemoryTokenStore()
-		if err := store.SaveToken(ctx, &auth.TokenRecord{
+		if err := store.CreateToken(ctx, &auth.TokenRecord{
 			TokenID:   "tok_exclusive_admin",
 			TokenHash: auth.HashToken(builtinToken),
 			Scopes:    adminScopes,
 		}); err != nil {
-			t.Fatalf("SaveToken: %v", err)
+			t.Fatalf("CreateToken: %v", err)
 		}
 		return store
 	}

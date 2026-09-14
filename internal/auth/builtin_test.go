@@ -53,8 +53,8 @@ func TestMemoryTokenStore(t *testing.T) {
 		CreatedAt: time.Now().UTC(),
 	}
 
-	if err := store.SaveToken(ctx, rec); err != nil {
-		t.Fatalf("SaveToken failed: %v", err)
+	if err := store.CreateToken(ctx, rec); err != nil {
+		t.Fatalf("CreateToken failed: %v", err)
 	}
 
 	got, err := store.GetTokenByHash(ctx, rec.TokenHash)
@@ -70,7 +70,7 @@ func TestMemoryTokenStore(t *testing.T) {
 		t.Errorf("ListTokens got %d items, err %v", len(list), err)
 	}
 
-	if err := store.RevokeToken(ctx, "tok_01"); err != nil {
+	if err := store.RevokeToken(ctx, "tok_01", time.Now().UTC()); err != nil {
 		t.Fatalf("RevokeToken failed: %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestMemoryTokenStore(t *testing.T) {
 		t.Errorf("expected token to be revoked, got %+v", revoked)
 	}
 
-	err = store.RevokeToken(ctx, "nonexistent")
+	err = store.RevokeToken(ctx, "nonexistent", time.Now().UTC())
 	if err == nil {
 		t.Errorf("expected error revoking nonexistent token")
 	}
@@ -91,21 +91,21 @@ func TestBuiltinAuthorizer(t *testing.T) {
 	authorizer := auth.NewBuiltinAuthorizer(store)
 
 	adminScopes, _ := auth.ParseScopes([]string{"rwc:*"})
-	store.SaveToken(ctx, &auth.TokenRecord{
+	store.CreateToken(ctx, &auth.TokenRecord{
 		TokenID:   "tok_admin",
 		TokenHash: auth.HashToken("walden_admin"),
 		Scopes:    adminScopes,
 	})
 
 	readerScopes, _ := auth.ParseScopes([]string{"r:blog-*"})
-	store.SaveToken(ctx, &auth.TokenRecord{
+	store.CreateToken(ctx, &auth.TokenRecord{
 		TokenID:   "tok_reader",
 		TokenHash: auth.HashToken("walden_reader"),
 		Scopes:    readerScopes,
 	})
 
 	revokedScopes, _ := auth.ParseScopes([]string{"rwc:*"})
-	store.SaveToken(ctx, &auth.TokenRecord{
+	store.CreateToken(ctx, &auth.TokenRecord{
 		TokenID:   "tok_revoked",
 		TokenHash: auth.HashToken("walden_revoked"),
 		Scopes:    revokedScopes,
@@ -186,8 +186,9 @@ func TestMemoryTokenStoreConcurrent(t *testing.T) {
 			scopes, _ := auth.ParseScopes([]string{"rwc:*"})
 
 			for i := 0; i < iterations; i++ {
-				// Save
-				_ = store.SaveToken(ctx, &auth.TokenRecord{
+				// Create (a duplicate after the first iteration, which CreateToken refuses;
+				// the point here is exercising concurrent access, not the create itself)
+				_ = store.CreateToken(ctx, &auth.TokenRecord{
 					TokenID:   tokenID,
 					TokenHash: tokenHash,
 					Scopes:    scopes,
@@ -208,7 +209,7 @@ func TestMemoryTokenStoreConcurrent(t *testing.T) {
 
 				// Revoke
 				if i%2 == 0 {
-					_ = store.RevokeToken(ctx, tokenID)
+					_ = store.RevokeToken(ctx, tokenID, time.Now().UTC())
 				}
 			}
 		}()

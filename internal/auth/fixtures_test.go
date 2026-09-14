@@ -442,7 +442,7 @@ func TestBuiltinTokensFixture(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to parse scopes for token %s: %v", tok.TokenID, err)
 		}
-		store.SaveToken(ctx, &auth.TokenRecord{
+		store.CreateToken(ctx, &auth.TokenRecord{
 			TokenID:   tok.TokenID,
 			TokenHash: tok.TokenHash,
 			Scopes:    scopes,
@@ -562,7 +562,7 @@ func TestBuiltinTokensJournalRoundTrip(t *testing.T) {
 		if len(tok.Scopes) > 1 {
 			multiScope++
 		}
-		if err := store.SaveToken(ctx, &auth.TokenRecord{
+		if err := store.CreateToken(ctx, &auth.TokenRecord{
 			TokenID:   replayed.TokenID,
 			TokenHash: replayed.TokenHash,
 			Scopes:    scopes,

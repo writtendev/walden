@@ -62,12 +62,12 @@ func TestAuthorizeVerdicts(t *testing.T) {
 
 		const builtinToken = "walden_decision_token"
 		store := auth.NewMemoryTokenStore()
-		if err := store.SaveToken(ctx, &auth.TokenRecord{
+		if err := store.CreateToken(ctx, &auth.TokenRecord{
 			TokenID:   "tok_decision",
 			TokenHash: auth.HashToken(builtinToken),
 			Scopes:    scopes,
 		}); err != nil {
-			t.Fatalf("SaveToken: %v", err)
+			t.Fatalf("CreateToken: %v", err)
 		}
 
 		now := time.Now().UTC()
@@ -168,12 +168,12 @@ func TestAuthorizeRefusesEmptyRequired(t *testing.T) {
 
 	const builtinToken = "walden_empty_required_token"
 	store := auth.NewMemoryTokenStore()
-	if err := store.SaveToken(ctx, &auth.TokenRecord{
+	if err := store.CreateToken(ctx, &auth.TokenRecord{
 		TokenID:   "tok_empty_required",
 		TokenHash: auth.HashToken(builtinToken),
 		Scopes:    scopes,
 	}); err != nil {
-		t.Fatalf("SaveToken: %v", err)
+		t.Fatalf("CreateToken: %v", err)
 	}
 
 	now := time.Now().UTC()

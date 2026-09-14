@@ -169,6 +169,83 @@ func TestInfoRefsGoldenPreamble(t *testing.T) {
 	}
 }
 
+// TestInfoRefsProtocolV2Negotiation pins WALD-38's edit to this handler:
+// the "# service=" preamble becomes conditional on the negotiated
+// protocol version instead of always present. Verified against git's own
+// git-http-backend (git 2.50.1): under protocol v2 the advertisement
+// carries no preamble at all, only git's own capability list; anything
+// other than an exact "version=2" match falls back to the v0 shape this
+// handler always produced, which is the same strict-match rule this
+// handler already applies to the header.
+func TestInfoRefsProtocolV2Negotiation(t *testing.T) {
+	s := store.New(t.TempDir())
+	newBareRepoWithCommit(t, s, "repo")
+	h := githttp.NewHandler(nil, s)
+
+	tests := []struct {
+		name         string
+		gitProtocol  string // "" means no header at all
+		wantPreamble bool
+		wantPrefix   string
+	}{
+		{"no-header-falls-back-to-v0", "", true, "001e# service=git-upload-pack\n0000"},
+		{"version-2", "version=2", false, "000eversion 2"},
+		{"unrecognized-version-falls-back-to-v0", "version=9", true, "001e# service=git-upload-pack\n0000"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/repo/info/refs?service=git-upload-pack", nil)
+			if tt.gitProtocol != "" {
+				req.Header.Set("Git-Protocol", tt.gitProtocol)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if !bytes.HasPrefix(rec.Body.Bytes(), []byte(tt.wantPrefix)) {
+				t.Errorf("body does not start with %q: got %q", tt.wantPrefix, rec.Body.Bytes())
+			}
+			hasPreamble := bytes.Contains(rec.Body.Bytes(), []byte("# service="))
+			if hasPreamble != tt.wantPreamble {
+				t.Errorf("body preamble present = %v, want %v: got %q", hasPreamble, tt.wantPreamble, rec.Body.Bytes())
+			}
+		})
+	}
+}
+
+// TestInfoRefsReceivePackIgnoresProtocolV2 pins the plan's deliberate
+// scope boundary: a Git-Protocol: version=2 header must not change
+// git-receive-pack's advertisement at all. Forwarding v2 there would only
+// drop the preamble for a push path this ticket cannot demonstrate end to
+// end (receive-pack's advertisement is byte-identical with and without
+// the env var, since v2 carries no push semantics), and would invalidate
+// this handler's own receive-pack golden for no gain. WALD-39 decides
+// receive-pack's v2 behavior separately, with a working push in hand.
+func TestInfoRefsReceivePackIgnoresProtocolV2(t *testing.T) {
+	s := store.New(t.TempDir())
+	sha := newBareRepoWithCommit(t, s, "repo")
+	h := githttp.NewHandler(nil, s)
+
+	req := httptest.NewRequest(http.MethodGet, "/repo/info/refs?service=git-receive-pack", nil)
+	req.Header.Set("Git-Protocol", "version=2")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	wantPreamble := "001f# service=git-receive-pack\n0000"
+	if !bytes.HasPrefix(rec.Body.Bytes(), []byte(wantPreamble)) {
+		t.Errorf("body does not start with preamble %q: got %q", wantPreamble, rec.Body.Bytes())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(sha+" refs/heads/main")) {
+		t.Errorf("body does not contain git's advertisement: got %q", rec.Body.Bytes())
+	}
+}
+
 // TestInfoRefsRefusals is the refusal table: each case names a status and
 // asserts the body is a single line with no embedded newline, per the
 // refusal convention.
@@ -214,9 +291,9 @@ func TestInfoRefsRefusals(t *testing.T) {
 // mux assumption produced: relying on net/http.ServeMux to auto-refuse a
 // non-GET method for "GET /{repo}/info/refs" doesn't hold once the "/"
 // catch-all is also registered (it swallows the request instead). This
-// asserts the explicit handleInfoRefsMethodNotAllowed registration keeps
-// the refusal in place: a POST here must get 405 and a single-line body,
-// never the catch-all's bare 200.
+// asserts the explicit methodNotAllowed registration keeps the refusal
+// in place: a POST here must get 405 and a single-line body, never the
+// catch-all's bare 200.
 func TestInfoRefsPostMethodNotAllowed(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")

@@ -3,19 +3,15 @@ package githttp
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net/http"
-	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/refusal"
-	"github.com/writtendev/walden/internal/store"
 )
 
 // maxStderrCapture bounds how much of git's stderr this handler retains for
@@ -32,8 +28,9 @@ var flushPkt = []byte("0000")
 // that counts itself, followed by s verbatim. This is framing, not
 // negotiation — the only pkt-line walden constructs itself is the
 // "# service=" preamble the smart-HTTP protocol requires the server, not
-// git, to emit; git's own refs, capability list, and trailing flush come
-// through untouched.
+// git, to emit under protocol v0/v1; git's own refs, capability list, and
+// trailing flush come through untouched. Under protocol v2 this preamble
+// is not emitted at all — see handleInfoRefs's wantV2 handling.
 func pktLine(s string) []byte {
 	return []byte(fmt.Sprintf("%04x%s", len(s)+4, s))
 }
@@ -94,40 +91,6 @@ func (b *boundedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// handleInfoRefsMethodNotAllowed refuses any method other than GET for
-// /{repo}/info/refs with a one-line 405.
-//
-// This exists because relying on net/http.ServeMux to produce that 405
-// automatically — the original plan here — turned out not to hold: the
-// mux only auto-generates 405 when no other registered pattern matches
-// the path, and this handler's package also registers a "/" catch-all
-// (githttp.go's handleRequest) that matches every path regardless of
-// method. With that catch-all present, a non-GET request to this path
-// falls through to it instead of getting a method-mismatch 405. Since the
-// catch-all is out of this ticket's scope to change, this handler states
-// the 405 rule directly: registerRoutes binds it to the same path pattern
-// without a method, and net/http.ServeMux prefers the more specific
-// "GET /{repo}/info/refs" registration for GET/HEAD, leaving every other
-// method here.
-func (h *Handler) handleInfoRefsMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
-	// RFC 9110 §15.5.6 makes this a MUST: a 405 response must name the
-	// target resource's currently supported methods — and that list is
-	// "GET, HEAD", not just "GET". net/http.ServeMux's GET-also-matches-HEAD
-	// rule means a HEAD request to this path is routed to handleInfoRefs
-	// (200, correct content type, empty body), so HEAD is genuinely
-	// supported here even though this handler never sees it. Naming only
-	// GET would tell the exact audience Allow exists for — proxies,
-	// scanners, cache revalidation — that HEAD is unsupported, which can
-	// turn a cheap conditional HEAD into a full GET (and a discarded git
-	// exec) on their end.
-	w.Header().Set("Allow", "GET, HEAD")
-	writeRefusal(w, http.StatusMethodNotAllowed, refusal.Refuse(
-		"method not allowed",
-		fmt.Sprintf("%s is not supported for /{repo}/info/refs", r.Method),
-		"use GET",
-	))
-}
-
 // handleInfoRefs serves GET /{repo}/info/refs: git's smart-HTTP ref
 // advertisement. Per ARCHITECTURE.md, walden wraps git rather than
 // reimplementing it — the refs, the capability list, and the trailing
@@ -146,79 +109,34 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	// obvious insertion point for it, before the exec below.
 	_ = action
 
-	path, err := h.store.RepoPath(repo)
-	if err != nil {
-		// store.RepoPath already distinguishes caller fault (a bad
-		// identifier, or a containment escape — auth.ErrInvalidRepo or
-		// store.ErrInvalidRepo) from operator fault (the data directory
-		// could not be resolved — store.ErrStoreUnavailable). Map the
-		// latter to 5xx and everything else to 4xx, so a misconfigured
-		// server is never reported to the client as though it typed a
-		// bad repository name.
-		if errors.Is(err, store.ErrStoreUnavailable) {
-			// The underlying error names the data directory's absolute
-			// path (e.g. "lstat /private/var/.../data: no such file or
-			// directory"). That belongs in the operator's log, not on
-			// the wire to an unauthenticated client — PHILOSOPHY.md's
-			// refusal convention is scoped to the operator, and this
-			// route has no authentication in front of it yet.
-			log.Printf("githttp: info/refs: repo path for %q: %v", repo, err)
-			writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
-				"repository unavailable",
-				"the server could not resolve the repository path",
-				"contact the operator",
-				store.ErrStoreUnavailable,
-			))
-			return
-		}
-		writeRefusal(w, http.StatusBadRequest, err)
+	path, ok := h.resolveRepoDir(w, "info/refs", repo)
+	if !ok {
 		return
 	}
 
-	if _, err := os.Stat(path); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			writeRefusal(w, http.StatusNotFound, refusal.RefuseWithCause(
-				"repository not found",
-				fmt.Sprintf("no repository named %q", repo),
-				"check the repository identifier or create it with a push",
-				store.ErrRepoNotFound,
-			))
-			return
-		}
-		// As above: log the full stat error (it names the absolute
-		// repository path) and send the client a fixed one-liner.
-		log.Printf("githttp: info/refs: stat repository path for %q: %v", repo, err)
-		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
-			"repository unavailable",
-			"the server could not access the repository",
-			"contact the operator",
-			store.ErrStoreUnavailable,
-		))
-		return
-	}
-
-	// An explicit, minimal environment rather than the server's own: just
-	// PATH, so git can find anything it execs internally.
+	// wantV2 mirrors git-http-backend's own negotiation: an exact match
+	// on the Git-Protocol header, restricted to upload-pack. Verified
+	// against git's own git-http-backend (git 2.50.1): under v2 the
+	// advertisement is git's bare capability list with no "# service="
+	// preamble at all, which is why the preamble below becomes
+	// conditional on wantV2. A hypothetical "version=2:key=value" client,
+	// or any value other than exactly "version=2", falls back to v0 —
+	// a correct interoperable outcome, not a break.
 	//
-	// Deliberately not forwarded: the request's Git-Protocol header. A v2
-	// client that sees a v2 capability advertisement here would follow up
-	// with `POST /{repo}/git-upload-pack` (command=ls-refs) to get the
-	// actual ref list — an endpoint that does not exist until WALD-38.
-	// Advertising a capability this server cannot yet complete is worse
-	// than not advertising it: ignoring the header keeps git on v0/v1,
-	// where this handler's own advertisement is the whole answer. Do not
-	// re-add GIT_PROTOCOL forwarding here without WALD-38 landing first.
-	env := []string{}
-	if p := os.Getenv("PATH"); p != "" {
-		env = append(env, "PATH="+p)
-	}
+	// receive-pack never negotiates v2 here on purpose: its advertisement
+	// is byte-identical with and without GIT_PROTOCOL (v2 carries no push
+	// semantics), so forwarding it would only drop the preamble on a push
+	// path WALD-38 cannot demonstrate end to end, for no gain. WALD-39
+	// decides receive-pack's v2 behavior separately, with a working push
+	// in hand.
+	wantV2 := service == "git-upload-pack" && r.Header.Get("Git-Protocol") == "version=2"
 
 	// Binding to the request context means a client disconnect kills the
 	// subprocess. Killing is not reaping, though: only Wait collects its
 	// exit status, closes the StdoutPipe read end, and releases the
 	// stderr pipe. See the waited/wait closure below.
 	cmd := exec.CommandContext(r.Context(), "git", subcommand, "--stateless-rpc", advertiseFlag, path)
-	cmd.Env = env
+	cmd.Env = gitEnv(wantV2)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -288,13 +206,17 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Expires", "Fri, 01 Jan 1980 00:00:00 GMT")
 	w.WriteHeader(http.StatusOK)
 
-	body := io.MultiReader(
-		bytes.NewReader(pktLine(fmt.Sprintf("# service=%s\n", service))),
-		bytes.NewReader(flushPkt),
-	)
-	if peekErr == nil {
-		body = io.MultiReader(body, br)
+	var parts []io.Reader
+	if !wantV2 {
+		parts = append(parts,
+			bytes.NewReader(pktLine(fmt.Sprintf("# service=%s\n", service))),
+			bytes.NewReader(flushPkt),
+		)
 	}
+	if peekErr == nil {
+		parts = append(parts, br)
+	}
+	body := io.MultiReader(parts...)
 
 	if _, err := io.Copy(w, body); err != nil {
 		// Bytes are already on the wire; the honest move is to stop and

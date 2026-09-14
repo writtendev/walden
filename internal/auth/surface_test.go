@@ -23,11 +23,12 @@ const authImportPath = "github.com/writtendev/walden/internal/auth"
 // reference: the Authorizer contract itself, the vocabulary needed to build a request
 // (Action, Actions, and their constants), the two ways to obtain an Authorizer, the store
 // interface and file-backed constructor a caller wires in (TokenStore, NewFileTokenStore), the
-// first-boot admin token primitives (AdminTokenID, EnsureAdminToken), the repo-identifier
-// validator WALD-37 reuses, and the sentinel errors a caller matches against with errors.Is
-// (including ErrStoreUnavailable). Everything else — ParseScope, Scope, Allows, Missing,
-// MatchGlob, HashToken, TokenRecord, ParseAndVerifyCapability, and so on — is an authorization
-// detail, reachable only from inside this package.
+// first-boot admin token primitives (AdminTokenID, EnsureAdminToken), the token CLI primitives
+// (GenerateToken, TokenRecord, ParseScope, ParseScopes), the repo-identifier validator WALD-37
+// reuses, and the sentinel errors a caller matches against with errors.Is (including
+// ErrStoreUnavailable, ErrTokenExists, ErrTokenNotFound, ErrTokenAlreadyRevoked). Everything
+// else — Scope, Allows, Missing, MatchGlob, HashToken, ParseAndVerifyCapability, and so on —
+// is an authorization detail, reachable only from inside this package.
 var authSurfaceAllowlist = map[string]bool{
 	"Authorizer":    true,
 	"NewAuthorizer": true,
@@ -43,16 +44,24 @@ var authSurfaceAllowlist = map[string]bool{
 	"EnsureAdminToken":  true,
 	"NewFileTokenStore": true,
 
-	"ErrUnauthorized":     true,
-	"ErrForbidden":        true,
-	"ErrInvalidRepo":      true,
-	"ErrInvalidScope":     true,
-	"ErrInvalidToken":     true,
-	"ErrExpired":          true,
-	"ErrNotYetValid":      true,
-	"ErrInvalidSignature": true,
-	"ErrCreateForbidden":  true,
-	"ErrStoreUnavailable": true,
+	"GenerateToken": true,
+	"TokenRecord":   true,
+	"ParseScope":    true,
+	"ParseScopes":   true,
+
+	"ErrUnauthorized":        true,
+	"ErrForbidden":           true,
+	"ErrInvalidRepo":         true,
+	"ErrInvalidScope":        true,
+	"ErrInvalidToken":        true,
+	"ErrExpired":             true,
+	"ErrNotYetValid":         true,
+	"ErrInvalidSignature":    true,
+	"ErrCreateForbidden":     true,
+	"ErrStoreUnavailable":    true,
+	"ErrTokenExists":         true,
+	"ErrTokenNotFound":       true,
+	"ErrTokenAlreadyRevoked": true,
 }
 
 // checkAuthSurface inspects one already-parsed file for references to internal/auth
@@ -216,7 +225,7 @@ func TestAuthSurfaceGuardResolvesImportAlias(t *testing.T) {
 			name: "unaliased import reaching a detail",
 			src: `package p
 import "github.com/writtendev/walden/internal/auth"
-var _ = auth.ParseScope
+var _ = auth.HashToken
 `,
 			wantViolation: true,
 		},
@@ -224,7 +233,7 @@ var _ = auth.ParseScope
 			name: "aliased import reaching a detail",
 			src: `package p
 import wauth "github.com/writtendev/walden/internal/auth"
-var _ = wauth.ParseScope
+var _ = wauth.HashToken
 `,
 			wantViolation: true,
 		},
@@ -256,7 +265,7 @@ func f(auth string) string { return auth }
 			name: "dot import is flagged on sight",
 			src: `package p
 import . "github.com/writtendev/walden/internal/auth"
-var _ = ParseScope
+var _ = HashToken
 `,
 			wantViolation: true,
 		},
@@ -267,7 +276,7 @@ import (
 	auth "github.com/writtendev/walden/internal/auth"
 	wauth "github.com/writtendev/walden/internal/auth"
 )
-var _ = auth.ParseScope
+var _ = auth.HashToken
 var _ wauth.Authorizer
 `,
 			wantViolation: true,

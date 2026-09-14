@@ -39,18 +39,30 @@ func pktLine(s string) []byte {
 }
 
 // actionForService maps a smart-HTTP service parameter to the git
-// subcommand that produces its advertisement and the auth.Action a
-// request for it requires, per spec/auth/v1/README.md section 3.2. walden
-// serves smart HTTP only: any other value, including an absent one (a
-// dumb-HTTP client), is refused.
-func actionForService(service string) (subcommand string, action auth.Action, err error) {
+// subcommand that produces its advertisement, the flag that asks that
+// subcommand to only advertise refs, and the auth.Action a request for it
+// requires, per spec/auth/v1/README.md section 3.2. walden serves smart
+// HTTP only: any other value, including an absent one (a dumb-HTTP
+// client), is refused.
+//
+// The advertise-refs flag differs between the two services, and each is
+// given the one its own documentation publishes rather than a convenient
+// alias. `git upload-pack -h` lists `--advertise-refs` in its usage
+// synopsis, so that is upload-pack's documented interface. `git
+// receive-pack -h` lists no advertise-refs flag at all — `--advertise-refs`
+// happens to work there too, but only as an undocumented alias; the
+// interface receive-pack's own man page publishes (and what
+// git-http-backend itself execs for both services) is
+// `--http-backend-info-refs`. A routine git security bump is free to drop
+// an undocumented alias; it is not free to drop a documented flag.
+func actionForService(service string) (subcommand, advertiseFlag string, action auth.Action, err error) {
 	switch service {
 	case "git-upload-pack":
-		return "upload-pack", auth.ActionRead, nil
+		return "upload-pack", "--advertise-refs", auth.ActionRead, nil
 	case "git-receive-pack":
-		return "receive-pack", auth.ActionWrite, nil
+		return "receive-pack", "--http-backend-info-refs", auth.ActionWrite, nil
 	default:
-		return "", "", refusal.Refuse(
+		return "", "", "", refusal.Refuse(
 			"unsupported service",
 			fmt.Sprintf("service %q is not git-upload-pack or git-receive-pack", service),
 			"walden serves git's smart HTTP protocol only",
@@ -98,6 +110,9 @@ func (b *boundedWriter) Write(p []byte) (int, error) {
 // "GET /{repo}/info/refs" registration for GET/HEAD, leaving every other
 // method here.
 func (h *Handler) handleInfoRefsMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	// RFC 9110 §15.5.6 makes this a MUST: a 405 response must name the
+	// target resource's currently supported methods.
+	w.Header().Set("Allow", "GET")
 	writeRefusal(w, http.StatusMethodNotAllowed, refusal.Refuse(
 		"method not allowed",
 		fmt.Sprintf("%s is not supported for /{repo}/info/refs", r.Method),
@@ -113,7 +128,7 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	repo := r.PathValue("repo")
 	service := r.URL.Query().Get("service")
 
-	subcommand, action, err := actionForService(service)
+	subcommand, advertiseFlag, action, err := actionForService(service)
 	if err != nil {
 		writeRefusal(w, http.StatusForbidden, err)
 		return
@@ -132,11 +147,23 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 		// latter to 5xx and everything else to 4xx, so a misconfigured
 		// server is never reported to the client as though it typed a
 		// bad repository name.
-		status := http.StatusBadRequest
 		if errors.Is(err, store.ErrStoreUnavailable) {
-			status = http.StatusInternalServerError
+			// The underlying error names the data directory's absolute
+			// path (e.g. "lstat /private/var/.../data: no such file or
+			// directory"). That belongs in the operator's log, not on
+			// the wire to an unauthenticated client — PHILOSOPHY.md's
+			// refusal convention is scoped to the operator, and this
+			// route has no authentication in front of it yet.
+			log.Printf("githttp: info/refs: repo path for %q: %v", repo, err)
+			writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
+				"repository unavailable",
+				"the server could not resolve the repository path",
+				"contact the operator",
+				store.ErrStoreUnavailable,
+			))
+			return
 		}
-		writeRefusal(w, status, err)
+		writeRefusal(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -150,10 +177,13 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 			))
 			return
 		}
+		// As above: log the full stat error (it names the absolute
+		// repository path) and send the client a fixed one-liner.
+		log.Printf("githttp: info/refs: stat repository path for %q: %v", repo, err)
 		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
 			"repository unavailable",
-			err.Error(),
-			"verify the repository path is accessible",
+			"the server could not access the repository",
+			"contact the operator",
 			store.ErrStoreUnavailable,
 		))
 		return
@@ -175,9 +205,11 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 		env = append(env, "PATH="+p)
 	}
 
-	// Binding to the request context means a client disconnect reaps the
-	// subprocess.
-	cmd := exec.CommandContext(r.Context(), "git", subcommand, "--stateless-rpc", "--advertise-refs", path)
+	// Binding to the request context means a client disconnect kills the
+	// subprocess. Killing is not reaping, though: only Wait collects its
+	// exit status, closes the StdoutPipe read end, and releases the
+	// stderr pipe. See the waited/wait closure below.
+	cmd := exec.CommandContext(r.Context(), "git", subcommand, "--stateless-rpc", advertiseFlag, path)
 	cmd.Env = env
 
 	stdout, err := cmd.StdoutPipe()
@@ -201,14 +233,36 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// From here on the process has been started, so it must be reaped on
+	// every exit path — including a client aborting mid-advertisement,
+	// which cancels r.Context() and kills the child without waiting for
+	// it. wait() is the single place that calls cmd.Wait(); the deferred
+	// call is the backstop that catches any return this function takes
+	// without having called wait() itself (the io.Copy error path is the
+	// one that used to skip it entirely), and the "waited" guard means an
+	// explicit call earlier in the function is never repeated by the
+	// defer.
+	var waited bool
+	wait := func() error {
+		waited = true
+		return cmd.Wait()
+	}
+	defer func() {
+		if !waited {
+			if err := wait(); err != nil {
+				log.Printf("githttp: info/refs: git %s %s %q: %v (%s)", subcommand, advertiseFlag, repo, err, strings.TrimSpace(stderrBuf.String()))
+			}
+		}
+	}()
+
 	// Peek before writing anything: if git exits non-zero having produced
 	// no output at all, nothing has reached the client yet and this can
 	// still be a clean refusal instead of a half-written response.
 	br := bufio.NewReader(stdout)
 	_, peekErr := br.Peek(1)
 	if peekErr != nil {
-		if waitErr := cmd.Wait(); waitErr != nil {
-			log.Printf("githttp: info/refs: git %s --advertise-refs %q: %v (%s)", subcommand, repo, waitErr, strings.TrimSpace(stderrBuf.String()))
+		if waitErr := wait(); waitErr != nil {
+			log.Printf("githttp: info/refs: git %s %s %q: %v (%s)", subcommand, advertiseFlag, repo, waitErr, strings.TrimSpace(stderrBuf.String()))
 			writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 				"ref advertisement failed",
 				"git exited with an error before producing an advertisement",
@@ -237,13 +291,15 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, body); err != nil {
 		// Bytes are already on the wire; the honest move is to stop and
 		// log rather than append a refusal into a half-written
-		// advertisement.
+		// advertisement. The deferred wait() above still reaps the
+		// subprocess: this used to return here without ever calling
+		// cmd.Wait(), which is exactly the leak round-1 review found.
 		log.Printf("githttp: info/refs: writing advertisement for %q: %v", repo, err)
 		return
 	}
 	if peekErr == nil {
-		if err := cmd.Wait(); err != nil {
-			log.Printf("githttp: info/refs: git %s --advertise-refs %q exited with error after streaming: %v (%s)", subcommand, repo, err, strings.TrimSpace(stderrBuf.String()))
+		if err := wait(); err != nil {
+			log.Printf("githttp: info/refs: git %s %s %q exited with error after streaming: %v (%s)", subcommand, advertiseFlag, repo, err, strings.TrimSpace(stderrBuf.String()))
 		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -347,49 +348,107 @@ func (s *FileTokenStore) ListTokens(ctx context.Context) ([]*TokenRecord, error)
 }
 
 // validateForWrite is the one gate every field of record passes through before CreateToken
-// appends it, so "anything CreateToken accepts can be read back" is a property of the code,
-// not an assumption about callers. Round 2 made that true of TokenHash alone; this closes it
-// for the rest of the record after round 3 found record.Scopes and record.TokenID unguarded
-// by the same omission — a record whose Scopes don't round-trip (nil, empty, or a
-// zero-valued Actions) reached disk, and every later read of the table then refused under
-// ErrStoreUnavailable with no way back through the store's own API. Patching Scopes alone
-// would make this the third field-shaped patch for one bug; this checks the whole record
-// instead, at the one place a record enters the store.
+// appends it, enforcing two invariants by construction rather than assumption:
 //
-// TokenID and TokenHash are checked against the validators internal/journal already defines
-// for the token_create record these fields will one day travel in unchanged (WALD-33) — the
-// same rule enforced twice, not a second spelling of it. An id or hash CreateToken accepts
-// today is one that record's own Validate will accept later, so that addition stays an
-// addition for these fields rather than a rewrite.
+//  1. Journal parity: A record this store accepts must be journalable as a token_create record
+//     by internal/journal when the meta-stream writer (WALD-33) lands later. This is verified
+//     by constructing an internal/journal.TokenCreateRecord and calling its Validate() method.
+//     TokenID, TokenHash, non-empty Scopes, scope character classes, scope uniqueness, and
+//     canonical UTC timestamp bounds are all checked against the journal record's schema in one
+//     step, so that future addition remains an addition rather than a repair or rewrite.
 //
-// Every other field — Scopes today, whatever TokenRecord grows tomorrow — is checked by
-// actually attempting the read: diskTokenFromRecord encodes record the way save() would, and
-// tryDecode decodes it back the way every load()-based read would. That is the exact pair a
-// stored record must survive, so a field added to TokenRecord and diskToken later is caught
-// by the same call, with nothing here to remember to update for it.
+//  2. Read parity: Anything CreateToken writes must be readable back from disk by this store
+//     unmodified. This is verified by simulating the full persistence pipeline: encoding a single-
+//     token diskTable to JSON via json.Marshal, decoding it back through json.Decoder with
+//     DisallowUnknownFields (matching load()), and running tryDecode() (matching toRecord()).
+//     Finally, it asserts that record.CreatedAt survives the RFC 3339 round-trip identically
+//     (rejecting non-whole-minute timezone offsets that cannot be faithfully encoded).
+//
+// Refusals return caller-fault sentinels (journal.ErrInvalidTokenID, journal.ErrInvalidTokenHash,
+// journal.ErrInvalidTokenScope, or journal.ErrInvalidTokenRecord) — never ErrStoreUnavailable,
+// which is reserved for operator-fault disk corruption.
 func (s *FileTokenStore) validateForWrite(record *TokenRecord) error {
-	if err := journal.ValidateTokenID(record.TokenID); err != nil {
+	scopeStrs := make([]string, len(record.Scopes))
+	for i, sc := range record.Scopes {
+		scopeStrs[i] = sc.String()
+	}
+	jrec := &journal.TokenCreateRecord{
+		Version:   journal.VersionPrefix,
+		Stream:    journal.MetaStreamID,
+		Seq:       1,
+		Type:      journal.RecordTypeTokenCreate,
+		TokenID:   record.TokenID,
+		TokenHash: record.TokenHash,
+		Scopes:    scopeStrs,
+		Timestamp: record.CreatedAt.UTC().Format(time.RFC3339),
+	}
+	if err := jrec.Validate(); err != nil {
+		switch {
+		case errors.Is(err, journal.ErrInvalidTokenID):
+			return refusal.RefuseWithCause(
+				"token create refused",
+				err.Error(),
+				"pass a token id containing only [a-zA-Z0-9._-]",
+				journal.ErrInvalidTokenID,
+			)
+		case errors.Is(err, journal.ErrInvalidTokenHash):
+			return refusal.RefuseWithCause(
+				"token create refused",
+				err.Error(),
+				"pass the sha256:<64-hex> storage hash from HashToken, not the raw token",
+				journal.ErrInvalidTokenHash,
+			)
+		default:
+			return refusal.RefuseWithCause(
+				"token create refused",
+				err.Error(),
+				"pass scopes and a timestamp that satisfy the token_create record schema",
+				journal.ErrInvalidTokenRecord,
+			)
+		}
+	}
+
+	dt := diskTokenFromRecord(record)
+	probeTable := diskTable{
+		Version: tokensFileVersion,
+		Tokens:  []diskToken{dt},
+	}
+	data, err := json.Marshal(probeTable)
+	if err != nil {
 		return refusal.RefuseWithCause(
 			"token create refused",
-			err.Error(),
-			"pass a token id containing only [a-zA-Z0-9._-]",
-			journal.ErrInvalidTokenID,
+			fmt.Sprintf("record cannot be encoded as JSON: %s", err.Error()),
+			"pass fields that can be encoded as JSON",
+			journal.ErrInvalidTokenRecord,
 		)
 	}
-	if err := journal.ValidateTokenHash(record.TokenHash); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var decodedTable diskTable
+	if err := dec.Decode(&decodedTable); err != nil || len(decodedTable.Tokens) != 1 {
 		return refusal.RefuseWithCause(
 			"token create refused",
-			err.Error(),
-			"pass the sha256:<64-hex> storage hash from HashToken, not the raw token",
-			journal.ErrInvalidTokenHash,
+			"record cannot be decoded back from JSON",
+			"pass fields that survive a JSON round-trip",
+			journal.ErrInvalidTokenRecord,
 		)
 	}
-	if _, err := diskTokenFromRecord(record).tryDecode(); err != nil {
+	decodedDT := decodedTable.Tokens[0]
+	rec, err := decodedDT.tryDecode()
+	if err != nil {
 		return refusal.RefuseWithCause(
 			"token create refused",
 			fmt.Sprintf("record would not read back once written: %s", err.Error()),
 			"pass scopes that round-trip through Scope.String()/ParseScopes: each needs at least one action and a non-empty pattern",
-			ErrStoreUnavailable,
+			journal.ErrInvalidTokenRecord,
+		)
+	}
+	if !rec.CreatedAt.Equal(record.CreatedAt) {
+		return refusal.RefuseWithCause(
+			"token create refused",
+			fmt.Sprintf("created_at timestamp %v does not survive RFC 3339 round-trip (zone offset must be a whole number of minutes)", record.CreatedAt),
+			"pass a timestamp with a whole-minute timezone offset (e.g. UTC)",
+			journal.ErrInvalidTokenRecord,
 		)
 	}
 	return nil

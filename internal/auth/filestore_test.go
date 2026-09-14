@@ -688,15 +688,17 @@ func TestFileTokenStoreRevokeRefusesDuplicateTokenID(t *testing.T) {
 	}
 }
 
-// TestFileTokenStoreCreateTokenRefusesUnreadableRecord pins the invariant round 3 found
-// missing: anything CreateToken accepts can be read back. Each case drives one field of an
+// TestFileTokenStoreCreateTokenRefusesUnreadableRecord pins the invariant that anything
+// CreateToken accepts can be read back and journaled. Each case drives one field of an
 // otherwise well-formed TokenRecord into a shape that either the store's own on-disk round
-// trip (Scopes) or a future token_create journal record, WALD-33 (TokenID, TokenHash) would
-// refuse, and asserts CreateToken refuses it too, before anything reaches the data directory
-// — rather than writing a row that a later ListTokens/GetTokenByHash/GetTokenByID call would
-// then refuse the *whole table* over, unrepairable through the store's own API. The
-// nil-scopes, empty-scopes, zero-Actions-scope, and both token-id cases all fail against the
-// pre-fix CreateToken, which validated only TokenHash.
+// trip across JSON and ParseScopes (Scopes, CreatedAt) or a future token_create journal
+// record, WALD-33 (TokenID, TokenHash, duplicate Scopes, Timestamp) would refuse, and asserts
+// CreateToken refuses it too, before anything reaches the data directory — rather than
+// writing a row that a later ListTokens/GetTokenByHash/GetTokenByID call would then refuse
+// the *whole table* over, or that WALD-33 cannot journal without repair. Every refusal
+// returns an input-shaped sentinel (journal.ErrInvalidTokenID, journal.ErrInvalidTokenHash,
+// journal.ErrInvalidTokenRecord) — never ErrStoreUnavailable, which is reserved for operator-
+// fault corruption.
 func TestFileTokenStoreCreateTokenRefusesUnreadableRecord(t *testing.T) {
 	validScopes, err := auth.ParseScopes([]string{"rwc:*"})
 	if err != nil {
@@ -712,19 +714,26 @@ func TestFileTokenStoreCreateTokenRefusesUnreadableRecord(t *testing.T) {
 		{
 			name:    "nil scopes",
 			mutate:  func(r *auth.TokenRecord) { r.Scopes = nil },
-			wantErr: auth.ErrStoreUnavailable,
+			wantErr: journal.ErrInvalidTokenRecord,
 		},
 		{
 			name:    "empty scopes",
 			mutate:  func(r *auth.TokenRecord) { r.Scopes = []auth.Scope{} },
-			wantErr: auth.ErrStoreUnavailable,
+			wantErr: journal.ErrInvalidTokenRecord,
 		},
 		{
 			name: "scope with zero-valued Actions",
 			mutate: func(r *auth.TokenRecord) {
 				r.Scopes = []auth.Scope{{Actions: auth.Actions{}, Pattern: "blog-*"}}
 			},
-			wantErr: auth.ErrStoreUnavailable,
+			wantErr: journal.ErrInvalidTokenRecord,
+		},
+		{
+			name: "duplicate scopes",
+			mutate: func(r *auth.TokenRecord) {
+				r.Scopes = []auth.Scope{validScopes[0], validScopes[0]}
+			},
+			wantErr: journal.ErrInvalidTokenRecord,
 		},
 		{
 			name:    "empty token id",
@@ -740,6 +749,20 @@ func TestFileTokenStoreCreateTokenRefusesUnreadableRecord(t *testing.T) {
 			name:    "unhashed token hash",
 			mutate:  func(r *auth.TokenRecord) { r.TokenHash = "walden_raw_not_a_hash" },
 			wantErr: journal.ErrInvalidTokenHash,
+		},
+		{
+			name: "created_at year outside [0000, 9999]",
+			mutate: func(r *auth.TokenRecord) {
+				r.CreatedAt = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+			},
+			wantErr: journal.ErrInvalidTokenRecord,
+		},
+		{
+			name: "created_at with non-whole-minute zone offset",
+			mutate: func(r *auth.TokenRecord) {
+				r.CreatedAt = time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("odd", 90))
+			},
+			wantErr: journal.ErrInvalidTokenRecord,
 		},
 	}
 

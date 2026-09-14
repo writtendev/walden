@@ -733,3 +733,73 @@ func TestReceivePackEmptyBodyDoesNotDoubleWait(t *testing.T) {
 		t.Errorf("log contains a spurious double-Wait failure for a request that succeeded: %q", got)
 	}
 }
+
+// TestReceivePackPreservesKeepAliveConnection reproduces round-3's major
+// finding: waitAfterStdoutSettled set an expired read deadline on w
+// unconditionally, which on the healthy success path caused net/http's
+// background read on the drained connection to error and invoke
+// cancelCtx() on the underlying connection. Any subsequent request reusing
+// that keep-alive connection arrived with r.Context() already canceled,
+// causing cmd.Start() to fail with 500 "context canceled".
+func TestReceivePackPreservesKeepAliveConnection(t *testing.T) {
+	work, sha := newWorkTreeWithCommit(t)
+	raw := captureRawReceivePackRequest(t, work)
+
+	s := store.New(t.TempDir())
+	barePath := newEmptyBareRepo(t, s, "target")
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	defer server.Close()
+
+	tr := &http.Transport{
+		MaxIdleConns:        1,
+		MaxIdleConnsPerHost: 1,
+		DisableKeepAlives:   false,
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr}
+
+	// 1. Push: valid body with exact Content-Length.
+	pushReq, err := http.NewRequest(http.MethodPost, server.URL+"/target/git-receive-pack", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	pushReq.Header.Set("Content-Type", "application/x-git-receive-pack-request")
+	pushReq.Header.Set("Content-Length", strconv.Itoa(len(raw)))
+
+	resp, err := client.Do(pushReq)
+	if err != nil {
+		t.Fatalf("push request failed: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read push response body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("push status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if !bytes.Contains(body, []byte("unpack ok")) {
+		t.Fatalf("push response does not contain 'unpack ok': %s", body)
+	}
+	if got := revParse(t, barePath, "refs/heads/main"); got != sha {
+		t.Fatalf("ref = %q, want %q", got, sha)
+	}
+
+	// 2. Second request on the same connection: info/refs advertisement.
+	infoReq, err := http.NewRequest(http.MethodGet, server.URL+"/target/info/refs?service=git-receive-pack", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	infoResp, err := client.Do(infoReq)
+	if err != nil {
+		t.Fatalf("second request on keep-alive connection failed: %v", err)
+	}
+	infoBody, err := io.ReadAll(infoResp.Body)
+	infoResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read second response body: %v", err)
+	}
+	if infoResp.StatusCode != http.StatusOK {
+		t.Fatalf("second request status = %d, want %d; body: %s", infoResp.StatusCode, http.StatusOK, infoBody)
+	}
+}

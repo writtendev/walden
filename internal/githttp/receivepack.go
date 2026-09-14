@@ -53,42 +53,45 @@ func isReceivePackContentType(v string) bool {
 	return strings.EqualFold(mediaType, receivePackContentType)
 }
 
-// waitAfterStdoutSettled calls wait after first setting a read deadline in
-// the past on w, so an os/exec stdin-copy goroutine still blocked reading
-// the request body -- parked there because a client announced a larger
-// Content-Length than it actually sent -- does not leave Wait blocked
-// indefinitely. cmd.Wait cannot return until that goroutine does, and
-// neither r.Context() (a merely silent client never cancels it) nor
-// receivePackWaitDelay (its timer, per go1.25's os/exec, is created only
-// after context cancellation -- see the comment on that constant) ever
-// unblocks it on their own.
+// receivePackDrainGrace bounds how long waitAfterStdoutSettled will wait for
+// cmd.Wait to finish on its own before forcing an expired read deadline on the
+// connection. On the healthy path (push succeeded and request body was fully
+// drained), git has exited and stdin hit EOF, so wait() returns almost
+// instantaneously — well within this grace period — leaving the keep-alive
+// connection untouched. Only if wait() stalls (the client over-declared
+// Content-Length and stopped sending) does the deadline fire to unblock the
+// stuck body read.
+const receivePackDrainGrace = 100 * time.Millisecond
+
+// waitAfterStdoutSettled calls wait(), but bounds how long it will block on an
+// os/exec stdin-copy goroutine that is parked in Read on the request body
+// because a client announced a larger Content-Length than it actually sent.
 //
-// Both of handleReceivePack's wait() call sites qualify to call this
-// rather than wait() directly: each runs only once git's stdout side has
-// already signalled it is done producing output -- a failed Peek (git has
-// exited) or an exhausted br after a full io.Copy (git closed its stdout,
-// which in --stateless-rpc mode means it is done or about to exit) -- so
-// applying the deadline never races a read this handler still expects to
-// succeed. It is not applied to the deferred backstop's own call: that
-// one fires only when writing the response itself failed, which already
-// implies the connection is going away.
+// Crucially, it does NOT set a read deadline immediately. Setting an expired
+// read deadline on a connection whose body was fully drained causes net/http's
+// background read on the socket to error and cancel the connection context,
+// poisoning the connection for any subsequent keep-alive request.
 //
-// This is also safe to call whether or not the body actually needed it:
-// once http.body has already returned io.EOF for a fully-drained body, a
-// further Read is answered from its own byte-count bookkeeping without
-// touching the connection at all, so an expired deadline set here touches
-// nothing already finished. When the body was not fully drained, forcing
-// the stuck Read to fail is the correct outcome regardless -- net/http
-// will not reuse a connection whose request body was not fully consumed
-// -- so this cannot turn a connection that should stay alive into one
-// that does not; it can only make that unavoidable outcome arrive
-// promptly instead of never. SetReadDeadline's own error is ignored: if
-// this ResponseWriter cannot support it, wait() falls back to whatever
-// bound cmd.WaitDelay still covers rather than failing loudly for
-// something orthogonal to the wait it guards.
+// Instead, it gives wait() a short grace period (receivePackDrainGrace) to
+// return on its own. For any healthy request where the body was fully sent,
+// git has already exited and stdin hit EOF, so wait() returns almost
+// instantaneously without ever touching the connection deadline. Only if
+// wait() does not return within the grace period — indicating that the
+// stdin copy goroutine is stuck reading missing body bytes — does it force
+// an expired read deadline to unblock the stuck Read.
 func waitAfterStdoutSettled(w http.ResponseWriter, wait func() error) error {
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
-	return wait()
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- wait()
+	}()
+
+	select {
+	case err := <-waitDone:
+		return err
+	case <-time.After(receivePackDrainGrace):
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		return <-waitDone
+	}
 }
 
 // handleReceivePack serves POST /{repo}/git-receive-pack: a push. Per

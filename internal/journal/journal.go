@@ -101,14 +101,27 @@ func (s *Seq) UnmarshalJSON(data []byte) error {
 // ParseSeqDecimal parses the exact decimal form of a sequence number: no leading
 // zeros, no sign, no whitespace, nothing a re-encoding would introduce.
 func ParseSeqDecimal(s string) (Seq, error) {
-	seq, err := strconv.ParseUint(s, 10, 64)
+	seq, err := parseExactDecimalUint(s)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %w", ErrInvalidSeq, err)
 	}
-	if strconv.FormatUint(seq, 10) != s {
-		return 0, fmt.Errorf("%w: %q is not the exact decimal form of %d", ErrInvalidSeq, s, seq)
-	}
 	return Seq(seq), nil
+}
+
+// parseExactDecimalUint parses the exact decimal form of an unsigned 64-bit
+// integer: no leading zeros, no sign, no whitespace, nothing a re-encoding
+// would introduce. Shared by every field this format carries as a JSON string
+// holding its exact decimal form (section 1.1) — Seq and Epoch alike — so the
+// discipline is defined once rather than copied at each type.
+func parseExactDecimalUint(s string) (uint64, error) {
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if strconv.FormatUint(v, 10) != s {
+		return 0, fmt.Errorf("%q is not the exact decimal form of %d", s, v)
+	}
+	return v, nil
 }
 
 // FormatSeq formats a 64-bit unsigned sequence number as a 20-digit zero-padded decimal string.

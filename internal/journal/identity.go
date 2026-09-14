@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -17,6 +18,22 @@ var (
 	ErrGenesisMissing      = errors.New("genesis record missing")
 	ErrInvalidGenesis      = errors.New("invalid genesis record")
 	ErrInvalidRotation     = errors.New("invalid key rotation record")
+
+	// ErrInvalidEpoch indicates a key epoch was not encoded as the exact
+	// decimal form of an unsigned 64-bit integer, per the discipline
+	// section 1.1 requires of every such field.
+	ErrInvalidEpoch = errors.New("invalid key epoch format")
+
+	// ErrUnknownKeyEpoch indicates a ref-transaction record names a key_epoch
+	// with no corresponding key in the chain verified so far. The epoch is a
+	// hint, not authority: an out-of-range epoch is refused rather than
+	// falling back to the active key.
+	ErrUnknownKeyEpoch = errors.New("key epoch not found in verified signing chain")
+
+	// ErrKeyEpochRegression indicates a ref-transaction record names a
+	// key_epoch lower than one already seen on the same stream, which would
+	// let a retired key validate a record inserted after a later one.
+	ErrKeyEpochRegression = errors.New("key epoch regressed on stream")
 )
 
 const (
@@ -166,21 +183,115 @@ func VerifyRotation(r *KeyRotationRecord, expectedActiveKey string) error {
 	return nil
 }
 
-// SigningChain tracks the active server signing key verified from genesis forward.
+// Epoch is an index into the server's signing key chain: 0 names the genesis
+// key, and each key_rotation record on the meta stream increments it by one.
+// A ref-transaction record's key_epoch names the key that signed it as a
+// hint, not authority — a reader still verifies the chain from genesis and
+// trusts the named key only because it is already in that verified chain.
+//
+// In JSON it is a string holding its exact decimal form, not a number, for
+// the same reason Seq is (section 1.1): a JSON number decoded as an
+// IEEE-754 double is exact only up to 2^53, and this format defines no
+// smaller range for an epoch than it does for a sequence.
+type Epoch uint64
+
+// String returns the exact decimal form of a key epoch: no leading zeros, no
+// sign, no whitespace.
+func (e Epoch) String() string {
+	return strconv.FormatUint(uint64(e), 10)
+}
+
+// MarshalJSON encodes a key epoch as a JSON string holding its exact decimal form.
+func (e Epoch) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + e.String() + `"`), nil
+}
+
+// UnmarshalJSON decodes a key epoch from a JSON string holding its exact
+// decimal form. A JSON number is refused, and so is a string that is not the
+// exact decimal form of the value it names, for the reasons
+// Seq.UnmarshalJSON gives: a rounded or reformatted epoch no longer names
+// the key position it claims to.
+//
+// As with Seq, this catches a malformed epoch but not an absent one: a
+// record with no "key_epoch" at all decodes to epoch 0 and passes Validate,
+// which cannot see a chain to range-check against. That gap is deliberately
+// left open here for the same reason it is left open on Seq.
+func (e *Epoch) UnmarshalJSON(data []byte) error {
+	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
+		return fmt.Errorf("%w: key epoch must be a JSON string holding its decimal form, got %s", ErrInvalidEpoch, data)
+	}
+	v, err := parseExactDecimalUint(string(data[1 : len(data)-1]))
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidEpoch, err)
+	}
+	*e = Epoch(v)
+	return nil
+}
+
+// SigningChain tracks the server signing key chain verified from genesis
+// forward: keys[0] is the genesis key (epoch 0), and keys[i] is the key
+// activated by the i'th rotation record. The active key is always the last
+// element.
+//
+// A SigningChain carries the state of one replay, not a read-only view of
+// the chain: VerifyRefTx advances lastEpoch as it verifies each ref
+// transaction. It is not safe for concurrent use — a chain must be driven
+// by a single goroutine end to end, never shared across goroutines
+// verifying in parallel.
 type SigningChain struct {
-	activeKey   string
+	keys        []string
 	lastMetaSeq Seq
 	initialized bool
+
+	// lastEpoch is reader-side replay state, not part of the chain itself:
+	// the highest key_epoch this replay has verified so far on each
+	// repository stream, so that a verified record can never be followed by
+	// one naming an earlier epoch on the same stream within this replay
+	// (WALD-96). The floor is per stream and starts empty for a stream this
+	// replay has not yet walked: it does not carry across a marker-resumed
+	// replay's baseline, and it protects nothing on a stream — new or old —
+	// that has not itself carried a record above epoch 0 in this replay
+	// (spec section 8, section 8.1 rule 15; closing either gap needs
+	// WALD-97's marker work or a floor that is not scoped per stream,
+	// neither of which this map provides).
+	lastEpoch map[StreamID]Epoch
 }
 
 // NewSigningChain creates an uninitialized signing chain.
 func NewSigningChain() *SigningChain {
-	return &SigningChain{}
+	return &SigningChain{lastEpoch: make(map[StreamID]Epoch)}
 }
 
 // ActiveKey returns the currently active public key string ("ed25519:<hex>").
 func (c *SigningChain) ActiveKey() string {
-	return c.activeKey
+	if len(c.keys) == 0 {
+		return ""
+	}
+	return c.keys[len(c.keys)-1]
+}
+
+// CurrentEpoch returns the epoch a writer should stamp on a record it signs
+// right now: the index of the currently active key in the chain.
+func (c *SigningChain) CurrentEpoch() Epoch {
+	if len(c.keys) == 0 {
+		return 0
+	}
+	return Epoch(len(c.keys) - 1)
+}
+
+// KeyAtEpoch resolves epoch to the public key the chain activated at that
+// position. The epoch is a hint a ref-transaction record carries, not
+// authority: it is trusted only because it indexes into a chain already
+// verified from genesis, so an epoch outside that chain is refused rather
+// than treated as a request to fall back to the active key.
+func (c *SigningChain) KeyAtEpoch(e Epoch) (string, error) {
+	if !c.initialized {
+		return "", fmt.Errorf("%w: cannot resolve key epoch before genesis", ErrGenesisMissing)
+	}
+	if uint64(e) >= uint64(len(c.keys)) {
+		return "", fmt.Errorf("%w: epoch %d, chain holds %d key(s)", ErrUnknownKeyEpoch, e, len(c.keys))
+	}
+	return c.keys[e], nil
 }
 
 // LastMetaSeq returns the last processed meta sequence number.
@@ -213,7 +324,7 @@ func (c *SigningChain) ApplyGenesis(g *GenesisRecord) error {
 	if _, err := ParsePublicKey(g.PublicKey); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidGenesis, err)
 	}
-	c.activeKey = g.PublicKey
+	c.keys = append(c.keys, g.PublicKey)
 	c.lastMetaSeq = 0
 	c.initialized = true
 	return nil
@@ -227,10 +338,10 @@ func (c *SigningChain) ApplyRotation(r *KeyRotationRecord) error {
 	if r.Seq != c.lastMetaSeq+1 {
 		return fmt.Errorf("%w: sequence gap or out-of-order rotation (expected %d, got %d)", ErrInvalidRotation, c.lastMetaSeq+1, r.Seq)
 	}
-	if err := VerifyRotation(r, c.activeKey); err != nil {
+	if err := VerifyRotation(r, c.ActiveKey()); err != nil {
 		return err
 	}
-	c.activeKey = r.NewPublicKey
+	c.keys = append(c.keys, r.NewPublicKey)
 	c.lastMetaSeq = r.Seq
 	return nil
 }

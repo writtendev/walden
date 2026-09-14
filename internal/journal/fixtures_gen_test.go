@@ -523,11 +523,13 @@ func generateFixtures(w *fixtureWriter) {
 	segC3 := w.writeSegment(fixtureRepoStream, repo.pack(c3, "^"+c1))
 
 	// seq 0: first push into an empty repository — the ref is created from the zero OID.
+	// Signed by the genesis key, so key_epoch 0.
 	w.writeRefTx(genesisKey, &journal.RefTransactionRecord{
 		Version:  journal.VersionPrefix,
 		Stream:   fixtureRepoStream,
 		Seq:      0,
 		Type:     journal.RecordTypeRefUpdate,
+		KeyEpoch: 0,
 		Segments: []string{segC1},
 		Updates: []journal.RefUpdate{
 			{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: c1},
@@ -541,6 +543,7 @@ func generateFixtures(w *fixtureWriter) {
 		Stream:   fixtureRepoStream,
 		Seq:      1,
 		Type:     journal.RecordTypeRefUpdate,
+		KeyEpoch: 0,
 		Segments: []string{segC2},
 		Updates: []journal.RefUpdate{
 			{Ref: "refs/heads/main", OldOID: c1, NewOID: c2},
@@ -555,6 +558,7 @@ func generateFixtures(w *fixtureWriter) {
 		Stream:   fixtureRepoStream,
 		Seq:      2,
 		Type:     journal.RecordTypeRefUpdate,
+		KeyEpoch: 0,
 		Segments: []string{},
 		Updates: []journal.RefUpdate{
 			{Ref: "refs/heads/feature", OldOID: c2, NewOID: journal.ZeroOID40},
@@ -563,12 +567,14 @@ func generateFixtures(w *fixtureWriter) {
 	})
 
 	// seq 3: force update — main moves to a commit that is not a descendant of its old
-	// tip, and the record is signed by the rotated key that _meta seq 2 activated.
+	// tip, and the record is signed by the rotated key that _meta seq 2 activated, so
+	// key_epoch 1 — the whole reason this format needs the field at all (WALD-96).
 	w.writeRefTx(rotatedKey, &journal.RefTransactionRecord{
 		Version:  journal.VersionPrefix,
 		Stream:   fixtureRepoStream,
 		Seq:      3,
 		Type:     journal.RecordTypeRefUpdate,
+		KeyEpoch: 1,
 		Segments: []string{segC3},
 		Updates: []journal.RefUpdate{
 			{Ref: "refs/heads/main", OldOID: c2, NewOID: c3},
@@ -604,6 +610,7 @@ func generateFixtures(w *fixtureWriter) {
 		Stream:   fixtureOpaqueStream,
 		Seq:      0,
 		Type:     journal.RecordTypeRefUpdate,
+		KeyEpoch: 0,
 		Segments: []string{segO1},
 		Updates: []journal.RefUpdate{
 			{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: o1},

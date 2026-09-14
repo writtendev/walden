@@ -306,23 +306,28 @@ func checkFixtureSegments(t *testing.T, stream journal.StreamID, rec *journal.Re
 // TestFixtureRepoStreams covers Ruling 3 (ref-transaction records: first push into an
 // empty repository, a multi-ref update, a branch delete with no segments, and a force
 // update) and Ruling 4 (content-addressed pack segments).
+//
+// Every record is verified against one chain replayed to the meta stream's head, with
+// no foreknowledge of which records predate the rotation at _meta seq 2: each record's
+// own key_epoch selects the key it is checked against (WALD-96). That is the property
+// this test exists to prove — previously it special-cased the last record onto a
+// separately replayed chain, which only passed because the test knew something the
+// format itself did not record.
 func TestFixtureRepoStreams(t *testing.T) {
-	// repo-alpha records 0 through 2 predate the key rotation at _meta seq 2.
-	preRotation := loadFixtureChain(t, 1)
-	postRotation := loadFixtureChain(t, 3)
+	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
 
 	alpha := fixtureStreamRecords(t, fixtureRepoStream)
 	if len(alpha) != 4 {
 		t.Fatalf("repo-alpha has %d transactions, want 4", len(alpha))
 	}
 
+	wantEpochs := []journal.Epoch{0, 0, 0, 1}
 	for i, rec := range alpha {
-		chain := preRotation
-		if i == 3 {
-			chain = postRotation
-		}
 		if err := chain.VerifyRefTx(rec); err != nil {
 			t.Errorf("repo-alpha seq %d failed signature verification: %v", rec.Seq, err)
+		}
+		if rec.KeyEpoch != wantEpochs[i] {
+			t.Errorf("repo-alpha seq %d key_epoch = %d, want %d", rec.Seq, rec.KeyEpoch, wantEpochs[i])
 		}
 		checkFixtureSegments(t, fixtureRepoStream, rec)
 	}
@@ -366,8 +371,11 @@ func TestFixtureRepoStreams(t *testing.T) {
 	if opaque[0].Seq != 0 {
 		t.Errorf("opaque stream first seq = %d, want 0", opaque[0].Seq)
 	}
-	if err := preRotation.VerifyRefTx(opaque[0]); err != nil {
+	if err := chain.VerifyRefTx(opaque[0]); err != nil {
 		t.Errorf("opaque stream seq 0 failed signature verification: %v", err)
+	}
+	if opaque[0].KeyEpoch != 0 {
+		t.Errorf("opaque stream seq 0 key_epoch = %d, want 0", opaque[0].KeyEpoch)
 	}
 	checkFixtureSegments(t, fixtureOpaqueStream, opaque[0])
 

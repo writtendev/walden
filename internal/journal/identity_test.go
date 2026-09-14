@@ -3,6 +3,7 @@ package journal_test
 import (
 	"crypto/ed25519"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -304,6 +305,48 @@ func TestUnchainableRotationErrors(t *testing.T) {
 	err = chain.ApplyRotation(rotSameKey)
 	if !errors.Is(err, journal.ErrInvalidRotation) {
 		t.Errorf("expected ErrInvalidRotation for same key rotation, got %v", err)
+	}
+}
+
+// TestEpochJSONEncoding covers spec section 1.1 at the key_epoch field, mirroring
+// TestRefTxSeqEncoding for Seq: a key epoch is a JSON string holding its exact decimal
+// form, and a JSON number, a leading zero, or any other reformatting is refused on
+// parse rather than coerced into the epoch its digits look like.
+func TestEpochJSONEncoding(t *testing.T) {
+	data, err := json.Marshal(journal.Epoch(^uint64(0)))
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	if string(data) != `"18446744073709551615"` {
+		t.Errorf("Epoch did not marshal as a decimal string: %s", data)
+	}
+
+	var parsed journal.Epoch
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if parsed != journal.Epoch(^uint64(0)) {
+		t.Errorf("epoch round-tripped to %d, want %d", uint64(parsed), ^uint64(0))
+	}
+
+	invalid := []string{
+		`0`,                      // a bare JSON number, not a string
+		`"01"`,                   // leading zero
+		`"+1"`,                   // sign
+		`" 1"`,                   // whitespace
+		`"18446744073709551616"`, // overflows uint64
+		`"1.0"`,                  // not an integer
+	}
+	for _, encoded := range invalid {
+		var e journal.Epoch
+		err := json.Unmarshal([]byte(encoded), &e)
+		if err == nil {
+			t.Errorf("expected epoch %s to be refused, got %d", encoded, uint64(e))
+			continue
+		}
+		if !errors.Is(err, journal.ErrInvalidEpoch) {
+			t.Errorf("expected ErrInvalidEpoch for %s, got %v", encoded, err)
+		}
 	}
 }
 

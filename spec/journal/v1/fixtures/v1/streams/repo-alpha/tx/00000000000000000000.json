@@ -3,6 +3,7 @@
   "stream": "repo-alpha",
   "seq": "0",
   "type": "ref_update",
+  "key_epoch": "0",
   "segments": [
     "db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"
   ],
@@ -14,5 +15,5 @@
     }
   ],
   "timestamp": "2026-08-31T00:02:00Z",
-  "signature": "ed25519:a91e5413e54463c4a1e33f7bc0825434284eb33465de77f7d116a4801c207aa2a5e3eab96b82c0eb702bf8bfda0b4a8c81b6a8addff7a1911fc71441272bca04"
+  "signature": "ed25519:e3663b676f671095e4b8653ddc1419b2349d39a8adab7f28b1cb6574bc62963ec2f03996af92d34d6e2fab685c365a180d411053af476d4b319fe6a9359a8805"
 }

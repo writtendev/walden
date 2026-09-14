@@ -352,7 +352,7 @@ func TestFixtureRepoStreams(t *testing.T) {
 	// where section 5.2's byte-preservation invariant is exercised (WALD-89); see
 	// TestFixtureNonASCIIRefBreaksOnNormalization.
 	if len(alpha[1].Updates) != 4 {
-		t.Errorf("repo-alpha seq 1 has %d updates, want 4", len(alpha[1].Updates))
+		t.Fatalf("repo-alpha seq 1 has %d updates, want 4", len(alpha[1].Updates))
 	}
 	if got := alpha[1].Updates[3].Ref; got != fixtureDecomposedRef {
 		t.Errorf("repo-alpha seq 1 updates[3].ref = %+q, want the decomposed non-ASCII ref", got)
@@ -570,6 +570,12 @@ func TestFixtureReplay(t *testing.T) {
 
 	t.Run("from_genesis", func(t *testing.T) {
 		records := fixtureStreamRecords(t, fixtureRepoStream)
+		if len(records) != 5 {
+			t.Fatalf("repo-alpha has %d transactions, want 5", len(records))
+		}
+		if len(records[1].Updates) != 4 {
+			t.Fatalf("repo-alpha seq 1 has %d updates, want 4", len(records[1].Updates))
+		}
 		alpha := newFixtureReplay(t)
 		for _, rec := range records {
 			alpha.apply(rec)

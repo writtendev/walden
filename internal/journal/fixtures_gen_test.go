@@ -50,8 +50,8 @@ const fixtureGitDate = "1767225600 +0000"
 // TestFixtureNonASCIIRefBreaksOnNormalization.
 //
 // Both are written as \u escapes for their non-ASCII codepoints, not literal UTF-8, so
-// this file's own bytes stay ASCII and neither form can be normalized out from under it
-// by an editor or a tool elsewhere in the chain.
+// neither ref literal contributes a byte an editor or a tool elsewhere in the chain
+// could normalize.
 const (
 	// fixtureDecomposedRef: "refs/heads/caf" + U+0065 LATIN SMALL LETTER E + U+0301
 	// COMBINING ACUTE ACCENT (UTF-8 ... 63 61 66 65 cc 81).

@@ -408,13 +408,24 @@ func fixtureTokenHash(rawToken string) string {
 	return journal.TokenHashPrefix + hex.EncodeToString(sum[:])
 }
 
-// writeToken validates and writes a token table mutation on the meta stream. Token records
-// carry no signature, so their own Validate is the only gate between the generator and the
-// fixture tree — which is why it is called here rather than left to the reading tests.
-func (w *fixtureWriter) writeToken(seq journal.Seq, rec interface{ Validate() error }) {
+// writeToken signs and writes a token table mutation on the meta stream, mirroring
+// writeRefTx: priv is the key active at seq, which the caller picks (the genesis key before
+// the seq 2 rotation, the rotated key after it), and SignTokenCreate/SignTokenRevoke
+// validate before signing, so there is nothing left for this to check on its own.
+func (w *fixtureWriter) writeToken(priv ed25519.PrivateKey, seq journal.Seq, rec interface{ Validate() error }) {
 	w.t.Helper()
-	if err := rec.Validate(); err != nil {
-		w.t.Fatalf("failed to validate _meta seq %d: %v", seq, err)
+	var err error
+	switch r := rec.(type) {
+	case *journal.TokenCreateRecord:
+		err = journal.SignTokenCreate(priv, r)
+	case *journal.TokenRevokeRecord:
+		err = journal.SignTokenRevoke(priv, r)
+	default:
+		w.t.Fatalf("writeToken: unsupported record type %T", rec)
+		return
+	}
+	if err != nil {
+		w.t.Fatalf("failed to sign _meta seq %d: %v", seq, err)
 	}
 	w.writeJSON(journal.TxKey(journal.MetaStreamID, seq), rec)
 }
@@ -486,7 +497,7 @@ func generateFixtures(w *fixtureWriter) {
 	adminToken := loadFixtureBuiltinToken(t, fixtureAdminTokenID)
 	writerToken := loadFixtureBuiltinToken(t, fixtureWriterTokenID)
 
-	w.writeToken(1, &journal.TokenCreateRecord{
+	w.writeToken(genesisKey, 1, &journal.TokenCreateRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       1,
@@ -511,7 +522,7 @@ func generateFixtures(w *fixtureWriter) {
 	}
 	w.writeJSON(journal.TxKey(journal.MetaStreamID, rotation.Seq), rotation)
 
-	w.writeToken(3, &journal.TokenRevokeRecord{
+	w.writeToken(rotatedKey, 3, &journal.TokenRevokeRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       3,
@@ -524,7 +535,7 @@ func generateFixtures(w *fixtureWriter) {
 	// A token carrying more than one scope, which is the case a single scope field cannot
 	// hold: spec/auth/v1 section 3.4 opens "a token may carry one or more scopes", and this
 	// is that sentence as bytes on the meta stream.
-	w.writeToken(4, &journal.TokenCreateRecord{
+	w.writeToken(rotatedKey, 4, &journal.TokenCreateRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       4,

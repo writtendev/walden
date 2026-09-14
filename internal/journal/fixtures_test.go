@@ -193,6 +193,28 @@ func loadFixtureChain(t *testing.T, maxSeq journal.Seq) *journal.SigningChain {
 			if chain.ActiveKey() != rotation.NewPublicKey {
 				t.Errorf("%s: active key = %q, want %q", path, chain.ActiveKey(), rotation.NewPublicKey)
 			}
+		case journal.RecordTypeTokenCreate:
+			create, err := journal.ParseTokenCreate(data)
+			if err != nil {
+				t.Fatalf("ParseTokenCreate failed on %s: %v", path, err)
+			}
+			if err := chain.VerifyTokenCreate(create); err != nil {
+				t.Fatalf("VerifyTokenCreate failed on %s: %v", path, err)
+			}
+			if err := chain.AdvanceMetaSeq(header.Seq); err != nil {
+				t.Fatalf("AdvanceMetaSeq failed on %s: %v", path, err)
+			}
+		case journal.RecordTypeTokenRevoke:
+			revoke, err := journal.ParseTokenRevoke(data)
+			if err != nil {
+				t.Fatalf("ParseTokenRevoke failed on %s: %v", path, err)
+			}
+			if err := chain.VerifyTokenRevoke(revoke); err != nil {
+				t.Fatalf("VerifyTokenRevoke failed on %s: %v", path, err)
+			}
+			if err := chain.AdvanceMetaSeq(header.Seq); err != nil {
+				t.Fatalf("AdvanceMetaSeq failed on %s: %v", path, err)
+			}
 		default:
 			if err := chain.AdvanceMetaSeq(header.Seq); err != nil {
 				t.Fatalf("AdvanceMetaSeq failed on %s: %v", path, err)
@@ -1214,12 +1236,12 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 				t.Fatalf("ApplyRotation failed on %s: %v", path, err)
 			}
 		case journal.RecordTypeTokenCreate:
-			var rec journal.TokenCreateRecord
-			if err := json.Unmarshal(data, &rec); err != nil {
-				t.Fatalf("failed to parse %s: %v", path, err)
+			rec, err := journal.ParseTokenCreate(data)
+			if err != nil {
+				t.Fatalf("ParseTokenCreate failed on %s: %v", path, err)
 			}
-			if err := rec.Validate(); err != nil {
-				t.Fatalf("%s: Validate failed: %v", path, err)
+			if err := chain.VerifyTokenCreate(rec); err != nil {
+				t.Fatalf("VerifyTokenCreate failed on %s: %v", path, err)
 			}
 			if rec.Seq != seq {
 				t.Errorf("%s: record seq = %d does not match its key", path, rec.Seq)
@@ -1232,12 +1254,12 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 				t.Fatalf("AdvanceMetaSeq failed on %s: %v", path, err)
 			}
 		case journal.RecordTypeTokenRevoke:
-			var rec journal.TokenRevokeRecord
-			if err := json.Unmarshal(data, &rec); err != nil {
-				t.Fatalf("failed to parse %s: %v", path, err)
+			rec, err := journal.ParseTokenRevoke(data)
+			if err != nil {
+				t.Fatalf("ParseTokenRevoke failed on %s: %v", path, err)
 			}
-			if err := rec.Validate(); err != nil {
-				t.Fatalf("%s: Validate failed: %v", path, err)
+			if err := chain.VerifyTokenRevoke(rec); err != nil {
+				t.Fatalf("VerifyTokenRevoke failed on %s: %v", path, err)
 			}
 			if rec.Seq != seq {
 				t.Errorf("%s: record seq = %d does not match its key", path, rec.Seq)
@@ -1309,6 +1331,134 @@ func assertFixtureTokenMatchesAuthSpec(t *testing.T, tokenID string, row *fixtur
 	}
 	if got, want := strings.Join(row.scopes, ","), strings.Join(published.Scopes, ","); got != want {
 		t.Errorf("%s scopes in the golden journal = %q, want the scopes spec/auth/v1/fixtures/builtin_tokens.json publishes for it, %q", tokenID, got, want)
+	}
+}
+
+// TestFixtureForgedTokenCreateRefused is WALD-104's own attack, run against the golden
+// journal. Before this ticket a token_create record carried no signature, so a party with
+// nothing but bucket write access could append one naming rwc:* at the next free _meta
+// sequence, and a replay following section 4.5's rules alone would restore it as a live
+// grant — spec section 2.2's named exception, closed here. The forged record below is
+// signed, just not by the key active at the sequence it claims: the shape of an attacker
+// who can write to the bucket but does not hold the current signing key. Verification
+// against the chain refuses it, in the section 8.1 rule 19 line, before it ever reaches a
+// token table.
+func TestFixtureForgedTokenCreateRefused(t *testing.T) {
+	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
+
+	forged := &journal.TokenCreateRecord{
+		Version:   journal.VersionPrefix,
+		Stream:    journal.MetaStreamID,
+		Seq:       fixtureMetaHeadSeq + 1,
+		Type:      journal.RecordTypeTokenCreate,
+		TokenID:   "tok_forged_00",
+		TokenHash: fixtureTokenHash("walden_sec_forged_0123456789abcdef"),
+		Scopes:    []string{"rwc:*"},
+		Timestamp: "2026-08-31T00:10:00Z",
+	}
+	// Signed with the retired genesis key, not the rotated key actually active at this
+	// sequence: bucket write access does not include the current signing key.
+	if err := journal.SignTokenCreate(fixtureKey(0x01), forged); err != nil {
+		t.Fatalf("SignTokenCreate failed: %v", err)
+	}
+
+	err := chain.VerifyTokenCreate(forged)
+	if err == nil {
+		t.Fatal("VerifyTokenCreate accepted a token record forged with a key other than the one active at its sequence")
+	}
+	if !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("error = %v, want ErrSignatureMismatch", err)
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "\n") {
+		t.Errorf("refusal is not one line: %q", msg)
+	}
+
+	// Spec section 8.1 rule 19, quoted verbatim: the reader stops with this exact line
+	// rather than skipping the record or guessing.
+	wantLine := "refusal: replay failed: signature mismatch for token record at seq 5"
+	if msg != wantLine {
+		t.Errorf("refusal = %q, want %q", msg, wantLine)
+	}
+}
+
+// TestFixtureTokenScopeTamperRefused covers the ticket's threat model directly against a
+// real record from the golden journal rather than a wholly forged one: seq 4's token_create
+// mints tok_writer_02 with the two narrower scopes rw:blog-* and r:docs, and widening that
+// in memory to rwc:* — the escalation this ticket exists to stop — no longer verifies. The
+// canonical payload covers scopes in array order, so a scope cannot be appended, replaced,
+// or reordered without invalidating the signature.
+func TestFixtureTokenScopeTamperRefused(t *testing.T) {
+	data, err := os.ReadFile(fixtureKeyPath(journal.TxKey(journal.MetaStreamID, 4)))
+	if err != nil {
+		t.Fatalf("failed to read meta fixture: %v", err)
+	}
+	rec, err := journal.ParseTokenCreate(data)
+	if err != nil {
+		t.Fatalf("ParseTokenCreate failed: %v", err)
+	}
+	rec.Scopes = []string{"rwc:*"}
+
+	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	if err := chain.VerifyTokenCreate(rec); !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("VerifyTokenCreate on a scope-widened record = %v, want ErrSignatureMismatch", err)
+	}
+}
+
+// TestFixtureTokenSignedByRetiredKeyRefused covers WALD-104's rotation case: a token record
+// correct in every field but re-signed with the retired genesis key after the seq 2
+// rotation is refused, exactly as a ref transaction signed by a retired key would be
+// (WALD-96) — rotation matters for token records too, even though they carry no key_epoch
+// of their own to name the key that should have signed them.
+func TestFixtureTokenSignedByRetiredKeyRefused(t *testing.T) {
+	data, err := os.ReadFile(fixtureKeyPath(journal.TxKey(journal.MetaStreamID, 4)))
+	if err != nil {
+		t.Fatalf("failed to read meta fixture: %v", err)
+	}
+	rec, err := journal.ParseTokenCreate(data)
+	if err != nil {
+		t.Fatalf("ParseTokenCreate failed: %v", err)
+	}
+	// Re-sign the identical fields with the retired genesis key instead of the rotated key
+	// that actually signed this record in the golden journal.
+	if err := journal.SignTokenCreate(fixtureKey(0x01), rec); err != nil {
+		t.Fatalf("SignTokenCreate failed: %v", err)
+	}
+
+	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	if err := chain.VerifyTokenCreate(rec); !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("VerifyTokenCreate against the active (rotated) key = %v, want ErrSignatureMismatch", err)
+	}
+}
+
+// TestFixtureTokenMissingSignatureRefusedAtParse covers the shadow-struct half of
+// WALD-104: a token record with no signature field at all is refused at parse, naming the
+// field, rather than decoding it to "" and reaching Validate — which is signature-agnostic
+// by design (internal/auth mints unsigned records for its own tests) — and passing there.
+func TestFixtureTokenMissingSignatureRefusedAtParse(t *testing.T) {
+	data, err := os.ReadFile(fixtureKeyPath(journal.TxKey(journal.MetaStreamID, 3)))
+	if err != nil {
+		t.Fatalf("failed to read meta fixture: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("failed to parse meta fixture: %v", err)
+	}
+	delete(raw, "signature")
+	stripped, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatalf("failed to marshal the stripped fixture: %v", err)
+	}
+
+	_, err = journal.ParseTokenRevoke(stripped)
+	if err == nil {
+		t.Fatal("ParseTokenRevoke accepted a record with no signature field")
+	}
+	if !errors.Is(err, journal.ErrInvalidTokenRecord) {
+		t.Errorf("error = %v, want ErrInvalidTokenRecord", err)
+	}
+	if !strings.Contains(err.Error(), `"signature"`) {
+		t.Errorf("error does not name the missing field: %v", err)
 	}
 }
 

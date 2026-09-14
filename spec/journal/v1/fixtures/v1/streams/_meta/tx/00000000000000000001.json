@@ -8,5 +8,6 @@
   "scopes": [
     "rwc:*"
   ],
-  "timestamp": "2026-08-31T00:01:00Z"
+  "timestamp": "2026-08-31T00:01:00Z",
+  "signature": "ed25519:cef6207dd61108ad67d6381822e3e47fa100b220f62132432e233f3bc339e27d8a46fb2035d99bd3b7d568d2b413e0eb27886458de4dbd8bbdeff6dc799d5108"
 }

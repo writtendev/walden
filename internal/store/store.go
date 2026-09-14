@@ -41,6 +41,15 @@ func New(dataDir string) *Store {
 	return &Store{dataDir: dataDir}
 }
 
+// DataDir returns the store's configured root directory, unresolved and
+// unvalidated. The receive-pack handler forwards this value to the
+// pre-receive hook as WALDEN_DATA_DIR, so the hook can resolve repository
+// paths without a config file of its own; passing the same path to
+// NewHandler a second time would invite the two copies to disagree.
+func (s *Store) DataDir() string {
+	return s.dataDir
+}
+
 // RepoPath validates repo and returns the filesystem path to its bare
 // repository.
 //

@@ -17,14 +17,22 @@ type Handler struct {
 	auth  auth.Authorizer
 	store *store.Store
 	mux   *http.ServeMux
+	// journalURL is the resolved WALDEN_JOURNAL value, empty in
+	// journal-less mode. handleReceivePack forwards it to the pre-receive
+	// hook's environment as WALDEN_JOURNAL, unset rather than empty when
+	// journal-less, so the hook can find the journal to append to.
+	journalURL string
 }
 
-// NewHandler creates a new git HTTP handler.
-func NewHandler(authorizer auth.Authorizer, repoStore *store.Store) *Handler {
+// NewHandler creates a new git HTTP handler. journalURL is the resolved
+// WALDEN_JOURNAL value, forwarded to the pre-receive hook environment on
+// every push; pass "" for journal-less mode.
+func NewHandler(authorizer auth.Authorizer, repoStore *store.Store, journalURL string) *Handler {
 	h := &Handler{
-		auth:  authorizer,
-		store: repoStore,
-		mux:   http.NewServeMux(),
+		auth:       authorizer,
+		store:      repoStore,
+		mux:        http.NewServeMux(),
+		journalURL: journalURL,
 	}
 	h.registerRoutes()
 	return h
@@ -38,6 +46,12 @@ func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("/{repo}/info/refs", methodNotAllowed("/{repo}/info/refs", "GET, HEAD"))
 	h.mux.HandleFunc("POST /{repo}/git-upload-pack", h.handleUploadPack)
 	h.mux.HandleFunc("/{repo}/git-upload-pack", methodNotAllowed("/{repo}/git-upload-pack", "POST"))
+	h.mux.HandleFunc("POST /{repo}/git-receive-pack", h.handleReceivePack)
+	// Same reasoning as info/refs above: without an explicit method-less
+	// registration here, the "/" catch-all below would answer a non-POST
+	// request to this path instead of ServeMux ever getting a chance to
+	// produce its own 405.
+	h.mux.HandleFunc("/{repo}/git-receive-pack", h.handleReceivePackMethodNotAllowed)
 	h.mux.HandleFunc("/", h.handleRequest)
 }
 

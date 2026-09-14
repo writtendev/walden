@@ -11,7 +11,7 @@ import (
 
 func TestHandlerServeHTTP(t *testing.T) {
 	s := store.New(t.TempDir())
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()

@@ -48,19 +48,21 @@ var authSurfaceAllowlist = map[string]bool{
 }
 
 // checkAuthSurface inspects one already-parsed file for references to internal/auth
-// identifiers outside authSurfaceAllowlist. It resolves the local name bound to the
+// identifiers outside authSurfaceAllowlist. It resolves every local name bound to the
 // authImportPath import from the file's own import declarations — rather than matching the
 // literal identifier "auth" — so an aliased import (`wauth "…/internal/auth"`) is resolved to
-// the real package and checked exactly like an unaliased one. A file that never imports
-// authImportPath is left alone, which also removes a converse false positive: an unrelated
-// local variable or field named "auth" in a file that doesn't import this package at all.
+// the real package and checked exactly like an unaliased one. Go allows importing the same
+// path more than once under different names in one file, so every matching import spec's name
+// is collected rather than just the last one seen. A file that never imports authImportPath is
+// left alone, which also removes a converse false positive: an unrelated local variable or
+// field named "auth" in a file that doesn't import this package at all.
 //
 // A dot-import (`. "…/internal/auth"`) binds the package's exported identifiers directly into
 // the file's scope, indistinguishable at the AST level from any other bare identifier without
 // full type information this guard does not have. Rather than silently miss that case the way
 // the alias bug did, a dot-import is reported on sight as its own violation.
 func checkAuthSurface(file *ast.File) []string {
-	var localName string
+	localNames := map[string]bool{}
 	dotImported := false
 	imported := false
 
@@ -72,13 +74,13 @@ func checkAuthSurface(file *ast.File) []string {
 		imported = true
 		switch {
 		case imp.Name == nil:
-			localName = "auth" // the package's own declared name
+			localNames["auth"] = true // the package's own declared name
 		case imp.Name.Name == "_":
 			// blank import: no identifier is ever bound, nothing to check
 		case imp.Name.Name == ".":
 			dotImported = true
 		default:
-			localName = imp.Name.Name
+			localNames[imp.Name.Name] = true
 		}
 	}
 
@@ -92,7 +94,7 @@ func checkAuthSurface(file *ast.File) []string {
 			"dot-imports %s: this guard cannot resolve which bare identifiers it introduces; use a named import (aliased or not) instead",
 			authImportPath))
 	}
-	if localName == "" {
+	if len(localNames) == 0 {
 		return violations
 	}
 
@@ -102,7 +104,7 @@ func checkAuthSurface(file *ast.File) []string {
 			return true
 		}
 		pkgIdent, ok := sel.X.(*ast.Ident)
-		if !ok || pkgIdent.Name != localName {
+		if !ok || !localNames[pkgIdent.Name] {
 			return true
 		}
 		if !authSurfaceAllowlist[sel.Sel.Name] {
@@ -244,6 +246,18 @@ func f(auth string) string { return auth }
 			src: `package p
 import . "github.com/writtendev/walden/internal/auth"
 var _ = ParseScope
+`,
+			wantViolation: true,
+		},
+		{
+			name: "same path imported twice under two names catches a reference through either",
+			src: `package p
+import (
+	auth "github.com/writtendev/walden/internal/auth"
+	wauth "github.com/writtendev/walden/internal/auth"
+)
+var _ = auth.ParseScope
+var _ wauth.Authorizer
 `,
 			wantViolation: true,
 		},

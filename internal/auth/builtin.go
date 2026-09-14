@@ -163,10 +163,10 @@ func NewBuiltinAuthorizer(store TokenStore) *BuiltinAuthorizer {
 	return &BuiltinAuthorizer{store: store}
 }
 
-// Authorize checks whether the token grants action on repo.
-func (b *BuiltinAuthorizer) Authorize(ctx context.Context, token string, action Action, repo string) (bool, error) {
+// Authorize checks whether the token grants every action in required on repo.
+func (b *BuiltinAuthorizer) Authorize(ctx context.Context, token string, required Actions, repo string) error {
 	if b == nil || b.store == nil {
-		return false, refusal.RefuseWithCause(
+		return refusal.RefuseWithCause(
 			"unauthorized",
 			"token store not available",
 			"initialize token store before checking authorization",
@@ -174,18 +174,22 @@ func (b *BuiltinAuthorizer) Authorize(ctx context.Context, token string, action 
 		)
 	}
 
+	if err := checkRequired(required); err != nil {
+		return err
+	}
+
 	if err := CheckRepoAndToken(token, repo); err != nil {
-		return false, err
+		return err
 	}
 
 	hash := HashToken(strings.TrimSpace(token))
 	record, err := b.store.GetTokenByHash(ctx, hash)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	if record == nil || record.Revoked {
-		return false, refusal.RefuseWithCause(
+		return refusal.RefuseWithCause(
 			"unauthorized",
 			"invalid or revoked token",
 			"verify token credentials or mint a new token with 'walden token create'",
@@ -193,9 +197,9 @@ func (b *BuiltinAuthorizer) Authorize(ctx context.Context, token string, action 
 		)
 	}
 
-	if !Allows(record.Scopes, action, repo) {
-		return false, ForbiddenRefusal(action, repo)
+	if action, missing := Missing(record.Scopes, required, repo); missing {
+		return ForbiddenRefusal(action, repo)
 	}
 
-	return true, nil
+	return nil
 }

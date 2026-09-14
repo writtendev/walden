@@ -10,6 +10,23 @@ import (
 	"github.com/writtendev/walden/internal/journal"
 )
 
+// onlyAction returns an Actions set containing exactly action. Several tests here and in
+// fixtures_test.go loop over the three auth.Action values to probe them one at a time;
+// this is the single place that turns a loop variable back into the Actions set Authorize
+// now takes.
+func onlyAction(action auth.Action) auth.Actions {
+	switch action {
+	case auth.ActionRead:
+		return auth.Actions{Read: true}
+	case auth.ActionWrite:
+		return auth.Actions{Write: true}
+	case auth.ActionCreate:
+		return auth.Actions{Create: true}
+	default:
+		return auth.Actions{}
+	}
+}
+
 func TestActions(t *testing.T) {
 	if auth.ActionRead != "r" {
 		t.Errorf("expected ActionRead to be 'r', got %q", auth.ActionRead)
@@ -66,9 +83,8 @@ func TestExclusiveModes(t *testing.T) {
 		t.Fatalf("NewAuthorizer(built-in): %v", err)
 	}
 	for _, action := range actions {
-		ok, err := builtin.Authorize(ctx, builtinToken, action, "repo-alpha")
-		if !ok || err != nil {
-			t.Fatalf("built-in mode refused action %q to its own admin token: ok=%v, err=%v", action, ok, err)
+		if err := builtin.Authorize(ctx, builtinToken, onlyAction(action), "repo-alpha"); err != nil {
+			t.Fatalf("built-in mode refused action %q to its own admin token: err=%v", action, err)
 		}
 	}
 
@@ -78,8 +94,8 @@ func TestExclusiveModes(t *testing.T) {
 		t.Fatalf("NewAuthorizer(delegated): %v", err)
 	}
 	for _, action := range actions {
-		ok, err := delegated.Authorize(ctx, builtinToken, action, "repo-alpha")
-		if ok {
+		err := delegated.Authorize(ctx, builtinToken, onlyAction(action), "repo-alpha")
+		if err == nil {
 			t.Errorf("delegated mode granted action %q to a built-in token; under a trust key the built-in store must not be consulted", action)
 		}
 		// Forbidden would mean the scopes were read out of the built-in store and
@@ -104,9 +120,9 @@ func TestExclusiveModes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignCapability: %v", err)
 	}
-	ok, err := builtin.Authorize(ctx, capToken, auth.ActionRead, "repo-alpha")
-	if ok || !errors.Is(err, auth.ErrUnauthorized) {
-		t.Errorf("built-in mode accepted a capability token: ok=%v, err=%v", ok, err)
+	err = builtin.Authorize(ctx, capToken, auth.Actions{Read: true}, "repo-alpha")
+	if !errors.Is(err, auth.ErrUnauthorized) {
+		t.Errorf("built-in mode accepted a capability token: err=%v", err)
 	}
 }
 

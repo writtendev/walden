@@ -3,7 +3,10 @@ package githttp
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -228,6 +231,74 @@ func TestEnsureRepoForPushRefusesReadOnlyExistingRepo(t *testing.T) {
 			}
 			if strings.ContainsAny(err.Error(), "\n\r") {
 				t.Errorf("refusal is not a single line: %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestEnsureRepoForPushConcurrentCreatorsAllSucceed drives the race PR #35's round-2 review
+// found rather than reasoning about it: several rwc:* pushes reaching the same missing
+// repository at once. Before the fix, store.CreateRepo's ErrRepoExists passed straight
+// through as a refusal telling every loser to "push to the existing repository instead of
+// creating it" — the exact push that had just failed. Every authorized caller must come out
+// of ensureRepoForPush able to push, against a repository created exactly once, with no
+// loser's .create-* temporary directory left behind.
+func TestEnsureRepoForPushConcurrentCreatorsAllSucceed(t *testing.T) {
+	ctx := context.Background()
+	const n = 8
+
+	for name, p := range mountAuthorizers(t, "rwc:*") {
+		t.Run(name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+			h := NewHandler(p.authorizer, s)
+
+			var wg sync.WaitGroup
+			paths := make([]string, n)
+			errs := make([]error, n)
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					paths[i], errs[i] = h.ensureRepoForPush(ctx, p.token, "racer")
+				}(i)
+			}
+			wg.Wait()
+
+			wantPath, err := s.RepoPath("racer")
+			if err != nil {
+				t.Fatalf("RepoPath: %v", err)
+			}
+
+			for i := 0; i < n; i++ {
+				if errs[i] != nil {
+					t.Errorf("ensureRepoForPush[%d] = %v, want nil (an authorized caller must not be refused for losing a creation race)", i, errs[i])
+				}
+				if paths[i] != wantPath {
+					t.Errorf("ensureRepoForPush[%d] path = %q, want %q", i, paths[i], wantPath)
+				}
+			}
+
+			exists, err := s.RepoExists(ctx, "racer")
+			if err != nil {
+				t.Fatalf("RepoExists: %v", err)
+			}
+			if !exists {
+				t.Fatalf("RepoExists after concurrent creators = false, want true")
+			}
+
+			// The repository was created exactly once and no loser's temporary directory
+			// survived: the data directory holds only "racer.git", nothing else.
+			entries, err := os.ReadDir(dataDir)
+			if err != nil {
+				t.Fatalf("ReadDir(%q): %v", dataDir, err)
+			}
+			if len(entries) != 1 || entries[0].Name() != filepath.Base(wantPath) {
+				names := make([]string, len(entries))
+				for i, e := range entries {
+					names[i] = e.Name()
+				}
+				t.Errorf("data directory entries = %v, want exactly [%q]", names, filepath.Base(wantPath))
 			}
 		})
 	}

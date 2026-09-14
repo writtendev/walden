@@ -27,6 +27,14 @@ import (
 // naming 'w', because auth.Missing reports the first missing action in canonical r, w, c
 // order — so neither refusal ever misdescribes what the token is short of.
 //
+// A lost creation race is success, not refusal. store.ErrRepoExists can only reach this point
+// when exists was false above and another push for the same repo won CreateRepo's publishing
+// rename in between — a second rwc:* push arriving while the first is still running git init.
+// The caller already cleared Authorize with Create, demonstrating it holds the create scope;
+// now that the repository exists, the Write it also holds is all §3.4 requires, so the push
+// proceeds against the winner's repository instead of being told to retry the exact push that
+// just failed. Any other CreateRepo error still refuses.
+//
 // ensureRepoForPush has no caller yet: WALD-52 wires it into
 // POST /{repo}/git-receive-pack once that handler has a token to pass it. It is fully
 // exercised by its own tests here.
@@ -51,7 +59,7 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 	}
 
 	if !exists {
-		if err := h.store.CreateRepo(ctx, repo); err != nil {
+		if err := h.store.CreateRepo(ctx, repo); err != nil && !errors.Is(err, store.ErrRepoExists) {
 			return "", err
 		}
 	}

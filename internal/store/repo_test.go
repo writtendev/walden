@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/writtendev/walden/internal/auth"
@@ -464,4 +465,68 @@ func TestClassifyRenameFailure(t *testing.T) {
 			t.Errorf("ClassifyRenameFailureForTest(%v) = %v, want errors.Is store.ErrStoreUnavailable", renameErr, err)
 		}
 	})
+}
+
+// TestCreateRepoConcurrentCreatorsExactlyOneWins pins CreateRepo's own doc comment claim — "a
+// concurrent creator that won the race makes the rename fail onto a non-empty directory" —
+// against a real race instead of a synthesized rename error. TestClassifyRenameFailure above
+// confirms the classification once ENOTEMPTY happens; this drives N goroutines at the same
+// missing repository so ENOTEMPTY (or EEXIST) actually happens, the way PR #35's round-2
+// review ran it by hand.
+func TestCreateRepoConcurrentCreatorsExactlyOneWins(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.CreateRepo(ctx, "racer")
+		}(i)
+	}
+	wg.Wait()
+
+	wins, losses := 0, 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			wins++
+		case errors.Is(err, store.ErrRepoExists):
+			losses++
+		default:
+			t.Errorf("CreateRepo[%d] = %v, want nil or errors.Is store.ErrRepoExists", i, err)
+		}
+	}
+	if wins != 1 {
+		t.Errorf("concurrent CreateRepo winners = %d, want exactly 1", wins)
+	}
+	if losses != n-1 {
+		t.Errorf("concurrent CreateRepo losses = %d, want %d", losses, n-1)
+	}
+
+	// No loser's .create-* temporary directory survives: the data directory holds only the
+	// winner's published repository.
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", dataDir, err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "racer.git" {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("data directory entries = %v, want exactly [%q] (no .create-* residue)", names, "racer.git")
+	}
+
+	exists, err := s.RepoExists(ctx, "racer")
+	if err != nil {
+		t.Fatalf("RepoExists: %v", err)
+	}
+	if !exists {
+		t.Errorf("RepoExists after concurrent creators = false, want true")
+	}
 }

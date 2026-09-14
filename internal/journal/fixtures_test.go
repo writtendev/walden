@@ -3,6 +3,7 @@ package journal_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -317,11 +318,11 @@ func TestFixtureRepoStreams(t *testing.T) {
 	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
 
 	alpha := fixtureStreamRecords(t, fixtureRepoStream)
-	if len(alpha) != 4 {
-		t.Fatalf("repo-alpha has %d transactions, want 4", len(alpha))
+	if len(alpha) != 5 {
+		t.Fatalf("repo-alpha has %d transactions, want 5", len(alpha))
 	}
 
-	wantEpochs := []journal.Epoch{0, 0, 0, 1}
+	wantEpochs := []journal.Epoch{0, 0, 0, 1, 1}
 	for i, rec := range alpha {
 		if err := chain.VerifyRefTx(rec); err != nil {
 			t.Errorf("repo-alpha seq %d failed signature verification: %v", rec.Seq, err)
@@ -340,9 +341,11 @@ func TestFixtureRepoStreams(t *testing.T) {
 		t.Errorf("repo-alpha seq 0 carries %d segments, want 1", len(alpha[0].Segments))
 	}
 
-	// seq 1: one transaction moving two refs atomically.
-	if len(alpha[1].Updates) != 2 {
-		t.Errorf("repo-alpha seq 1 has %d updates, want 2", len(alpha[1].Updates))
+	// seq 1: one transaction moving two refs and creating a tag that is never
+	// touched again — the ref recoverable only because the marker below carries
+	// the ref set rather than just a replay-from sequence (WALD-97).
+	if len(alpha[1].Updates) != 3 {
+		t.Errorf("repo-alpha seq 1 has %d updates, want 3", len(alpha[1].Updates))
 	}
 
 	// seq 2: a branch delete introduces no objects, so segments is empty.
@@ -361,6 +364,16 @@ func TestFixtureRepoStreams(t *testing.T) {
 	}
 	if alpha[3].Updates[0].OldOID != alpha[1].Updates[0].NewOID {
 		t.Error("repo-alpha seq 3 does not force-update the tip left by seq 1")
+	}
+
+	// seq 4: main advances again, past the marker baseline (seq 3, below). Its
+	// old_oid only resolves for a reader that actually applied the marker's ref
+	// set, which is the continuity check the marker path could not make before.
+	if alpha[4].Updates[0].Ref != "refs/heads/main" {
+		t.Errorf("repo-alpha seq 4 updates %q, want refs/heads/main", alpha[4].Updates[0].Ref)
+	}
+	if alpha[4].Updates[0].OldOID != alpha[3].Updates[0].NewOID {
+		t.Error("repo-alpha seq 4 does not continue from the tip left by seq 3")
 	}
 
 	// Ruling 2: an opaque stream identifier keeps its own counter, starting at zero.
@@ -447,9 +460,10 @@ func (p *fixtureReplay) requireCommittish(rec *journal.RefTransactionRecord, ref
 }
 
 // apply replays one ref transaction: unpack the segments it references, resolve every
-// object ID it names, then move the refs. trackRefs is false on the marker path, where
-// the snapshot supplies the objects but the marker carries no ref state to check against.
-func (p *fixtureReplay) apply(rec *journal.RefTransactionRecord, trackRefs bool) {
+// object ID it names, then move the refs. The marker path seeds p.refs from the
+// marker's own ref set (WALD-97) before calling apply, so both replay paths track ref
+// state identically from here on; neither needs an escape hatch that skips tracking.
+func (p *fixtureReplay) apply(rec *journal.RefTransactionRecord) {
 	p.t.Helper()
 	for _, hash := range rec.Segments {
 		p.unpack(journal.SegmentKey(rec.Stream, hash))
@@ -460,9 +474,6 @@ func (p *fixtureReplay) apply(rec *journal.RefTransactionRecord, trackRefs bool)
 		}
 		if !isZeroOID(u.NewOID) {
 			p.requireCommittish(rec, u.Ref, u.NewOID)
-		}
-		if !trackRefs {
-			continue
 		}
 		current, exists := p.refs[u.Ref]
 		switch {
@@ -505,10 +516,8 @@ func (p *fixtureReplay) commitsAndTags() []string {
 // well-formed, and every link one of them makes resolvable.
 //
 // Every commit and tag in the database is named as a starting point, because git follows
-// links only out of the tips it is given. A replay from the marker has no refs to give it,
-// and a bare `git fsck` there walks nothing and passes an object database that is missing
-// half its history. Naming the objects the database already holds asks the question
-// without reconstructing ref state, which the marker does not carry.
+// links only out of the tips it is given, and naming the objects the database already
+// holds asks the question without depending on publish() having run first.
 func (p *fixtureReplay) fsck() {
 	p.t.Helper()
 	args := append([]string{"fsck", "--strict", "--no-progress", "--no-dangling"}, p.commitsAndTags()...)
@@ -534,28 +543,37 @@ func (p *fixtureReplay) publish() {
 
 // TestFixtureReplay materializes the golden journal with the real git binary, both from
 // sequence 0 and from the section 7.5 marker. Both paths assert that every object
-// identifier the transactions name is present and is a commit, and both fsck the object
-// database they leave behind; only the replay from sequence 0 reconstructs ref state and
-// checks that the refs land where the journal says they land, because a marker carries a
-// baseline sequence and a snapshot and no ref state to check against. A well-formed
-// record pointing at an object its packs do not hold is exactly the defect these fixtures
-// exist to rule out, and nothing short of resolving the packs can see it.
+// identifier the transactions name is present and is a commit, both reconstruct ref
+// state and check that the refs land where the journal says they land, and both fsck
+// the object database they leave behind. The marker path can reconstruct ref state at
+// all only because the marker itself now carries the authoritative ref set as of its
+// baseline sequence (WALD-97); before that, "from sequence 0" was the only path that
+// could assert final ref state, and this test's "Done when" is the two paths agreeing:
+// the marker path must arrive at exactly the ref map the genesis path does. A
+// well-formed record pointing at an object its packs do not hold is exactly the defect
+// these fixtures exist to rule out, and nothing short of resolving the packs can see it.
 func TestFixtureReplay(t *testing.T) {
+	var genesisRefs map[string]string
+
 	t.Run("from_genesis", func(t *testing.T) {
 		records := fixtureStreamRecords(t, fixtureRepoStream)
 		alpha := newFixtureReplay(t)
 		for _, rec := range records {
-			alpha.apply(rec, true)
+			alpha.apply(rec)
 		}
 		alpha.publish()
+		genesisRefs = alpha.refs
 
-		// After the whole stream, main stands where seq 3 left it and the branch that
-		// seq 2 deleted is gone.
-		if got, want := alpha.refs["refs/heads/main"], records[3].Updates[0].NewOID; got != want {
+		// After the whole stream, main stands where seq 4 left it, the tag seq 1
+		// created is still there untouched, and the branch seq 2 deleted is gone.
+		if got, want := alpha.refs["refs/heads/main"], records[4].Updates[0].NewOID; got != want {
 			t.Errorf("replayed refs/heads/main = %q, want %q", got, want)
 		}
-		if len(alpha.refs) != 1 {
-			t.Errorf("replayed repo-alpha holds %d refs, want only refs/heads/main: %v", len(alpha.refs), alpha.refs)
+		if got, want := alpha.refs["refs/tags/v0.1"], records[1].Updates[2].NewOID; got != want {
+			t.Errorf("replayed refs/tags/v0.1 = %q, want %q", got, want)
+		}
+		if len(alpha.refs) != 2 {
+			t.Errorf("replayed repo-alpha holds %d refs, want refs/heads/main and refs/tags/v0.1: %v", len(alpha.refs), alpha.refs)
 		}
 
 		// seq 3 is a force update: its new tip is not a descendant of the tip it
@@ -571,7 +589,7 @@ func TestFixtureReplay(t *testing.T) {
 		// The opaque stream replays on its own, from its own sequence 0.
 		opaque := newFixtureReplay(t)
 		for _, rec := range fixtureStreamRecords(t, fixtureOpaqueStream) {
-			opaque.apply(rec, true)
+			opaque.apply(rec)
 		}
 		opaque.publish()
 		if len(opaque.refs) != 2 {
@@ -589,10 +607,22 @@ func TestFixtureReplay(t *testing.T) {
 			t.Fatalf("ParseMarker failed on the golden marker: %v", err)
 		}
 
-		// Section 7.5: apply the snapshot, set the baseline, resume at sequence + 1, and
-		// ignore everything the snapshot supersedes rather than treating it as corruption.
+		// Section 7.5: verify the marker's signature against the key its own key_epoch
+		// names in the chain, before trusting any field on it — including the ref set
+		// the rest of this subtest is about to seed replay state from.
+		chain := loadFixtureChain(t, fixtureMetaHeadSeq)
+		if err := chain.VerifyMarker(marker); err != nil {
+			t.Fatalf("VerifyMarker failed on the golden marker: %v", err)
+		}
+
+		// Apply the snapshot, set exactly the marker's refs and no others, seed the
+		// epoch floor, and resume replay at sequence + 1 — ignoring everything the
+		// snapshot supersedes rather than treating it as corruption.
 		replay := newFixtureReplay(t)
 		replay.unpack(journal.SnapshotKey(fixtureRepoStream, marker.Snapshot))
+		for _, ref := range marker.Refs {
+			replay.refs[ref.Ref] = ref.OID
+		}
 
 		resumed := 0
 		for _, rec := range fixtureStreamRecords(t, fixtureRepoStream) {
@@ -603,17 +633,35 @@ func TestFixtureReplay(t *testing.T) {
 				t.Fatalf("replay from the marker hit sequence %d, want %d", rec.Seq, want)
 			}
 			resumed++
-			// The marker carries a baseline sequence and a snapshot, and no ref state, so
-			// this path resolves objects without a prior ref map to check them against.
-			replay.apply(rec, false)
+			// chain.VerifyRefTx sees the epoch floor VerifyMarker seeded above, so a
+			// record naming an epoch below it would be refused here exactly as one
+			// below a floor raised by an earlier ref transaction would be (WALD-96,
+			// WALD-97).
+			if err := chain.VerifyRefTx(rec); err != nil {
+				t.Errorf("repo-alpha seq %d failed signature verification on the marker-seeded chain: %v", rec.Seq, err)
+			}
+			replay.apply(rec)
 		}
 		if resumed == 0 {
 			t.Fatal("the marker leaves no transactions to replay, so this proves nothing")
 		}
-		// The marker path has no ref state to publish, but the snapshot and the segments
-		// it resumed with leave an object database behind, and git answers for that one
-		// the same way it answers for the replay from genesis.
-		replay.fsck()
+		replay.publish()
+
+		// "Done when" item 5: a reader built from the spec prose alone recovers
+		// identical ref state from the genesis path and the marker path. Deleting the
+		// refs field from the committed marker.json by hand must make this fail — if
+		// it still passes, this assertion is not doing the work.
+		if len(genesisRefs) == 0 {
+			t.Fatal("from_genesis did not run first, so there is nothing to compare against")
+		}
+		if len(replay.refs) != len(genesisRefs) {
+			t.Errorf("marker-path replay holds %d refs, genesis-path replay holds %d: %v vs %v", len(replay.refs), len(genesisRefs), replay.refs, genesisRefs)
+		}
+		for ref, oid := range genesisRefs {
+			if got := replay.refs[ref]; got != oid {
+				t.Errorf("marker-path replay: %s = %q, want %q (from the genesis-path replay)", ref, got, oid)
+			}
+		}
 	})
 }
 
@@ -707,6 +755,18 @@ func TestFixtureMarkerAndSupersededHistory(t *testing.T) {
 		t.Fatalf("ValidateSnapshot failed on the golden snapshot: %v", err)
 	}
 
+	// Section 7.3's third guarantee: every object the marker's ref set names is
+	// carried by the snapshot pack the same marker names.
+	snapshotRepo := newGitRepo(t)
+	if _, err := snapshotRepo.tryRun(snapshot, "unpack-objects", "-q"); err != nil {
+		t.Fatalf("snapshot pack is not something git can unpack: %v", err)
+	}
+	for _, ref := range marker.Refs {
+		if _, err := snapshotRepo.tryRun(nil, "cat-file", "-e", ref.OID); err != nil {
+			t.Errorf("marker names %s at %s, which the snapshot pack does not carry: %v", ref.Ref, ref.OID, err)
+		}
+	}
+
 	// Superseded history is still on disk, and replay resumes at marker.sequence + 1.
 	records := fixtureStreamRecords(t, fixtureRepoStream)
 	if marker.Sequence == 0 || marker.Sequence >= journal.Seq(len(records)-1) {
@@ -728,10 +788,107 @@ func TestFixtureMarkerAndSupersededHistory(t *testing.T) {
 		t.Error("expected the fixture journal to retain transactions the snapshot supersedes")
 	}
 
+	// This is the case WALD-97 exists to cover, and the only thing that proves it
+	// worked: at least one ref in the marker's set is never touched again after
+	// the baseline sequence, so a reader resuming replay at marker.sequence + 1
+	// could never otherwise learn that ref exists.
+	lastTouch := make(map[string]journal.Seq)
+	touchedAfterBaseline := make(map[string]bool)
+	for _, rec := range records {
+		for _, u := range rec.Updates {
+			lastTouch[u.Ref] = rec.Seq
+			if rec.Seq > marker.Sequence {
+				touchedAfterBaseline[u.Ref] = true
+			}
+		}
+	}
+	recoverableOnlyByMarker := 0
+	for _, ref := range marker.Refs {
+		if _, ok := lastTouch[ref.Ref]; !ok {
+			t.Errorf("marker names ref %s, which no transaction ever touches", ref.Ref)
+			continue
+		}
+		if !touchedAfterBaseline[ref.Ref] {
+			recoverableOnlyByMarker++
+		}
+	}
+	if recoverableOnlyByMarker == 0 {
+		t.Error("expected at least one marker ref that is never touched again after the baseline sequence — the case this ticket closes")
+	}
+
+	// key_epoch_floor must equal the highest key_epoch any record at or before
+	// the baseline sequence carries: the floor a replay resumed from this marker
+	// seeds LastEpoch with (spec section 7.2, 7.5).
+	var wantFloor journal.Epoch
+	for _, rec := range records {
+		if rec.Seq > marker.Sequence {
+			continue
+		}
+		if rec.KeyEpoch > wantFloor {
+			wantFloor = rec.KeyEpoch
+		}
+	}
+	if marker.KeyEpochFloor != wantFloor {
+		t.Errorf("marker key_epoch_floor = %d, want %d (the highest key_epoch among records at or before sequence %d)", marker.KeyEpochFloor, wantFloor, marker.Sequence)
+	}
+
 	// The opaque stream has never been compacted: no marker means replay from seq 0.
 	opaqueMarker := fixtureKeyPath(journal.MarkerKey(fixtureOpaqueStream))
 	if _, err := os.Stat(opaqueMarker); !os.IsNotExist(err) {
 		t.Errorf("expected the opaque stream to have no marker, stat returned %v", err)
+	}
+}
+
+// TestFixtureMarkerSeedsEpochFloorAgainstForgedRecord is WALD-97's epoch-floor defect in
+// two assertions. A chain that verifies the golden marker learns that repo-alpha's history
+// carries epoch 1 as of the baseline, so a record forged past that baseline with the
+// leaked, already-retired genesis key (epoch 0) is refused — rule 15 (section 8.1) with a
+// floor that actually survived compaction. The same forged record verifies cleanly against
+// a chain that never saw the marker, which is exactly the hole this ticket closes: before
+// WALD-97, every resumed replay looked like the unseeded chain below, regardless of what
+// the stream's real history reached.
+func TestFixtureMarkerSeedsEpochFloorAgainstForgedRecord(t *testing.T) {
+	data, err := os.ReadFile(fixtureKeyPath(journal.MarkerKey(fixtureRepoStream)))
+	if err != nil {
+		t.Fatalf("failed to read marker fixture: %v", err)
+	}
+	marker, err := journal.ParseMarker(data)
+	if err != nil {
+		t.Fatalf("ParseMarker failed on the golden marker: %v", err)
+	}
+
+	// A leaked genesis key forges a record naming its own (retired) epoch, placed just
+	// past the marker's baseline sequence.
+	forged := &journal.RefTransactionRecord{
+		Version:  journal.VersionPrefix,
+		Stream:   fixtureRepoStream,
+		Seq:      marker.Sequence + 1,
+		Type:     journal.RecordTypeRefUpdate,
+		KeyEpoch: 0,
+		Updates: []journal.RefUpdate{
+			{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "8a65c6d3715c0e1e92d6e3e5362e49c7198cfb60"},
+		},
+		Timestamp: "2026-08-31T00:59:00Z",
+	}
+	if err := journal.SignRefTx(fixtureKey(0x01), forged); err != nil {
+		t.Fatalf("SignRefTx with the genesis key failed: %v", err)
+	}
+
+	// Seeded from the marker: the floor is 1, and the forged record's epoch 0 is refused.
+	seeded := loadFixtureChain(t, fixtureMetaHeadSeq)
+	if err := seeded.VerifyMarker(marker); err != nil {
+		t.Fatalf("VerifyMarker failed on the golden marker: %v", err)
+	}
+	if err := seeded.VerifyRefTx(forged); !errors.Is(err, journal.ErrKeyEpochRegression) {
+		t.Errorf("expected ErrKeyEpochRegression for the forged record on a marker-seeded chain, got %v", err)
+	}
+
+	// Unseeded: the same chain, replaying the same stream, but never shown the marker.
+	// LastEpoch has nothing to compare against, so the forged record verifies — the
+	// exact defect this ticket closes.
+	unseeded := loadFixtureChain(t, fixtureMetaHeadSeq)
+	if err := unseeded.VerifyRefTx(forged); err != nil {
+		t.Errorf("expected the forged record to verify on an unseeded chain (demonstrating the defect), got %v", err)
 	}
 }
 

@@ -517,10 +517,12 @@ func generateFixtures(w *fixtureWriter) {
 	c1 := repo.commit("", "README.md", "walden fixture repository\n", "first commit")
 	c2 := repo.commit(c1, "README.md", "walden fixture repository\nsecond line\n", "second commit")
 	c3 := repo.commit(c1, "README.md", "walden fixture repository\nrewritten line\n", "rewritten second commit")
+	c4 := repo.commit(c3, "README.md", "walden fixture repository\nrewritten line\nfourth line\n", "fourth commit")
 
 	segC1 := w.writeSegment(fixtureRepoStream, repo.pack(c1))
 	segC2 := w.writeSegment(fixtureRepoStream, repo.pack(c2, "^"+c1))
 	segC3 := w.writeSegment(fixtureRepoStream, repo.pack(c3, "^"+c1))
+	segC4 := w.writeSegment(fixtureRepoStream, repo.pack(c4, "^"+c3))
 
 	// seq 0: first push into an empty repository — the ref is created from the zero OID.
 	// Signed by the genesis key, so key_epoch 0.
@@ -537,7 +539,11 @@ func generateFixtures(w *fixtureWriter) {
 		Timestamp: "2026-08-31T00:02:00Z",
 	})
 
-	// seq 1: fast-forward main and create a second branch in one atomic transaction.
+	// seq 1: fast-forward main, create a second branch, and tag the commit main is
+	// leaving behind — all in one atomic transaction. refs/tags/v0.1 is never touched
+	// again after this: it is the ref whose last update sits at or before the marker
+	// baseline (moved to seq 3 below), recoverable only because the marker now carries
+	// the ref set rather than just a replay-from sequence (WALD-97).
 	w.writeRefTx(genesisKey, &journal.RefTransactionRecord{
 		Version:  journal.VersionPrefix,
 		Stream:   fixtureRepoStream,
@@ -548,6 +554,7 @@ func generateFixtures(w *fixtureWriter) {
 		Updates: []journal.RefUpdate{
 			{Ref: "refs/heads/main", OldOID: c1, NewOID: c2},
 			{Ref: "refs/heads/feature", OldOID: journal.ZeroOID40, NewOID: c2},
+			{Ref: "refs/tags/v0.1", OldOID: journal.ZeroOID40, NewOID: c1},
 		},
 		Timestamp: "2026-08-31T00:03:00Z",
 	})
@@ -568,7 +575,10 @@ func generateFixtures(w *fixtureWriter) {
 
 	// seq 3: force update — main moves to a commit that is not a descendant of its old
 	// tip, and the record is signed by the rotated key that _meta seq 2 activated, so
-	// key_epoch 1 — the whole reason this format needs the field at all (WALD-96).
+	// key_epoch 1 — the whole reason this format needs the field at all (WALD-96). This
+	// is also the marker's baseline sequence below: at seq 3, the highest key_epoch any
+	// repo-alpha record has carried so far is 1, which is what the marker's
+	// key_epoch_floor asserts.
 	w.writeRefTx(rotatedKey, &journal.RefTransactionRecord{
 		Version:  journal.VersionPrefix,
 		Stream:   fixtureRepoStream,
@@ -582,17 +592,48 @@ func generateFixtures(w *fixtureWriter) {
 		Timestamp: "2026-08-31T00:07:00Z",
 	})
 
-	// --- Compaction: a snapshot consolidating everything through seq 1, published
-	// before the marker that points at it. The segments and transactions it supersedes
-	// stay in the fixture tree on purpose; readers must ignore them, not reject them.
-	snapshotHash := w.writeSnapshot(fixtureRepoStream, repo.pack(c2))
+	// seq 4: main advances again, past the marker baseline below, still signed by the
+	// rotated key. Its old_oid of c3 only resolves for a reader replaying from the
+	// marker if that reader actually applied the marker's ref set — the continuity
+	// check the marker path could never make before this ticket.
+	w.writeRefTx(rotatedKey, &journal.RefTransactionRecord{
+		Version:  journal.VersionPrefix,
+		Stream:   fixtureRepoStream,
+		Seq:      4,
+		Type:     journal.RecordTypeRefUpdate,
+		KeyEpoch: 1,
+		Segments: []string{segC4},
+		Updates: []journal.RefUpdate{
+			{Ref: "refs/heads/main", OldOID: c3, NewOID: c4},
+		},
+		Timestamp: "2026-08-31T00:10:00Z",
+	})
+
+	// --- Compaction: a snapshot consolidating everything through seq 3 — past the key
+	// rotation, so one stream demonstrates both halves of WALD-97 at once. The marker
+	// carries the authoritative ref set as of seq 3 (refs/heads/main at c3 and
+	// refs/tags/v0.1 at c1, sorted ascending by ref name) and the epoch floor as of seq 3
+	// (1, the highest key_epoch any record at or before seq 3 carries), signed by the
+	// rotated key that also signed seq 3. The segments and transactions compaction
+	// supersedes stay in the fixture tree on purpose; readers must ignore them, not
+	// reject them.
+	snapshotHash := w.writeSnapshot(fixtureRepoStream, repo.pack(c3))
 
 	marker := &journal.Marker{
-		Version:   journal.VersionPrefix,
-		Stream:    fixtureRepoStream,
-		Sequence:  1,
-		Snapshot:  snapshotHash,
+		Version:       journal.VersionPrefix,
+		Stream:        fixtureRepoStream,
+		Sequence:      3,
+		KeyEpoch:      1,
+		KeyEpochFloor: 1,
+		Snapshot:      snapshotHash,
+		Refs: []journal.MarkerRef{
+			{Ref: "refs/heads/main", OID: c3},
+			{Ref: "refs/tags/v0.1", OID: c1},
+		},
 		Timestamp: "2026-08-31T01:00:00Z",
+	}
+	if err := journal.SignMarker(rotatedKey, marker); err != nil {
+		t.Fatalf("failed to sign marker: %v", err)
 	}
 	markerBytes, err := journal.MarshalMarker(marker)
 	if err != nil {

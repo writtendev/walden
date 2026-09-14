@@ -317,9 +317,13 @@ func VerifyRefTx(r *RefTransactionRecord, activePublicKey string) error {
 // retired key would go on validating records forever.
 //
 // VerifyRefTx mutates c: on success it raises c's per-stream floor to
-// r.KeyEpoch. A SigningChain carries the state of exactly one replay and is
-// not safe for concurrent use — drive it from a single goroutine; do not
-// call VerifyRefTx on the same chain from more than one goroutine at a time.
+// r.KeyEpoch — unless a prior (*SigningChain).VerifyMarker call already seeded
+// a higher floor for this stream from a verified marker's key_epoch_floor
+// (WALD-97), in which case a record naming an epoch below that floor is
+// refused here exactly as one below a floor VerifyRefTx itself raised would
+// be. A SigningChain carries the state of exactly one replay and is not safe
+// for concurrent use — drive it from a single goroutine; do not call
+// VerifyRefTx on the same chain from more than one goroutine at a time.
 func (c *SigningChain) VerifyRefTx(r *RefTransactionRecord) error {
 	if c == nil || !c.initialized {
 		return fmt.Errorf("%w: cannot verify ref transaction before genesis", ErrGenesisMissing)

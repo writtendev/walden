@@ -248,12 +248,14 @@ type SigningChain struct {
 	// repository stream, so that a verified record can never be followed by
 	// one naming an earlier epoch on the same stream within this replay
 	// (WALD-96). The floor is per stream and starts empty for a stream this
-	// replay has not yet walked: it does not carry across a marker-resumed
-	// replay's baseline, and it protects nothing on a stream — new or old —
-	// that has not itself carried a record above epoch 0 in this replay
-	// (spec section 8, section 8.1 rule 15; closing either gap needs
-	// WALD-97's marker work or a floor that is not scoped per stream,
-	// neither of which this map provides).
+	// replay has not yet walked, unless (*SigningChain).VerifyMarker has
+	// already seeded it from a verified marker's key_epoch_floor when replay
+	// resumes from a compaction baseline (WALD-97). It still protects
+	// nothing on a stream — new or old — that has not itself carried a
+	// record above epoch 0 in this replay and carries no marker to seed a
+	// floor from (spec section 8, section 8.1 rule 15's remaining gap;
+	// closing it needs a floor that is not scoped per stream, which this
+	// map does not provide, and no ticket tracks it).
 	lastEpoch map[StreamID]Epoch
 }
 

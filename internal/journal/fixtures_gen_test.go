@@ -38,6 +38,29 @@ import (
 // fixtureGitDate is the fixed author and committer date for every fixture commit.
 const fixtureGitDate = "1767225600 +0000"
 
+// fixtureDecomposedRef and fixturePrecomposedRef are two different byte sequences that
+// render as the identical glyph, refs/heads/caf\u00e9. Section 5.2 of the journal spec
+// says Unicode normalization "permanently breaks signature verification"; until WALD-89
+// no fixture exercised that claim, because every published ref name was ASCII and
+// therefore NFC-invariant. fixtureDecomposedRef is the one the golden journal actually
+// carries, on repo-alpha's seq 1 record and in its marker's ref set. fixturePrecomposedRef
+// never appears anywhere in the fixture tree: the two spellings collide as loose refs on
+// a normalization-insensitive filesystem, so it exists only as a Go literal, used to swap
+// fixtureDecomposedRef out in the negative assertions of
+// TestFixtureNonASCIIRefBreaksOnNormalization.
+//
+// Both are written as \u escapes for their non-ASCII codepoints, not literal UTF-8, so
+// neither ref literal contributes a byte an editor or a tool elsewhere in the chain
+// could normalize.
+const (
+	// fixtureDecomposedRef: "refs/heads/caf" + U+0065 LATIN SMALL LETTER E + U+0301
+	// COMBINING ACUTE ACCENT (UTF-8 ... 63 61 66 65 cc 81).
+	fixtureDecomposedRef = "refs/heads/cafe\u0301"
+	// fixturePrecomposedRef: "refs/heads/caf" + U+00E9 LATIN SMALL LETTER E WITH ACUTE,
+	// the NFC form of fixtureDecomposedRef (UTF-8 ... 63 61 66 c3 a9).
+	fixturePrecomposedRef = "refs/heads/caf\u00e9"
+)
+
 // fixtureKey derives the deterministic Ed25519 signing key whose seed is seedByte repeated.
 func fixtureKey(seedByte byte) ed25519.PrivateKey {
 	seed := make([]byte, ed25519.SeedSize)
@@ -385,13 +408,24 @@ func fixtureTokenHash(rawToken string) string {
 	return journal.TokenHashPrefix + hex.EncodeToString(sum[:])
 }
 
-// writeToken validates and writes a token table mutation on the meta stream. Token records
-// carry no signature, so their own Validate is the only gate between the generator and the
-// fixture tree — which is why it is called here rather than left to the reading tests.
-func (w *fixtureWriter) writeToken(seq journal.Seq, rec interface{ Validate() error }) {
+// writeToken signs and writes a token table mutation on the meta stream, mirroring
+// writeRefTx: priv is the key active at seq, which the caller picks (the genesis key before
+// the seq 2 rotation, the rotated key after it), and SignTokenCreate/SignTokenRevoke
+// validate before signing, so there is nothing left for this to check on its own.
+func (w *fixtureWriter) writeToken(priv ed25519.PrivateKey, seq journal.Seq, rec interface{ Validate() error }) {
 	w.t.Helper()
-	if err := rec.Validate(); err != nil {
-		w.t.Fatalf("failed to validate _meta seq %d: %v", seq, err)
+	var err error
+	switch r := rec.(type) {
+	case *journal.TokenCreateRecord:
+		err = journal.SignTokenCreate(priv, r)
+	case *journal.TokenRevokeRecord:
+		err = journal.SignTokenRevoke(priv, r)
+	default:
+		w.t.Fatalf("writeToken: unsupported record type %T", rec)
+		return
+	}
+	if err != nil {
+		w.t.Fatalf("failed to sign _meta seq %d: %v", seq, err)
 	}
 	w.writeJSON(journal.TxKey(journal.MetaStreamID, seq), rec)
 }
@@ -463,7 +497,7 @@ func generateFixtures(w *fixtureWriter) {
 	adminToken := loadFixtureBuiltinToken(t, fixtureAdminTokenID)
 	writerToken := loadFixtureBuiltinToken(t, fixtureWriterTokenID)
 
-	w.writeToken(1, &journal.TokenCreateRecord{
+	w.writeToken(genesisKey, 1, &journal.TokenCreateRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       1,
@@ -488,7 +522,7 @@ func generateFixtures(w *fixtureWriter) {
 	}
 	w.writeJSON(journal.TxKey(journal.MetaStreamID, rotation.Seq), rotation)
 
-	w.writeToken(3, &journal.TokenRevokeRecord{
+	w.writeToken(rotatedKey, 3, &journal.TokenRevokeRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       3,
@@ -501,7 +535,7 @@ func generateFixtures(w *fixtureWriter) {
 	// A token carrying more than one scope, which is the case a single scope field cannot
 	// hold: spec/auth/v1 section 3.4 opens "a token may carry one or more scopes", and this
 	// is that sentence as bytes on the meta stream.
-	w.writeToken(4, &journal.TokenCreateRecord{
+	w.writeToken(rotatedKey, 4, &journal.TokenCreateRecord{
 		Version:   journal.VersionPrefix,
 		Stream:    journal.MetaStreamID,
 		Seq:       4,
@@ -517,10 +551,12 @@ func generateFixtures(w *fixtureWriter) {
 	c1 := repo.commit("", "README.md", "walden fixture repository\n", "first commit")
 	c2 := repo.commit(c1, "README.md", "walden fixture repository\nsecond line\n", "second commit")
 	c3 := repo.commit(c1, "README.md", "walden fixture repository\nrewritten line\n", "rewritten second commit")
+	c4 := repo.commit(c3, "README.md", "walden fixture repository\nrewritten line\nfourth line\n", "fourth commit")
 
 	segC1 := w.writeSegment(fixtureRepoStream, repo.pack(c1))
 	segC2 := w.writeSegment(fixtureRepoStream, repo.pack(c2, "^"+c1))
 	segC3 := w.writeSegment(fixtureRepoStream, repo.pack(c3, "^"+c1))
+	segC4 := w.writeSegment(fixtureRepoStream, repo.pack(c4, "^"+c3))
 
 	// seq 0: first push into an empty repository — the ref is created from the zero OID.
 	// Signed by the genesis key, so key_epoch 0.
@@ -537,7 +573,15 @@ func generateFixtures(w *fixtureWriter) {
 		Timestamp: "2026-08-31T00:02:00Z",
 	})
 
-	// seq 1: fast-forward main and create a second branch in one atomic transaction.
+	// seq 1: fast-forward main, create a second branch, tag the commit main is leaving
+	// behind, and create a fourth ref whose name is deliberately not NFC-invariant — all
+	// in one atomic transaction. refs/tags/v0.1 and fixtureDecomposedRef are never
+	// touched again after this: both are refs whose last update sits at or before the
+	// marker baseline (moved to seq 3 below), recoverable only because the marker now
+	// carries the ref set rather than just a replay-from sequence (WALD-97).
+	// fixtureDecomposedRef additionally demonstrates section 5.2's byte-preservation
+	// rule: it points at the same commit main started this push at, costing no new pack
+	// (WALD-89).
 	w.writeRefTx(genesisKey, &journal.RefTransactionRecord{
 		Version:  journal.VersionPrefix,
 		Stream:   fixtureRepoStream,
@@ -548,6 +592,8 @@ func generateFixtures(w *fixtureWriter) {
 		Updates: []journal.RefUpdate{
 			{Ref: "refs/heads/main", OldOID: c1, NewOID: c2},
 			{Ref: "refs/heads/feature", OldOID: journal.ZeroOID40, NewOID: c2},
+			{Ref: "refs/tags/v0.1", OldOID: journal.ZeroOID40, NewOID: c1},
+			{Ref: fixtureDecomposedRef, OldOID: journal.ZeroOID40, NewOID: c1},
 		},
 		Timestamp: "2026-08-31T00:03:00Z",
 	})
@@ -568,7 +614,10 @@ func generateFixtures(w *fixtureWriter) {
 
 	// seq 3: force update — main moves to a commit that is not a descendant of its old
 	// tip, and the record is signed by the rotated key that _meta seq 2 activated, so
-	// key_epoch 1 — the whole reason this format needs the field at all (WALD-96).
+	// key_epoch 1 — the whole reason this format needs the field at all (WALD-96). This
+	// is also the marker's baseline sequence below: at seq 3, the highest key_epoch any
+	// repo-alpha record has carried so far is 1, which is what the marker's
+	// key_epoch_floor asserts.
 	w.writeRefTx(rotatedKey, &journal.RefTransactionRecord{
 		Version:  journal.VersionPrefix,
 		Stream:   fixtureRepoStream,
@@ -582,17 +631,53 @@ func generateFixtures(w *fixtureWriter) {
 		Timestamp: "2026-08-31T00:07:00Z",
 	})
 
-	// --- Compaction: a snapshot consolidating everything through seq 1, published
-	// before the marker that points at it. The segments and transactions it supersedes
-	// stay in the fixture tree on purpose; readers must ignore them, not reject them.
-	snapshotHash := w.writeSnapshot(fixtureRepoStream, repo.pack(c2))
+	// seq 4: main advances again, past the marker baseline below, still signed by the
+	// rotated key. Its old_oid of c3 only resolves for a reader replaying from the
+	// marker if that reader actually applied the marker's ref set — the continuity
+	// check the marker path could never make before this ticket.
+	w.writeRefTx(rotatedKey, &journal.RefTransactionRecord{
+		Version:  journal.VersionPrefix,
+		Stream:   fixtureRepoStream,
+		Seq:      4,
+		Type:     journal.RecordTypeRefUpdate,
+		KeyEpoch: 1,
+		Segments: []string{segC4},
+		Updates: []journal.RefUpdate{
+			{Ref: "refs/heads/main", OldOID: c3, NewOID: c4},
+		},
+		Timestamp: "2026-08-31T00:10:00Z",
+	})
+
+	// --- Compaction: a snapshot consolidating everything through seq 3 — past the key
+	// rotation, so one stream demonstrates both halves of WALD-97 at once. The marker
+	// carries the authoritative ref set as of seq 3 (fixtureDecomposedRef and
+	// refs/tags/v0.1 at c1, refs/heads/main at c3, sorted ascending by the raw bytes of
+	// ref name — fixtureDecomposedRef sorts first) and the epoch floor as of seq 3
+	// (1, the highest key_epoch any record at or before seq 3 carries), signed by the
+	// rotated key that also signed seq 3. The segments and transactions compaction
+	// supersedes stay in the fixture tree on purpose; readers must ignore them, not
+	// reject them. Carrying fixtureDecomposedRef here too means the same non-NFC-
+	// invariant byte sequence is signed on a second, independent surface — the one a
+	// reader reaches on the resume path, which trusts the marker's own bytes rather
+	// than replaying them (WALD-89).
+	snapshotHash := w.writeSnapshot(fixtureRepoStream, repo.pack(c3))
 
 	marker := &journal.Marker{
-		Version:   journal.VersionPrefix,
-		Stream:    fixtureRepoStream,
-		Sequence:  1,
-		Snapshot:  snapshotHash,
+		Version:       journal.VersionPrefix,
+		Stream:        fixtureRepoStream,
+		Sequence:      3,
+		KeyEpoch:      1,
+		KeyEpochFloor: 1,
+		Snapshot:      snapshotHash,
+		Refs: []journal.MarkerRef{
+			{Ref: fixtureDecomposedRef, OID: c1},
+			{Ref: "refs/heads/main", OID: c3},
+			{Ref: "refs/tags/v0.1", OID: c1},
+		},
 		Timestamp: "2026-08-31T01:00:00Z",
+	}
+	if err := journal.SignMarker(rotatedKey, marker); err != nil {
+		t.Fatalf("failed to sign marker: %v", err)
 	}
 	markerBytes, err := journal.MarshalMarker(marker)
 	if err != nil {

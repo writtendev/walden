@@ -21,6 +21,12 @@ var (
 	ErrExpired          = errors.New("capability expired")
 	ErrNotYetValid      = errors.New("capability not yet valid")
 	ErrInvalidSignature = errors.New("invalid signature")
+	// ErrCreateForbidden marks a forbidden refusal whose missing action is specifically
+	// create ('c'). ForbiddenRefusal attaches it, joined with ErrForbidden, when the missing
+	// action is ActionCreate, so a caller deciding whether a push may create a repository
+	// can tell "lacks w" from "has w, lacks c" with errors.Is instead of parsing the refusal
+	// text.
+	ErrCreateForbidden = errors.New("missing create scope")
 
 	// ErrTokenExists marks a TokenStore.CreateToken refusal: a record already exists with the
 	// given TokenID or TokenHash. CreateToken never overwrites, so a create is always a
@@ -127,11 +133,20 @@ func checkRequired(required Actions) error {
 }
 
 // ForbiddenRefusal creates a single-line refusal when a token lacks sufficient scope.
+//
+// When action is ActionCreate, the refusal's cause joins ErrForbidden with ErrCreateForbidden
+// so a caller can distinguish "lacks create" from any other forbidden refusal via errors.Is,
+// without this changing the rendered message: Refusal.Err is only ever consulted by
+// errors.Is, never printed.
 func ForbiddenRefusal(action Action, repo string) error {
+	cause := error(ErrForbidden)
+	if action == ActionCreate {
+		cause = errors.Join(ErrForbidden, ErrCreateForbidden)
+	}
 	return refusal.RefuseWithCause(
 		"forbidden",
 		fmt.Sprintf("token does not grant action %q on repository %q", action, repo),
 		fmt.Sprintf("request scope '%s:%s' from administrator or issuer", action, repo),
-		ErrForbidden,
+		cause,
 	)
 }

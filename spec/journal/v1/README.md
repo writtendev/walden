@@ -60,8 +60,8 @@ The server's signing identity is born with the journal and lives in it:
   - **Private Key:** Stored locally on server disk alongside the token store; never written to object storage.
 
 ### 2.2 Security Model and Honest Boundaries
-- **Tamper-Evidence, Not Server Trust:** Journal signing provides **tamper-evidence of the history, not protection from a malicious server.** A server that holds the signing key and wishes to lie can sign its lies. Signing guarantees that once written, history in object storage cannot be altered, forged, or spliced by unauthorized third parties or storage providers without failing cryptographic verification — with the one exception named immediately below.
-- **One Named Exception — Token Records Are Unsigned in v1:** The guarantee above holds for every record this format signs: key rotations chain to genesis, and ref transactions verify against the key that was active when they were written — named explicitly by the record's own `key_epoch` (section 5.1), so a reader never has to guess which key that was from timing alone. It does **not** hold for the `token_create` and `token_revoke` records of sections 4.3 and 4.4, which carry no signature in v1. A third party who can write to the bucket can append a `token_create` and a replay rebuilds it as a live grant — a working credential, because the hash the record names is the value a server looks a request up by — without failing any check this specification defines. That is a different party from the malicious server conceded above: the exception covers exactly the party the guarantee otherwise excludes, so it is named here rather than left for a reader to discover in section 4.5. Closing the gap means giving both record types a canonical payload and a signature, so that a forged or tampered token record fails verification like any other record; that is a format change, and this document does not define it. Until such a change lands, tamper-evidence for the token table rests on the bucket's own access control and not on this signing identity.
+- **Tamper-Evidence, Not Server Trust:** Journal signing provides **tamper-evidence of the history, not protection from a malicious server.** A server that holds the signing key and wishes to lie can sign its lies. Signing guarantees that once written, history in object storage cannot be altered, forged, or spliced by unauthorized third parties or storage providers without failing cryptographic verification.
+- **Every Record Is Signed Except the One That Cannot Be:** Key rotations chain to genesis; ref transactions verify against the key that was active when they were written, named explicitly by the record's own `key_epoch` (section 5.1) so a reader never has to guess which key that was from timing alone; the marker verifies the same way against its own `key_epoch` (section 7.2); and `token_create` and `token_revoke` (sections 4.3, 4.4) verify against the key active at the meta sequence they were written to (section 4.3's canonical payload note; section 8, step 2). The genesis record is the one exception, and it is structural rather than a gap left open: it *establishes* the signing identity everything else in the journal chains to, so there is no prior key in this journal for it to be signed with. Nothing else this specification defines is unsigned, and a third party who can write to the bucket cannot append a working `token_create`, a moved ref, or a rewritten marker without failing verification.
 - **Permanent Private Key Loss:** Losing the private signing key is an unrecoverable-for-signing state. The server can no longer accept new writes or append new records. Existing history in the bucket remains permanently readable, verifiable from genesis forward, and fully restorable.
 
 ---
@@ -181,7 +181,8 @@ A built-in token is minted by the server's own CLI, and the server stores its ha
   "scopes": [
     "rwc:*"
   ],
-  "timestamp": "2026-08-31T00:01:00Z"
+  "timestamp": "2026-08-31T00:01:00Z",
+  "signature": "ed25519:cef6207dd61108ad67d6381822e3e47fa100b220f62132432e233f3bc339e27d8a46fb2035d99bd3b7d568d2b413e0eb27886458de4dbd8bbdeff6dc799d5108"
 }
 ```
 
@@ -196,8 +197,9 @@ This is the golden journal's own token creation record, byte for byte:
 | `type` | string | MUST be `"token_create"`. |
 | `token_id` | string | Stable identifier for the token, matching `^[a-zA-Z0-9._-]+$` (max 255 bytes) — the same character class a stream ID uses, so it is safe unescaped in a key, a log line, and a one-line refusal. Unique within the journal: an identifier is never reused. |
 | `token_hash` | string | The stored hash of the raw bearer token, `sha256:<64-lowercase-hex>`. Lowercase is required, not folded, because the value is compared byte for byte against the hash a request produces. |
-| `scopes` | array of strings | One or more scope strings the token was minted with, in the order minted. Each MUST be a non-empty string, and no string may repeat. |
+| `scopes` | array of strings | One or more scope strings the token was minted with, in the order minted. Each MUST be a non-empty string containing no ASCII control character (`0x00`-`0x1F` or `0x7F`, the newline included) — the same character-class ban section 5.2 states for a ref name, and for the same reason: the Canonical Token Creation Signing Payload below frames one scope per line, and a scope carrying that line's own delimiter could otherwise be split into two once inside the payload. No string may repeat. |
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of token creation. |
+| `signature` | string | Ed25519 signature formatted as `ed25519:<128-hex>`, generated by the key active at this meta sequence (section 8, step 2) over the Canonical Token Creation Signing Payload (below). |
 
 **The raw token is not here, and cannot be derived from what is.** The journal carries the hash the server compares against; a bucket, a backup of it, or a replay of it grants nobody a token they did not already hold.
 
@@ -217,13 +219,32 @@ A token may carry more than one scope, and the array is what makes that expressi
     "rw:blog-*",
     "r:docs"
   ],
-  "timestamp": "2026-08-31T00:09:00Z"
+  "timestamp": "2026-08-31T00:09:00Z",
+  "signature": "ed25519:dc42713cefbac3aeaa9b2d1d606053190f313abb5192f312e169a9d7d5f3ad79411b7b457d3ea4abea3aa4911a79c92da29f73d2fed6e9ebd02120f649422c04"
 }
 ```
 
 Byte for byte, again:
 [`fixtures/v1/streams/_meta/tx/00000000000000000004.json`](fixtures/v1/streams/_meta/tx/00000000000000000004.json).
-It is the same token the auth specification publishes as `tok_writer_02`, hash and scopes included; those are the whole of the agreement between the two fixture sets.
+It is the same token the auth specification publishes as `tok_writer_02`, hash and scopes included; those are the whole of the agreement between the two fixture sets. It is also signed by `K1`, the key the `_meta` sequence 2 rotation activated — this record was written after that rotation, and the key active at a meta sequence is what verifies it (see the payload note below).
+
+#### Canonical Token Creation Signing Payload
+The signature is computed over deterministic UTF-8 bytes structured as follows:
+```
+walden-token-create:v1\n
+stream:_meta\n
+seq:<seq>\n
+token_id:<token_id>\n
+token_hash:<token_hash>\n
+scope:<scope-1>\n
+scope:<scope-2>\n
+timestamp:<timestamp>\n
+```
+Each line terminates with a newline (`\n`, `0x0A`). `<seq>` is the decimal sequence number with no leading zeros, unchanged by the encoding rule of section 1.1. One `scope:` line is emitted per entry in `scopes`, in array order, exactly as section 5.3 emits one `segment:` line per segment and section 7.2 one `ref:` line per ref — so the signature covers the count and the order, and a scope cannot be appended to a minted token without invalidating it. This framing is unambiguous only because section 4.3's field table already refuses a scope string containing a control character: without that rule, a scope carrying its own `\nscope:` could be split into what looks like two `scope:` lines once inside this payload, letting a second scope be added to a token without changing the signed bytes — the same way section 5.2's character restrictions on ref names are what make the `update:` line above safe for the same idiom.
+
+**`token_hash` is written verbatim, with no lowercasing.** This is the one place this payload deliberately diverges from the Canonical Marker Signing Payload (section 7.2) and the Canonical Ref-Transaction Signing Payload (section 5.3), which both fold the hex fields they carry to lowercase in the payload. `token_hash` needs no such folding: section 4.3's field table already refuses a non-lowercase hash rather than accepting and normalizing one, so there is no case ambiguity here for lowercasing to paper over, and folding it in the payload anyway would just be a second, silent path to the same class of defect. `token_id`, each `scope` string, and `timestamp` are likewise written exactly as the record carries them.
+
+A token record signed at meta sequence *N* is verified against the key that was active at sequence *N*, not against a key it names itself: unlike a ref-transaction record or the marker, this record carries no `key_epoch`. Section 8's replay of `_meta` is always contiguous from genesis — `_meta` is never compacted (section 7.1's Scope bullet states `_meta` is not subject to pack snapshotting, and section 8 step 3 excludes it from the marker sweep by name) — so a reader reaching sequence *N* already knows which key rotation, if any, was most recently applied, exactly as it knows which key verifies a `key_rotation` record itself. There is no floor to seed either: a token record is one event at one sequence, not a summary of history a resumed replay skipped.
 
 ### 4.4 Token Revocation Records (`token_revoke`)
 
@@ -241,12 +262,13 @@ Revoking a token appends a `token_revoke` record naming the token that is being 
   "type": "token_revoke",
   "token_id": "tok_admin_01",
   "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
-  "timestamp": "2026-08-31T00:08:00Z"
+  "timestamp": "2026-08-31T00:08:00Z",
+  "signature": "ed25519:b18b4702fc2732d315f89d3ccd57d8339b9c5983eeffe39bc8087b76ae80f2c1a2efeb5a0d76b8b0a56be5ee4a046cfaa4ef7f5bd6f9a8dd665792f188306b00"
 }
 ```
 
 This is the golden journal's own revocation, byte for byte:
-[`fixtures/v1/streams/_meta/tx/00000000000000000003.json`](fixtures/v1/streams/_meta/tx/00000000000000000003.json).
+[`fixtures/v1/streams/_meta/tx/00000000000000000003.json`](fixtures/v1/streams/_meta/tx/00000000000000000003.json). It is signed by `K1`, the key the sequence 2 rotation activated one sequence earlier — the same key that verifies this record is verified against for the reason the payload note below states.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
@@ -257,23 +279,39 @@ This is the golden journal's own revocation, byte for byte:
 | `token_id` | string | The identifier of the token being revoked, under the same rules section 4.3 states for it. A reader matches on this field. |
 | `token_hash` | string | The same `sha256:<64-lowercase-hex>` the creating record carried for that identifier, repeated here. |
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of revocation. |
+| `signature` | string | Ed25519 signature formatted as `ed25519:<128-hex>`, generated by the key active at this meta sequence (section 8, step 2) over the Canonical Token Revocation Signing Payload (below). |
 
 The record names the token twice on purpose. The identifier is what a reader matches on; the hash is what a *server* keys its table by, so repeating it lets a revocation be applied — and read by a human — against the table as it is actually held. Repeating it also makes disagreement visible: a revocation whose hash is not the one recorded for that identifier does not describe the token it claims to, and a reader refuses it rather than revoking something on a guess.
 
 A revocation carries no `scopes`. It withdraws a grant; it does not describe one.
+
+#### Canonical Token Revocation Signing Payload
+The signature is computed over deterministic UTF-8 bytes structured as follows:
+```
+walden-token-revoke:v1\n
+stream:_meta\n
+seq:<seq>\n
+token_id:<token_id>\n
+token_hash:<token_hash>\n
+timestamp:<timestamp>\n
+```
+Each line terminates with a newline (`\n`, `0x0A`). `<seq>` is the decimal sequence number with no leading zeros, unchanged by the encoding rule of section 1.1. `token_hash` is written verbatim, with no lowercasing, and `token_id` and `timestamp` are likewise written exactly as the record carries them — see section 4.3's payload note for why `token_hash` is not folded the way sections 5.3 and 7.2 fold an object id.
+
+As with a `token_create` record, this record carries no `key_epoch` and is verified against the key active at its own meta sequence rather than a key it names itself; section 4.3's payload note states the reason once for both record types.
 
 ### 4.5 Rebuilding the Token Table
 
 A reader replaying `_meta` from genesis forward holds the token table when it reaches the head. The rules are the whole of it:
 
 1. **Start empty.** A journal with no token records rebuilds to no tokens.
-2. **A record that violates its own field rules never reaches the table.** The constraints stated in the field tables of sections 4.3 and 4.4 are normative — the `token_id` character class and 255-byte cap, `token_hash` as `sha256:<64-lowercase-hex>`, and, for a creation, a `scopes` array carrying at least one entry with no entry empty and none repeated. A record violating any of them is refused before it is applied (section 8.1, rule 13); the reader does not apply it, and does not repair it.
-3. **`token_create`** inserts a row: `token_id` → (`token_hash`, `scopes`), live. A record naming a `token_id` the table already holds is a reused identifier, which this format forbids; the reader refuses (section 8.1, rule 10).
-4. **`token_revoke`** finds the row named by `token_id` and marks it revoked. An identifier the table does not hold is unchainable, exactly as an unchainable rotation is: the reader refuses (rule 11), and does not create the row. A `token_hash` that disagrees with the one the row carries is likewise refused (rule 12).
-5. **Rows are never removed.** The journal is append-only, and what a replay rebuilds is the history of a token rather than a snapshot of a mutable file. A revoked row is kept, revoked.
-6. **The table is the whole identity model.** There are no accounts, owners, or expiries to rebuild, because there are none to record. A row is a hash to look a request up by and the scopes to answer it with.
+2. **A record whose signature does not verify never reaches the table.** `token_create` and `token_revoke` are verified against the key active at their own meta sequence (section 4.3's payload note) before section 8's replay applies either to the table. A `signature` that is absent or not formatted as `ed25519:<128-hex>` is a field-rule violation, refused under section 8.1's rule 13 with `<reason>` naming the field; a well-formed signature that does not verify against the active key is refused under rule 19. Either way, the reader stops rather than skipping the record or guessing at what it would have granted.
+3. **A record that violates its own field rules never reaches the table.** The constraints stated in the field tables of sections 4.3 and 4.4 are normative — the `token_id` character class and 255-byte cap, `token_hash` as `sha256:<64-lowercase-hex>`, `signature` present and formatted as `ed25519:<128-hex>`, and, for a creation, a `scopes` array carrying at least one entry with no entry empty, none repeated, and none containing an ASCII control character (`0x00`-`0x1F` or `0x7F`, the newline included). A record violating any of them is refused before it is applied (section 8.1, rule 13); the reader does not apply it, and does not repair it.
+4. **`token_create`** inserts a row: `token_id` → (`token_hash`, `scopes`), live. A record naming a `token_id` the table already holds is a reused identifier, which this format forbids; the reader refuses (section 8.1, rule 10).
+5. **`token_revoke`** finds the row named by `token_id` and marks it revoked. An identifier the table does not hold is unchainable, exactly as an unchainable rotation is: the reader refuses (rule 11), and does not create the row. A `token_hash` that disagrees with the one the row carries is likewise refused (rule 12).
+6. **Rows are never removed.** The journal is append-only, and what a replay rebuilds is the history of a token rather than a snapshot of a mutable file. A revoked row is kept, revoked.
+7. **The table is the whole identity model.** There are no accounts, owners, or expiries to rebuild, because there are none to record. A row is a hash to look a request up by and the scopes to answer it with.
 
-**These records carry no signature in v1, and that is an exception to the guarantee of section 2.2 rather than an instance of it.** A key rotation and a ref transaction are signed and chain to the genesis key; a token record is not. So the guarantee section 2.2 makes — that written history cannot be altered, forged, or spliced by an unauthorized third party or a storage provider without failing verification — does not reach the token table. A party who can append to `_meta` in the bucket can append a `token_create` naming a hash of their own choosing and the scopes `rwc:*`, and a replay following the rules above rebuilds it as a live grant. Nothing in the algorithm of section 8 catches it, because there is no signature to check. What that grant is worth is the point: `token_hash` is the value a server keys its table by, so the forger holds a raw token that authorizes, not merely a misleading row in a table. The bucket's own access control is the whole of the defence here, which is a weaker claim than section 2.2's, and it is stated in both places so that a reimplementer cannot infer the stronger one.
+**These records are signed, and the guarantee of section 2.2 reaches the token table because of it.** A `token_create` or `token_revoke` is verified against the key active at its own meta sequence before either is applied, exactly as a key rotation or a ref transaction is verified before it is trusted. A party who can append to `_meta` in the bucket can still append a `token_create` naming a hash of their own choosing and the scopes `rwc:*`, but the replay above never reaches the table with it: the signature does not verify against the active key, rule 19 refuses it in one line, and the replay stops. What the bucket's own access control now defends is a narrower thing than a working credential — a party without the signing key can litter `_meta` with records a reader will never apply, but cannot mint one that authorizes anything.
 
 ---
 
@@ -339,7 +377,7 @@ Each object in the `updates` array represents a single ref transition:
 In Git, ref names are raw sequences of non-zero bytes subject only to Git's ref format rules (`git-check-ref-format`). Git does not enforce UTF-8 encoding or Unicode normalization on ref names.
 
 - **Byte Preservation Invariant:** Writers and readers MUST treat ref names as exact, opaque byte sequences.
-- **No Unicode Normalization:** Unicode normalization algorithms (such as NFC or NFD conversion) MUST NOT be applied to ref names. Applying Unicode normalization alters the raw byte sequence and permanently breaks signature verification.
+- **No Unicode Normalization:** Unicode normalization algorithms (such as NFC or NFD conversion) MUST NOT be applied to ref names. Applying Unicode normalization alters the raw byte sequence and permanently breaks signature verification. The golden journal carries a ref name that is deliberately not NFC-invariant — `refs/heads/caf` + U+0065 + U+0301 (decomposed), on [`repo-alpha`'s seq 1 record](fixtures/v1/streams/repo-alpha/tx/00000000000000000001.json) and in [its marker's ref set](fixtures/v1/streams/repo-alpha/marker.json) — for exactly this reason: swapping it for its precomposed NFC form (`refs/heads/caf` + U+00E9) breaks both signatures, which is this paragraph's claim, executed.
 - **Character Restrictions:** Ref names must not contain ASCII control characters (`0x00`–`0x1F`, `0x7F`), space (`0x20`), `~`, `^`, `:`, `?`, `*`, `[`, `\`, `@{`, `//`, trailing slashes, leading/trailing component dots, end with `.lock`, or have any slash-delimited component ending with `.lock`.
 
 ### 5.3 Canonical Ref-Transaction Signing Payload
@@ -462,15 +500,36 @@ A background task periodically consolidates all reachable Git objects across his
 - **Scope:** Snapshots and markers are published per repository stream. The `_meta` stream records small, rare server configuration events (genesis, token tables, key rotations) and is not subject to pack snapshotting.
 
 ### 7.2 JSON Schema and Field Specification
-`marker.json` is a UTF-8 JSON document stored at the root of the stream prefix:
+`marker.json` is a UTF-8 JSON document stored at the root of the stream prefix. It is a
+**signed record**: unsigned, a marker holding authoritative branch tips would
+be a direct history-rewrite vector for anyone who can write to the bucket — precisely
+the threat the server signing identity exists to detect, and the reason ref-transaction
+records are signed at all.
 
 ```json
 {
   "version": "v1",
   "stream": "repo-alpha",
-  "sequence": "1",
-  "snapshot": "3731601fba561af499185a3875c5df9f2b5e5ab71ea260a3297e12e1ddf9576c",
-  "timestamp": "2026-08-31T01:00:00Z"
+  "sequence": "3",
+  "key_epoch": "1",
+  "key_epoch_floor": "1",
+  "snapshot": "cd04837137cbca78f87a66055eb1ec4a598842618fa6cdb126295c6cda9b6638",
+  "refs": [
+    {
+      "ref": "refs/heads/café",
+      "oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
+    },
+    {
+      "ref": "refs/heads/main",
+      "oid": "fe75a8a9eea356bbe01fdf92d95d448190ad7942"
+    },
+    {
+      "ref": "refs/tags/v0.1",
+      "oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
+    }
+  ],
+  "timestamp": "2026-08-31T01:00:00Z",
+  "signature": "ed25519:0d96768618efdfcdbd282a0252ce336236019045812dd8e9385b25b26f8a3f1dd36b0daee8cdb950266b8fcf4ee893bd2d72af4541f33a0bca0ae598f0a3d605"
 }
 ```
 
@@ -478,24 +537,98 @@ This is the golden journal's own marker, byte for byte:
 [`fixtures/v1/streams/repo-alpha/marker.json`](fixtures/v1/streams/repo-alpha/marker.json).
 Note that `snapshot` names an object under `snapshots/`, not under `segments/`:
 the two are separate key spaces, and a digest that resolves in one has no
-meaning in the other.
+meaning in the other. The baseline moved to sequence 3 — past the key rotation
+at `_meta` sequence 2 — precisely so this one marker could demonstrate both
+halves of this section at once: `refs/tags/v0.1` is created at sequence 1 and
+never touched again, so it is recoverable only because this marker carries the
+ref set, and `key_epoch_floor` is `1` because sequence 3 is the record that
+carried epoch 1. `refs/heads/caf` + U+0065 + U+0301 — a ref name that is
+deliberately not NFC-invariant (section 5.2) — is created on the same seq 1
+record and sorts first in this array by the raw bytes of its name; it is never
+touched again either, so it is recoverable only from this marker in exactly
+the way `refs/tags/v0.1` is.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `version` | string | Format version; MUST be `"v1"`. |
 | `stream` | string | Stream identifier matching `^[a-zA-Z0-9._-]+$` (max 255 bytes). |
 | `sequence` | string | Unsigned 64-bit sequence number ($k \ge 0$) in exact decimal form (section 1.1), representing the latest ref transaction fully incorporated into the snapshot pack. |
+| `key_epoch` | string | Index into the signing key chain, in exact decimal form (section 1.1), naming the key that signed *this marker* — stamped at compaction time. Section 5.1's semantics apply word for word: a hint, not authority, refused if it falls outside the chain verified from genesis. |
+| `key_epoch_floor` | string | The highest `key_epoch` carried by any record on this stream at sequence $\le$ `sequence`, in exact decimal form (section 1.1). It is what a replay resuming from this marker seeds `LastEpoch` with (section 8, rule 15). `key_epoch_floor` MUST be $\le$ `key_epoch`: compaction lags key rotation, so a rotation can land between the baseline and the marker's publication, and a marker signed by a key older than the history it claims to summarize is refused rather than repaired. |
 | `snapshot` | string | Exactly 64 lowercase hexadecimal characters representing the SHA-256 digest of the consolidated snapshot packfile bytes verbatim (`^[0-9a-f]{64}$`). |
+| `refs` | array of objects | The authoritative ref set as of `sequence` — **not a delta** — as an array of Ref Objects (below). MAY be `[]`: a stream whose every ref has been deleted has an empty ref set, and that is authoritative state, not a missing field. |
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp when the snapshot was generated and published (e.g. `"2026-08-31T01:00:00Z"`). |
+| `signature` | string | Ed25519 signature formatted as `ed25519:<128-hex>`, signed by the key named by `key_epoch` over the Canonical Marker Signing Payload (below). |
+
+#### Ref Object (`refs[]`)
+Each object in the `refs` array names one ref and the object id it stood at, as of
+`sequence`:
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `ref` | string | The full Git ref name. **Encoding is section 5.2's, unchanged and by reference:** a plain JSON string holding the raw byte sequence, no normalization, no new escaping scheme. If that encoding is ever revisited, `updates[].ref` and this field move together. |
+| `oid` | string | 40-character (SHA-1) or 64-character (SHA-256) lowercase hex object ID the ref points at. Never the all-zero OID: a ref that does not exist is absent from the array, not present pointing at zeros. |
+
+Rules, stated here rather than left implied:
+
+1. **An array of objects, not a JSON object map.** A map has no defined key order and no
+   defined behavior for duplicate keys, and this array is signed — the canonical payload
+   below needs a deterministic byte order, which only an array gives it.
+2. **Sorted ascending by the raw bytes of `ref`.** Readers MUST refuse a `refs` array that
+   is not sorted this way.
+3. **No duplicate ref name, and no zero OID.** Readers MUST refuse either.
+4. **Uniform OID length.** Every `oid` in one marker's `refs` is the same length: mixed
+   SHA-1 and SHA-256 object IDs in a single marker are refused, matching section 5.1's
+   rule for `updates[]`.
+5. **`refs` MAY be `[]`.** An empty ref set is a stream with nothing left standing, and
+   that is what compaction observed, not an omission.
+
+#### Canonical Marker Signing Payload
+The marker's Ed25519 signature is computed over a deterministic byte stream, styled on
+sections 4.2 and 5.3:
+
+```
+walden-marker:v1\n
+stream:<stream>\n
+sequence:<sequence>\n
+key_epoch:<key_epoch>\n
+key_epoch_floor:<key_epoch_floor>\n
+timestamp:<timestamp>\n
+snapshot:<lowercase-64-hex>\n
+ref:<ref-1> <lowercase-oid-1>\n
+ref:<ref-2> <lowercase-oid-2>\n
+```
+
+1. **Header Line:** `walden-marker:v1\n`
+2. **Stream Line:** `stream:<stream>\n` where `<stream>` is the exact stream ID string.
+3. **Sequence Line:** `sequence:<sequence>\n`, decimal, no leading zeros — the same text
+   the JSON string carries (section 1.1).
+4. **Key Epoch Line:** `key_epoch:<key_epoch>\n`, decimal, no leading zeros. Covered by
+   the signature like every other line here: it cannot be altered on a written marker
+   without invalidating it.
+5. **Key Epoch Floor Line:** `key_epoch_floor:<key_epoch_floor>\n`, decimal, no leading
+   zeros. This is what makes the floor unforgeable: the only way to raise it on a
+   verified chain is a marker whose signature — which covers this line — actually
+   verifies.
+6. **Timestamp Line:** `timestamp:<timestamp>\n`, the RFC 3339 UTC timestamp string.
+7. **Snapshot Line:** `snapshot:<lowercase-64-hex>\n`, the snapshot pack's digest,
+   lowercased.
+8. **Ref Lines:** For each entry in `refs`, in array order (which rule 2 above already
+   requires to be sorted ascending), a line `ref:<ref> <lowercase-oid>\n`. Zero ref lines
+   are emitted for an empty `refs` array.
+9. **Newline Termination:** Every line MUST terminate with a single newline byte (`\n`,
+   `0x0A`).
+10. **Unknown Fields Excluded:** Per section 5.4's rule, restated for the marker: unknown
+    JSON fields are never part of this payload.
 
 #### Forward Compatibility & Unknown Fields
 In accordance with Walden's forward compatibility principles:
 1. **Deserialization Tolerance:** Readers MUST ignore unrecognized JSON keys when parsing `marker.json`.
 2. **Writers:** Writers generating format v1 markers MUST NOT emit undefined keys.
 
-### 7.3 The Two Core Guarantees & Invariants
+### 7.3 The Core Guarantees & Invariants
 
-From the reader's side, a published marker provides two non-negotiable guarantees:
+From the reader's side, a published marker provides three non-negotiable guarantees:
 
 #### 1. The Publish-Last Invariant (Referential Integrity)
 > **Guarantee 1:** *Every object a published marker references already exists in storage.*
@@ -517,6 +650,13 @@ Compaction is purely an acceleration mechanism. It does **not** synchronously pu
 
 - **Paranoia as Policy:** Object storage is cheap, and paranoia is on brand. Walden preserves older segments and transaction files for weeks, months, or indefinitely to support auditability, historical verification, and disaster recovery.
 - **Reader Obligation:** When a reader initializes state from a snapshot at `sequence = N`, any pack segment files under `segments/` or transaction files under `tx/` with sequence $s \le N$ remaining in storage are valid historical artifacts. Readers **MUST NOT** reject the journal, fail validation, or treat the presence of superseded records as duplicate writes, replay conflicts, or storage corruption. Readers simply begin active sequential replay at sequence $N + 1$.
+
+#### 3. The Ref-Set Referential Integrity Invariant
+> **Guarantee 3:** *Every object the marker's ref set names is carried by the snapshot pack the same marker names.*
+
+A ref in `refs` pointing at an object the snapshot does not carry would be indistinguishable, to a reader that trusts the marker, from a ref genuinely reachable at the baseline — except that applying the snapshot and then trying to set that ref would fail. Readers MUST refuse a marker with this property outright (section 7.6).
+
+This adds no second ordering constraint beyond Guarantee 1's. The compactor still builds the snapshot from the exact ref state it is snapshotting, uploads and verifies the pack, and publishes the marker last — the ref set and the epoch floor travel *inside* the marker rather than as a separate object, so there is nothing new to sequence between: the snapshot pack is one write, the marker (now carrying more fields) is the second and still last.
 
 ### 7.4 Snapshot Packfile Framing & Storage Rules
 Consolidated snapshot packfiles follow identical byte framing and verification rules as standard pack segments:
@@ -544,50 +684,69 @@ When initializing or materializing a repository from the journal, a reader MUST 
              │                             │
              ▼                             ▼
 ┌───────────────────────────┐ ┌───────────────────────────┐
-│ 2. Parse & Validate       │ │ Start replay from seq 0   │
+│ 2. Parse Marker Structure │ │ Start replay from seq 0   │
 │    marker.json            │ │ (tx/00000000000000000000) │
-└────────────┬──────────────┘ └─────────────┬─────────────┘
+└────────────┬──────────────┘ │ Refs = {}                 │
+             │                │ LastEpoch = 0             │
+             ▼                └─────────────┬─────────────┘
+┌───────────────────────────┐              │
+│ 3. Verify Marker Signature│              │
+│    against the key named  │              │
+│    by key_epoch (section  │              │
+│    8) — before trusting   │              │
+│    any other field on it  │              │
+└────────────┬──────────────┘              │
              │                             │
              ▼                             │
 ┌───────────────────────────┐              │
-│ 3. Fetch Snapshot Pack    │              │
+│ 4. Fetch Snapshot Pack    │              │
 │    snapshots/<hash>.pack  │              │
 │    Verify SHA-256 & PACK  │              │
 └────────────┬──────────────┘              │
              │                             │
              ▼                             │
 ┌───────────────────────────┐              │
-│ 4. Apply Snapshot Pack    │              │
+│ 5. Apply Snapshot Pack    │              │
 │    Baseline Seq S = seq   │              │
+│    Refs = marker.refs     │              │
+│    LastEpoch =            │              │
+│      marker.key_epoch_    │              │
+│      floor                │              │
 └────────────┬──────────────┘              │
              │                             │
              ▼                             │
 ┌──────────────────────────────────────────▼──────────────┐
-│ 5. Sequential Replay of tx/ Starting at S + 1           │
+│ 6. Sequential Replay of tx/ Starting at S + 1           │
 │    - Ignore any tx <= S and superseded segments         │
 │    - Assert strictly contiguous sequence: S+1, S+2, ... │
 │    - Verify signature against the key named by          │
 │      record.key_epoch (section 8)                       │
+│    - Assert record.key_epoch >= LastEpoch               │
 │    - Fetch & verify referenced segments/<hash>.pack     │
-│    - Apply ref updates                                  │
+│    - Apply ref updates onto Refs (from the marker's     │
+│      set, or {} with no marker) and no others           │
 └─────────────────────────────────────────────────────────┘
 ```
 
 1. **Query Marker:** Issue a `GET` request for `v1/streams/<stream-id>/marker.json`.
 2. **If Marker Present:**
-   - **Validate Marker Structure:** Parse JSON and verify `version == "v1"`, `stream == <stream-id>`, valid `sequence`, valid 64-hex `snapshot` hash, and valid UTC `timestamp`.
+   - **Parse Marker Structure:** Parse JSON and verify `version == "v1"`, `stream == <stream-id>`, valid `sequence`, `key_epoch`, `key_epoch_floor` with `key_epoch_floor <= key_epoch`, valid 64-hex `snapshot` hash, a well-formed `refs` array (section 7.2's rules), and valid UTC `timestamp`. Every field is required; a marker missing any of them is refused (section 7.6) before signature verification is even attempted.
+   - **Verify Marker Signature — before trusting any other field:** Resolve the key named by `key_epoch` in the chain verified from genesis forward (section 8, which must already have replayed `_meta` in full before any marker is trusted), and verify the Ed25519 signature against the Canonical Marker Signing Payload (section 7.2). An epoch outside the chain, or a signature that does not verify, is refused immediately — nothing past this step reads a field off an unverified marker.
    - **Download Snapshot:** Fetch `v1/streams/<stream-id>/snapshots/<snapshot-hash>.pack`.
-   - **Verify Snapshot:** Compute SHA-256 over downloaded bytes; assert equality with `marker.snapshot`. Verify `PACK` header and Git checksum.
+   - **Verify Snapshot:** Compute SHA-256 over downloaded bytes; assert equality with `marker.snapshot`. Verify `PACK` header and Git checksum. Assert every OID in `marker.refs` resolves inside this snapshot pack (Guarantee 3, section 7.3).
    - **Apply Snapshot:** Index and unpack the snapshot packfile into the bare repository object database.
-   - **Set Replay Baseline:** Set baseline sequence $S = \text{marker.sequence}$.
+   - **Set Replay Baseline:** Set baseline sequence $S = \text{marker.sequence}$, `Refs = marker.refs` (exactly those refs, and no others — not merged with anything, since the marker's ref set is authoritative, not a delta), and `LastEpoch = marker.key_epoch_floor`.
    - **List Tail Transactions:** Perform a `LIST` on `v1/streams/<stream-id>/tx/` with `start-after` set to `v1/streams/<stream-id>/tx/<S:020d>.json`.
    - **Sequential Replay:** For each transaction record in ascending order ($S+1, S+2, \dots$):
      - Assert that sequence numbers are strictly contiguous with no gaps.
      - Verify the Ed25519 signature against the key named by the record's `key_epoch` (section 8), not against whichever key happens to be active now.
-     - Fetch referenced segments from `segments/<sha256>.pack` and apply ref updates.
+     - Assert `record.key_epoch >= LastEpoch` (section 8, rule 15), which the marker's `key_epoch_floor` seeded above rather than leaving at `0`.
+     - Fetch referenced segments from `segments/<sha256>.pack` and apply ref updates onto `Refs`.
 3. **If Marker Absent:**
-   - Set baseline sequence $S = -1$.
-   - Replay all transaction records sequentially from sequence `0` (`tx/00000000000000000000.json`) forward.
+   - Set baseline sequence $S = -1$, `Refs = {}`, and `LastEpoch = 0`.
+   - Replay all transaction records sequentially from sequence `0` (`tx/00000000000000000000.json`) forward, tracking `Refs` from empty rather than from a marker's set.
+
+A reader following this algorithm from the genesis path and from the marker path arrives at identical ref state for the same stream — the acceptance test this section exists to satisfy, and the one `TestFixtureReplay` runs against the golden journal.
 
 ### 7.6 Single-Line Refusal Message Formats
 
@@ -609,9 +768,21 @@ When verification or download fails during marker or snapshot handling, Walden a
    ```
    refusal: replay failed: corrupt marker on stream <stream-id> (<reason>) (marker.json in object storage is malformed)
    ```
-5. **Invalid Marker Fields:**
+5. **Invalid Marker Fields:** A malformed ref set (bad ref name, zero OID, duplicate, out of order, mixed OID lengths), a missing required field, or `key_epoch_floor` above `key_epoch` — every one of these refuses under this same line, with `<reason>` naming the rule that failed; none of them gets its own refusal:
    ```
    refusal: replay failed: invalid marker on stream <stream-id> (<reason>) (marker.json in object storage is invalid)
+   ```
+6. **Marker Signature Mismatch:** If a marker's signature does not verify against the key its own `key_epoch` names:
+   ```
+   refusal: replay failed: signature mismatch for marker on stream <stream-id> at sequence <N>
+   ```
+7. **Marker Names an Unknown Key Epoch:** If a marker's `key_epoch` is not a valid index into the chain verified from genesis forward — worded to match rule 14's ref-transaction equivalent (section 8.1) — the reader MUST NOT fall back to the active key. It MUST abort immediately:
+   ```
+   refusal: replay failed: marker on stream <stream-id> names unknown key epoch <E>
+   ```
+8. **Marker Ref Not in Snapshot:** If a marker names a ref pointing at an object the snapshot pack it also names does not carry (Guarantee 3, section 7.3):
+   ```
+   refusal: replay failed: marker on stream <stream-id> names <ref> at <oid>, which the snapshot pack does not carry (marker.json in object storage is invalid)
    ```
 
 ---
@@ -638,6 +809,7 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │    │     LastMetaSeq = seq                             │
 │    ├── type == "token_create" or "token_revoke":       │
 │    │     Verify record fields (sections 4.3, 4.4)      │
+│    │     Verify signature with Chain[-1] over payload  │
 │    │     Apply to the token table (section 4.5)        │
 │    │     LastMetaSeq = seq                             │
 │    └── other meta records:                             │
@@ -651,10 +823,12 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │    For each stream matching ^[a-zA-Z0-9._-]+$          │
 │    OTHER THAN _meta:                                   │
 │    ├── Check for marker.json:                          │
-│    │     If present: verify snapshot & set S = marker  │
-│    │     If absent: set S = -1                         │
+│    │     If present: verify marker (sig & epoch),      │
+│    │       verify+apply snapshot, refs = marker.refs,  │
+│    │       S = marker.sequence                         │
+│    │     If absent: S = -1, refs = {}                  │
 │    ├── Verify sequence starting at S + 1 with no gaps  │
-│    ├── LastEpoch = 0   (per-stream, resets each stream)│
+│    ├── LastEpoch = marker.key_epoch_floor, else 0      │
 │    ├── For each ref transaction at seq S+1, S+2, ...:  │
 │    │     Verify type == "ref_update"                   │
 │    │     Verify ref format and OID transition rules    │
@@ -668,21 +842,19 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │    │     Verify Ed25519 signature against              │
 │    │       Chain[record.key_epoch]                     │
 │    │     LastEpoch = record.key_epoch                  │
-│    └── Track ref states from baseline forward          │
+│    └── Track ref states from marker.refs (or {}) fwd   │
 └────────────────────────────────────────────────────────┘
 ```
 
 Step 3 excludes `_meta` from the stream sweep: `_meta` carries `genesis`, `key_rotation`, `token_create`, and `token_revoke` records, never `ref_update`, and step 2 already replays it in full. `_meta` itself matches `^[a-zA-Z0-9._-]+$` — the same pattern a repository stream ID matches — so a reader that does not exclude it by name would otherwise try to verify meta records as ref transactions and fail on the first one (see section 9.1).
 
+Verifying the marker itself needs `Chain`, so it happens only after step 2's full `_meta` replay — the ordering section 7.5 states explicitly and this section has so far only implied. A marker is trusted only once its signature verifies against the key its own `key_epoch` names in that chain (section 7.5, 7.6); nothing about `S`, `refs`, or `LastEpoch` is read off it before that.
+
 `record.key_epoch` is a hint, not authority: it selects a position in `Chain`, and `Chain` is trusted only because step 2 verified it from genesis forward. An epoch outside `Chain` (rule 14) is refused outright — never a reason to fall back to `Chain[-1]` or to any other key.
 
-Rule 15's floor is real, but it is narrower than "a retired key can never validate a ref update again" — in two independent ways, not one.
+Rule 15's floor is real, but it is narrower than "a retired key can never validate a ref update again": `LastEpoch` is tracked per stream (step 3), and a stream this replay has not yet seen carry an epoch above `0` gives rule 15 nothing to compare against. A leaked genesis key `K0` still validates a `key_epoch: 0` record — signed and accepted — on any such stream, in a full, uncompacted replay from genesis: a stream that happened to stop before the rotation, or one that does not exist yet and that an attacker holding `K0` creates after the rotation for exactly this purpose. Rule 15 only compares a record's epoch against epochs this replay has already verified on that same stream, so a stream with nothing yet verified on it — old or brand new — has no floor above `0` to enforce. No ticket tracks this gap: closing it would need a floor that is not scoped per stream, which rule 15 does not attempt and which is a larger change than this section's mechanism.
 
-First, it does not survive a marker baseline. `LastEpoch` starts at `0` for every replay of a stream, including one resuming from `marker.json` at baseline `S` (section 7): such a replay begins at `S + 1` and never sees the records at or before `S`, so it has no way to learn the highest epoch they carried, and `marker.json` itself carries no epoch to seed the floor from (section 7.2). On a stream compacted past a key rotation, that means a record forged at `S + 1` or later with a leaked, already-retired key's epoch clears rule 15 exactly as a genuine low-epoch record would have before compaction — the floor a fresh replay starts from is always `0`, regardless of what the stream's full history actually reached. Closing this gap means carrying the floor forward in `marker.json` itself, which is a marker format change out of this section's scope (tracked as WALD-97).
-
-Second, and needing no marker or compaction at all: `LastEpoch` is tracked per stream (step 3), and a stream this replay has not yet seen carry an epoch above `0` gives rule 15 nothing to compare against. A leaked genesis key `K0` still validates a `key_epoch: 0` record — signed and accepted — on any such stream, in a full, uncompacted replay from genesis: a stream that happened to stop before the rotation, or one that does not exist yet and that an attacker holding `K0` creates after the rotation for exactly this purpose. Rule 15 only compares a record's epoch against epochs this replay has already verified on that same stream, so a stream with nothing yet verified on it — old or brand new — has no floor above `0` to enforce. No ticket tracks this gap: closing it would need a floor that is not scoped per stream, which rule 15 does not attempt and which is a larger change than this section's mechanism.
-
-So rule 15 delivers the non-decreasing guarantee only per stream, and only for records after the point — genesis or a marker baseline — where a given replay first sees that stream carry an epoch above `0`. A stream that never reaches that point in a given replay gets no protection from this rule at all.
+So rule 15 delivers the non-decreasing guarantee only per stream, and only for records after the point — genesis, or a marker baseline whose `key_epoch_floor` seeded the floor (section 7.2) — where a given replay first sees that stream carry an epoch above `0`. A stream that never reaches that point in a given replay gets no protection from this rule at all.
 
 ### 8.1 Verification Failure Rules
 1. **Unchainable Rotation:** If `record.old_public_key != Chain[-1]` (the currently active key, the last element of `Chain`), the rotation does not chain to genesis. The reader MUST abort immediately with a single-line error:
@@ -730,7 +902,7 @@ So rule 15 delivers the non-decreasing guarantee only per stream, and only for r
     ```
     refusal: replay failed: token revoke at seq <N> disagrees with the hash recorded for token <token-id>
     ```
-13. **Malformed Token Record:** If a `token_create` or `token_revoke` violates any field rule of section 4.3 or 4.4 — the `token_id` character class or 255-byte cap, the `token_hash` format, or a `scopes` array that is empty, holds an empty string, or repeats one — the record is refused before it is applied to the token table (section 4.5, rule 2), with `<reason>` naming the field rule that failed:
+13. **Malformed Token Record:** If a `token_create` or `token_revoke` violates any field rule of section 4.3 or 4.4 — the `token_id` character class or 255-byte cap, the `token_hash` format, a `scopes` array that is empty, holds an empty string, repeats one, or contains a scope with an ASCII control character (`0x00`-`0x1F` or `0x7F`, the newline included), or a `signature` field that is absent or not formatted as `ed25519:<128-hex>` — the record is refused before it is applied to the token table (section 4.5, rule 3), with `<reason>` naming the field rule that failed:
     ```
     refusal: replay failed: invalid token record at seq <N> (<reason>)
     ```
@@ -743,7 +915,23 @@ So rule 15 delivers the non-decreasing guarantee only per stream, and only for r
     ```
     refusal: replay failed: ref update on stream <id> at seq <N> names key epoch <E> below epoch <F> already seen on this stream
     ```
-    Without this check a retired key, still present earlier in `Chain`, would go on validating any record naming its epoch forever within the replay — exactly the outcome key rotation exists to end. "Already seen on this stream" means seen by `LastEpoch` in this replay (step 3), which starts at `0` regardless of the stream's history before the replay's baseline — see the caveat under step 3 above. This rule cannot, by itself, stop a retired key from validating a record placed after the baseline of a resumed replay, nor one placed on a stream this replay has not yet seen carry a higher epoch — including a stream the attacker creates after the rotation for exactly that reason. The first needs the floor to survive the marker (WALD-97); the second needs a floor that is not scoped per stream, which this rule does not provide.
+    Without this check a retired key, still present earlier in `Chain`, would go on validating any record naming its epoch forever within the replay — exactly the outcome key rotation exists to end. "Already seen on this stream" means seen by `LastEpoch` in this replay (step 3) — see the caveat under step 3 above. This rule cannot, by itself, stop a retired key from validating a record placed on a stream this replay has not yet seen carry a higher epoch — including a stream the attacker creates after the rotation for exactly that reason — which needs a floor that is not scoped per stream, and this rule does not provide one.
+16. **Marker Signature Mismatch:** If a marker's signature does not verify against the key its own `key_epoch` names, the reader MUST abort immediately, before trusting any other field on the marker:
+    ```
+    refusal: replay failed: signature mismatch for marker on stream <id> at sequence <N>
+    ```
+17. **Marker Names an Unknown Key Epoch:** If a marker's `key_epoch` is not a valid index into `Chain`, the reader MUST NOT fall back to `Chain[-1]` or any other key — worded to match rule 14's ref-transaction equivalent:
+    ```
+    refusal: replay failed: marker on stream <id> names unknown key epoch <E>
+    ```
+18. **Marker Ref Not in Snapshot:** If a marker names a ref pointing at an object the snapshot pack it also names does not carry (Guarantee 3, section 7.3):
+    ```
+    refusal: replay failed: marker on stream <id> names <ref> at <oid>, which the snapshot pack does not carry (marker.json in object storage is invalid)
+    ```
+19. **Token Record Signature Mismatch:** If a `token_create` or `token_revoke` record's signature does not verify against the key active at its own meta sequence (`Chain[-1]` at the point the replay reaches it — section 4.3's payload note explains why this is `Chain[-1]` and not a named `key_epoch`), the reader MUST abort immediately, before the record is applied to the token table:
+    ```
+    refusal: replay failed: signature mismatch for token record at seq <N>
+    ```
 
 ---
 
@@ -949,8 +1137,8 @@ These five messages, the `If-None-Match: *` precondition, and the derivation of 
 To materialize or restore a repository stream from the journal:
 
 1. **Locate Marker:** Check for `v1/streams/<stream-id>/marker.json`.
-   - If present: Parse and validate `marker.json` per Section 7. Load and verify the referenced snapshot packfile from `v1/streams/<stream-id>/snapshots/<sha256>.pack` and initialize repository state at `marker.sequence`.
-   - If absent: Begin replay from `seq = 00000000000000000000`.
+   - If present: Parse `marker.json` per Section 7 and **verify its signature against the key its own `key_epoch` names, before trusting any other field on it.** Load and verify the referenced snapshot packfile from `v1/streams/<stream-id>/snapshots/<sha256>.pack`, apply it, **set exactly the marker's `refs` and no others**, **seed the epoch floor from `marker.key_epoch_floor`**, and initialize repository state at `marker.sequence`.
+   - If absent: Begin replay from `seq = 00000000000000000000` with an empty ref set and an epoch floor of `0`.
 2. **Scan Transactions:** Perform a paginated `LIST` under `v1/streams/<stream-id>/tx/` with `start-after` set to the last materialized sequence (e.g. `v1/streams/<stream-id>/tx/<sequence:020d>.json`).
 3. **Verify Continuity:**
    - Verify that sequence numbers are strictly contiguous ($s_0+1, s_0+2, \dots$).

@@ -19,3 +19,14 @@ func ProviderHostsForTest() []ProviderHostRow {
 	}
 	return rows
 }
+
+// HookIsRunnableForTest exposes hookIsRunnable to the external test package.
+func HookIsRunnableForTest(hookPath string) error {
+	return hookIsRunnable(hookPath)
+}
+
+// ClassifyRenameFailureForTest exposes classifyRenameFailure to the external
+// test package.
+func ClassifyRenameFailureForTest(err error, repo string) error {
+	return classifyRenameFailure(err, repo)
+}

@@ -17,8 +17,18 @@
       "ref": "refs/heads/feature",
       "old_oid": "0000000000000000000000000000000000000000",
       "new_oid": "930ffee596a4e29a9049f3a465b0ae21fcefe6ea"
+    },
+    {
+      "ref": "refs/tags/v0.1",
+      "old_oid": "0000000000000000000000000000000000000000",
+      "new_oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
+    },
+    {
+      "ref": "refs/heads/café",
+      "old_oid": "0000000000000000000000000000000000000000",
+      "new_oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
     }
   ],
   "timestamp": "2026-08-31T00:03:00Z",
-  "signature": "ed25519:ad9530f3fea9254e025b5e6495def1271c0ca3acb5f378ae40a30d7c2a6237e45b3d262529a5456c3b33b58943610142835976729e7baf12cbe2aceec5314803"
+  "signature": "ed25519:96cdb35a8e24d946b852a6cc82493aa47e0e90ea6cd49e117b6066c5f09766b8ee38e9bf2099d5b790428f238e0c3e939b74845b4af6cceea8ab7ae0fc1e850b"
 }

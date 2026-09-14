@@ -9,5 +9,6 @@
     "rw:blog-*",
     "r:docs"
   ],
-  "timestamp": "2026-08-31T00:09:00Z"
+  "timestamp": "2026-08-31T00:09:00Z",
+  "signature": "ed25519:dc42713cefbac3aeaa9b2d1d606053190f313abb5192f312e169a9d7d5f3ad79411b7b457d3ea4abea3aa4911a79c92da29f73d2fed6e9ebd02120f649422c04"
 }

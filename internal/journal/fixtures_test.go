@@ -355,7 +355,7 @@ func TestFixtureRepoStreams(t *testing.T) {
 		t.Errorf("repo-alpha seq 1 has %d updates, want 4", len(alpha[1].Updates))
 	}
 	if got := alpha[1].Updates[3].Ref; got != fixtureDecomposedRef {
-		t.Errorf("repo-alpha seq 1 updates[3].ref = %q, want the decomposed non-ASCII ref", got)
+		t.Errorf("repo-alpha seq 1 updates[3].ref = %+q, want the decomposed non-ASCII ref", got)
 	}
 	if got, want := alpha[1].Updates[3].NewOID, alpha[0].Updates[0].NewOID; got != want {
 		t.Errorf("repo-alpha seq 1 updates[3].new_oid = %q, want %q (c1, the commit main started this push at)", got, want)
@@ -947,7 +947,7 @@ func TestFixtureNonASCIIRefBreaksOnNormalization(t *testing.T) {
 		t.Fatalf("repo-alpha seq 1 has %d updates, want 4", len(record.Updates))
 	}
 	if got := record.Updates[3].Ref; got != fixtureDecomposedRef {
-		t.Fatalf("repo-alpha seq 1 updates[3].ref = %q, want %q byte for byte", got, fixtureDecomposedRef)
+		t.Fatalf("repo-alpha seq 1 updates[3].ref = %+q, want %+q byte for byte", got, fixtureDecomposedRef)
 	}
 
 	markerPath := fixtureKeyPath(journal.MarkerKey(fixtureRepoStream))
@@ -962,8 +962,11 @@ func TestFixtureNonASCIIRefBreaksOnNormalization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseMarker failed on the golden marker: %v", err)
 	}
-	if len(marker.Refs) == 0 || marker.Refs[0].Ref != fixtureDecomposedRef {
-		t.Fatalf("marker refs[0].ref = %q, want %q byte for byte (sorted first)", marker.Refs[0].Ref, fixtureDecomposedRef)
+	if len(marker.Refs) == 0 {
+		t.Fatalf("the golden marker carries no refs at all, so this test cannot check the decomposed one")
+	}
+	if got := marker.Refs[0].Ref; got != fixtureDecomposedRef {
+		t.Fatalf("marker refs[0].ref = %+q, want %+q byte for byte (sorted first)", got, fixtureDecomposedRef)
 	}
 
 	// Sanity: both verify as committed, before either is tampered with.

@@ -268,7 +268,7 @@ Revoking a token appends a `token_revoke` record naming the token that is being 
 ```
 
 This is the golden journal's own revocation, byte for byte:
-[`fixtures/v1/streams/_meta/tx/00000000000000000003.json`](fixtures/v1/streams/_meta/tx/00000000000000000003.json). It is signed by `K1`, the key the sequence 2 rotation activated two sequences earlier — the same key that verifies this record is verified against for the reason the payload note below states.
+[`fixtures/v1/streams/_meta/tx/00000000000000000003.json`](fixtures/v1/streams/_meta/tx/00000000000000000003.json). It is signed by `K1`, the key the sequence 2 rotation activated one sequence earlier — the same key that verifies this record is verified against for the reason the payload note below states.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |

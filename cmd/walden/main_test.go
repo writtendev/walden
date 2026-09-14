@@ -2,40 +2,49 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"go/parser"
 	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/writtendev/walden/internal/auth"
 )
 
 func TestRunUsageAndVersion(t *testing.T) {
 	tests := []struct {
-		name       string
-		args       []string
-		wantErr    bool
-		wantOutSub string
-		wantErrSub string
+		name           string
+		args           []string
+		useTempDataDir bool
+		wantErr        bool
+		wantOutSub     string
+		wantErrSub     string
 	}{
 		{
-			name:       "empty-args-defaults-to-serve",
-			args:       []string{},
-			wantErr:    false,
-			wantOutSub: "walden server starting",
+			name:           "empty-args-defaults-to-serve",
+			args:           []string{},
+			useTempDataDir: true,
+			wantErr:        false,
+			wantOutSub:     "walden server starting",
 		},
 		{
-			name:       "default-serve-when-single-arg",
-			args:       []string{"walden"},
-			wantErr:    false,
-			wantOutSub: "walden server starting",
+			name:           "default-serve-when-single-arg",
+			args:           []string{"walden"},
+			useTempDataDir: true,
+			wantErr:        false,
+			wantOutSub:     "walden server starting",
 		},
 		{
-			name:       "serve-subcommand",
-			args:       []string{"walden", "serve"},
-			wantErr:    false,
-			wantOutSub: "walden server starting",
+			name:           "serve-subcommand",
+			args:           []string{"walden", "serve"},
+			useTempDataDir: true,
+			wantErr:        false,
+			wantOutSub:     "walden server starting",
 		},
 		{
 			name:       "serve-print-config-default",
@@ -152,6 +161,9 @@ func TestRunUsageAndVersion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.useTempDataDir {
+				t.Setenv("WALDEN_DATA_DIR", t.TempDir())
+			}
 			var stdout, stderr bytes.Buffer
 			err := run(tt.args, &stdout, &stderr)
 			if (err != nil) != tt.wantErr {
@@ -172,6 +184,7 @@ func TestRunUsageAndVersion(t *testing.T) {
 }
 
 func TestRunServeOutputIncludesGitVersion(t *testing.T) {
+	t.Setenv("WALDEN_DATA_DIR", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	err := runServe(nil, &stdout, &stderr)
 	if err != nil {
@@ -794,5 +807,231 @@ func TestRefusalConventionFormat(t *testing.T) {
 	tokenErrStr := errToken.Error()
 	if !strings.Contains(tokenErrStr, ": ") || !strings.Contains(tokenErrStr, "(") || !strings.HasSuffix(tokenErrStr, ")") {
 		t.Errorf("refusal format mismatch: %q (expected '<what>: <why> (<fix>)')", tokenErrStr)
+	}
+}
+
+func TestServeFirstBootMintsAdminToken(t *testing.T) {
+	dataDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	err := runServe([]string{"--data-dir", dataDir}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runServe failed: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "admin token: walden_") {
+		t.Fatalf("expected stdout to contain 'admin token: walden_', got:\n%s", out)
+	}
+	if !strings.Contains(out, "walden server starting on :8470") {
+		t.Errorf("expected server starting line in output, got:\n%s", out)
+	}
+
+	// Verify order: admin token printed before server starting line
+	adminIdx := strings.Index(out, "admin token: ")
+	startIdx := strings.Index(out, "walden server starting on")
+	if adminIdx >= startIdx {
+		t.Errorf("expected admin token line before server start line, got adminIdx=%d, startIdx=%d", adminIdx, startIdx)
+	}
+
+	// Extract token
+	var token string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "admin token: ") {
+			token = strings.TrimPrefix(line, "admin token: ")
+			break
+		}
+	}
+	if token == "" {
+		t.Fatalf("failed to extract admin token from output")
+	}
+
+	// Verify tokens.json file exists
+	tokensFile := filepath.Join(dataDir, "tokens.json")
+	if _, err := os.Stat(tokensFile); err != nil {
+		t.Fatalf("expected tokens.json to exist: %v", err)
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), auth.AdminTokenID)
+	if err != nil {
+		t.Fatalf("failed to get admin token from store: %v", err)
+	}
+	if rec.TokenHash != auth.HashToken(token) {
+		t.Errorf("token hash in store %q != HashToken(%q) = %q", rec.TokenHash, token, auth.HashToken(token))
+	}
+	if rec.Revoked {
+		t.Errorf("expected admin token to not be revoked")
+	}
+
+	// Verify the minted token grants rwc:* permissions
+	authorizer := auth.NewBuiltinAuthorizer(store)
+	ctx := context.Background()
+	for _, repo := range []string{"alpha", "bravo-repo"} {
+		if err := authorizer.Authorize(ctx, token, auth.Actions{Read: true, Write: true, Create: true}, repo); err != nil {
+			t.Errorf("expected rwc:* authorization to succeed for %q, got: %v", repo, err)
+		}
+	}
+}
+
+func TestServeSecondBootDoesNotMintOrPrint(t *testing.T) {
+	dataDir := t.TempDir()
+
+	// Boot 1
+	var stdout1, stderr1 bytes.Buffer
+	if err := runServe([]string{"--data-dir", dataDir}, &stdout1, &stderr1); err != nil {
+		t.Fatalf("first runServe failed: %v", err)
+	}
+	if !strings.Contains(stdout1.String(), "admin token: walden_") {
+		t.Fatalf("first runServe expected admin token line")
+	}
+
+	tokensFile := filepath.Join(dataDir, "tokens.json")
+	initialContent, err := os.ReadFile(tokensFile)
+	if err != nil {
+		t.Fatalf("failed to read tokens.json: %v", err)
+	}
+
+	// Boot 2
+	var stdout2, stderr2 bytes.Buffer
+	if err := runServe([]string{"--data-dir", dataDir}, &stdout2, &stderr2); err != nil {
+		t.Fatalf("second runServe failed: %v", err)
+	}
+	if strings.Contains(stdout2.String(), "admin token: ") {
+		t.Errorf("second runServe should not output admin token, got:\n%s", stdout2.String())
+	}
+	if !strings.Contains(stdout2.String(), "walden server starting on :8470") {
+		t.Errorf("second runServe missing server start line, got:\n%s", stdout2.String())
+	}
+
+	secondContent, err := os.ReadFile(tokensFile)
+	if err != nil {
+		t.Fatalf("failed to read tokens.json after second boot: %v", err)
+	}
+	if string(initialContent) != string(secondContent) {
+		t.Errorf("tokens.json changed after second boot:\nInitial: %s\nSecond: %s", initialContent, secondContent)
+	}
+}
+
+func TestServeDelegatedModeDoesNotMint(t *testing.T) {
+	dataDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	err := runServe([]string{"--data-dir", dataDir, "--auth-trust", "ed25519:test-public-key"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runServe with auth-trust failed: %v", err)
+	}
+
+	if strings.Contains(stdout.String(), "admin token: ") {
+		t.Errorf("delegated mode must not mint or print admin token, got:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "walden server starting on :8470") {
+		t.Errorf("delegated mode missing server start line, got:\n%s", stdout.String())
+	}
+
+	tokensFile := filepath.Join(dataDir, "tokens.json")
+	if _, err := os.Stat(tokensFile); !os.IsNotExist(err) {
+		t.Errorf("tokens.json should not exist in delegated mode, stat err: %v", err)
+	}
+}
+
+func TestServePrintConfigDoesNotMint(t *testing.T) {
+	dataDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	err := runServe([]string{"--data-dir", dataDir, "--print-config"}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runServe --print-config failed: %v", err)
+	}
+
+	if strings.Contains(stdout.String(), "admin token: ") {
+		t.Errorf("--print-config must not mint or print admin token, got:\n%s", stdout.String())
+	}
+
+	tokensFile := filepath.Join(dataDir, "tokens.json")
+	if _, err := os.Stat(tokensFile); !os.IsNotExist(err) {
+		t.Errorf("tokens.json should not exist after --print-config, stat err: %v", err)
+	}
+}
+
+func TestServeConcurrentBootSingleToken(t *testing.T) {
+	dataDir := t.TempDir()
+	const concurrency = 16
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	outputs := make([]string, concurrency)
+	errs := make([]error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		idx := i
+		go func() {
+			defer wg.Done()
+			var stdout, stderr bytes.Buffer
+			errs[idx] = runServe([]string{"--data-dir", dataDir}, &stdout, &stderr)
+			outputs[idx] = stdout.String()
+		}()
+	}
+
+	wg.Wait()
+
+	adminTokenCount := 0
+	var mintedToken string
+	for i := 0; i < concurrency; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d failed: %v", i, errs[i])
+		}
+		if !strings.Contains(outputs[i], "walden server starting on :8470") {
+			t.Errorf("goroutine %d missing server starting line: %q", i, outputs[i])
+		}
+		if strings.Contains(outputs[i], "admin token: ") {
+			adminTokenCount++
+			for _, line := range strings.Split(outputs[i], "\n") {
+				if strings.HasPrefix(line, "admin token: ") {
+					mintedToken = strings.TrimPrefix(line, "admin token: ")
+				}
+			}
+		}
+	}
+
+	if adminTokenCount != 1 {
+		t.Fatalf("expected exactly 1 admin token printed, got %d", adminTokenCount)
+	}
+	if !strings.HasPrefix(mintedToken, "walden_") {
+		t.Errorf("expected minted token prefix 'walden_', got %q", mintedToken)
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	tokens, err := store.ListTokens(context.Background())
+	if err != nil {
+		t.Fatalf("failed to list tokens: %v", err)
+	}
+	if len(tokens) != 1 {
+		t.Fatalf("expected exactly 1 token in store, got %d", len(tokens))
+	}
+	if tokens[0].TokenID != auth.AdminTokenID {
+		t.Errorf("token ID in store = %q, want %q", tokens[0].TokenID, auth.AdminTokenID)
+	}
+	if tokens[0].TokenHash != auth.HashToken(mintedToken) {
+		t.Errorf("token hash in store = %q, want %q", tokens[0].TokenHash, auth.HashToken(mintedToken))
+	}
+}
+
+func TestServeDataDirCreationFailure(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(tmpFile, []byte("x"), 0600); err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	invalidDataDir := filepath.Join(tmpFile, "cannot_mkdir")
+
+	var stdout, stderr bytes.Buffer
+	err := runServe([]string{"--data-dir", invalidDataDir}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected runServe to fail when data dir cannot be created")
+	}
+	if !errors.Is(err, auth.ErrStoreUnavailable) {
+		t.Errorf("expected error to wrap ErrStoreUnavailable, got: %v", err)
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, "\n") {
+		t.Errorf("expected single-line error, got: %q", errStr)
 	}
 }

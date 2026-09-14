@@ -292,3 +292,175 @@ func TestGetTokenByIDNotFound(t *testing.T) {
 		}
 	})
 }
+
+func TestEnsureAdminToken(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("nil store returns refusal with ErrStoreUnavailable", func(t *testing.T) {
+		token, err := auth.EnsureAdminToken(ctx, nil)
+		if token != "" {
+			t.Errorf("expected empty token for nil store, got %q", token)
+		}
+		checkSingleLineRefusal(t, err, auth.ErrStoreUnavailable)
+	})
+
+	t.Run("empty memory store mints admin token and grants rwc", func(t *testing.T) {
+		store := auth.NewMemoryTokenStore()
+		token, err := auth.EnsureAdminToken(ctx, store)
+		if err != nil {
+			t.Fatalf("EnsureAdminToken failed: %v", err)
+		}
+		if !strings.HasPrefix(token, auth.TokenPrefix) {
+			t.Fatalf("expected token prefix %q, got %q", auth.TokenPrefix, token)
+		}
+
+		rec, err := store.GetTokenByID(ctx, auth.AdminTokenID)
+		if err != nil {
+			t.Fatalf("GetTokenByID(%q) failed: %v", auth.AdminTokenID, err)
+		}
+		if rec == nil {
+			t.Fatalf("expected admin token record, got nil")
+		}
+		if rec.TokenID != auth.AdminTokenID {
+			t.Errorf("token ID = %q, want %q", rec.TokenID, auth.AdminTokenID)
+		}
+		if rec.TokenHash != auth.HashToken(token) {
+			t.Errorf("token hash %q does not match hash of %q", rec.TokenHash, token)
+		}
+		if rec.Revoked {
+			t.Errorf("admin token should not be revoked")
+		}
+		if len(rec.Scopes) != 1 || rec.Scopes[0].String() != "rwc:*" {
+			t.Errorf("admin token scopes = %v, want [rwc:*]", rec.Scopes)
+		}
+
+		// Verify that the minted token grants Read, Write, and Create on arbitrary repos
+		authorizer := auth.NewBuiltinAuthorizer(store)
+		repos := []string{"repo-1", "org-repo", "any.git"}
+		for _, repo := range repos {
+			if err := authorizer.Authorize(ctx, token, auth.Actions{Read: true}, repo); err != nil {
+				t.Errorf("expected read on %q to be authorized, got %v", repo, err)
+			}
+			if err := authorizer.Authorize(ctx, token, auth.Actions{Write: true}, repo); err != nil {
+				t.Errorf("expected write on %q to be authorized, got %v", repo, err)
+			}
+			if err := authorizer.Authorize(ctx, token, auth.Actions{Create: true}, repo); err != nil {
+				t.Errorf("expected create on %q to be authorized, got %v", repo, err)
+			}
+			if err := authorizer.Authorize(ctx, token, auth.Actions{Read: true, Write: true, Create: true}, repo); err != nil {
+				t.Errorf("expected rwc on %q to be authorized, got %v", repo, err)
+			}
+		}
+
+		// Second call on the same store returns "" and adds no tokens
+		token2, err := auth.EnsureAdminToken(ctx, store)
+		if err != nil {
+			t.Fatalf("second EnsureAdminToken call failed: %v", err)
+		}
+		if token2 != "" {
+			t.Errorf("second call returned token %q, want empty", token2)
+		}
+		tokens, err := store.ListTokens(ctx)
+		if err != nil {
+			t.Fatalf("ListTokens failed: %v", err)
+		}
+		if len(tokens) != 1 {
+			t.Errorf("expected 1 token in store after second call, got %d", len(tokens))
+		}
+	})
+
+	t.Run("empty file store mints admin token and second call is no-op", func(t *testing.T) {
+		dir := t.TempDir()
+		store := auth.NewFileTokenStore(dir)
+		token, err := auth.EnsureAdminToken(ctx, store)
+		if err != nil {
+			t.Fatalf("EnsureAdminToken on file store failed: %v", err)
+		}
+		if !strings.HasPrefix(token, auth.TokenPrefix) {
+			t.Fatalf("expected token prefix %q, got %q", auth.TokenPrefix, token)
+		}
+
+		rec, err := store.GetTokenByID(ctx, auth.AdminTokenID)
+		if err != nil {
+			t.Fatalf("GetTokenByID(%q) failed: %v", auth.AdminTokenID, err)
+		}
+		if rec.TokenHash != auth.HashToken(token) {
+			t.Errorf("token hash %q does not match hash of %q", rec.TokenHash, token)
+		}
+
+		// Second call returns ""
+		token2, err := auth.EnsureAdminToken(ctx, store)
+		if err != nil {
+			t.Fatalf("second EnsureAdminToken call failed: %v", err)
+		}
+		if token2 != "" {
+			t.Errorf("second call returned %q, want empty", token2)
+		}
+	})
+
+	t.Run("store with existing active token does not mint admin token", func(t *testing.T) {
+		store := auth.NewMemoryTokenStore()
+		scopes, _ := auth.ParseScopes([]string{"rw:*"})
+		_ = store.CreateToken(ctx, &auth.TokenRecord{
+			TokenID:   "custom_token",
+			TokenHash: auth.HashToken("walden_custom"),
+			Scopes:    scopes,
+			CreatedAt: time.Now().UTC(),
+		})
+
+		token, err := auth.EnsureAdminToken(ctx, store)
+		if err != nil {
+			t.Fatalf("EnsureAdminToken failed: %v", err)
+		}
+		if token != "" {
+			t.Errorf("expected empty token when tokens already exist, got %q", token)
+		}
+		_, err = store.GetTokenByID(ctx, auth.AdminTokenID)
+		if !errors.Is(err, auth.ErrTokenNotFound) {
+			t.Errorf("expected ErrTokenNotFound for admin token, got %v", err)
+		}
+	})
+
+	t.Run("store with existing revoked token does not mint admin token", func(t *testing.T) {
+		store := auth.NewMemoryTokenStore()
+		scopes, _ := auth.ParseScopes([]string{"rw:*"})
+		_ = store.CreateToken(ctx, &auth.TokenRecord{
+			TokenID:   "revoked_token",
+			TokenHash: auth.HashToken("walden_revoked"),
+			Scopes:    scopes,
+			CreatedAt: time.Now().UTC(),
+		})
+		_ = store.RevokeToken(ctx, "revoked_token", time.Now().UTC())
+
+		token, err := auth.EnsureAdminToken(ctx, store)
+		if err != nil {
+			t.Fatalf("EnsureAdminToken failed: %v", err)
+		}
+		if token != "" {
+			t.Errorf("expected empty token when revoked token exists, got %q", token)
+		}
+		_, err = store.GetTokenByID(ctx, auth.AdminTokenID)
+		if !errors.Is(err, auth.ErrTokenNotFound) {
+			t.Errorf("expected ErrTokenNotFound for admin token, got %v", err)
+		}
+	})
+
+	t.Run("lost race ErrTokenExists returns empty token without error", func(t *testing.T) {
+		store := &raceMockStore{MemoryTokenStore: auth.NewMemoryTokenStore()}
+		token, err := auth.EnsureAdminToken(ctx, store)
+		if err != nil {
+			t.Fatalf("EnsureAdminToken failed on lost race: %v", err)
+		}
+		if token != "" {
+			t.Errorf("expected empty token on lost race, got %q", token)
+		}
+	})
+}
+
+type raceMockStore struct {
+	*auth.MemoryTokenStore
+}
+
+func (r *raceMockStore) CreateToken(ctx context.Context, record *auth.TokenRecord) error {
+	return auth.ErrTokenExists
+}

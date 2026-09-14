@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -20,6 +21,9 @@ const (
 
 	// HashPrefix is the prefix for SHA-256 token storage hashes.
 	HashPrefix = "sha256:"
+
+	// AdminTokenID is the stable token ID assigned to the first-boot admin token.
+	AdminTokenID = "admin"
 )
 
 // TokenRecord represents a built-in token's stored metadata and permissions.
@@ -52,6 +56,56 @@ func GenerateToken() (rawToken, tokenHash string, err error) {
 	rawToken = TokenPrefix + base64.RawURLEncoding.EncodeToString(b)
 	tokenHash = HashToken(rawToken)
 	return rawToken, tokenHash, nil
+}
+
+// EnsureAdminToken ensures a first-boot admin token exists when store has no tokens.
+// If store is empty, it generates and persists an admin token with ID AdminTokenID and
+// scope "rwc:*", returning the raw bearer token. If tokens already exist, or if another
+// concurrent process wins the race to create the token (ErrTokenExists), it returns ("", nil).
+// If store is nil, it refuses under ErrStoreUnavailable.
+func EnsureAdminToken(ctx context.Context, store TokenStore) (string, error) {
+	if store == nil {
+		return "", refusal.RefuseWithCause(
+			"token store unavailable",
+			"token store is nil",
+			"initialize token store before ensuring admin token",
+			ErrStoreUnavailable,
+		)
+	}
+
+	tokens, err := store.ListTokens(ctx)
+	if err != nil {
+		return "", err
+	}
+	if len(tokens) > 0 {
+		return "", nil
+	}
+
+	rawToken, tokenHash, err := GenerateToken()
+	if err != nil {
+		return "", err
+	}
+
+	scopes, err := ParseScopes([]string{"rwc:*"})
+	if err != nil {
+		return "", err
+	}
+
+	record := &TokenRecord{
+		TokenID:   AdminTokenID,
+		TokenHash: tokenHash,
+		Scopes:    scopes,
+		CreatedAt: time.Now().UTC(),
+	}
+
+	if err := store.CreateToken(ctx, record); err != nil {
+		if errors.Is(err, ErrTokenExists) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	return rawToken, nil
 }
 
 // TokenStore defines the storage interface for built-in token records. Its mutation

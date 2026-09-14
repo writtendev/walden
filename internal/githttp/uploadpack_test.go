@@ -1,18 +1,23 @@
 package githttp_test
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/writtendev/walden/internal/githttp"
 	"github.com/writtendev/walden/internal/store"
@@ -280,4 +285,104 @@ func seedLargeBlob(t *testing.T, s *store.Store, repo string, size int) {
 		t.Fatalf("RepoPath(%q): %v", repo, err)
 	}
 	runGit(t, t.TempDir(), "clone", "-q", "--bare", work, barePath)
+}
+
+// captureRawUploadPackRequest runs a real `git clone` against a recording
+// server that answers the info/refs negotiation with the real handler but
+// intercepts the POST .../git-upload-pack request, capturing the exact bytes
+// git put on the wire for the fetch/clone negotiation.
+func captureRawUploadPackRequest(t *testing.T, s *store.Store, repo string) ([]byte, string) {
+	t.Helper()
+
+	var captured []byte
+	var proto string
+	recorder := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-upload-pack") {
+			b, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("reading captured request body: %v", err)
+			}
+			captured = b
+			proto = r.Header.Get("Git-Protocol")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		githttp.NewHandler(nil, s, "").ServeHTTP(w, r)
+	})
+	server := httptest.NewServer(recorder)
+	defer server.Close()
+
+	dest := filepath.Join(t.TempDir(), "clone")
+	cmd := exec.Command("git", "clone", "-q", server.URL+"/"+repo, dest)
+	cmd.Dir = t.TempDir()
+	cmd.Env = gitClientEnv()
+	_, _ = cmd.CombinedOutput()
+
+	if len(captured) == 0 {
+		t.Fatal("did not capture a git-upload-pack request body")
+	}
+	return captured, proto
+}
+
+// TestUploadPackStreamingDoesNotHangOnDeadBody reproduces round 1's major finding:
+// a client that over-declares its Content-Length by announcing more bytes than sent
+// on a fetch/clone request previously hung indefinitely after git finished streaming
+// the packfile, because proc.wait() blocked waiting for os/exec's stdin-copy
+// goroutine to read the missing body bytes. Calling proc.waitSettled() ensures the
+// grace period elapses and release() sets an expired read deadline, terminating
+// the response cleanly.
+func TestUploadPackStreamingDoesNotHangOnDeadBody(t *testing.T) {
+	s := store.New(t.TempDir())
+	newBareRepoWithCommit(t, s, "target")
+	raw, proto := captureRawUploadPackRequest(t, s, "target")
+
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", server.URL, err)
+	}
+
+	conn, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		t.Fatalf("dial %s: %v", u.Host, err)
+	}
+	defer conn.Close()
+
+	// Content-Length is declared to be 100 bytes larger than what is actually sent.
+	request := "POST /target/git-upload-pack HTTP/1.1\r\n" +
+		"Host: " + u.Host + "\r\n" +
+		"Content-Type: application/x-git-upload-pack-request\r\n"
+	if proto != "" {
+		request += "Git-Protocol: " + proto + "\r\n"
+	}
+	request += "Content-Length: " + strconv.Itoa(len(raw)+100) + "\r\n" +
+		"Connection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatalf("write request headers: %v", err)
+	}
+	if _, err := conn.Write(raw); err != nil {
+		t.Fatalf("write request body: %v", err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("did not receive response within 5s: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("did not receive the end of the response body within 5s -- this is the hang this test guards against: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if len(body) == 0 {
+		t.Errorf("expected non-empty pack response body")
+	}
 }

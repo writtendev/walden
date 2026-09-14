@@ -3,11 +3,13 @@
 package githttp_test
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -243,4 +245,26 @@ func countOpenFDs(t *testing.T) int {
 		t.Fatalf("read /proc/self/fd: %v", err)
 	}
 	return len(entries)
+}
+
+// TestSetupProcessGroupCancelExitedProcess verifies that cmd.Cancel does not
+// surface an error when called on an exited process group.
+//
+// When request context cancellation races child exit, the process group may
+// have already exited. On Linux, syscall.Kill(-pid, SIGKILL) returns ESRCH;
+// on Darwin/BSD, it returns EPERM or ESRCH. In either case, cmd.Cancel must
+// ignore the error and return nil, preventing cmd.Wait from surfacing phantom
+// cancellation errors.
+func TestSetupProcessGroupCancelExitedProcess(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), "true")
+	githttp.SetupProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("cmd.Start: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("cmd.Wait: %v", err)
+	}
+	if err := cmd.Cancel(); err != nil {
+		t.Fatalf("cmd.Cancel() returned error on exited process: %v", err)
+	}
 }

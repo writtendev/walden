@@ -172,7 +172,14 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if peekErr == nil {
-		if err := proc.wait(); err != nil {
+		// git's --stateless-rpc does not read its stdin to EOF: it reads
+		// the negotiation, streams the packfile, and exits. io.Copy above
+		// returning nil means git's stdout hit EOF, i.e. git is done -- but
+		// if the client over-declared its Content-Length, the stdin-copy
+		// goroutine can still be parked reading the request body at this
+		// exact moment. waitSettled bounds how long it waits for wait()
+		// before unblocking the stuck body read via release().
+		if err := proc.waitSettled(); err != nil {
 			log.Printf("githttp: upload-pack: git upload-pack %q exited with error after streaming: %v (%s)", repo, err, strings.TrimSpace(proc.stderr.String()))
 		}
 	}

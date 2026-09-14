@@ -20,11 +20,32 @@ import (
 	"github.com/writtendev/walden/internal/store"
 )
 
-// runGit runs git in dir and fails the test on error.
+// gitClientEnv returns a minimal environment for a git client exec'd by
+// this test suite: just PATH, so git can be found, and nothing else — no
+// HOME, no GIT_CONFIG_*, none of the ambient environment's git
+// configuration. This mirrors what handleInfoRefs does for its own git
+// child (see inforefs.go's "explicit, minimal environment" comment), so
+// these tests exercise walden's client behavior rather than whatever git
+// config happens to be set on the machine running the suite — a global
+// http.proxy in ~/.gitconfig, for instance, would otherwise silently
+// change what git ls-remote does here.
+func gitClientEnv() []string {
+	env := []string{}
+	if p := os.Getenv("PATH"); p != "" {
+		env = append(env, "PATH="+p)
+	}
+	return env
+}
+
+// runGit runs git in dir and fails the test on error. dir must be a real
+// directory — never the test process's own working directory — both so
+// the command doesn't depend on wherever the suite happens to be run from,
+// and so it can't pick up a repository's local git config by accident.
 func runGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	cmd.Env = gitClientEnv()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
@@ -48,7 +69,7 @@ func newBareRepoWithCommit(t *testing.T, s *store.Store, repo string) string {
 	if err != nil {
 		t.Fatalf("RepoPath(%q): %v", repo, err)
 	}
-	runGit(t, "", "clone", "-q", "--bare", work, barePath)
+	runGit(t, t.TempDir(), "clone", "-q", "--bare", work, barePath)
 
 	return sha
 }
@@ -77,6 +98,8 @@ func TestInfoRefsRealClient(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			args := append(append([]string{}, tt.args...), "ls-remote", server.URL+"/repo")
 			cmd := exec.Command("git", args...)
+			cmd.Dir = t.TempDir()
+			cmd.Env = gitClientEnv()
 			out, err := cmd.CombinedOutput()
 			if err != nil {
 				t.Fatalf("git ls-remote: %v\n%s", err, out)
@@ -206,8 +229,8 @@ func TestInfoRefsPostMethodNotAllowed(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusMethodNotAllowed, rec.Body.String())
 	}
-	if got := rec.Header().Get("Allow"); got != "GET" {
-		t.Errorf("Allow = %q, want %q (RFC 9110 §15.5.6 requires it on a 405)", got, "GET")
+	if got := rec.Header().Get("Allow"); got != "GET, HEAD" {
+		t.Errorf("Allow = %q, want %q (RFC 9110 §15.5.6 requires it on a 405, and HEAD is also supported via ServeMux's GET-matches-HEAD rule)", got, "GET, HEAD")
 	}
 	body := strings.TrimRight(rec.Body.String(), "\n")
 	if strings.Contains(body, "\n") {
@@ -281,8 +304,8 @@ func TestInfoRefsAbortReapsChild(t *testing.T) {
 	// is generous, not load-bearing.
 	time.Sleep(2 * time.Second)
 
-	if zombies := zombieGitChildren(t); len(zombies) > 0 {
-		t.Errorf("%d zombie git child(ren) survived %d aborted requests: pids %v", len(zombies), attempts, zombies)
+	if survivors := survivingGitChildren(t); len(survivors) > 0 {
+		t.Errorf("%d git child(ren) survived %d aborted requests: %v", len(survivors), attempts, survivors)
 	}
 }
 
@@ -306,12 +329,27 @@ func seedManyRefs(t *testing.T, s *store.Store, repo, sha string, n int) {
 	}
 }
 
-// zombieGitChildren returns the pids of any zombie ("Z" state) processes
-// under /proc whose parent is this test binary and whose command name is
-// "git" — the subprocess handleInfoRefs execs. It only reads process
-// state and never waits on anything, so it cannot itself reap (and thereby
-// mask) a leak.
-func zombieGitChildren(t *testing.T) []int {
+// survivingGitChildren returns a description of every process under /proc
+// whose parent is this test binary and whose command name is "git" — the
+// subprocess handleInfoRefs execs — regardless of whether that process has
+// exited and is waiting to be reaped ("Z", zombie) or is still running.
+//
+// Checking only for zombies misses a worse failure shape: if a future edit
+// swapped exec.CommandContext for a plain exec.Command (dropping context
+// cancellation), an aborted request would leave git still alive and still
+// writing into a stdout pipe nobody is draining — cmd.Wait() would then
+// block forever on that still-running child instead of reaping a
+// <defunct> one. That is strictly worse than the original zombie leak (a
+// live process, a live pipe pair, and a permanently blocked handler
+// goroutine, instead of just a zombie entry) and a zombie-only check
+// reports zero and passes. TestInfoRefsAbortReapsChild only calls this
+// after its settle window, by which point every aborted request's child
+// should be gone — so any git process still attached to this test binary
+// at that point, zombie or not, is a leak.
+//
+// It only reads process state and never waits on anything, so it cannot
+// itself reap (and thereby mask) a leak.
+func survivingGitChildren(t *testing.T) []string {
 	t.Helper()
 
 	entries, err := os.ReadDir("/proc")
@@ -320,7 +358,7 @@ func zombieGitChildren(t *testing.T) []int {
 	}
 
 	self := strconv.Itoa(os.Getpid())
-	var zombies []int
+	var survivors []string
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
@@ -340,9 +378,14 @@ func zombieGitChildren(t *testing.T) []int {
 			continue
 		}
 
-		if strings.Contains(string(status), "State:\tZ ") {
-			zombies = append(zombies, pid)
+		state := "unknown"
+		for _, line := range strings.Split(string(status), "\n") {
+			if strings.HasPrefix(line, "State:\t") {
+				state = strings.TrimSpace(strings.TrimPrefix(line, "State:\t"))
+				break
+			}
 		}
+		survivors = append(survivors, fmt.Sprintf("pid %d (%s)", pid, state))
 	}
-	return zombies
+	return survivors
 }

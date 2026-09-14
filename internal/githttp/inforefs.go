@@ -111,8 +111,16 @@ func (b *boundedWriter) Write(p []byte) (int, error) {
 // method here.
 func (h *Handler) handleInfoRefsMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
 	// RFC 9110 §15.5.6 makes this a MUST: a 405 response must name the
-	// target resource's currently supported methods.
-	w.Header().Set("Allow", "GET")
+	// target resource's currently supported methods — and that list is
+	// "GET, HEAD", not just "GET". net/http.ServeMux's GET-also-matches-HEAD
+	// rule means a HEAD request to this path is routed to handleInfoRefs
+	// (200, correct content type, empty body), so HEAD is genuinely
+	// supported here even though this handler never sees it. Naming only
+	// GET would tell the exact audience Allow exists for — proxies,
+	// scanners, cache revalidation — that HEAD is unsupported, which can
+	// turn a cheap conditional HEAD into a full GET (and a discarded git
+	// exec) on their end.
+	w.Header().Set("Allow", "GET, HEAD")
 	writeRefusal(w, http.StatusMethodNotAllowed, refusal.Refuse(
 		"method not allowed",
 		fmt.Sprintf("%s is not supported for /{repo}/info/refs", r.Method),

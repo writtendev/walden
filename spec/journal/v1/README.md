@@ -339,7 +339,7 @@ Each object in the `updates` array represents a single ref transition:
 In Git, ref names are raw sequences of non-zero bytes subject only to Git's ref format rules (`git-check-ref-format`). Git does not enforce UTF-8 encoding or Unicode normalization on ref names.
 
 - **Byte Preservation Invariant:** Writers and readers MUST treat ref names as exact, opaque byte sequences.
-- **No Unicode Normalization:** Unicode normalization algorithms (such as NFC or NFD conversion) MUST NOT be applied to ref names. Applying Unicode normalization alters the raw byte sequence and permanently breaks signature verification.
+- **No Unicode Normalization:** Unicode normalization algorithms (such as NFC or NFD conversion) MUST NOT be applied to ref names. Applying Unicode normalization alters the raw byte sequence and permanently breaks signature verification. The golden journal carries a ref name that is deliberately not NFC-invariant — `refs/heads/caf` + U+0065 + U+0301 (decomposed), on [`repo-alpha`'s seq 1 record](fixtures/v1/streams/repo-alpha/tx/00000000000000000001.json) and in [its marker's ref set](fixtures/v1/streams/repo-alpha/marker.json) — for exactly this reason: swapping it for its precomposed NFC form (`refs/heads/caf` + U+00E9) breaks both signatures, which is this paragraph's claim, executed.
 - **Character Restrictions:** Ref names must not contain ASCII control characters (`0x00`–`0x1F`, `0x7F`), space (`0x20`), `~`, `^`, `:`, `?`, `*`, `[`, `\`, `@{`, `//`, trailing slashes, leading/trailing component dots, end with `.lock`, or have any slash-delimited component ending with `.lock`.
 
 ### 5.3 Canonical Ref-Transaction Signing Payload
@@ -478,6 +478,10 @@ records are signed at all.
   "snapshot": "cd04837137cbca78f87a66055eb1ec4a598842618fa6cdb126295c6cda9b6638",
   "refs": [
     {
+      "ref": "refs/heads/café",
+      "oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
+    },
+    {
       "ref": "refs/heads/main",
       "oid": "fe75a8a9eea356bbe01fdf92d95d448190ad7942"
     },
@@ -487,7 +491,7 @@ records are signed at all.
     }
   ],
   "timestamp": "2026-08-31T01:00:00Z",
-  "signature": "ed25519:f914a903e538e757f1ed29e511a03fcbeb7d597c618af649ae63dde93a28ac2509af288ab96d4bd4b50b8a443b5d0a097733aab9b82d05ecd0081318b0a93a0c"
+  "signature": "ed25519:0d96768618efdfcdbd282a0252ce336236019045812dd8e9385b25b26f8a3f1dd36b0daee8cdb950266b8fcf4ee893bd2d72af4541f33a0bca0ae598f0a3d605"
 }
 ```
 
@@ -500,7 +504,11 @@ at `_meta` sequence 2 — precisely so this one marker could demonstrate both
 halves of this section at once: `refs/tags/v0.1` is created at sequence 1 and
 never touched again, so it is recoverable only because this marker carries the
 ref set, and `key_epoch_floor` is `1` because sequence 3 is the record that
-carried epoch 1.
+carried epoch 1. `refs/heads/caf` + U+0065 + U+0301 — a ref name that is
+deliberately not NFC-invariant (section 5.2) — is created on the same seq 1
+record and sorts first in this array by the raw bytes of its name; it is never
+touched again either, so it is recoverable only from this marker in exactly
+the way `refs/tags/v0.1` is.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |

@@ -38,6 +38,29 @@ import (
 // fixtureGitDate is the fixed author and committer date for every fixture commit.
 const fixtureGitDate = "1767225600 +0000"
 
+// fixtureDecomposedRef and fixturePrecomposedRef are two different byte sequences that
+// render as the identical glyph, refs/heads/caf\u00e9. Section 5.2 of the journal spec
+// says Unicode normalization "permanently breaks signature verification"; until WALD-89
+// no fixture exercised that claim, because every published ref name was ASCII and
+// therefore NFC-invariant. fixtureDecomposedRef is the one the golden journal actually
+// carries, on repo-alpha's seq 1 record and in its marker's ref set. fixturePrecomposedRef
+// never appears anywhere in the fixture tree: the two spellings collide as loose refs on
+// a normalization-insensitive filesystem, so it exists only as a Go literal, used to swap
+// fixtureDecomposedRef out in the negative assertions of
+// TestFixtureNonASCIIRefBreaksOnNormalization.
+//
+// Both are written as \u escapes for their non-ASCII codepoints, not literal UTF-8, so
+// neither ref literal contributes a byte an editor or a tool elsewhere in the chain
+// could normalize.
+const (
+	// fixtureDecomposedRef: "refs/heads/caf" + U+0065 LATIN SMALL LETTER E + U+0301
+	// COMBINING ACUTE ACCENT (UTF-8 ... 63 61 66 65 cc 81).
+	fixtureDecomposedRef = "refs/heads/cafe\u0301"
+	// fixturePrecomposedRef: "refs/heads/caf" + U+00E9 LATIN SMALL LETTER E WITH ACUTE,
+	// the NFC form of fixtureDecomposedRef (UTF-8 ... 63 61 66 c3 a9).
+	fixturePrecomposedRef = "refs/heads/caf\u00e9"
+)
+
 // fixtureKey derives the deterministic Ed25519 signing key whose seed is seedByte repeated.
 func fixtureKey(seedByte byte) ed25519.PrivateKey {
 	seed := make([]byte, ed25519.SeedSize)
@@ -539,11 +562,15 @@ func generateFixtures(w *fixtureWriter) {
 		Timestamp: "2026-08-31T00:02:00Z",
 	})
 
-	// seq 1: fast-forward main, create a second branch, and tag the commit main is
-	// leaving behind — all in one atomic transaction. refs/tags/v0.1 is never touched
-	// again after this: it is the ref whose last update sits at or before the marker
-	// baseline (moved to seq 3 below), recoverable only because the marker now carries
-	// the ref set rather than just a replay-from sequence (WALD-97).
+	// seq 1: fast-forward main, create a second branch, tag the commit main is leaving
+	// behind, and create a fourth ref whose name is deliberately not NFC-invariant — all
+	// in one atomic transaction. refs/tags/v0.1 and fixtureDecomposedRef are never
+	// touched again after this: both are refs whose last update sits at or before the
+	// marker baseline (moved to seq 3 below), recoverable only because the marker now
+	// carries the ref set rather than just a replay-from sequence (WALD-97).
+	// fixtureDecomposedRef additionally demonstrates section 5.2's byte-preservation
+	// rule: it points at the same commit main started this push at, costing no new pack
+	// (WALD-89).
 	w.writeRefTx(genesisKey, &journal.RefTransactionRecord{
 		Version:  journal.VersionPrefix,
 		Stream:   fixtureRepoStream,
@@ -555,6 +582,7 @@ func generateFixtures(w *fixtureWriter) {
 			{Ref: "refs/heads/main", OldOID: c1, NewOID: c2},
 			{Ref: "refs/heads/feature", OldOID: journal.ZeroOID40, NewOID: c2},
 			{Ref: "refs/tags/v0.1", OldOID: journal.ZeroOID40, NewOID: c1},
+			{Ref: fixtureDecomposedRef, OldOID: journal.ZeroOID40, NewOID: c1},
 		},
 		Timestamp: "2026-08-31T00:03:00Z",
 	})
@@ -611,12 +639,16 @@ func generateFixtures(w *fixtureWriter) {
 
 	// --- Compaction: a snapshot consolidating everything through seq 3 — past the key
 	// rotation, so one stream demonstrates both halves of WALD-97 at once. The marker
-	// carries the authoritative ref set as of seq 3 (refs/heads/main at c3 and
-	// refs/tags/v0.1 at c1, sorted ascending by ref name) and the epoch floor as of seq 3
+	// carries the authoritative ref set as of seq 3 (fixtureDecomposedRef and
+	// refs/tags/v0.1 at c1, refs/heads/main at c3, sorted ascending by the raw bytes of
+	// ref name — fixtureDecomposedRef sorts first) and the epoch floor as of seq 3
 	// (1, the highest key_epoch any record at or before seq 3 carries), signed by the
 	// rotated key that also signed seq 3. The segments and transactions compaction
 	// supersedes stay in the fixture tree on purpose; readers must ignore them, not
-	// reject them.
+	// reject them. Carrying fixtureDecomposedRef here too means the same non-NFC-
+	// invariant byte sequence is signed on a second, independent surface — the one a
+	// reader reaches on the resume path, which trusts the marker's own bytes rather
+	// than replaying them (WALD-89).
 	snapshotHash := w.writeSnapshot(fixtureRepoStream, repo.pack(c3))
 
 	marker := &journal.Marker{
@@ -627,6 +659,7 @@ func generateFixtures(w *fixtureWriter) {
 		KeyEpochFloor: 1,
 		Snapshot:      snapshotHash,
 		Refs: []journal.MarkerRef{
+			{Ref: fixtureDecomposedRef, OID: c1},
 			{Ref: "refs/heads/main", OID: c3},
 			{Ref: "refs/tags/v0.1", OID: c1},
 		},

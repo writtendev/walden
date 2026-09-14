@@ -170,7 +170,8 @@ When a built-in token is created, a record is conditionally appended to the `_me
   "scopes": [
     "rwc:*"
   ],
-  "timestamp": "2026-08-31T00:01:00Z"
+  "timestamp": "2026-08-31T00:01:00Z",
+  "signature": "ed25519:cef6207dd61108ad67d6381822e3e47fa100b220f62132432e233f3bc339e27d8a46fb2035d99bd3b7d568d2b413e0eb27886458de4dbd8bbdeff6dc799d5108"
 }
 ```
 
@@ -191,7 +192,8 @@ Revoking a token appends a `token_revoke` record to the `_meta` stream, defined 
   "type": "token_revoke",
   "token_id": "tok_admin_01",
   "token_hash": "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb",
-  "timestamp": "2026-08-31T00:08:00Z"
+  "timestamp": "2026-08-31T00:08:00Z",
+  "signature": "ed25519:b18b4702fc2732d315f89d3ccd57d8339b9c5983eeffe39bc8087b76ae80f2c1a2efeb5a0d76b8b0a56be5ee4a046cfaa4ef7f5bd6f9a8dd665792f188306b00"
 }
 ```
 

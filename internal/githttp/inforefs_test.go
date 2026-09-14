@@ -180,7 +180,7 @@ func TestInfoRefsGoldenPreamble(t *testing.T) {
 func TestInfoRefsProtocolV2Negotiation(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	tests := []struct {
 		name         string
@@ -227,7 +227,7 @@ func TestInfoRefsProtocolV2Negotiation(t *testing.T) {
 func TestInfoRefsReceivePackIgnoresProtocolV2(t *testing.T) {
 	s := store.New(t.TempDir())
 	sha := newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/repo/info/refs?service=git-receive-pack", nil)
 	req.Header.Set("Git-Protocol", "version=2")

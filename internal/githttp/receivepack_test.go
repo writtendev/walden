@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -600,6 +601,92 @@ func TestReceivePackCleanRefusalDoesNotHangOnDeadBody(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if survivors := survivingGitChildren(t); len(survivors) > 0 {
 		t.Errorf("%d git child(ren) survived: %v", len(survivors), survivors)
+	}
+}
+
+// TestReceivePackStreamingDoesNotHangOnDeadBody reproduces round-2's medium
+// finding: the same unbounded Wait round 1 closed on the no-output branch
+// (TestReceivePackCleanRefusalDoesNotHangOnDeadBody, above) was still open
+// on the streaming branch -- and there it strands the client after a
+// *successful* push rather than merely delaying a refusal.
+//
+// git's --stateless-rpc does not read its stdin to EOF: it reads the
+// commands and exactly the pack index-pack expects, reports, and exits.
+// So a client that over-declares its Content-Length by even one byte
+// leaves os/exec's stdin-copy goroutine parked in a Read on the request
+// body long after git has finished and its stdout has already been
+// copied to the client in full. Before the fix, the trailing wait() on
+// this branch blocked on that goroutine forever -- receivePackWaitDelay
+// never arms against a client that is merely silent, since its timer (per
+// go1.25's os/exec) is only created after the request context is
+// cancelled -- so the chunked response was left unterminated even though
+// the ref had already moved server-side.
+//
+// This raises a real push's captured raw bytes (captureRawReceivePackRequest,
+// above) over a raw connection with a Content-Length one byte higher than
+// what is actually sent, then asserts the response reaches its end (the
+// closing zero-length chunk) within a bound a fixed handler clears in
+// milliseconds, and that the ref moved despite the miscounted framing.
+func TestReceivePackStreamingDoesNotHangOnDeadBody(t *testing.T) {
+	work, sha := newWorkTreeWithCommit(t)
+	raw := captureRawReceivePackRequest(t, work)
+
+	s := store.New(t.TempDir())
+	barePath := newEmptyBareRepo(t, s, "target")
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	defer server.Close()
+
+	u, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", server.URL, err)
+	}
+
+	conn, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		t.Fatalf("dial %s: %v", u.Host, err)
+	}
+	defer conn.Close()
+
+	request := "POST /target/git-receive-pack HTTP/1.1\r\n" +
+		"Host: " + u.Host + "\r\n" +
+		"Content-Type: application/x-git-receive-pack-request\r\n" +
+		"Content-Length: " + strconv.Itoa(len(raw)+1) + "\r\n" +
+		"Connection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatalf("write request headers: %v", err)
+	}
+	// The declared Content-Length is one byte more than what follows: the
+	// client goes silent right after, the same one-byte miscount round
+	// 2's reproduction used, with no hostility beyond that required.
+	if _, err := conn.Write(raw); err != nil {
+		t.Fatalf("write request body: %v", err)
+	}
+
+	// Round 2's reproduction saw the handler still parked 25s after git
+	// had already completed the push and exited. A fixed handler
+	// terminates the response in well under a second; this bound is
+	// generous, not load-bearing.
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("did not receive response headers within 5s: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("did not receive the end of the response body within 5s -- this is the hang this test guards against: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", resp.StatusCode, http.StatusOK, body)
+	}
+	if !bytes.Contains(body, []byte("unpack ok")) {
+		t.Errorf("response does not contain %q: %q", "unpack ok", body)
+	}
+	if got := revParse(t, barePath, "refs/heads/main"); got != sha {
+		t.Errorf("refs/heads/main = %q, want %q -- push should have succeeded despite the miscounted Content-Length", got, sha)
 	}
 }
 

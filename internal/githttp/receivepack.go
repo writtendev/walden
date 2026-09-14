@@ -3,12 +3,10 @@ package githttp
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
-	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,7 +15,6 @@ import (
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/refusal"
-	"github.com/writtendev/walden/internal/store"
 )
 
 // receivePackContentType is the one Content-Type a receive-pack RPC body
@@ -42,24 +39,56 @@ const receivePackContentType = "application/x-git-receive-pack-request"
 // here does not silently lose that protection.
 const receivePackWaitDelay = 5 * time.Second
 
-// handleReceivePackMethodNotAllowed refuses any method other than POST for
-// /{repo}/git-receive-pack with a one-line 405.
+// isReceivePackContentType reports whether v names receivePackContentType,
+// ignoring any parameters (e.g. a charset) and case, per RFC 9110 §8.3.1 --
+// matching isUploadPackContentType (uploadpack.go), the sibling route's
+// answer to the identical question. Before this, the two routes disagreed:
+// a legal "application/x-git-receive-pack-request; charset=utf-8" was 200
+// on fetch and 415 on push.
+func isReceivePackContentType(v string) bool {
+	mediaType, _, err := mime.ParseMediaType(v)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mediaType, receivePackContentType)
+}
+
+// waitAfterStdoutSettled calls wait after first setting a read deadline in
+// the past on w, so an os/exec stdin-copy goroutine still blocked reading
+// the request body -- parked there because a client announced a larger
+// Content-Length than it actually sent -- does not leave Wait blocked
+// indefinitely. cmd.Wait cannot return until that goroutine does, and
+// neither r.Context() (a merely silent client never cancels it) nor
+// receivePackWaitDelay (its timer, per go1.25's os/exec, is created only
+// after context cancellation -- see the comment on that constant) ever
+// unblocks it on their own.
 //
-// Same reasoning as handleInfoRefsMethodNotAllowed in inforefs.go: relying
-// on net/http.ServeMux to auto-generate this 405 does not hold once the
-// package's "/" catch-all (githttp.go's handleRequest) is also registered,
-// since that catch-all matches every path regardless of method and would
-// otherwise answer a non-POST request here with a bare 200. registerRoutes
-// binds this handler to the same path pattern without a method, so
-// ServeMux prefers the more specific "POST /{repo}/git-receive-pack"
-// registration for POST and leaves every other method here.
-func (h *Handler) handleReceivePackMethodNotAllowed(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Allow", "POST")
-	writeRefusal(w, http.StatusMethodNotAllowed, refusal.Refuse(
-		"method not allowed",
-		fmt.Sprintf("%s is not supported for /{repo}/git-receive-pack", r.Method),
-		"use POST",
-	))
+// Both of handleReceivePack's wait() call sites qualify to call this
+// rather than wait() directly: each runs only once git's stdout side has
+// already signalled it is done producing output -- a failed Peek (git has
+// exited) or an exhausted br after a full io.Copy (git closed its stdout,
+// which in --stateless-rpc mode means it is done or about to exit) -- so
+// applying the deadline never races a read this handler still expects to
+// succeed. It is not applied to the deferred backstop's own call: that
+// one fires only when writing the response itself failed, which already
+// implies the connection is going away.
+//
+// This is also safe to call whether or not the body actually needed it:
+// once http.body has already returned io.EOF for a fully-drained body, a
+// further Read is answered from its own byte-count bookkeeping without
+// touching the connection at all, so an expired deadline set here touches
+// nothing already finished. When the body was not fully drained, forcing
+// the stuck Read to fail is the correct outcome regardless -- net/http
+// will not reuse a connection whose request body was not fully consumed
+// -- so this cannot turn a connection that should stay alive into one
+// that does not; it can only make that unavoidable outcome arrive
+// promptly instead of never. SetReadDeadline's own error is ignored: if
+// this ResponseWriter cannot support it, wait() falls back to whatever
+// bound cmd.WaitDelay still covers rather than failing loudly for
+// something orthogonal to the wait it guards.
+func waitAfterStdoutSettled(w http.ResponseWriter, wait func() error) error {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+	return wait()
 }
 
 // handleReceivePack serves POST /{repo}/git-receive-pack: a push. Per
@@ -77,7 +106,7 @@ func (h *Handler) handleReceivePackMethodNotAllowed(w http.ResponseWriter, r *ht
 func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	repo := r.PathValue("repo")
 
-	if ct := r.Header.Get("Content-Type"); ct != receivePackContentType {
+	if ct := r.Header.Get("Content-Type"); !isReceivePackContentType(ct) {
 		writeRefusal(w, http.StatusUnsupportedMediaType, refusal.Refuse(
 			"unsupported content type",
 			fmt.Sprintf("Content-Type %q is not %q", ct, receivePackContentType),
@@ -93,59 +122,16 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	// and no git client would gzip one. WALD-38's planner tested the real
 	// binaries and found git-http-backend — the reference
 	// implementation this repo wraps rather than reimplements — does
-	// accept and inflate a gzip-encoded request body. Settling this by
-	// testing rather than by the earlier assumption (recorded in a
-	// comment on WALD-39):
-	//
-	//   - `strings` on git-http-backend (git 2.50.1, Apple Git-155) shows
-	//     it links the gzip-decompression path for its request body:
-	//     "Content-Encoding: gzip", "x-gzip", and "request ended in the
-	//     middle of the gzip stream" (its own truncation error) are all
-	//     present.
-	//   - A real `git push` of both a trivial commit and a 5MB
-	//     highly-redundant file, captured with GIT_TRACE_CURL against a
-	//     git-http-backend CGI instance, never sent Content-Encoding on
-	//     the git-receive-pack POST in either case — git's client-side
-	//     gzip path (also present in the git binary) only fires when
-	//     compressing would shrink the request, and a packfile is
-	//     already zlib-deflated, so it never wins that comparison.
-	//
-	// No git client observed here sends a gzipped push, but the
-	// reference server accepts one, and inflating one costs a
-	// gzip.NewReader from the standard library — a small, permanent
-	// accommodation is preferable to a 415 that would blame a client
-	// for doing something git-http-backend itself allows. "x-gzip" is
-	// accepted alongside "gzip" for the same reason: `strings` on the
-	// same git-http-backend binary lists "x-gzip" right next to
-	// "Content-Encoding: gzip" in its gzip-decompression path — it is
-	// the legacy spelling of the identical encoding, not a distinct one,
-	// and refusing it would be the same class of mistake this decision
-	// exists to avoid. Anything other than absent, "identity", "gzip",
-	// or "x-gzip" is still refused: those remain unrecognized, not
-	// merely unlikely.
-	var body io.Reader = r.Body
-	switch enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))); enc {
-	case "", "identity":
-		// body already set to r.Body.
-	case "gzip", "x-gzip":
-		gz, err := gzip.NewReader(r.Body)
-		if err != nil {
-			writeRefusal(w, http.StatusBadRequest, refusal.RefuseWithCause(
-				"invalid request body",
-				"Content-Encoding: gzip was declared but the body is not a valid gzip stream",
-				"send an uncompressed body or a correctly gzip-compressed one",
-				err,
-			))
-			return
-		}
-		defer gz.Close()
-		body = gz
-	default:
-		writeRefusal(w, http.StatusUnsupportedMediaType, refusal.Refuse(
-			"unsupported content encoding",
-			fmt.Sprintf("Content-Encoding %q is not supported", enc),
-			"send the request uncompressed or gzip-compressed",
-		))
+	// accept and inflate a gzip-encoded request body, and landed
+	// requestBodyReader (uploadpack.go) to answer this question for both
+	// RPC routes: it accepts absent, "identity", "gzip", or the legacy
+	// "x-gzip" spelling git-http-backend's own binary treats as gzip's
+	// alias, and refuses anything else with a one-line 415. Reusing it
+	// here rather than re-deriving the same switch converges this
+	// route's accept set with upload-pack's rather than settling the
+	// question a second time.
+	body, ok := requestBodyReader(w, r)
+	if !ok {
 		return
 	}
 
@@ -175,46 +161,16 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	required := auth.Actions{Write: action == auth.ActionWrite}
 	_ = required
 
-	path, err := h.store.RepoPath(repo)
-	if err != nil {
-		// Same mapping as handleInfoRefs: store.ErrStoreUnavailable is an
-		// operator fault (5xx); everything else — a bad identifier, a
-		// containment escape — is caller fault (4xx).
-		if errors.Is(err, store.ErrStoreUnavailable) {
-			log.Printf("githttp: receive-pack: repo path for %q: %v", repo, err)
-			writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
-				"repository unavailable",
-				"the server could not resolve the repository path",
-				"contact the operator",
-				store.ErrStoreUnavailable,
-			))
-			return
-		}
-		writeRefusal(w, http.StatusBadRequest, err)
-		return
-	}
-
-	if _, err := os.Stat(path); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			// A plain 404: this ticket does not wire in create-on-push
-			// (see WALD-39's "Sequencing" section — that call needs a
-			// token, which arrives with WALD-52). The §3.4 create-scope
-			// refusal text lands there, not here.
-			writeRefusal(w, http.StatusNotFound, refusal.RefuseWithCause(
-				"repository not found",
-				fmt.Sprintf("no repository named %q", repo),
-				"check the repository identifier or push to create it once creation is wired in",
-				store.ErrRepoNotFound,
-			))
-			return
-		}
-		log.Printf("githttp: receive-pack: stat repository path for %q: %v", repo, err)
-		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
-			"repository unavailable",
-			"the server could not access the repository",
-			"contact the operator",
-			store.ErrStoreUnavailable,
-		))
+	// resolveRepoDir (gitcmd.go) is the same RepoPath-then-stat sequence
+	// WALD-38 already uses for info/refs and upload-pack, converged here
+	// so a push to a repository that does not exist reads identically to
+	// a fetch of one rather than the differently-worded 404 this file
+	// used to compose by hand. Push-time repo creation is still not
+	// wired in (that needs a token, which arrives with WALD-52 -- see
+	// WALD-39's ticket "Sequencing" section); that is a behavior gap,
+	// not a wording one, and this change does not touch it.
+	path, ok := h.resolveRepoDir(w, "receive-pack", repo)
+	if !ok {
 		return
 	}
 
@@ -223,18 +179,17 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	// pre-receive hook (WALD-43, dispatched by argv from the same
 	// binary) uses to find its repository and its journal with no
 	// config file of its own.
-	env := []string{}
-	if p := os.Getenv("PATH"); p != "" {
-		env = append(env, "PATH="+p)
-	}
-	// Deliberately not forwarded: the request's Git-Protocol header.
-	// WALD-38's probe found receive-pack's advertisement is
-	// byte-identical whether or not GIT_PROTOCOL=version=2 is set, so
-	// forwarding it here would change nothing observable except
+	// gitEnv (gitcmd.go) is the same PATH-only environment WALD-38 already
+	// builds for the sibling routes; called with wantV2 always false
+	// because, deliberately, receive-pack never forwards the request's
+	// Git-Protocol header. WALD-38's probe found receive-pack's
+	// advertisement is byte-identical whether or not GIT_PROTOCOL=version=2
+	// is set, so forwarding it here would change nothing observable except
 	// dropping the v0 preamble — and would invalidate WALD-36's
 	// receive-pack golden fixture for no demonstrated benefit. The safe
 	// default is to leave receive-pack on v0 until something demonstrates
-	// a reason to move it; do not re-add this without that evidence.
+	// a reason to move it; do not pass true here without that evidence.
+	env := gitEnv(false)
 	env = append(env,
 		"WALDEN_REPO="+repo,
 		"WALDEN_DATA_DIR="+h.store.DataDir(),
@@ -338,27 +293,19 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	_, peekErr := br.Peek(1)
 	if peekErr != nil {
 		// git has already exited (that is what made the peek fail) and
-		// the refusal below is composed and ready — but cmd.Wait() will
+		// the refusal below is composed and ready -- but cmd.Wait() will
 		// not return until the stdin-copy goroutine os/exec started for
 		// cmd.Stdin (body: r.Body, or a gzip.Reader wrapping it)
 		// finishes, and that goroutine is blocked in a Read on r.Body
 		// whenever the client announced a Content-Length and simply
 		// stopped sending without closing the connection. git exiting
 		// does not unblock it, and neither does receivePackWaitDelay
-		// above: os/exec only forces closed the pipe end it owns once
-		// its delay elapses, and a Read already parked in r.Body is
-		// upstream of that pipe (proven both by reading go1.25's
-		// os/exec source and by reproducing the hang standalone). The
-		// one thing that does reach a Read already in flight on the
-		// request body is a deadline on the request itself: setting one
-		// in the past turns that Read into an immediate error, which
-		// finishes the copy goroutine and lets Wait return right away
-		// instead of waiting out however long the client stays silent.
-		// SetReadDeadline's error is deliberately ignored — if this
-		// ResponseWriter cannot support it, wait() below falls back to
-		// receivePackWaitDelay's bound rather than hanging forever.
-		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
-		if waitErr := wait(); waitErr != nil {
+		// above (see that constant's comment) -- waitAfterStdoutSettled
+		// is what reaches a Read already in flight on the request body,
+		// finishing the copy goroutine and letting Wait return right
+		// away instead of waiting out however long the client stays
+		// silent.
+		if waitErr := waitAfterStdoutSettled(w, wait); waitErr != nil {
 			log.Printf("githttp: receive-pack: git receive-pack %q: %v (%s)", repo, waitErr, strings.TrimSpace(stderrBuf.String()))
 			writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 				"receive-pack failed",
@@ -379,12 +326,12 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	// No Content-Length: the response is chunked and unbuffered, flushed
-	// after every write, which is what lets sideband progress and a
-	// hook's relayed stderr reach the client while it is still watching
-	// rather than only once the handler returns.
-	fw := flushWriter{w: w, rc: http.NewResponseController(w)}
+	// after every write (newFlushingWriter, uploadpack.go), which is what
+	// lets sideband progress and a hook's relayed stderr reach the client
+	// while it is still watching rather than only once the handler
+	// returns.
 	if peekErr == nil {
-		if _, err := io.Copy(fw, br); err != nil {
+		if _, err := io.Copy(newFlushingWriter(w), br); err != nil {
 			// The 200 and some bytes are already on the wire; the honest
 			// move is to stop and log rather than append anything to a
 			// half-written result. The deferred wait() above still reaps
@@ -394,7 +341,17 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if peekErr == nil {
-		if err := wait(); err != nil {
+		// git's --stateless-rpc does not read its stdin to EOF: it reads
+		// the commands and exactly the pack index-pack expects, reports,
+		// and exits. io.Copy above returning nil means git's stdout hit
+		// EOF, i.e. git is done -- but if the client over-declared its
+		// Content-Length, the stdin-copy goroutine can still be parked
+		// reading the request body at this exact moment, which is round
+		// 2's finding: this trailing wait() had the identical hazard
+		// round 1 fixed above, on the branch that runs after a
+		// *successful* push instead of before a refusal.
+		// waitAfterStdoutSettled closes it the same way.
+		if err := waitAfterStdoutSettled(w, wait); err != nil {
 			// Exactly the headline promise: git's non-zero exit (a
 			// declined push, a hook rejection) is logged here and never
 			// gates the response already sent above.
@@ -407,26 +364,4 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	// os/exec's "Wait was already called" and log a git failure that
 	// never happened, exactly mirroring handleInfoRefs's identical
 	// guard in inforefs.go.
-}
-
-// flushWriter wraps an http.ResponseWriter so every Write is flushed
-// immediately. Without this, sideband progress and a hook's relayed
-// stderr would sit in a buffer until the handler returns instead of
-// reaching the client as git produces them — a declined push would still
-// arrive as `ng`, but the developer would not see it live.
-type flushWriter struct {
-	w  http.ResponseWriter
-	rc *http.ResponseController
-}
-
-func (f flushWriter) Write(p []byte) (int, error) {
-	n, err := f.w.Write(p)
-	if err != nil {
-		return n, err
-	}
-	// Flush is best-effort: a ResponseWriter that cannot support it (or a
-	// client that has already gone away) does not turn an otherwise
-	// successful write into a copy failure.
-	_ = f.rc.Flush()
-	return n, nil
 }

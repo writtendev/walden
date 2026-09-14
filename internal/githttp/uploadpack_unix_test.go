@@ -65,7 +65,7 @@ func TestUploadPackAbortKillsChild(t *testing.T) {
 		t.Fatalf("mkdir %q: %v", barePath, err)
 	}
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s))
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)

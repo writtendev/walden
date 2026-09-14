@@ -51,7 +51,7 @@ func (h *Handler) registerRoutes() {
 	// registration here, the "/" catch-all below would answer a non-POST
 	// request to this path instead of ServeMux ever getting a chance to
 	// produce its own 405.
-	h.mux.HandleFunc("/{repo}/git-receive-pack", h.handleReceivePackMethodNotAllowed)
+	h.mux.HandleFunc("/{repo}/git-receive-pack", methodNotAllowed("/{repo}/git-receive-pack", "POST"))
 	h.mux.HandleFunc("/", h.handleRequest)
 }
 

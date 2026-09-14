@@ -142,3 +142,7 @@ type RepositoryManager interface {
 	// RepoPath returns the on-disk path to the repository.
 	RepoPath(repo string) (string, error)
 }
+
+// var _ RepositoryManager = (*Store)(nil) pins Store to the interface at
+// compile time, so the two cannot drift apart silently.
+var _ RepositoryManager = (*Store)(nil)

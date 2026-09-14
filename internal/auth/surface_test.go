@@ -45,6 +45,7 @@ var authSurfaceAllowlist = map[string]bool{
 	"ErrExpired":          true,
 	"ErrNotYetValid":      true,
 	"ErrInvalidSignature": true,
+	"ErrCreateForbidden":  true,
 }
 
 // checkAuthSurface inspects one already-parsed file for references to internal/auth

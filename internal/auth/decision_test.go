@@ -138,3 +138,74 @@ func TestAuthorizeVerdicts(t *testing.T) {
 		}
 	}
 }
+
+// TestAuthorizeRefusesEmptyRequired pins the one fail-open the plan calls out by name: asking
+// to authorize nothing must never be answered as a trivial grant. Without this test, nothing
+// in the suite ever calls Authorize with auth.Actions{} — so if a later refactor dropped or
+// reordered checkRequired (inlining it, moving it below the token lookup, hoisting the
+// evaluation into a shared helper), Missing would be handed a zero-value Actions, its loop
+// body would never run since nothing is required, it would report nothing missing, and
+// Authorize would return nil — a full grant — with every other test in the package still
+// green, because every one of them passes a non-empty set.
+//
+// The token and capability here carry every scope ("rwc:*"), so a refusal can only be
+// explained by the empty-required guard itself, never by an ordinary missing-scope denial —
+// which is what makes this test able to catch the regression described above instead of
+// passing either way.
+func TestAuthorizeRefusesEmptyRequired(t *testing.T) {
+	ctx := context.Background()
+	const repo = "repo-alpha"
+
+	priv, pub, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair: %v", err)
+	}
+
+	scopes, err := auth.ParseScopes([]string{"rwc:*"})
+	if err != nil {
+		t.Fatalf("ParseScopes: %v", err)
+	}
+
+	const builtinToken = "walden_empty_required_token"
+	store := auth.NewMemoryTokenStore()
+	if err := store.SaveToken(ctx, &auth.TokenRecord{
+		TokenID:   "tok_empty_required",
+		TokenHash: auth.HashToken(builtinToken),
+		Scopes:    scopes,
+	}); err != nil {
+		t.Fatalf("SaveToken: %v", err)
+	}
+
+	now := time.Now().UTC()
+	capToken, err := auth.SignCapability(priv, &auth.CapabilityPayload{
+		Version:   "v1",
+		ID:        "cap_empty_required",
+		Scopes:    []string{"rwc:*"},
+		IssuedAt:  now.Format(time.RFC3339),
+		ExpiresAt: now.Add(time.Hour).Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatalf("SignCapability: %v", err)
+	}
+
+	providers := map[string]struct {
+		authorizer auth.Authorizer
+		token      string
+	}{
+		"built-in":  {auth.NewBuiltinAuthorizer(store), builtinToken},
+		"delegated": {auth.NewDelegatedAuthorizer(pub), capToken},
+	}
+
+	for name, p := range providers {
+		err := p.authorizer.Authorize(ctx, p.token, auth.Actions{}, repo)
+		if err == nil {
+			t.Fatalf("%s provider: Authorize(ctx, token, Actions{}, repo) = nil, want a refusal", name)
+		}
+		if !errors.Is(err, auth.ErrInvalidScope) {
+			t.Errorf("%s provider: Authorize(ctx, token, Actions{}, repo) = %v, want ErrInvalidScope", name, err)
+		}
+		if strings.ContainsAny(err.Error(), "\n\r") {
+			t.Errorf("%s provider: refusal is not a single line: %q", name, err.Error())
+		}
+	}
+}

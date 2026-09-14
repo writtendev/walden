@@ -463,7 +463,7 @@ A background task periodically consolidates all reachable Git objects across his
 
 ### 7.2 JSON Schema and Field Specification
 `marker.json` is a UTF-8 JSON document stored at the root of the stream prefix. It is a
-**signed record** (WALD-97): unsigned, a marker holding authoritative branch tips would
+**signed record**: unsigned, a marker holding authoritative branch tips would
 be a direct history-rewrite vector for anyone who can write to the bucket — precisely
 the threat the server signing identity exists to detect, and the reason ref-transaction
 records are signed at all.

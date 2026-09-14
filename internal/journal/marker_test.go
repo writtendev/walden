@@ -437,6 +437,102 @@ func TestSigningChainVerifyMarker(t *testing.T) {
 	}
 }
 
+// TestSigningChainVerifyMarkerFloorNeverLowers is the WALD-97 round-1 finding in
+// two assertions: VerifyMarker must raise a stream's epoch floor, never lower one
+// (*SigningChain).VerifyRefTx already established. Without the fix, verifying a
+// marker with a lower key_epoch_floor after verifying a ref transaction on the
+// same stream would silently drop that stream's floor back down, and a record
+// naming a retired epoch above the marker's floor but below the floor already
+// seen would incorrectly verify.
+func TestSigningChainVerifyMarkerFloorNeverLowers(t *testing.T) {
+	priv1, pub1 := deterministicKeypair(0x01)
+	priv2, pub2 := deterministicKeypair(0x02)
+
+	chain := journal.NewSigningChain()
+	genesis := &journal.GenesisRecord{
+		Version:   "v1",
+		Stream:    journal.MetaStreamID,
+		Seq:       0,
+		Type:      "genesis",
+		PublicKey: journal.FormatPublicKey(pub1),
+		Timestamp: "2026-08-31T00:00:00Z",
+	}
+	if err := chain.ApplyGenesis(genesis); err != nil {
+		t.Fatalf("ApplyGenesis failed: %v", err)
+	}
+	rot := &journal.KeyRotationRecord{
+		Version:      "v1",
+		Stream:       journal.MetaStreamID,
+		Seq:          1,
+		Type:         "key_rotation",
+		OldPublicKey: journal.FormatPublicKey(pub1),
+		NewPublicKey: journal.FormatPublicKey(pub2),
+		Timestamp:    "2026-08-31T00:02:00Z",
+	}
+	if err := journal.SignRotation(priv1, rot); err != nil {
+		t.Fatalf("SignRotation failed: %v", err)
+	}
+	if err := chain.ApplyRotation(rot); err != nil {
+		t.Fatalf("ApplyRotation failed: %v", err)
+	}
+
+	// First, an ordinary ref transaction at the rotated key's epoch (1) raises this
+	// stream's floor to 1 through (*SigningChain).VerifyRefTx.
+	high := &journal.RefTransactionRecord{
+		Version:  "v1",
+		Stream:   "repo-alpha",
+		Seq:      4,
+		Type:     "ref_update",
+		KeyEpoch: 1,
+		Updates: []journal.RefUpdate{
+			{Ref: "refs/heads/main", OldOID: "fe75a8a9eea356bbe01fdf92d95d448190ad7942", NewOID: "8a65c6d3715c0e1e92d6e3e5362e49c7198cfb60"},
+		},
+		Timestamp: "2026-08-31T00:10:00Z",
+	}
+	if err := journal.SignRefTx(priv2, high); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	if err := chain.VerifyRefTx(high); err != nil {
+		t.Fatalf("chain.VerifyRefTx(high) failed: %v", err)
+	}
+
+	// Now verify a marker for the same stream carrying a lower key_epoch_floor (0)
+	// than the floor VerifyRefTx already established (1) — the shape of a
+	// materializer that validates the tail it already has on disk, then consults
+	// marker.json, or a compactor verifying the records it just snapshotted before
+	// signing and verifying the marker it produces from them.
+	m := validSignableMarker()
+	m.KeyEpoch = 1
+	m.KeyEpochFloor = 0
+	if err := journal.SignMarker(priv2, m); err != nil {
+		t.Fatalf("SignMarker failed: %v", err)
+	}
+	if err := chain.VerifyMarker(m); err != nil {
+		t.Fatalf("chain.VerifyMarker(m) failed: %v", err)
+	}
+
+	// The floor must still be 1, not lowered to the marker's 0: a record forged
+	// with the retired epoch-0 key must still be refused, not accepted because the
+	// marker silently reset the floor to its own, older baseline.
+	forged := &journal.RefTransactionRecord{
+		Version:  "v1",
+		Stream:   "repo-alpha",
+		Seq:      5,
+		Type:     "ref_update",
+		KeyEpoch: 0,
+		Updates: []journal.RefUpdate{
+			{Ref: "refs/heads/main", OldOID: "8a65c6d3715c0e1e92d6e3e5362e49c7198cfb60", NewOID: "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"},
+		},
+		Timestamp: "2026-08-31T00:11:00Z",
+	}
+	if err := journal.SignRefTx(priv1, forged); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	if err := chain.VerifyRefTx(forged); !errors.Is(err, journal.ErrKeyEpochRegression) {
+		t.Errorf("expected ErrKeyEpochRegression for a retired-epoch record after a lower-floor marker verified, got %v", err)
+	}
+}
+
 func TestParseMarkerInvalidJSON(t *testing.T) {
 	cases := []struct {
 		name string
@@ -958,6 +1054,42 @@ func TestMarkerRefusalFormatting(t *testing.T) {
 	expectedMarkerInvalid := "refusal: replay failed: invalid marker on stream repo-alpha (invalid marker) (marker.json in object storage is invalid)"
 	if msg != expectedMarkerInvalid {
 		t.Errorf("unexpected invalid marker refusal: got %q, want %q", msg, expectedMarkerInvalid)
+	}
+
+	// 6. Marker signature mismatch refusal (section 7.6 item 6 / 8.1 rule 16)
+	err = journal.RefuseMarkerSignatureMismatch(stream, journal.Seq(3))
+	if !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("expected errors.Is(err, ErrSignatureMismatch) to be true")
+	}
+	msg = err.Error()
+	if strings.Contains(msg, "\n") {
+		t.Errorf("refusal message contains newline: %q", msg)
+	}
+	expectedMarkerSignatureMismatch := "refusal: replay failed: signature mismatch for marker on stream repo-alpha at sequence 3"
+	if msg != expectedMarkerSignatureMismatch {
+		t.Errorf("unexpected marker signature mismatch refusal: got %q, want %q", msg, expectedMarkerSignatureMismatch)
+	}
+
+	// 8. Marker ref not in snapshot refusal (section 7.6 item 8 / 8.1 rule 18). Not
+	// wired to a caller in this package: deciding whether a marker's ref set is
+	// covered by its snapshot pack means enumerating the pack's objects, which
+	// needs either exec'ing git or reimplementing pack handling — AGENTS.md
+	// reserves that to code that wraps git, not to internal/journal. Enforcing
+	// Guarantee 3 (section 7.3) belongs to whatever reads the snapshot pack
+	// (a future compactor/reader), not to this package. Pinned here anyway so
+	// the published string cannot drift from section 7.6 item 8 with this check
+	// command still green.
+	err = journal.RefuseMarkerRefNotInSnapshot(stream, "refs/heads/main", "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+	if !errors.Is(err, journal.ErrInvalidMarker) {
+		t.Errorf("expected errors.Is(err, ErrInvalidMarker) to be true")
+	}
+	msg = err.Error()
+	if strings.Contains(msg, "\n") {
+		t.Errorf("refusal message contains newline: %q", msg)
+	}
+	expectedMarkerRefNotInSnapshot := "refusal: replay failed: marker on stream repo-alpha names refs/heads/main at 4b825dc642cb6eb9a060e54bf8d69288fbee4904, which the snapshot pack does not carry (marker.json in object storage is invalid)"
+	if msg != expectedMarkerRefNotInSnapshot {
+		t.Errorf("unexpected marker ref not in snapshot refusal: got %q, want %q", msg, expectedMarkerRefNotInSnapshot)
 	}
 }
 

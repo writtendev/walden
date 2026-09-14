@@ -328,15 +328,20 @@ func VerifyMarker(m *Marker, activePublicKey string) error {
 // chain (spec section 7.5), exactly as (*SigningChain).VerifyRefTx does for a ref
 // transaction: the epoch is a hint, not authority, and an epoch outside the chain
 // verified from genesis is refused rather than a reason to fall back to the
-// active key.
+// active key. A signature that fails to verify against that key refuses with
+// RefuseMarkerSignatureMismatch (spec section 7.6 item 6 / 8.1 rule 16), not the
+// raw package-level error.
 //
-// On success, VerifyMarker mutates c: it seeds c's per-stream epoch floor for
-// m.Stream from m.KeyEpochFloor, which is what lets a replay resumed from this
+// On success, VerifyMarker mutates c: it raises c's per-stream epoch floor for
+// m.Stream to m.KeyEpochFloor, which is what lets a replay resumed from this
 // marker's baseline enforce rule 15 (key epoch regression) against the stream's
-// full history rather than starting blind at epoch 0 (WALD-97). Seeding happens
-// only here, as a side effect of verifying the signature that covers the floor —
+// full history rather than starting blind at epoch 0. Raises, never lowers: if
+// (*SigningChain).VerifyRefTx already advanced this stream's floor above
+// m.KeyEpochFloor — for instance because a caller verified part of the tail
+// before consulting the marker — that higher floor stands. Seeding happens only
+// here, as a side effect of verifying the signature that covers the floor —
 // there is no second mechanism, so the floor cannot be raised except by a marker
-// whose signature actually verifies.
+// whose signature actually verifies, and it can never be lowered by one either.
 func (c *SigningChain) VerifyMarker(m *Marker) error {
 	if c == nil || !c.initialized {
 		return fmt.Errorf("%w: cannot verify marker before genesis", ErrGenesisMissing)
@@ -349,12 +354,17 @@ func (c *SigningChain) VerifyMarker(m *Marker) error {
 		return RefuseMarkerUnknownKeyEpoch(m.Stream, m.KeyEpoch)
 	}
 	if err := VerifyMarker(m, key); err != nil {
+		if errors.Is(err, ErrSignatureMismatch) {
+			return RefuseMarkerSignatureMismatch(m.Stream, m.Sequence)
+		}
 		return err
 	}
 	if c.lastEpoch == nil {
 		c.lastEpoch = make(map[StreamID]Epoch)
 	}
-	c.lastEpoch[m.Stream] = m.KeyEpochFloor
+	if cur, seen := c.lastEpoch[m.Stream]; !seen || m.KeyEpochFloor > cur {
+		c.lastEpoch[m.Stream] = m.KeyEpochFloor
+	}
 	return nil
 }
 

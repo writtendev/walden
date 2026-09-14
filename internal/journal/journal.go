@@ -83,9 +83,12 @@ func (s Seq) MarshalJSON() ([]byte, error) {
 // calls UnmarshalJSON for a key that is missing, so a record with no "seq" at all
 // decodes to sequence 0 and passes Validate. Validate cannot close that gap
 // either — 0 is a legitimate sequence, so telling absent from zero means retyping
-// the field as *Seq. That is deliberately left open here rather than half-closed:
-// no production path parses these records yet, and WALD-97 rewrites marker parsing
-// to verify a signature, which is where presence gets settled.
+// the field as *Seq. That gap is deliberately left open here on Seq itself:
+// RefTransactionRecord and GenesisRecord still decode straight into this type and
+// so still cannot tell an absent seq from seq 0. ParseMarker (WALD-97) closes the
+// same gap for markers by decoding into a shadow struct of pointer fields first —
+// the presence check Seq's own UnmarshalJSON cannot perform — and handing off to
+// this type only once every required field, including this one, is known present.
 func (s *Seq) UnmarshalJSON(data []byte) error {
 	if len(data) < 2 || data[0] != '"' || data[len(data)-1] != '"' {
 		return fmt.Errorf("%w: sequence must be a JSON string holding its decimal form, got %s", ErrInvalidSeq, data)

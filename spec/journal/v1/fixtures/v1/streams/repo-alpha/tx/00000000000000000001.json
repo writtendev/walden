@@ -17,8 +17,13 @@
       "ref": "refs/heads/feature",
       "old_oid": "0000000000000000000000000000000000000000",
       "new_oid": "930ffee596a4e29a9049f3a465b0ae21fcefe6ea"
+    },
+    {
+      "ref": "refs/tags/v0.1",
+      "old_oid": "0000000000000000000000000000000000000000",
+      "new_oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
     }
   ],
   "timestamp": "2026-08-31T00:03:00Z",
-  "signature": "ed25519:ad9530f3fea9254e025b5e6495def1271c0ca3acb5f378ae40a30d7c2a6237e45b3d262529a5456c3b33b58943610142835976729e7baf12cbe2aceec5314803"
+  "signature": "ed25519:65d5baec22c8472bf3ee0d1d357f9ca0e7538eed06fb659925da053880df94f00384957946e64299107bcc43b2de955d1687dacf6d2e66ed54185edd843e2c0b"
 }

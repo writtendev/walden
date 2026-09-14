@@ -1,7 +1,20 @@
 {
   "version": "v1",
   "stream": "repo-alpha",
-  "sequence": "1",
-  "snapshot": "3731601fba561af499185a3875c5df9f2b5e5ab71ea260a3297e12e1ddf9576c",
-  "timestamp": "2026-08-31T01:00:00Z"
+  "sequence": "3",
+  "key_epoch": "1",
+  "key_epoch_floor": "1",
+  "snapshot": "cd04837137cbca78f87a66055eb1ec4a598842618fa6cdb126295c6cda9b6638",
+  "refs": [
+    {
+      "ref": "refs/heads/main",
+      "oid": "fe75a8a9eea356bbe01fdf92d95d448190ad7942"
+    },
+    {
+      "ref": "refs/tags/v0.1",
+      "oid": "63ed45846ea17a17cc2c2b3ddc54e37dd402ae96"
+    }
+  ],
+  "timestamp": "2026-08-31T01:00:00Z",
+  "signature": "ed25519:f914a903e538e757f1ed29e511a03fcbeb7d597c618af649ae63dde93a28ac2509af288ab96d4bd4b50b8a443b5d0a097733aab9b82d05ecd0081318b0a93a0c"
 }

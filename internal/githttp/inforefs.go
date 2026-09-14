@@ -1,23 +1,16 @@
 package githttp
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os/exec"
 	"strings"
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/refusal"
 )
-
-// maxStderrCapture bounds how much of git's stderr this handler retains for
-// the log line when an advertisement fails; the rest is discarded so a
-// verbose or hostile subprocess cannot grow this handler's memory use.
-const maxStderrCapture = 4096
 
 // flushPkt is the pkt-line flush packet: the literal four bytes "0000",
 // the smart-HTTP protocol's own framing for "no more data in this
@@ -73,24 +66,6 @@ func writeRefusal(w http.ResponseWriter, status int, err error) {
 	http.Error(w, err.Error(), status)
 }
 
-// boundedWriter caps how many bytes it retains from a stream, discarding
-// the remainder while still reporting a full write so a caller such as
-// exec's stderr plumbing never sees a short write.
-type boundedWriter struct {
-	buf   *bytes.Buffer
-	limit int
-}
-
-func (b *boundedWriter) Write(p []byte) (int, error) {
-	if remaining := b.limit - b.buf.Len(); remaining > 0 {
-		if remaining > len(p) {
-			remaining = len(p)
-		}
-		b.buf.Write(p[:remaining])
-	}
-	return len(p), nil
-}
-
 // handleInfoRefs serves GET /{repo}/info/refs: git's smart-HTTP ref
 // advertisement. Per ARCHITECTURE.md, walden wraps git rather than
 // reimplementing it — the refs, the capability list, and the trailing
@@ -131,26 +106,8 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	// in hand.
 	wantV2 := service == "git-upload-pack" && r.Header.Get("Git-Protocol") == "version=2"
 
-	// Binding to the request context means a client disconnect kills the
-	// subprocess. Killing is not reaping, though: only Wait collects its
-	// exit status, closes the StdoutPipe read end, and releases the
-	// stderr pipe. See the waited/wait closure below.
-	cmd := exec.CommandContext(r.Context(), "git", subcommand, "--stateless-rpc", advertiseFlag, path)
-	cmd.Env = gitEnv(wantV2)
-
-	stdout, err := cmd.StdoutPipe()
+	proc, err := startGit(r.Context(), gitEnv(wantV2), nil, nil, subcommand, "--stateless-rpc", advertiseFlag, path)
 	if err != nil {
-		writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
-			"ref advertisement failed",
-			"could not open a pipe to the git subprocess",
-			"check the server's git installation",
-		))
-		return
-	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &boundedWriter{buf: &stderrBuf, limit: maxStderrCapture}
-
-	if err := cmd.Start(); err != nil {
 		writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 			"ref advertisement failed",
 			"could not start the git subprocess",
@@ -158,25 +115,10 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 		))
 		return
 	}
-
-	// From here on the process has been started, so it must be reaped on
-	// every exit path — including a client aborting mid-advertisement,
-	// which cancels r.Context() and kills the child without waiting for
-	// it. wait() is the single place that calls cmd.Wait(); the deferred
-	// call is the backstop that catches any return this function takes
-	// without having called wait() itself (the io.Copy error path is the
-	// one that used to skip it entirely), and the "waited" guard means an
-	// explicit call earlier in the function is never repeated by the
-	// defer.
-	var waited bool
-	wait := func() error {
-		waited = true
-		return cmd.Wait()
-	}
 	defer func() {
-		if !waited {
-			if err := wait(); err != nil {
-				log.Printf("githttp: info/refs: git %s %s %q: %v (%s)", subcommand, advertiseFlag, repo, err, strings.TrimSpace(stderrBuf.String()))
+		if !proc.waited {
+			if err := proc.wait(); err != nil {
+				log.Printf("githttp: info/refs: git %s %s %q: %v (%s)", subcommand, advertiseFlag, repo, err, strings.TrimSpace(proc.stderr.String()))
 			}
 		}
 	}()
@@ -184,11 +126,10 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	// Peek before writing anything: if git exits non-zero having produced
 	// no output at all, nothing has reached the client yet and this can
 	// still be a clean refusal instead of a half-written response.
-	br := bufio.NewReader(stdout)
-	_, peekErr := br.Peek(1)
+	_, peekErr := proc.stdout.Peek(1)
 	if peekErr != nil {
-		if waitErr := wait(); waitErr != nil {
-			log.Printf("githttp: info/refs: git %s %s %q: %v (%s)", subcommand, advertiseFlag, repo, waitErr, strings.TrimSpace(stderrBuf.String()))
+		if waitErr := proc.wait(); waitErr != nil {
+			log.Printf("githttp: info/refs: git %s %s %q: %v (%s)", subcommand, advertiseFlag, repo, waitErr, strings.TrimSpace(proc.stderr.String()))
 			writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 				"ref advertisement failed",
 				"git exited with an error before producing an advertisement",
@@ -214,7 +155,7 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 	if peekErr == nil {
-		parts = append(parts, br)
+		parts = append(parts, proc.stdout)
 	}
 	body := io.MultiReader(parts...)
 
@@ -228,8 +169,8 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if peekErr == nil {
-		if err := wait(); err != nil {
-			log.Printf("githttp: info/refs: git %s %s %q exited with error after streaming: %v (%s)", subcommand, advertiseFlag, repo, err, strings.TrimSpace(stderrBuf.String()))
+		if err := proc.wait(); err != nil {
+			log.Printf("githttp: info/refs: git %s %s %q exited with error after streaming: %v (%s)", subcommand, advertiseFlag, repo, err, strings.TrimSpace(proc.stderr.String()))
 		}
 	}
 }

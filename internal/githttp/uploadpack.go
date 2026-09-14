@@ -1,33 +1,19 @@
 package githttp
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"net/http"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/refusal"
 )
-
-// uploadPackWaitDelay bounds how long cmd.Wait may block after git's own
-// exit and pipe closures have otherwise settled. Cancelling the request
-// context kills the child, but killing is not reaping: the stdin-copy
-// goroutine os/exec starts for cmd.Stdin can still be blocked writing to
-// a dead child's closed pipe. Without a WaitDelay, Wait can block on that
-// goroutine forever instead of the handler's deferred wait() ever
-// returning — the exact "cancelled rather than orphaned" case this
-// ticket names. This is one field, not a supervision layer: deadlines,
-// process groups, and reaping policy beyond this belong to WALD-41.
-const uploadPackWaitDelay = 5 * time.Second
 
 // uploadPackContentType is the only Content-Type this endpoint accepts,
 // per git's smart-HTTP protocol.
@@ -78,30 +64,6 @@ func requestBodyReader(w http.ResponseWriter, r *http.Request) (io.Reader, bool)
 	}
 }
 
-// flushingWriter wraps a ResponseWriter so every Write is immediately
-// flushed to the connection. Without this, sideband progress on a long
-// fetch sits in net/http's own buffering and a real clone looks hung —
-// git's own backend writes unbuffered, and this endpoint matches it.
-type flushingWriter struct {
-	w http.ResponseWriter
-	c *http.ResponseController
-}
-
-func newFlushingWriter(w http.ResponseWriter) *flushingWriter {
-	return &flushingWriter{w: w, c: http.NewResponseController(w)}
-}
-
-func (f *flushingWriter) Write(p []byte) (int, error) {
-	n, err := f.w.Write(p)
-	if err != nil {
-		return n, err
-	}
-	if flushErr := f.c.Flush(); flushErr != nil && !errors.Is(flushErr, http.ErrNotSupported) {
-		return n, flushErr
-	}
-	return n, nil
-}
-
 // handleUploadPack serves POST /{repo}/git-upload-pack: git's
 // stateless-rpc fetch/clone endpoint. Per ARCHITECTURE.md, walden wraps
 // git rather than reimplementing it — the request body goes into git's
@@ -148,29 +110,11 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request) {
 	// isn't told to expect it.
 	wantV2 := r.Header.Get("Git-Protocol") == "version=2"
 
-	// Binding to the request context means a client disconnect kills the
-	// subprocess. Killing is not reaping, though: only Wait collects its
-	// exit status and releases its pipes. See the waited/wait closure
-	// below, and uploadPackWaitDelay above for why Wait itself cannot
-	// hang forever on this path.
-	cmd := exec.CommandContext(r.Context(), "git", "upload-pack", "--stateless-rpc", path)
-	cmd.Env = gitEnv(wantV2)
-	cmd.Stdin = reqBody
-	cmd.WaitDelay = uploadPackWaitDelay
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
-			"upload-pack failed",
-			"could not open a pipe to the git subprocess",
-			"check the server's git installation",
-		))
-		return
+	releaseBody := func() {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &boundedWriter{buf: &stderrBuf, limit: maxStderrCapture}
-
-	if err := cmd.Start(); err != nil {
+	proc, err := startGit(r.Context(), gitEnv(wantV2), reqBody, releaseBody, "upload-pack", "--stateless-rpc", path)
+	if err != nil {
 		writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 			"upload-pack failed",
 			"could not start the git subprocess",
@@ -178,25 +122,11 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request) {
 		))
 		return
 	}
-
-	// From here on the process has been started, so it must be reaped on
-	// every exit path — including a client aborting mid-fetch, which
-	// cancels r.Context() and kills the child without waiting for it.
-	// wait() is the single place that calls cmd.Wait(); the deferred call
-	// is the backstop that catches any return this function takes
-	// without having called wait() itself (in particular the io.Copy
-	// error path), and the "waited" guard means an explicit call earlier
-	// in the function is never repeated by the defer. Mirrors
-	// handleInfoRefs's identical discipline in inforefs.go.
-	var waited bool
-	wait := func() error {
-		waited = true
-		return cmd.Wait()
-	}
 	defer func() {
-		if !waited {
-			if err := wait(); err != nil {
-				log.Printf("githttp: upload-pack: git upload-pack %q: %v (%s)", repo, err, strings.TrimSpace(stderrBuf.String()))
+		if !proc.waited {
+			proc.release()
+			if err := proc.wait(); err != nil {
+				log.Printf("githttp: upload-pack: git upload-pack %q: %v (%s)", repo, err, strings.TrimSpace(proc.stderr.String()))
 			}
 		}
 	}()
@@ -207,11 +137,11 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request) {
 	// response. Peeking cannot deadlock here: the stdin copy runs in its
 	// own goroutine inside os/exec, so blocking on git's first output
 	// byte blocks only this handler goroutine.
-	br := bufio.NewReader(stdout)
-	_, peekErr := br.Peek(1)
+	_, peekErr := proc.stdout.Peek(1)
 	if peekErr != nil {
-		if waitErr := wait(); waitErr != nil {
-			log.Printf("githttp: upload-pack: git upload-pack %q: %v (%s)", repo, waitErr, strings.TrimSpace(stderrBuf.String()))
+		proc.release()
+		if waitErr := proc.wait(); waitErr != nil {
+			log.Printf("githttp: upload-pack: git upload-pack %q: %v (%s)", repo, waitErr, strings.TrimSpace(proc.stderr.String()))
 			writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 				"upload-pack failed",
 				"git exited with an error before producing any output",
@@ -231,7 +161,7 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request) {
 
 	var body io.Reader = bytes.NewReader(nil)
 	if peekErr == nil {
-		body = br
+		body = proc.stdout
 	}
 
 	if _, err := io.Copy(newFlushingWriter(w), body); err != nil {
@@ -242,8 +172,8 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if peekErr == nil {
-		if err := wait(); err != nil {
-			log.Printf("githttp: upload-pack: git upload-pack %q exited with error after streaming: %v (%s)", repo, err, strings.TrimSpace(stderrBuf.String()))
+		if err := proc.wait(); err != nil {
+			log.Printf("githttp: upload-pack: git upload-pack %q exited with error after streaming: %v (%s)", repo, err, strings.TrimSpace(proc.stderr.String()))
 		}
 	}
 }

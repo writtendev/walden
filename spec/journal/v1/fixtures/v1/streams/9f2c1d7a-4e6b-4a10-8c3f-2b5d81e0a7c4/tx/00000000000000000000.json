@@ -3,6 +3,7 @@
   "stream": "9f2c1d7a-4e6b-4a10-8c3f-2b5d81e0a7c4",
   "seq": "0",
   "type": "ref_update",
+  "key_epoch": "0",
   "segments": [
     "b57e002c347f2488844f25584abf312c4293c730ca8082efd680e67930084cbd"
   ],
@@ -19,5 +20,5 @@
     }
   ],
   "timestamp": "2026-08-31T00:05:00Z",
-  "signature": "ed25519:6e9272d5dc69c0e5cb8295a5f151f95541fac2a0d0a406d6d3cbb184c177fb37d0051272a77e6b957a7ca161cb48e094a720ae3f5dd31759d6abb9a5d36c9e0d"
+  "signature": "ed25519:32ca4d0b76052bd99f472fb2e94f7a7802ae41974d0acd8ecc44caeee12c53285a69635b57fba35a55c4cd9861d5d818918ac00ad61ed58536f86001e8c01b0e"
 }

@@ -61,7 +61,7 @@ The server's signing identity is born with the journal and lives in it:
 
 ### 2.2 Security Model and Honest Boundaries
 - **Tamper-Evidence, Not Server Trust:** Journal signing provides **tamper-evidence of the history, not protection from a malicious server.** A server that holds the signing key and wishes to lie can sign its lies. Signing guarantees that once written, history in object storage cannot be altered, forged, or spliced by unauthorized third parties or storage providers without failing cryptographic verification — with the one exception named immediately below.
-- **One Named Exception — Token Records Are Unsigned in v1:** The guarantee above holds for every record this format signs: key rotations chain to genesis, and ref transactions verify against the key that was active when they were written. It does **not** hold for the `token_create` and `token_revoke` records of sections 4.3 and 4.4, which carry no signature in v1. A third party who can write to the bucket can append a `token_create` and a replay rebuilds it as a live grant — a working credential, because the hash the record names is the value a server looks a request up by — without failing any check this specification defines. That is a different party from the malicious server conceded above: the exception covers exactly the party the guarantee otherwise excludes, so it is named here rather than left for a reader to discover in section 4.5. Closing the gap means giving both record types a canonical payload and a signature, so that a forged or tampered token record fails verification like any other record; that is a format change, and this document does not define it. Until such a change lands, tamper-evidence for the token table rests on the bucket's own access control and not on this signing identity.
+- **One Named Exception — Token Records Are Unsigned in v1:** The guarantee above holds for every record this format signs: key rotations chain to genesis, and ref transactions verify against the key that was active when they were written — named explicitly by the record's own `key_epoch` (section 5.1), so a reader never has to guess which key that was from timing alone. It does **not** hold for the `token_create` and `token_revoke` records of sections 4.3 and 4.4, which carry no signature in v1. A third party who can write to the bucket can append a `token_create` and a replay rebuilds it as a live grant — a working credential, because the hash the record names is the value a server looks a request up by — without failing any check this specification defines. That is a different party from the malicious server conceded above: the exception covers exactly the party the guarantee otherwise excludes, so it is named here rather than left for a reader to discover in section 4.5. Closing the gap means giving both record types a canonical payload and a signature, so that a forged or tampered token record fails verification like any other record; that is a format change, and this document does not define it. Until such a change lands, tamper-evidence for the token table rests on the bucket's own access control and not on this signing identity.
 - **Permanent Private Key Loss:** Losing the private signing key is an unrecoverable-for-signing state. The server can no longer accept new writes or append new records. Existing history in the bucket remains permanently readable, verifiable from genesis forward, and fully restorable.
 
 ---
@@ -292,6 +292,7 @@ The ref-transaction record is the atomic unit of repository history in walden. E
   "stream": "repo-alpha",
   "seq": "0",
   "type": "ref_update",
+  "key_epoch": "0",
   "segments": [
     "db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"
   ],
@@ -303,15 +304,15 @@ The ref-transaction record is the atomic unit of repository history in walden. E
     }
   ],
   "timestamp": "2026-08-31T00:02:00Z",
-  "signature": "ed25519:a91e5413e54463c4a1e33f7bc0825434284eb33465de77f7d116a4801c207aa2a5e3eab96b82c0eb702bf8bfda0b4a8c81b6a8addff7a1911fc71441272bca04"
+  "signature": "ed25519:e3663b676f671095e4b8653ddc1419b2349d39a8adab7f28b1cb6574bc62963ec2f03996af92d34d6e2fab685c365a180d411053af476d4b319fe6a9359a8805"
 }
 ```
 
 This is the golden journal's own first record, byte for byte:
 [`fixtures/v1/streams/repo-alpha/tx/00000000000000000000.json`](fixtures/v1/streams/repo-alpha/tx/00000000000000000000.json).
 The segment it names is a real packfile in the fixture tree, `new_oid` is the
-commit that packfile carries, and the signature verifies against the public key
-the genesis record declares.
+commit that packfile carries, and the signature verifies against key epoch 0
+in the chain — the genesis key, since this record predates any rotation.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
@@ -319,10 +320,11 @@ the genesis record declares.
 | `stream` | string | Stream identifier (`<stream-id>`). |
 | `seq` | string | Strictly monotonic unsigned 64-bit sequence number ($k \ge 0$) in exact decimal form (section 1.1). |
 | `type` | string | MUST be `"ref_update"`. |
+| `key_epoch` | string | Index into the signing key chain, in exact decimal form (section 1.1), naming the key that signed this record. `0` is the genesis key; each `key_rotation` record on `_meta` increments it by one. A hint, not authority: section 8 verifies the chain from genesis and trusts the named key only because it is already in that verified chain. |
 | `segments` | array of strings | List of zero or more 64-character lowercase hexadecimal SHA-256 digests of newly written packfiles. May be empty (`[]`) for operations not introducing new objects (e.g. branch deletion, fast-forward to existing commit, tag deletion). |
 | `updates` | array of objects | List of one or more ref update triples defining atomic ref transitions. MUST NOT contain duplicate ref names within the same transaction. |
 | `timestamp` | string | ISO-8601 / RFC 3339 UTC timestamp of transaction creation (e.g. `"2026-08-31T00:02:00Z"`). |
-| `signature` | string | Ed25519 signature formatted as `ed25519:<128-hex>`, signed by the active server signing key over the Canonical Ref-Transaction Signing Payload. |
+| `signature` | string | Ed25519 signature formatted as `ed25519:<128-hex>`, signed by the key named by `key_epoch` over the Canonical Ref-Transaction Signing Payload. |
 
 #### Ref Update Triple (`updates[]`)
 Each object in the `updates` array represents a single ref transition:
@@ -347,6 +349,7 @@ The transaction's Ed25519 signature is computed over a deterministic byte stream
 walden-ref-update:v1\n
 stream:<stream>\n
 seq:<seq>\n
+key_epoch:<key_epoch>\n
 timestamp:<timestamp>\n
 segment:<sha256-1>\n
 segment:<sha256-2>\n
@@ -357,15 +360,16 @@ update:<ref-2> <old_oid-2> <new_oid-2>\n
 1. **Header Line:** `walden-ref-update:v1\n`
 2. **Stream Line:** `stream:<stream>\n` where `<stream>` is the exact stream ID string.
 3. **Sequence Line:** `seq:<seq>\n` where `<seq>` is the decimal sequence number with no leading zeros (e.g. `0`, `1`, `42`) — the same text the JSON string carries, so the encoding rule of section 1.1 leaves signatures untouched.
-4. **Timestamp Line:** `timestamp:<timestamp>\n` where `<timestamp>` is the RFC 3339 UTC timestamp string.
-5. **Segment Lines:** For each SHA-256 hash in `segments` (in array order), a line formatted as `segment:<lowercase-64-hex>\n`. If `segments` is empty, zero segment lines are emitted.
-6. **Update Lines:** For each update triple in `updates` (in array order), a line formatted as `update:<ref> <lowercase-old_oid> <lowercase-new_oid>\n`.
-7. **Newline Termination:** Every line MUST terminate with a single newline byte (`\n`, `0x0A`).
+4. **Key Epoch Line:** `key_epoch:<key_epoch>\n` where `<key_epoch>` is the decimal key epoch with no leading zeros — the same text the JSON string carries. Covered by the signature like every other line here: `key_epoch` cannot be altered on a written record without invalidating it.
+5. **Timestamp Line:** `timestamp:<timestamp>\n` where `<timestamp>` is the RFC 3339 UTC timestamp string.
+6. **Segment Lines:** For each SHA-256 hash in `segments` (in array order), a line formatted as `segment:<lowercase-64-hex>\n`. If `segments` is empty, zero segment lines are emitted.
+7. **Update Lines:** For each update triple in `updates` (in array order), a line formatted as `update:<ref> <lowercase-old_oid> <lowercase-new_oid>\n`.
+8. **Newline Termination:** Every line MUST terminate with a single newline byte (`\n`, `0x0A`).
 
 ### 5.4 Rules for Unknown Fields (Forward Compatibility)
 To support forward compatibility and extensible metadata:
 1. **Ignored During Deserialization:** Readers parsing v1 records MUST ignore unrecognized JSON object keys.
-2. **Excluded from Canonical Payload:** Unknown fields MUST NOT be included in the Canonical Ref-Transaction Signing Payload. The canonical payload is strictly composed of the fields defined in Section 5.3 (`stream`, `seq`, `timestamp`, `segments`, `updates`).
+2. **Excluded from Canonical Payload:** Unknown fields MUST NOT be included in the Canonical Ref-Transaction Signing Payload. The canonical payload is strictly composed of the fields defined in Section 5.3 (`stream`, `seq`, `key_epoch`, `timestamp`, `segments`, `updates`).
 3. **Writers:** Writers generating v1 records MUST NOT emit undefined fields.
 
 ### 5.5 What a Future v2 Reader Owes a v1 Record (Permanent Verifiability)
@@ -562,7 +566,8 @@ When initializing or materializing a repository from the journal, a reader MUST 
 │ 5. Sequential Replay of tx/ Starting at S + 1           │
 │    - Ignore any tx <= S and superseded segments         │
 │    - Assert strictly contiguous sequence: S+1, S+2, ... │
-│    - Verify transaction signatures against ActiveKey    │
+│    - Verify signature against the key named by          │
+│      record.key_epoch (section 8)                       │
 │    - Fetch & verify referenced segments/<hash>.pack     │
 │    - Apply ref updates                                  │
 └─────────────────────────────────────────────────────────┘
@@ -578,7 +583,7 @@ When initializing or materializing a repository from the journal, a reader MUST 
    - **List Tail Transactions:** Perform a `LIST` on `v1/streams/<stream-id>/tx/` with `start-after` set to `v1/streams/<stream-id>/tx/<S:020d>.json`.
    - **Sequential Replay:** For each transaction record in ascending order ($S+1, S+2, \dots$):
      - Assert that sequence numbers are strictly contiguous with no gaps.
-     - Verify the Ed25519 signature against the active signing key.
+     - Verify the Ed25519 signature against the key named by the record's `key_epoch` (section 8), not against whichever key happens to be active now.
      - Fetch referenced segments from `segments/<sha256>.pack` and apply ref updates.
 3. **If Marker Absent:**
    - Set baseline sequence $S = -1$.
@@ -618,7 +623,7 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 ```
 ┌────────────────────────────────────────────────────────┐
 │ 1. Read Genesis: _meta/tx/00000000000000000000.json    │
-│    ActiveKey = genesis.public_key                      │
+│    Chain = [genesis.public_key]     (epoch 0)          │
 │    LastMetaSeq = 0                                     │
 └───────────────────────────┬────────────────────────────┘
                             │
@@ -627,9 +632,9 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │ 2. Sequential Replay of _meta Stream                   │
 │    For each tx at LastMetaSeq + 1:                     │
 │    ├── type == "key_rotation":                         │
-│    │     Assert old_public_key == ActiveKey            │
-│    │     Verify signature with ActiveKey over payload  │
-│    │     ActiveKey = new_public_key                    │
+│    │     Assert old_public_key == Chain[-1]            │
+│    │     Verify signature with Chain[-1] over payload  │
+│    │     Chain = Chain + [new_public_key]  (epoch++)   │
 │    │     LastMetaSeq = seq                             │
 │    ├── type == "token_create" or "token_revoke":       │
 │    │     Verify record fields (sections 4.3, 4.4)      │
@@ -643,11 +648,13 @@ Every reader or recovery engine verifying a journal MUST execute the following d
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │ 3. Verify Repository Streams & Ref Transactions        │
-│    For each stream matching ^[a-zA-Z0-9._-]+$:         │
+│    For each stream matching ^[a-zA-Z0-9._-]+$          │
+│    OTHER THAN _meta:                                   │
 │    ├── Check for marker.json:                          │
 │    │     If present: verify snapshot & set S = marker  │
 │    │     If absent: set S = -1                         │
 │    ├── Verify sequence starting at S + 1 with no gaps  │
+│    ├── LastEpoch = 0   (per-stream, resets each stream)│
 │    ├── For each ref transaction at seq S+1, S+2, ...:  │
 │    │     Verify type == "ref_update"                   │
 │    │     Verify ref format and OID transition rules    │
@@ -655,14 +662,22 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 │    │       Fetch segment from segments/<sha256>.pack   │
 │    │       Verify SHA-256(bytes) == <sha256>           │
 │    │       Verify packfile header (PACK, len >= 32)    │
+│    │     Assert record.key_epoch < len(Chain)          │
+│    │     Assert record.key_epoch >= LastEpoch          │
 │    │     Compute Canonical Ref-Transaction Payload     │
-│    │     Verify Ed25519 signature against ActiveKey    │
+│    │     Verify Ed25519 signature against              │
+│    │       Chain[record.key_epoch]                     │
+│    │     LastEpoch = record.key_epoch                  │
 │    └── Track ref states from baseline forward          │
 └────────────────────────────────────────────────────────┘
 ```
 
+Step 3 excludes `_meta` from the stream sweep: `_meta` carries `genesis`, `key_rotation`, `token_create`, and `token_revoke` records, never `ref_update`, and step 2 already replays it in full. `_meta` itself matches `^[a-zA-Z0-9._-]+$` — the same pattern a repository stream ID matches — so a reader that does not exclude it by name would otherwise try to verify meta records as ref transactions and fail on the first one (see section 9.1).
+
+`record.key_epoch` is a hint, not authority: it selects a position in `Chain`, and `Chain` is trusted only because step 2 verified it from genesis forward. An epoch outside `Chain` (rule 14) or lower than one already verified on that same stream (rule 15) is refused outright — never a reason to fall back to `Chain[-1]` or to any other key. The per-stream floor is what stops a retired key from validating a record inserted after a later one on the same stream, which is the entire reason a key is rotated in the first place.
+
 ### 8.1 Verification Failure Rules
-1. **Unchainable Rotation:** If `record.old_public_key != ActiveKey`, the rotation does not chain to genesis. The reader MUST abort immediately with a single-line error:
+1. **Unchainable Rotation:** If `record.old_public_key != Chain[-1]` (the currently active key, the last element of `Chain`), the rotation does not chain to genesis. The reader MUST abort immediately with a single-line error:
    ```
    refusal: replay failed: key rotation at seq <N> does not chain to active key
    ```
@@ -712,6 +727,15 @@ Every reader or recovery engine verifying a journal MUST execute the following d
     refusal: replay failed: invalid token record at seq <N> (<reason>)
     ```
     A `token_hash` that is not `sha256:<64-lowercase-hex>` is refused under this rule and not repaired, which is also what keeps a raw bearer token out of the journal: a record carrying one where the hash belongs does not parse as a hash, and a writer that emits it is refused rather than publishing the secret.
+14. **Unknown Key Epoch:** If a `ref_update` record's `key_epoch` is not a valid index into `Chain` (that is, `key_epoch >= len(Chain)`), the reader MUST NOT fall back to `Chain[-1]` or any other key. It MUST abort immediately with a single-line error:
+    ```
+    refusal: replay failed: ref update on stream <id> at seq <N> names unknown key epoch <E>
+    ```
+15. **Key Epoch Regression:** If a `ref_update` record's `key_epoch` is lower than the `key_epoch` already verified on a prior record of the *same stream*, the reader MUST abort immediately with a single-line error:
+    ```
+    refusal: replay failed: ref update on stream <id> at seq <N> names key epoch <E> below epoch <F> already seen on this stream
+    ```
+    Without this check a retired key, still present earlier in `Chain`, would go on validating any record naming its epoch forever — exactly the outcome key rotation exists to end.
 
 ---
 
@@ -719,7 +743,7 @@ Every reader or recovery engine verifying a journal MUST execute the following d
 
 ### 9.1 Stream Partitioning
 - **Repository Streams:** Each repo is one stream with caller-chosen ID matching `^[a-zA-Z0-9._-]+$` (max 255 bytes). Sequence starts at `0` upon first push.
-- **The Meta Stream (`_meta`):** Reserved for server identity, key rotations, and token mutations.
+- **The Meta Stream (`_meta`):** Reserved for server identity, key rotations, and token mutations. It carries no `ref_update` records and, although its name matches `^[a-zA-Z0-9._-]+$` like any repository stream, it is excluded by name from the repository-stream sweep of section 8 step 3 — section 8 step 2 already replays it in full.
 - **Per-Stream Fencing:** Fencing leases are strictly isolated per stream. A conditional append conflict on repo stream $A$ fences stream $A$ on that instance, with zero effect on repo stream $B$ or on `_meta`.
 
 ### 9.2 Key Space Layout

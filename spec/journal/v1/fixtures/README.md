@@ -60,7 +60,7 @@ The two repository streams and the meta stream advance independently. Read in ti
 | `00:09:00Z` | `_meta` | 4 | A narrower token replaces it: `tok_writer_02`, carrying two scopes. |
 | `01:00:00Z` | `repo-alpha` | — | Compaction publishes a snapshot through sequence 1 and then `marker.json`. |
 
-A ref transaction is verified against the signing key that was active when it was written: the rotation at `_meta` sequence 2 activates `K1` for what follows it and does not invalidate the history `K0` signed.
+A ref transaction is verified against the signing key that was active when it was written, named explicitly by the record's own `key_epoch` rather than inferred from timing: the rotation at `_meta` sequence 2 activates `K1` (epoch 1) for what follows it and does not invalidate the history `K0` (epoch 0) signed.
 
 ## Key Space and Identity Conformance Rules
 
@@ -70,7 +70,7 @@ Every object key is `v1/streams/<stream-id>/…`, exactly as spec section 9.2 de
 2. **Genesis Record (`_meta/tx/00000000000000000000.json`):** Declares the root Ed25519 public key. No signature field; it is the root of trust, not a claim about one.
 3. **Key Rotation (`_meta/tx/…`):** Carries `old_public_key`, `new_public_key`, and a signature by `old_public_key` over the canonical rotation payload. A rotation whose `old_public_key` is not the active key does not chain and must be refused.
 4. **Token Table Records (`_meta/tx/…`):** `token_create` carries the token's identifier, the `sha256:<64-lowercase-hex>` the server stores in place of the raw token, and the scopes it was minted with as an array — one entry at sequence 1, two at sequence 4, because a token may carry more than one. `token_revoke` names the token by identifier and repeats the hash it was created with. Replaying the meta stream rebuilds the whole token table from these records alone; neither carries a signature, which spec sections 2.2 and 4.5 name as the one exception to the tamper-evidence this format otherwise guarantees.
-5. **Ref-Transaction Records (`<stream>/tx/…`):** Carry `segments`, `updates` (ref update triples with ref names as raw byte sequences), `timestamp`, and a signature by the active server signing key over the canonical ref-update payload.
+5. **Ref-Transaction Records (`<stream>/tx/…`):** Carry `key_epoch` (which key in the signing chain signed this record — `0` on every record here except `repo-alpha` seq 3, which carries `1`), `segments`, `updates` (ref update triples with ref names as raw byte sequences), `timestamp`, and a signature by the key `key_epoch` names over the canonical ref-update payload.
 6. **Segment Keys (`segments/`):** Must strictly match `^[0-9a-f]{64}\.pack$`. Content-addressed by SHA-256 of the raw packfile bytes verbatim.
 7. **Snapshot Keys (`snapshots/`):** Must strictly match `^[0-9a-f]{64}\.pack$`. Content-addressed by SHA-256 of the consolidated pack bytes. The snapshot pack must be uploaded and verified before `marker.json` is published (the Publish-Last Invariant).
 8. **Marker (`marker.json`):** Declares the replay baseline `sequence` and `snapshot` hash. `repo-alpha` carries a marker at sequence 1, so sequences 0 and 1 and the segments they reference are superseded — they remain in this fixture tree on purpose, and a reader must ignore them and resume at sequence 2 rather than treat them as corruption. The opaque stream carries no marker, which means replay starts at sequence 0.

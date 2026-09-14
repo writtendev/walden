@@ -199,10 +199,11 @@ func TestCanonicalRefUpdatePayload(t *testing.T) {
 		},
 	}
 
-	payload := journal.CanonicalRefUpdatePayload(stream, seq, timestamp, segments, updates)
+	payload := journal.CanonicalRefUpdatePayload(stream, seq, 0, timestamp, segments, updates)
 	expected := "walden-ref-update:v1\n" +
 		"stream:repo-alpha\n" +
 		"seq:0\n" +
+		"key_epoch:0\n" +
 		"timestamp:2026-08-31T00:02:00Z\n" +
 		"segment:4a49646b96dbca4f1eb8699ef7cefdcae68fefc6ee7ae6305a3f25c7e1ef5638\n" +
 		"update:refs/heads/main 0000000000000000000000000000000000000000 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n"
@@ -219,10 +220,11 @@ func TestCanonicalRefUpdatePayload(t *testing.T) {
 			NewOID: "0000000000000000000000000000000000000000",
 		},
 	}
-	payloadDel := journal.CanonicalRefUpdatePayload(stream, 1, timestamp, nil, updatesDel)
+	payloadDel := journal.CanonicalRefUpdatePayload(stream, 1, 1, timestamp, nil, updatesDel)
 	expectedDel := "walden-ref-update:v1\n" +
 		"stream:repo-alpha\n" +
 		"seq:1\n" +
+		"key_epoch:1\n" +
 		"timestamp:2026-08-31T00:02:00Z\n" +
 		"update:refs/heads/feature 4b825dc642cb6eb9a060e54bf8d69288fbee4904 0000000000000000000000000000000000000000\n"
 
@@ -326,6 +328,15 @@ func TestSignAndVerifyRefTx(t *testing.T) {
 	if err := journal.VerifyRefTx(&recTamperedRefName, formattedPub); !errors.Is(err, journal.ErrSignatureMismatch) {
 		t.Errorf("expected ErrSignatureMismatch when tampering ref name, got %v", err)
 	}
+
+	// 7. Tamper key_epoch: it is covered by the signature (WALD-96) exactly like every
+	// other field here, so changing it invalidates the signature rather than silently
+	// picking a different verification key.
+	recTamperedEpoch := *rec
+	recTamperedEpoch.KeyEpoch = rec.KeyEpoch + 1
+	if err := journal.VerifyRefTx(&recTamperedEpoch, formattedPub); !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("expected ErrSignatureMismatch when tampering key_epoch, got %v", err)
+	}
 }
 
 func TestSigningChainRefTxVerification(t *testing.T) {
@@ -391,10 +402,11 @@ func TestSigningChainRefTxVerification(t *testing.T) {
 
 	// 4. Ref tx signed with new key 2
 	tx1 := &journal.RefTransactionRecord{
-		Version: "v1",
-		Stream:  "repo-alpha",
-		Seq:     1,
-		Type:    "ref_update",
+		Version:  "v1",
+		Stream:   "repo-alpha",
+		Seq:      1,
+		Type:     "ref_update",
+		KeyEpoch: 1,
 		Updates: []journal.RefUpdate{
 			{
 				Ref:    "refs/heads/main",
@@ -418,6 +430,125 @@ func TestSigningChainRefTxVerification(t *testing.T) {
 	}
 	if err := chain.VerifyRefTx(&tx1OldKey); !errors.Is(err, journal.ErrSignatureMismatch) {
 		t.Errorf("expected ErrSignatureMismatch for old key after rotation, got %v", err)
+	}
+}
+
+// TestSigningChainKeyEpochEnforcement covers WALD-96: a ref-transaction record is
+// verified against the key its own key_epoch names, an epoch outside the verified
+// chain is refused rather than a reason to fall back to the active key, and an epoch
+// lower than one already seen on the same stream is refused too, so a retired key
+// cannot go on validating records forever.
+func TestSigningChainKeyEpochEnforcement(t *testing.T) {
+	priv1, pub1 := deterministicKeypair(0x01)
+	priv2, pub2 := deterministicKeypair(0x02)
+
+	chain := journal.NewSigningChain()
+	genesis := &journal.GenesisRecord{
+		Version:   "v1",
+		Stream:    journal.MetaStreamID,
+		Seq:       0,
+		Type:      "genesis",
+		PublicKey: journal.FormatPublicKey(pub1),
+		Timestamp: "2026-08-31T00:00:00Z",
+	}
+	if err := chain.ApplyGenesis(genesis); err != nil {
+		t.Fatalf("ApplyGenesis failed: %v", err)
+	}
+	if chain.CurrentEpoch() != 0 {
+		t.Errorf("CurrentEpoch after genesis = %d, want 0", chain.CurrentEpoch())
+	}
+
+	rot := &journal.KeyRotationRecord{
+		Version:      "v1",
+		Stream:       journal.MetaStreamID,
+		Seq:          1,
+		Type:         "key_rotation",
+		OldPublicKey: journal.FormatPublicKey(pub1),
+		NewPublicKey: journal.FormatPublicKey(pub2),
+		Timestamp:    "2026-08-31T00:02:00Z",
+	}
+	if err := journal.SignRotation(priv1, rot); err != nil {
+		t.Fatalf("SignRotation failed: %v", err)
+	}
+	if err := chain.ApplyRotation(rot); err != nil {
+		t.Fatalf("ApplyRotation failed: %v", err)
+	}
+	if chain.CurrentEpoch() != 1 {
+		t.Errorf("CurrentEpoch after rotation = %d, want 1", chain.CurrentEpoch())
+	}
+
+	newRec := func(seq journal.Seq, epoch journal.Epoch) *journal.RefTransactionRecord {
+		return &journal.RefTransactionRecord{
+			Version:  "v1",
+			Stream:   "repo-x",
+			Seq:      seq,
+			Type:     "ref_update",
+			KeyEpoch: epoch,
+			Updates: []journal.RefUpdate{
+				{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+			},
+			Timestamp: "2026-08-31T00:03:00Z",
+		}
+	}
+
+	// An epoch naming a key that has never existed in the chain is refused outright,
+	// not treated as a request to fall back to the active key.
+	unknown := newRec(0, 2)
+	if err := journal.SignRefTx(priv2, unknown); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	err := chain.VerifyRefTx(unknown)
+	if !errors.Is(err, journal.ErrUnknownKeyEpoch) {
+		t.Errorf("expected ErrUnknownKeyEpoch for out-of-range epoch, got %v", err)
+	}
+	wantMsg := "refusal: replay failed: ref update on stream repo-x at seq 0 names unknown key epoch 2"
+	if err == nil || err.Error() != wantMsg {
+		t.Errorf("unknown key epoch refusal = %q, want %q", err, wantMsg)
+	}
+
+	// seq 0 at epoch 0, signed by the genesis key: establishes the floor for repo-x.
+	rec0 := newRec(0, 0)
+	if err := journal.SignRefTx(priv1, rec0); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	if err := chain.VerifyRefTx(rec0); err != nil {
+		t.Fatalf("chain.VerifyRefTx(rec0) failed: %v", err)
+	}
+
+	// A record naming epoch 1 but signed by the epoch-0 key fails signature
+	// verification: the epoch names which key to check against, and does not by
+	// itself make a record valid.
+	wrongKey := newRec(1, 1)
+	if err := journal.SignRefTx(priv1, wrongKey); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	if err := chain.VerifyRefTx(wrongKey); !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("expected ErrSignatureMismatch for epoch/key mismatch, got %v", err)
+	}
+
+	// seq 1 at epoch 1, correctly signed by the rotated key: advances the floor.
+	rec1 := newRec(1, 1)
+	if err := journal.SignRefTx(priv2, rec1); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	if err := chain.VerifyRefTx(rec1); err != nil {
+		t.Fatalf("chain.VerifyRefTx(rec1) failed: %v", err)
+	}
+
+	// seq 2 naming epoch 0 again — the retired key correctly signs it, but the floor
+	// this stream already reached (epoch 1) refuses it anyway. Without this check a
+	// retired key would go on validating records forever, which defeats rotation.
+	regressed := newRec(2, 0)
+	if err := journal.SignRefTx(priv1, regressed); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	err = chain.VerifyRefTx(regressed)
+	if !errors.Is(err, journal.ErrKeyEpochRegression) {
+		t.Errorf("expected ErrKeyEpochRegression, got %v", err)
+	}
+	wantRegressionMsg := "refusal: replay failed: ref update on stream repo-x at seq 2 names key epoch 0 below epoch 1 already seen on this stream"
+	if err == nil || err.Error() != wantRegressionMsg {
+		t.Errorf("key epoch regression refusal = %q, want %q", err, wantRegressionMsg)
 	}
 }
 
@@ -990,7 +1121,7 @@ func TestRefNameRawBytePreservationNonUTF8(t *testing.T) {
 	}
 
 	// Verify CanonicalRefUpdatePayload contains the exact raw byte sequence
-	payload := journal.CanonicalRefUpdatePayload(rec.Stream, rec.Seq, rec.Timestamp, rec.Segments, rec.Updates)
+	payload := journal.CanonicalRefUpdatePayload(rec.Stream, rec.Seq, rec.KeyEpoch, rec.Timestamp, rec.Segments, rec.Updates)
 	expectedSub := "update:" + rawBytesRef + " " + journal.ZeroOID40 + " 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n"
 	if !strings.Contains(string(payload), expectedSub) {
 		t.Fatalf("canonical payload did not preserve exact raw bytes:\npayload:\n%s\nexpected substring:\n%s", string(payload), expectedSub)

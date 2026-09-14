@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/writtendev/walden/internal/refusal"
 )
 
 const (
@@ -38,10 +40,23 @@ const ZeroOID64 = "0000000000000000000000000000000000000000000000000000000000000
 
 // RefTransactionRecord represents a ref_update record on a stream carrying ref transitions and pack segments.
 type RefTransactionRecord struct {
-	Version   string      `json:"version"`
-	Stream    StreamID    `json:"stream"`
-	Seq       Seq         `json:"seq"`
-	Type      string      `json:"type"`
+	Version string   `json:"version"`
+	Stream  StreamID `json:"stream"`
+	Seq     Seq      `json:"seq"`
+	Type    string   `json:"type"`
+
+	// KeyEpoch names, as a hint rather than authority, the signing key that
+	// signed this record: an index into the chain a reader has already
+	// verified from genesis (WALD-96). It is part of the canonical signing
+	// payload (CanonicalRefUpdatePayload), so it cannot be altered without
+	// invalidating the signature.
+	//
+	// Validate does not range-check it against a chain — this type cannot see
+	// one — so a record with no "key_epoch" at all decodes to epoch 0 and
+	// passes Validate like any other. That is the same absent-vs-zero gap Seq
+	// documents on its own UnmarshalJSON, left open here for the same reason.
+	KeyEpoch Epoch `json:"key_epoch"`
+
 	Segments  []string    `json:"segments"`
 	Updates   []RefUpdate `json:"updates"`
 	Timestamp string      `json:"timestamp"`
@@ -221,7 +236,7 @@ func (r *RefTransactionRecord) Validate() error {
 
 // CanonicalRefUpdatePayload returns the deterministic canonical byte payload to sign/verify for a RefTransactionRecord.
 // Ref names are embedded as exact byte sequences without Unicode normalization.
-func CanonicalRefUpdatePayload(stream StreamID, seq Seq, timestamp string, segments []string, updates []RefUpdate) []byte {
+func CanonicalRefUpdatePayload(stream StreamID, seq Seq, keyEpoch Epoch, timestamp string, segments []string, updates []RefUpdate) []byte {
 	var sb strings.Builder
 	sb.WriteString("walden-ref-update:v1\n")
 	sb.WriteString("stream:")
@@ -229,6 +244,9 @@ func CanonicalRefUpdatePayload(stream StreamID, seq Seq, timestamp string, segme
 	sb.WriteByte('\n')
 	sb.WriteString("seq:")
 	sb.WriteString(seq.String())
+	sb.WriteByte('\n')
+	sb.WriteString("key_epoch:")
+	sb.WriteString(keyEpoch.String())
 	sb.WriteByte('\n')
 	sb.WriteString("timestamp:")
 	sb.WriteString(timestamp)
@@ -258,7 +276,7 @@ func SignRefTx(priv ed25519.PrivateKey, r *RefTransactionRecord) error {
 	if err := r.Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidRefTx, err)
 	}
-	payload := CanonicalRefUpdatePayload(r.Stream, r.Seq, r.Timestamp, r.Segments, r.Updates)
+	payload := CanonicalRefUpdatePayload(r.Stream, r.Seq, r.KeyEpoch, r.Timestamp, r.Segments, r.Updates)
 	sig := ed25519.Sign(priv, payload)
 	r.Signature = FormatSignature(sig)
 	return nil
@@ -283,17 +301,65 @@ func VerifyRefTx(r *RefTransactionRecord, activePublicKey string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidSignature, err)
 	}
-	payload := CanonicalRefUpdatePayload(r.Stream, r.Seq, r.Timestamp, r.Segments, r.Updates)
+	payload := CanonicalRefUpdatePayload(r.Stream, r.Seq, r.KeyEpoch, r.Timestamp, r.Segments, r.Updates)
 	if !ed25519.Verify(pubKey, payload, sigBytes) {
 		return fmt.Errorf("%w: signature mismatch for ref update on stream %q at seq %d", ErrSignatureMismatch, r.Stream, r.Seq)
 	}
 	return nil
 }
 
-// VerifyRefTx verifies a ref transaction record against the active signing key in the chain.
+// VerifyRefTx verifies a ref transaction record against the key its own
+// key_epoch names in the chain (spec section 8, step 3), rather than against
+// whatever key happens to be active now. The epoch is a hint, not authority:
+// the chain is still the one verified from genesis forward, an epoch outside
+// it is refused rather than a reason to fall back to the active key, and an
+// epoch lower than one already verified on this stream is refused too, or a
+// retired key would go on validating records forever.
 func (c *SigningChain) VerifyRefTx(r *RefTransactionRecord) error {
 	if c == nil || !c.initialized {
 		return fmt.Errorf("%w: cannot verify ref transaction before genesis", ErrGenesisMissing)
 	}
-	return VerifyRefTx(r, c.activeKey)
+	if r == nil {
+		return fmt.Errorf("%w: record cannot be nil", ErrInvalidRefTx)
+	}
+	key, err := c.KeyAtEpoch(r.KeyEpoch)
+	if err != nil {
+		return RefuseUnknownKeyEpoch(r.Stream, r.Seq, r.KeyEpoch)
+	}
+	if last, seen := c.lastEpoch[r.Stream]; seen && r.KeyEpoch < last {
+		return RefuseKeyEpochRegression(r.Stream, r.Seq, r.KeyEpoch, last)
+	}
+	if err := VerifyRefTx(r, key); err != nil {
+		return err
+	}
+	c.lastEpoch[r.Stream] = r.KeyEpoch
+	return nil
+}
+
+// RefuseUnknownKeyEpoch returns a single-line operator-facing refusal when a
+// ref-transaction record names a key_epoch with no corresponding key in the
+// chain verified so far (spec section 8.1). The epoch is a hint, not
+// authority, so an out-of-range value is refused rather than treated as
+// license to fall back to the active key.
+func RefuseUnknownKeyEpoch(stream StreamID, seq Seq, epoch Epoch) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("ref update on stream %s at seq %d names unknown key epoch %s", stream, seq, epoch),
+		"",
+		ErrUnknownKeyEpoch,
+	)
+}
+
+// RefuseKeyEpochRegression returns a single-line operator-facing refusal when
+// a ref-transaction record names a key_epoch lower than one already verified
+// on the same stream (spec section 8.1). Without this check a retired key
+// could go on validating records inserted after a later one on that stream,
+// which defeats the reason a key is rotated at all.
+func RefuseKeyEpochRegression(stream StreamID, seq Seq, epoch, lastEpoch Epoch) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("ref update on stream %s at seq %d names key epoch %s below epoch %s already seen on this stream", stream, seq, epoch, lastEpoch),
+		"",
+		ErrKeyEpochRegression,
+	)
 }

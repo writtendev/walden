@@ -85,7 +85,7 @@ func TestInfoRefsRealClient(t *testing.T) {
 	s := store.New(t.TempDir())
 	wantSHA := newBareRepoWithCommit(t, s, "repo")
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s))
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
 	defer server.Close()
 
 	for _, tt := range []struct {
@@ -126,7 +126,7 @@ func TestInfoRefsRealClient(t *testing.T) {
 func TestInfoRefsGoldenPreamble(t *testing.T) {
 	s := store.New(t.TempDir())
 	sha := newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	tests := []struct {
 		service      string
@@ -180,7 +180,7 @@ func TestInfoRefsGoldenPreamble(t *testing.T) {
 func TestInfoRefsProtocolV2Negotiation(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	tests := []struct {
 		name         string
@@ -227,7 +227,7 @@ func TestInfoRefsProtocolV2Negotiation(t *testing.T) {
 func TestInfoRefsReceivePackIgnoresProtocolV2(t *testing.T) {
 	s := store.New(t.TempDir())
 	sha := newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/repo/info/refs?service=git-receive-pack", nil)
 	req.Header.Set("Git-Protocol", "version=2")
@@ -252,7 +252,7 @@ func TestInfoRefsReceivePackIgnoresProtocolV2(t *testing.T) {
 func TestInfoRefsRefusals(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	tests := []struct {
 		name       string
@@ -297,7 +297,7 @@ func TestInfoRefsRefusals(t *testing.T) {
 func TestInfoRefsPostMethodNotAllowed(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/repo/info/refs", nil)
 	rec := httptest.NewRecorder()
@@ -347,7 +347,7 @@ func TestInfoRefsAbortReapsChild(t *testing.T) {
 	// exited and awaiting Wait — at the moment each connection is aborted.
 	seedManyRefs(t, s, "big", sha, 50000)
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s))
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)

@@ -29,7 +29,7 @@ func TestUploadPackRealClient(t *testing.T) {
 	s := store.New(t.TempDir())
 	wantSHA := newBareRepoWithCommit(t, s, "repo")
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s))
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
 	defer server.Close()
 
 	for _, tt := range []struct {
@@ -100,7 +100,7 @@ func TestUploadPackGzipInflate(t *testing.T) {
 	s := store.New(t.TempDir())
 	wantSHA := newBareRepoWithCommit(t, s, "repo")
 
-	real := githttp.NewHandler(nil, s)
+	real := githttp.NewHandler(nil, s, "")
 	forceGzip := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/git-upload-pack") {
 			real.ServeHTTP(w, r)
@@ -163,7 +163,7 @@ func TestUploadPackMemoryStaysFlat(t *testing.T) {
 	s := store.New(t.TempDir())
 	seedLargeBlob(t, s, "big", blobSize)
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s))
+	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
 	defer server.Close()
 
 	runtime.GC()
@@ -201,13 +201,13 @@ func TestUploadPackMemoryStaysFlat(t *testing.T) {
 func TestUploadPackRefusals(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s)
+	h := githttp.NewHandler(nil, s, "")
 
 	// A data directory that cannot be resolved at all, for the 500 case
 	// — the same technique internal/store's own
 	// TestStoreRepoPathUnresolvableDataDir uses.
 	badStore := store.New(filepath.Join(t.TempDir(), "does-not-exist"))
-	hBadDataDir := githttp.NewHandler(nil, badStore)
+	hBadDataDir := githttp.NewHandler(nil, badStore, "")
 
 	tests := []struct {
 		name        string

@@ -75,7 +75,7 @@ func TestEnsureRepoForPushCreatesOnFullScope(t *testing.T) {
 	for name, p := range mountAuthorizers(t, "rwc:*") {
 		t.Run(name, func(t *testing.T) {
 			s := store.New(t.TempDir())
-			h := NewHandler(p.authorizer, s)
+			h := NewHandler(p.authorizer, s, "")
 
 			path, err := h.ensureRepoForPush(ctx, p.token, "newrepo")
 			if err != nil {
@@ -110,7 +110,7 @@ func TestEnsureRepoForPushRefusesMissingCreateScope(t *testing.T) {
 	for name, p := range mountAuthorizers(t, "rw:*") {
 		t.Run(name, func(t *testing.T) {
 			s := store.New(t.TempDir())
-			h := NewHandler(p.authorizer, s)
+			h := NewHandler(p.authorizer, s, "")
 
 			_, err := h.ensureRepoForPush(ctx, p.token, "newrepo")
 			if err == nil {
@@ -151,7 +151,7 @@ func TestEnsureRepoForPushSucceedsWriteOnlyAgainstExistingRepo(t *testing.T) {
 			if err := s.CreateRepo(ctx, "existing"); err != nil {
 				t.Fatalf("CreateRepo (setup): %v", err)
 			}
-			h := NewHandler(p.authorizer, s)
+			h := NewHandler(p.authorizer, s, "")
 
 			path, err := h.ensureRepoForPush(ctx, p.token, "existing")
 			if err != nil {
@@ -177,7 +177,7 @@ func TestEnsureRepoForPushRefusesReadOnlyMissingRepo(t *testing.T) {
 	for name, p := range mountAuthorizers(t, "r:*") {
 		t.Run(name, func(t *testing.T) {
 			s := store.New(t.TempDir())
-			h := NewHandler(p.authorizer, s)
+			h := NewHandler(p.authorizer, s, "")
 
 			_, err := h.ensureRepoForPush(ctx, p.token, "newrepo")
 			if err == nil {
@@ -217,7 +217,7 @@ func TestEnsureRepoForPushRefusesReadOnlyExistingRepo(t *testing.T) {
 			if err := s.CreateRepo(ctx, "existing"); err != nil {
 				t.Fatalf("CreateRepo (setup): %v", err)
 			}
-			h := NewHandler(p.authorizer, s)
+			h := NewHandler(p.authorizer, s, "")
 
 			_, err := h.ensureRepoForPush(ctx, p.token, "existing")
 			if err == nil {
@@ -278,7 +278,7 @@ func TestEnsureRepoForPushRefusesLostRaceToNonDirectory(t *testing.T) {
 					}
 				},
 			}
-			h := NewHandler(wrapped, s)
+			h := NewHandler(wrapped, s, "")
 
 			gotPath, err := h.ensureRepoForPush(ctx, p.token, "racer")
 			if err == nil {
@@ -309,7 +309,7 @@ func TestEnsureRepoForPushConcurrentCreatorsAllSucceed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dataDir := t.TempDir()
 			s := store.New(dataDir)
-			h := NewHandler(p.authorizer, s)
+			h := NewHandler(p.authorizer, s, "")
 
 			var wg sync.WaitGroup
 			paths := make([]string, n)

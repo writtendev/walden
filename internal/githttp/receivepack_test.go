@@ -137,13 +137,14 @@ func TestReceivePackRealClient(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := store.New(t.TempDir())
 			barePath := newEmptyBareRepo(t, s, "repo")
-			server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+			h, tok := newTestHandler(t, s, "")
+			server := httptest.NewServer(h)
 			defer server.Close()
 
 			work, sha1 := newWorkTreeWithCommit(t)
 
 			push := func(refspec string) string {
-				args := append(append([]string{}, tt.args...), "push", server.URL+"/repo", refspec)
+				args := append(append([]string{}, tt.args...), "push", authURL(server.URL, tok)+"/repo", refspec)
 				cmd := exec.Command("git", args...)
 				cmd.Dir = work
 				cmd.Env = gitClientEnv()
@@ -184,12 +185,13 @@ func TestReceivePackHookRejectionIsACompletedRPC(t *testing.T) {
 	installHook(t, barePath, "pre-receive", "#!/bin/sh\necho 'walden: declined for testing' >&2\nexit 1\n")
 
 	var pushStatus int
-	server := httptest.NewServer(captureReceivePackStatus(githttp.NewHandler(nil, s, ""), &pushStatus))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(captureReceivePackStatus(h, &pushStatus))
 	defer server.Close()
 
 	work, _ := newWorkTreeWithCommit(t)
 
-	cmd := exec.Command("git", "push", server.URL+"/repo", "main")
+	cmd := exec.Command("git", "push", authURL(server.URL, tok)+"/repo", "main")
 	cmd.Dir = work
 	cmd.Env = gitClientEnv()
 	out, err := cmd.CombinedOutput()
@@ -223,7 +225,7 @@ func TestReceivePackHookRejectionIsACompletedRPC(t *testing.T) {
 // by this handler, plus whatever git itself adds around a hook invocation —
 // never the server's ambient environment forwarded wholesale.
 func TestReceivePackHookEnvironment(t *testing.T) {
-	runPush := func(t *testing.T, h http.Handler, barePath string) map[string]string {
+	runPush := func(t *testing.T, h http.Handler, token, barePath string) map[string]string {
 		t.Helper()
 
 		dumpPath := filepath.Join(t.TempDir(), "env.dump")
@@ -233,7 +235,7 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 		defer server.Close()
 
 		work, _ := newWorkTreeWithCommit(t)
-		cmd := exec.Command("git", "push", server.URL+"/repo", "main")
+		cmd := exec.Command("git", "push", authURL(server.URL, token)+"/repo", "main")
 		cmd.Dir = work
 		cmd.Env = gitClientEnv()
 		_, _ = cmd.CombinedOutput() // the hook always exits 1; only its env dump matters
@@ -259,7 +261,8 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 	t.Run("core-variables-and-git-owned-ones", func(t *testing.T) {
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
-		env := runPush(t, githttp.NewHandler(nil, s, "https://example.com/bucket/prefix"), barePath)
+		h, tok := newTestHandler(t, s, "https://example.com/bucket/prefix")
+		env := runPush(t, h, tok, barePath)
 
 		if got := env["WALDEN_REPO"]; got != "repo" {
 			t.Errorf("WALDEN_REPO = %q, want %q", got, "repo")
@@ -284,7 +287,8 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 	t.Run("journal-less-mode-omits-the-variable-entirely", func(t *testing.T) {
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
-		env := runPush(t, githttp.NewHandler(nil, s, ""), barePath)
+		h, tok := newTestHandler(t, s, "")
+		env := runPush(t, h, tok, barePath)
 
 		if v, ok := env["WALDEN_JOURNAL"]; ok {
 			t.Errorf("WALDEN_JOURNAL = %q, want the variable absent entirely (journal-less mode), not empty", v)
@@ -297,7 +301,8 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
-		env := runPush(t, githttp.NewHandler(nil, s, ""), barePath)
+		h, tok := newTestHandler(t, s, "")
+		env := runPush(t, h, tok, barePath)
 
 		if got := env["AWS_ACCESS_KEY_ID"]; got != "test-access-key-id" {
 			t.Errorf("AWS_ACCESS_KEY_ID = %q, want %q", got, "test-access-key-id")
@@ -317,7 +322,8 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 func TestReceivePackRefusals(t *testing.T) {
 	s := store.New(t.TempDir())
 	newEmptyBareRepo(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	authorizer, tok := newTestAuthorizer(t, "rw:*")
+	h := githttp.NewHandler(authorizer, s, "")
 
 	tests := []struct {
 		name        string
@@ -338,6 +344,7 @@ func TestReceivePackRefusals(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(""))
+			req.Header.Set("Authorization", "Bearer "+tok)
 			if tt.contentType != "" {
 				req.Header.Set("Content-Type", tt.contentType)
 			}
@@ -368,7 +375,7 @@ func TestReceivePackRefusals(t *testing.T) {
 func TestReceivePackMethodNotAllowedHeader(t *testing.T) {
 	s := store.New(t.TempDir())
 	newEmptyBareRepo(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	h, _ := newTestHandler(t, s, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/repo/git-receive-pack", nil)
 	rec := httptest.NewRecorder()
@@ -396,7 +403,8 @@ func captureRawReceivePackRequest(t *testing.T, work string) []byte {
 
 	s := store.New(t.TempDir())
 	newEmptyBareRepo(t, s, "capture")
-	h := githttp.NewHandler(nil, s, "")
+	authorizer, tok := newTestAuthorizer(t, "rwc:*")
+	h := githttp.NewHandler(authorizer, s, "")
 
 	var captured []byte
 	recorder := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -416,7 +424,7 @@ func captureRawReceivePackRequest(t *testing.T, work string) []byte {
 	server := httptest.NewServer(recorder)
 	defer server.Close()
 
-	cmd := exec.Command("git", "push", server.URL+"/capture", "main")
+	cmd := exec.Command("git", "push", authURL(server.URL, tok)+"/capture", "main")
 	cmd.Dir = work
 	cmd.Env = gitClientEnv()
 	_, _ = cmd.CombinedOutput() // expected to fail; only the captured bytes matter
@@ -456,13 +464,15 @@ func TestReceivePackGzipInflate(t *testing.T) {
 		t.Run(encoding, func(t *testing.T) {
 			s := store.New(t.TempDir())
 			barePath := newEmptyBareRepo(t, s, "target")
-			server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+			h, tok := newTestHandler(t, s, "")
+			server := httptest.NewServer(h)
 			defer server.Close()
 
 			req, err := http.NewRequest(http.MethodPost, server.URL+"/target/git-receive-pack", bytes.NewReader(compressedBytes))
 			if err != nil {
 				t.Fatalf("http.NewRequest: %v", err)
 			}
+			req.Header.Set("Authorization", "Bearer "+tok)
 			req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
 			req.Header.Set("Content-Encoding", encoding)
 
@@ -496,9 +506,10 @@ func TestReceivePackGzipInflate(t *testing.T) {
 func TestReceivePackInvalidGzip(t *testing.T) {
 	s := store.New(t.TempDir())
 	newEmptyBareRepo(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	h, tok := newTestHandler(t, s, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/repo/git-receive-pack", strings.NewReader("not actually gzip"))
+	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
 	req.Header.Set("Content-Encoding", "gzip")
 	rec := httptest.NewRecorder()
@@ -540,7 +551,8 @@ func TestReceivePackCleanRefusalDoesNotHangOnDeadBody(t *testing.T) {
 		t.Fatalf("MkdirAll(%q): %v", notARepo, err)
 	}
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)
@@ -556,6 +568,7 @@ func TestReceivePackCleanRefusalDoesNotHangOnDeadBody(t *testing.T) {
 
 	request := "POST /notarepo/git-receive-pack HTTP/1.1\r\n" +
 		"Host: " + u.Host + "\r\n" +
+		"Authorization: Bearer " + tok + "\r\n" +
 		"Content-Type: application/x-git-receive-pack-request\r\n" +
 		"Content-Length: 1000000\r\n" +
 		"Connection: close\r\n\r\n"
@@ -633,7 +646,8 @@ func TestReceivePackStreamingDoesNotHangOnDeadBody(t *testing.T) {
 
 	s := store.New(t.TempDir())
 	barePath := newEmptyBareRepo(t, s, "target")
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)
@@ -649,6 +663,7 @@ func TestReceivePackStreamingDoesNotHangOnDeadBody(t *testing.T) {
 
 	request := "POST /target/git-receive-pack HTTP/1.1\r\n" +
 		"Host: " + u.Host + "\r\n" +
+		"Authorization: Bearer " + tok + "\r\n" +
 		"Content-Type: application/x-git-receive-pack-request\r\n" +
 		"Content-Length: " + strconv.Itoa(len(raw)+1) + "\r\n" +
 		"Connection: close\r\n\r\n"
@@ -705,7 +720,7 @@ func TestReceivePackStreamingDoesNotHangOnDeadBody(t *testing.T) {
 func TestReceivePackEmptyBodyDoesNotDoubleWait(t *testing.T) {
 	s := store.New(t.TempDir())
 	newEmptyBareRepo(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	h, tok := newTestHandler(t, s, "")
 
 	var logs bytes.Buffer
 	prevOutput := log.Writer()
@@ -718,6 +733,7 @@ func TestReceivePackEmptyBodyDoesNotDoubleWait(t *testing.T) {
 	}()
 
 	req := httptest.NewRequest(http.MethodPost, "/repo/git-receive-pack", strings.NewReader("0000"))
+	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -747,7 +763,8 @@ func TestReceivePackPreservesKeepAliveConnection(t *testing.T) {
 
 	s := store.New(t.TempDir())
 	barePath := newEmptyBareRepo(t, s, "target")
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	tr := &http.Transport{
@@ -763,6 +780,7 @@ func TestReceivePackPreservesKeepAliveConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
+	pushReq.Header.Set("Authorization", "Bearer "+tok)
 	pushReq.Header.Set("Content-Type", "application/x-git-receive-pack-request")
 	pushReq.Header.Set("Content-Length", strconv.Itoa(len(raw)))
 
@@ -790,6 +808,7 @@ func TestReceivePackPreservesKeepAliveConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
+	infoReq.Header.Set("Authorization", "Bearer "+tok)
 	infoResp, err := client.Do(infoReq)
 	if err != nil {
 		t.Fatalf("second request on keep-alive connection failed: %v", err)

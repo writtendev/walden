@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/refusal"
 )
 
@@ -78,42 +77,10 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// actionForService (inforefs.go) is called here with the literal
-	// "git-receive-pack" so spec/auth/v1 §3.2's service->action table
-	// stays defined in exactly one function, rather than this handler
-	// hardcoding auth.ActionWrite on its own account. The error branch is
-	// unreachable for this literal, known-good value, but is handled
-	// rather than ignored.
-	_, _, action, err := actionForService("git-receive-pack")
+	token := credentialFromRequest(r)
+	path, err := h.ensureRepoForPush(r.Context(), token, repo)
 	if err != nil {
-		log.Printf("githttp: receive-pack: actionForService(git-receive-pack): %v", err)
-		writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
-			"receive-pack failed",
-			"internal action mapping error",
-			"contact the operator",
-		))
-		return
-	}
-	// required is the auth.Actions this request needs. WALD-52 owns the
-	// 401 challenge and Basic/Bearer token parsing; this is the one
-	// obvious insertion point for the Authorize call, before the exec
-	// below. See WALD-39's ticket "Sequencing" section: this handler
-	// lands with no authorization call at all, mirroring handleInfoRefs,
-	// because there is no token to check with until WALD-52 parses
-	// Authorization.
-	required := auth.Actions{Write: action == auth.ActionWrite}
-	_ = required
-
-	// resolveRepoDir (gitcmd.go) is the same RepoPath-then-stat sequence
-	// WALD-38 already uses for info/refs and upload-pack, converged here
-	// so a push to a repository that does not exist reads identically to
-	// a fetch of one rather than the differently-worded 404 this file
-	// used to compose by hand. Push-time repo creation is still not
-	// wired in (that needs a token, which arrives with WALD-52 -- see
-	// WALD-39's ticket "Sequencing" section); that is a behavior gap,
-	// not a wording one, and this change does not touch it.
-	path, ok := h.resolveRepoDir(w, "receive-pack", repo)
-	if !ok {
+		writeAuthRefusal(w, "receive-pack", repo, err)
 		return
 	}
 

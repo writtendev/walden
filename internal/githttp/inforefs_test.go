@@ -30,7 +30,9 @@ import (
 // http.proxy in ~/.gitconfig, for instance, would otherwise silently
 // change what git ls-remote does here.
 func gitClientEnv() []string {
-	env := []string{}
+	env := []string{
+		"GIT_TERMINAL_PROMPT=0",
+	}
 	if p := os.Getenv("PATH"); p != "" {
 		env = append(env, "PATH="+p)
 	}
@@ -85,7 +87,8 @@ func TestInfoRefsRealClient(t *testing.T) {
 	s := store.New(t.TempDir())
 	wantSHA := newBareRepoWithCommit(t, s, "repo")
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	for _, tt := range []struct {
@@ -96,7 +99,7 @@ func TestInfoRefsRealClient(t *testing.T) {
 		{"protocol-v0", []string{"-c", "protocol.version=0"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			args := append(append([]string{}, tt.args...), "ls-remote", server.URL+"/repo")
+			args := append(append([]string{}, tt.args...), "ls-remote", authURL(server.URL, tok)+"/repo")
 			cmd := exec.Command("git", args...)
 			cmd.Dir = t.TempDir()
 			cmd.Env = gitClientEnv()
@@ -126,7 +129,7 @@ func TestInfoRefsRealClient(t *testing.T) {
 func TestInfoRefsGoldenPreamble(t *testing.T) {
 	s := store.New(t.TempDir())
 	sha := newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	h, tok := newTestHandler(t, s, "")
 
 	tests := []struct {
 		service      string
@@ -141,6 +144,7 @@ func TestInfoRefsGoldenPreamble(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.service, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/repo/info/refs?service="+tt.service, nil)
+			req.Header.Set("Authorization", "Bearer "+tok)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 
@@ -180,7 +184,7 @@ func TestInfoRefsGoldenPreamble(t *testing.T) {
 func TestInfoRefsProtocolV2Negotiation(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	h, tok := newTestHandler(t, s, "")
 
 	tests := []struct {
 		name         string
@@ -196,6 +200,7 @@ func TestInfoRefsProtocolV2Negotiation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/repo/info/refs?service=git-upload-pack", nil)
+			req.Header.Set("Authorization", "Bearer "+tok)
 			if tt.gitProtocol != "" {
 				req.Header.Set("Git-Protocol", tt.gitProtocol)
 			}
@@ -227,9 +232,10 @@ func TestInfoRefsProtocolV2Negotiation(t *testing.T) {
 func TestInfoRefsReceivePackIgnoresProtocolV2(t *testing.T) {
 	s := store.New(t.TempDir())
 	sha := newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	h, tok := newTestHandler(t, s, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/repo/info/refs?service=git-receive-pack", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Git-Protocol", "version=2")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -252,7 +258,8 @@ func TestInfoRefsReceivePackIgnoresProtocolV2(t *testing.T) {
 func TestInfoRefsRefusals(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	authorizer, tok := newTestAuthorizer(t, "rw:*")
+	h := githttp.NewHandler(authorizer, s, "")
 
 	tests := []struct {
 		name       string
@@ -270,6 +277,7 @@ func TestInfoRefsRefusals(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req.Header.Set("Authorization", "Bearer "+tok)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 
@@ -297,7 +305,7 @@ func TestInfoRefsRefusals(t *testing.T) {
 func TestInfoRefsPostMethodNotAllowed(t *testing.T) {
 	s := store.New(t.TempDir())
 	newBareRepoWithCommit(t, s, "repo")
-	h := githttp.NewHandler(nil, s, "")
+	h, _ := newTestHandler(t, s, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/repo/info/refs", nil)
 	rec := httptest.NewRecorder()
@@ -347,7 +355,8 @@ func TestInfoRefsAbortReapsChild(t *testing.T) {
 	// exited and awaiting Wait — at the moment each connection is aborted.
 	seedManyRefs(t, s, "big", sha, 50000)
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)
@@ -361,7 +370,7 @@ func TestInfoRefsAbortReapsChild(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial %s: %v", u.Host, err)
 		}
-		if _, err := fmt.Fprintf(conn, "GET /big/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", u.Host); err != nil {
+		if _, err := fmt.Fprintf(conn, "GET /big/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n", u.Host, tok); err != nil {
 			t.Fatalf("write request: %v", err)
 		}
 		// Read a little of the response so the server has started

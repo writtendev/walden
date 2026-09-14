@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/writtendev/walden/internal/githttp"
 	"github.com/writtendev/walden/internal/store"
 )
 
@@ -65,7 +64,8 @@ func TestUploadPackAbortKillsChild(t *testing.T) {
 		t.Fatalf("mkdir %q: %v", barePath, err)
 	}
 
-	server := httptest.NewServer(githttp.NewHandler(nil, s, ""))
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
 	defer server.Close()
 
 	u, err := url.Parse(server.URL)
@@ -80,8 +80,8 @@ func TestUploadPackAbortKillsChild(t *testing.T) {
 
 	reqBody := "0000"
 	request := fmt.Sprintf(
-		"POST /repo/git-upload-pack HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-		u.Host, len(reqBody), reqBody,
+		"POST /repo/git-upload-pack HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer %s\r\nContent-Type: application/x-git-upload-pack-request\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		u.Host, tok, len(reqBody), reqBody,
 	)
 	if _, err := conn.Write([]byte(request)); err != nil {
 		t.Fatalf("write request: %v", err)

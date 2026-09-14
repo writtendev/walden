@@ -72,21 +72,17 @@ type diskTable struct {
 	Tokens  []diskToken `json:"tokens"`
 }
 
-// toRecord converts a disk-encoded token into the TokenRecord shape the rest of the package
-// works with, parsing its scopes back into the published vocabulary. path is the tokens.json
-// path this record was read from, purely so a parse failure can be wrapped as a corrupted
-// store naming the file — a scope string an operator never typed must not refuse under
-// ErrInvalidScope blaming input, and it is the one corrupt-store path errors.Is(err,
-// ErrStoreUnavailable) would otherwise miss.
-func (d diskToken) toRecord(path string) (*TokenRecord, error) {
+// tryDecode attempts the same conversion toRecord performs — a disk-encoded token back into
+// the TokenRecord shape the rest of the package works with — but returns ParseScopes' error
+// unwrapped rather than as an operator-facing refusal. It is the one place a disk-encoded
+// token is turned back into a TokenRecord, so a real read (toRecord, below) and CreateToken's
+// pre-write guard (validateForWrite) run the exact same round trip and each shapes its own
+// refusal around the result, instead of the write side reimplementing the round trip and
+// drifting from what a read actually does.
+func (d diskToken) tryDecode() (*TokenRecord, error) {
 	scopes, err := ParseScopes(d.Scopes)
 	if err != nil {
-		return nil, refusal.RefuseWithCause(
-			"token store corrupted",
-			fmt.Sprintf("%s carries token %q with an unparseable scope: %s", path, d.TokenID, err.Error()),
-			"restore tokens.json from backup; it will not be recreated automatically",
-			ErrStoreUnavailable,
-		)
+		return nil, err
 	}
 	return &TokenRecord{
 		TokenID:   d.TokenID,
@@ -96,6 +92,25 @@ func (d diskToken) toRecord(path string) (*TokenRecord, error) {
 		Revoked:   d.Revoked,
 		RevokedAt: d.RevokedAt,
 	}, nil
+}
+
+// toRecord converts a disk-encoded token into the TokenRecord shape the rest of the package
+// works with, parsing its scopes back into the published vocabulary. path is the tokens.json
+// path this record was read from, purely so a parse failure can be wrapped as a corrupted
+// store naming the file — a scope string an operator never typed must not refuse under
+// ErrInvalidScope blaming input, and it is the one corrupt-store path errors.Is(err,
+// ErrStoreUnavailable) would otherwise miss.
+func (d diskToken) toRecord(path string) (*TokenRecord, error) {
+	rec, err := d.tryDecode()
+	if err != nil {
+		return nil, refusal.RefuseWithCause(
+			"token store corrupted",
+			fmt.Sprintf("%s carries token %q with an unparseable scope: %s", path, d.TokenID, err.Error()),
+			"restore tokens.json from backup; it will not be recreated automatically",
+			ErrStoreUnavailable,
+		)
+	}
+	return rec, nil
 }
 
 // diskTokenFromRecord converts a TokenRecord into its on-disk shape.
@@ -331,20 +346,35 @@ func (s *FileTokenStore) ListTokens(ctx context.Context) ([]*TokenRecord, error)
 	return records, nil
 }
 
-// CreateToken appends a new token record, refusing (ErrTokenExists) rather than overwriting
-// when a record already exists with the same TokenID or TokenHash — a create is always a
-// create, never an upsert a caller must infer from success alone. record.CreatedAt is
-// persisted as given; CreateToken never calls time.Now, so a future meta-stream journal
-// writer (WALD-33) can stamp both records from the same instant.
+// validateForWrite is the one gate every field of record passes through before CreateToken
+// appends it, so "anything CreateToken accepts can be read back" is a property of the code,
+// not an assumption about callers. Round 2 made that true of TokenHash alone; this closes it
+// for the rest of the record after round 3 found record.Scopes and record.TokenID unguarded
+// by the same omission — a record whose Scopes don't round-trip (nil, empty, or a
+// zero-valued Actions) reached disk, and every later read of the table then refused under
+// ErrStoreUnavailable with no way back through the store's own API. Patching Scopes alone
+// would make this the third field-shaped patch for one bug; this checks the whole record
+// instead, at the one place a record enters the store.
 //
-// record.TokenHash must already be a storage hash ("sha256:<64-hex>") — CreateToken rejects
-// anything else via journal.ValidateTokenHash, the same rule a token_create record enforces,
-// rather than trusting the caller to have hashed it. "Raw tokens never touch disk" is a
-// property this store holds itself to, not one it merely assumes of its callers; the refusal
-// withholds the value, since a rejected hash may be a live raw token.
-func (s *FileTokenStore) CreateToken(ctx context.Context, record *TokenRecord) error {
-	if record == nil {
-		return refusal.Refuse("token create refused", "record is nil", "pass a non-nil token record")
+// TokenID and TokenHash are checked against the validators internal/journal already defines
+// for the token_create record these fields will one day travel in unchanged (WALD-33) — the
+// same rule enforced twice, not a second spelling of it. An id or hash CreateToken accepts
+// today is one that record's own Validate will accept later, so that addition stays an
+// addition for these fields rather than a rewrite.
+//
+// Every other field — Scopes today, whatever TokenRecord grows tomorrow — is checked by
+// actually attempting the read: diskTokenFromRecord encodes record the way save() would, and
+// tryDecode decodes it back the way every load()-based read would. That is the exact pair a
+// stored record must survive, so a field added to TokenRecord and diskToken later is caught
+// by the same call, with nothing here to remember to update for it.
+func (s *FileTokenStore) validateForWrite(record *TokenRecord) error {
+	if err := journal.ValidateTokenID(record.TokenID); err != nil {
+		return refusal.RefuseWithCause(
+			"token create refused",
+			err.Error(),
+			"pass a token id containing only [a-zA-Z0-9._-]",
+			journal.ErrInvalidTokenID,
+		)
 	}
 	if err := journal.ValidateTokenHash(record.TokenHash); err != nil {
 		return refusal.RefuseWithCause(
@@ -353,6 +383,34 @@ func (s *FileTokenStore) CreateToken(ctx context.Context, record *TokenRecord) e
 			"pass the sha256:<64-hex> storage hash from HashToken, not the raw token",
 			journal.ErrInvalidTokenHash,
 		)
+	}
+	if _, err := diskTokenFromRecord(record).tryDecode(); err != nil {
+		return refusal.RefuseWithCause(
+			"token create refused",
+			fmt.Sprintf("record would not read back once written: %s", err.Error()),
+			"pass scopes that round-trip through Scope.String()/ParseScopes: each needs at least one action and a non-empty pattern",
+			ErrStoreUnavailable,
+		)
+	}
+	return nil
+}
+
+// CreateToken appends a new token record, refusing (ErrTokenExists) rather than overwriting
+// when a record already exists with the same TokenID or TokenHash — a create is always a
+// create, never an upsert a caller must infer from success alone. record.CreatedAt is
+// persisted as given; CreateToken never calls time.Now, so a future meta-stream journal
+// writer (WALD-33) can stamp both records from the same instant.
+//
+// Before anything else, record is run through validateForWrite: "raw tokens never touch
+// disk" and "a record this store accepts can be read back" are properties this store holds
+// itself to, not ones it merely assumes of its callers. A rejected hash withholds the value,
+// since it may be a live raw token; nothing else record carries is a secret.
+func (s *FileTokenStore) CreateToken(ctx context.Context, record *TokenRecord) error {
+	if record == nil {
+		return refusal.Refuse("token create refused", "record is nil", "pass a non-nil token record")
+	}
+	if err := s.validateForWrite(record); err != nil {
+		return err
 	}
 
 	lock, err := acquireStoreLock(s.lockPath)

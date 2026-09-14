@@ -687,3 +687,141 @@ func TestFileTokenStoreRevokeRefusesDuplicateTokenID(t *testing.T) {
 		t.Errorf("record B = %+v, want present and unrevoked", recB)
 	}
 }
+
+// TestFileTokenStoreCreateTokenRefusesUnreadableRecord pins the invariant round 3 found
+// missing: anything CreateToken accepts can be read back. Each case drives one field of an
+// otherwise well-formed TokenRecord into a shape that either the store's own on-disk round
+// trip (Scopes) or a future token_create journal record, WALD-33 (TokenID, TokenHash) would
+// refuse, and asserts CreateToken refuses it too, before anything reaches the data directory
+// — rather than writing a row that a later ListTokens/GetTokenByHash/GetTokenByID call would
+// then refuse the *whole table* over, unrepairable through the store's own API. The
+// nil-scopes, empty-scopes, zero-Actions-scope, and both token-id cases all fail against the
+// pre-fix CreateToken, which validated only TokenHash.
+func TestFileTokenStoreCreateTokenRefusesUnreadableRecord(t *testing.T) {
+	validScopes, err := auth.ParseScopes([]string{"rwc:*"})
+	if err != nil {
+		t.Fatalf("ParseScopes: %v", err)
+	}
+	validHash := auth.HashToken("walden_probe_unreadable")
+
+	cases := []struct {
+		name    string
+		mutate  func(*auth.TokenRecord)
+		wantErr error
+	}{
+		{
+			name:    "nil scopes",
+			mutate:  func(r *auth.TokenRecord) { r.Scopes = nil },
+			wantErr: auth.ErrStoreUnavailable,
+		},
+		{
+			name:    "empty scopes",
+			mutate:  func(r *auth.TokenRecord) { r.Scopes = []auth.Scope{} },
+			wantErr: auth.ErrStoreUnavailable,
+		},
+		{
+			name: "scope with zero-valued Actions",
+			mutate: func(r *auth.TokenRecord) {
+				r.Scopes = []auth.Scope{{Actions: auth.Actions{}, Pattern: "blog-*"}}
+			},
+			wantErr: auth.ErrStoreUnavailable,
+		},
+		{
+			name:    "empty token id",
+			mutate:  func(r *auth.TokenRecord) { r.TokenID = "" },
+			wantErr: journal.ErrInvalidTokenID,
+		},
+		{
+			name:    "token id outside the published character class",
+			mutate:  func(r *auth.TokenRecord) { r.TokenID = "tok/with/slash" },
+			wantErr: journal.ErrInvalidTokenID,
+		},
+		{
+			name:    "unhashed token hash",
+			mutate:  func(r *auth.TokenRecord) { r.TokenHash = "walden_raw_not_a_hash" },
+			wantErr: journal.ErrInvalidTokenHash,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			store := auth.NewFileTokenStore(dir)
+
+			record := &auth.TokenRecord{
+				TokenID:   "tok_probe",
+				TokenHash: validHash,
+				Scopes:    append([]auth.Scope(nil), validScopes...),
+				CreatedAt: time.Now().UTC(),
+			}
+			tc.mutate(record)
+
+			err := store.CreateToken(ctx, record)
+			checkSingleLineRefusal(t, err, tc.wantErr)
+
+			entries, readErr := os.ReadDir(dir)
+			if readErr != nil {
+				t.Fatalf("ReadDir: %v", readErr)
+			}
+			if len(entries) != 0 {
+				t.Errorf("data directory has %d entries after a refused CreateToken, want 0: %v", len(entries), entries)
+			}
+		})
+	}
+}
+
+// TestFileTokenStoreCreateTokenRoundTrips pins the other half of the same invariant: a record
+// CreateToken accepts loads back identically through a second store instance, field for
+// field — not merely "does not error" on either side.
+func TestFileTokenStoreCreateTokenRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := auth.NewFileTokenStore(dir)
+
+	scopes, err := auth.ParseScopes([]string{"rw:blog-*", "r:docs"})
+	if err != nil {
+		t.Fatalf("ParseScopes: %v", err)
+	}
+	want := &auth.TokenRecord{
+		TokenID:   "tok_roundtrip",
+		TokenHash: auth.HashToken("walden_roundtrip_probe"),
+		Scopes:    scopes,
+		CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+	}
+
+	if err := store.CreateToken(ctx, want); err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	// A second, independent store instance over the same directory: proves the record came
+	// back from what was actually written, not from anything cached in-process.
+	verify := auth.NewFileTokenStore(dir)
+	got, err := verify.GetTokenByHash(ctx, want.TokenHash)
+	if err != nil {
+		t.Fatalf("GetTokenByHash: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetTokenByHash returned nil for a token CreateToken just accepted")
+	}
+	if got.TokenID != want.TokenID {
+		t.Errorf("TokenID = %q, want %q", got.TokenID, want.TokenID)
+	}
+	if got.TokenHash != want.TokenHash {
+		t.Errorf("TokenHash = %q, want %q", got.TokenHash, want.TokenHash)
+	}
+	if !got.CreatedAt.Equal(want.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, want.CreatedAt)
+	}
+	if got.Revoked {
+		t.Error("Revoked = true for a freshly created token")
+	}
+	if len(got.Scopes) != len(want.Scopes) {
+		t.Fatalf("Scopes = %+v, want %+v", got.Scopes, want.Scopes)
+	}
+	for i := range want.Scopes {
+		if got.Scopes[i] != want.Scopes[i] {
+			t.Errorf("Scopes[%d] = %+v, want %+v", i, got.Scopes[i], want.Scopes[i])
+		}
+	}
+}

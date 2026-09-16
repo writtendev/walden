@@ -853,6 +853,27 @@ func TestObjectURLBuilding(t *testing.T) {
 			wantPath:  "/test-bucket/v1/streams/tx 1+2.json",
 			wantHost:  "s3.fake.test",
 		},
+		{
+			// An empty key addresses the bucket root, the way WALD-21's
+			// LIST does - Journal.Prefix must not be joined onto the path
+			// in this case, or a non-empty prefix routes the request to
+			// an object path instead of the bucket root a real S3
+			// ListObjectsV2 needs (see list.go's journalKey/refuseList).
+			name:      "path-style-empty-key-nonempty-prefix-is-bucket-root",
+			pathStyle: true,
+			prefix:    "v1",
+			key:       "",
+			wantPath:  "/test-bucket",
+			wantHost:  "s3.fake.test",
+		},
+		{
+			name:      "virtual-hosted-empty-key-nonempty-prefix-is-bucket-root",
+			pathStyle: false,
+			prefix:    "v1",
+			key:       "",
+			wantPath:  "/",
+			wantHost:  "test-bucket.s3.fake.test",
+		},
 	}
 
 	for _, tt := range tests {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -43,8 +44,6 @@ var suiteSkip = map[string]string{
 	"get-slash-normalized":               "assumes dot-segment normalization; S3 signs the path single-encoded and unnormalized",
 	"get-slash-pointless-dot-normalized": "assumes dot-segment normalization; S3 signs the path single-encoded and unnormalized",
 	"get-slashes-normalized":             "assumes dot-segment normalization; S3 signs the path single-encoded and unnormalized",
-	"get-space-normalized":               "assumes dot-segment normalization; S3 signs the path single-encoded and unnormalized",
-	"post-sts-header-after":              "tests a session token carried as an unsigned header added after Authorization (a presign-style placement); walden's signer always signs the session token header",
 }
 
 func TestSigV4Suite(t *testing.T) {
@@ -62,11 +61,21 @@ func TestSigV4Suite(t *testing.T) {
 		}
 		name := entry.Name()
 		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(root, name)
 			if reason, ok := suiteSkip[name]; ok {
 				seenSkip[name] = true
+				// A case can only sit in suiteSkip while it genuinely fails.
+				// If it now matches every fixture, the reason it was skipped
+				// for no longer holds and the skip has gone stale silently.
+				if mismatches := suiteCaseMismatches(t, dir); len(mismatches) == 0 {
+					t.Errorf("case %q is listed in suiteSkip (%s) but passes unmodified; remove it from suiteSkip", name, reason)
+					return
+				}
 				t.Skip(reason)
 			}
-			runSuiteCase(t, filepath.Join(root, name))
+			for _, mismatch := range suiteCaseMismatches(t, dir) {
+				t.Error(mismatch)
+			}
 		})
 	}
 
@@ -85,13 +94,20 @@ type suiteContext struct {
 		SecretAccessKey string `json:"secret_access_key"`
 		Token           string `json:"token"`
 	} `json:"credentials"`
-	Region    string `json:"region"`
-	Service   string `json:"service"`
-	SignBody  bool   `json:"sign_body"`
-	Timestamp string `json:"timestamp"`
+	Region           string `json:"region"`
+	Service          string `json:"service"`
+	SignBody         bool   `json:"sign_body"`
+	Timestamp        string `json:"timestamp"`
+	OmitSessionToken bool   `json:"omit_session_token"`
 }
 
-func runSuiteCase(t *testing.T, dir string) {
+// suiteCaseMismatches runs the AWS SigV4 conformance check for the case in
+// dir and returns one message per stage (canonical request, string to sign,
+// signature, Authorization header) whose output does not match its
+// fixture. An empty result means the case passes in full; suiteSkip may
+// only name a case for which this is never empty, and the guard in
+// TestSigV4Suite enforces that.
+func suiteCaseMismatches(t *testing.T, dir string) []string {
 	t.Helper()
 
 	var ctx suiteContext
@@ -110,10 +126,11 @@ func runSuiteCase(t *testing.T, dir string) {
 	}
 
 	// Signing-time headers: always x-amz-date, the session token when
-	// credentials carry one, and the payload hash only when this case
-	// opted into signing the body. None of these come from request.txt.
+	// credentials carry one and the case doesn't ask for it to be left out,
+	// and the payload hash only when this case opted into signing the
+	// body. None of these come from request.txt.
 	header.Set("X-Amz-Date", now.UTC().Format(store.AmzDateFormatForTest))
-	if ctx.Credentials.Token != "" {
+	if ctx.Credentials.Token != "" && !ctx.OmitSessionToken {
 		header.Set("X-Amz-Security-Token", ctx.Credentials.Token)
 	}
 	payloadHash := store.EmptySHA256ForTest
@@ -123,28 +140,32 @@ func runSuiteCase(t *testing.T, dir string) {
 		header.Set("X-Amz-Content-Sha256", payloadHash)
 	}
 
+	var mismatches []string
+
 	creq, signedHeaders := store.CanonicalRequestForTest(method, path, query, header, host, payloadHash)
 	if want := string(readTestFile(t, dir, "header-canonical-request.txt")); creq != want {
-		t.Errorf("canonical request:\n got: %q\nwant: %q", creq, want)
+		mismatches = append(mismatches, fmt.Sprintf("canonical request:\n got: %q\nwant: %q", creq, want))
 	}
 
 	dateStamp := now.UTC().Format(store.DateFormatForTest)
 	scope := store.ScopeStringForTest(dateStamp, ctx.Region, ctx.Service)
 	sts := store.StringToSignForTest(now, scope, creq)
 	if want := string(readTestFile(t, dir, "header-string-to-sign.txt")); sts != want {
-		t.Errorf("string to sign:\n got: %q\nwant: %q", sts, want)
+		mismatches = append(mismatches, fmt.Sprintf("string to sign:\n got: %q\nwant: %q", sts, want))
 	}
 
 	key := store.SigningKeyForTest(ctx.Credentials.SecretAccessKey, dateStamp, ctx.Region, ctx.Service)
 	sig := store.SignatureForTest(key, sts)
 	if want := string(readTestFile(t, dir, "header-signature.txt")); sig != want {
-		t.Errorf("signature: got %s want %s", sig, want)
+		mismatches = append(mismatches, fmt.Sprintf("signature: got %s want %s", sig, want))
 	}
 
 	authz := store.AuthorizationHeaderForTest(ctx.Credentials.AccessKeyID, scope, signedHeaders, sig)
 	if want := extractAuthorization(t, readTestFile(t, dir, "header-signed-request.txt")); authz != want {
-		t.Errorf("authorization header:\n got: %q\nwant: %q", authz, want)
+		mismatches = append(mismatches, fmt.Sprintf("authorization header:\n got: %q\nwant: %q", authz, want))
 	}
+
+	return mismatches
 }
 
 // parseSuiteRequest parses request.txt's raw-HTTP-ish text into the pieces

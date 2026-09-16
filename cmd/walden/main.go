@@ -26,10 +26,7 @@ import (
 var Version = "dev"
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	if err := run(ctx, os.Args, os.Stdout, os.Stderr); err != nil {
+	if err := run(context.Background(), os.Args, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "walden: %v\n", err)
 		os.Exit(1)
 	}
@@ -37,7 +34,7 @@ func main() {
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return runServe(ctx, nil, stdout, stderr)
+		return dispatchServe(ctx, nil, stdout, stderr)
 	}
 
 	prog := filepath.Base(args[0])
@@ -48,12 +45,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	if len(args) < 2 {
-		return runServe(ctx, args[1:], stdout, stderr)
+		return dispatchServe(ctx, args[1:], stdout, stderr)
 	}
 
 	switch args[1] {
 	case "serve":
-		return runServe(ctx, args[2:], stdout, stderr)
+		return dispatchServe(ctx, args[2:], stdout, stderr)
 	case "token":
 		return runToken(args[2:], stdout, stderr)
 	case "pre-receive":
@@ -66,10 +63,23 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return nil
 	default:
 		if strings.HasPrefix(args[1], "-") {
-			return runServe(ctx, args[1:], stdout, stderr)
+			return dispatchServe(ctx, args[1:], stdout, stderr)
 		}
 		return refusal.Refuse("unknown command", args[1], "run 'walden help' for usage")
 	}
+}
+
+// dispatchServe installs the SIGINT/SIGTERM handling that runServe relies on
+// to close its listener and return -- scoped to the serve path alone.
+// Installing it any earlier (once in main, ahead of the dispatch above)
+// would leave every subcommand's process catching those signals whether or
+// not it reads ctx: token create/list/revoke and the pre-receive hook don't,
+// so a blocked tokens.lock wait would swallow Ctrl-C and SIGTERM instead of
+// exiting on them the way the Go default handler does.
+func dispatchServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runServe(ctx, args, stdout, stderr)
 }
 
 func printUsage(w io.Writer) {

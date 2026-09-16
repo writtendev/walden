@@ -272,6 +272,7 @@ By construction there are few, and each is legible:
 | machine/disk dies          | none durable; cache lost                                | boot walden against the same journal          |
 | object storage unreachable | pushes fail loudly; reads keep serving                  | pushes succeed when storage returns           |
 | fenced-out writer          | conditional put fails; writes stop on that instance     | traffic already belongs to the current writer |
+| append outcome unknown     | writes stop on that stream on that instance             | restart; materialization reads what landed    |
 | crash mid-push             | refs never moved; journal may hold an unreferenced pack | harmless; compaction tidies                   |
 | journal-less mode          | durability = the disk, as warned                        | enable `WALDEN_JOURNAL`                       |
 

@@ -1101,6 +1101,12 @@ Single-writer safety (fencing) is governed by strict deterministic rules. Any re
 - If repository stream `A` is fenced due to a conflict at sequence $k$, repository stream `B` and the `_meta` stream on the same walden instance are completely unaffected and continue normal write and read operations.
 - Fencing on the `_meta` stream prevents further configuration/token mutations while repository push operations on individual repo streams continue unaffected (and vice-versa).
 
+#### 6. Resending a Conditional Append
+- A writer MAY resend a conditional append only while every earlier attempt at that key is known not to have been applied. That is the case when the request never fully reached storage, or when storage rejected it before evaluation: `408`, `400` `RequestTimeout`, `409` `ConditionalRequestConflict`, `429`, or `503`.
+- After an attempt whose outcome is unknown, the writer MUST NOT resend it. That includes a connection lost or timed out after the full request was sent, and a `500`, `502`, or `504`. The reason: a resend's `412` could be its own earlier write, and item 2's "definitive proof" would then be false.
+- The writer MUST NOT `GET` the key or `LIST` the stream to find out. That is guessing, and it is forbidden by item 4.
+- The writer MUST transition the stream to permanently fenced (item 3) and refuse the write. Restart re-materializes from the journal, which is the authority on whether the record landed.
+
 ---
 
 ### 11.5 Single-Line Refusal Message Formats
@@ -1137,8 +1143,21 @@ In accordance with Walden's operator-facing refusal convention (`refusal.Refusal
    provider. It is a fast pre-flight against a table of providers already known to lack CAS,
    not the compare-and-swap check itself; that check is a boot-time probe of the bucket and
    is not implemented yet (see section 11.2).
+7. **Conditional Append With Unknown Outcome (Repository Stream):**
+   ```
+   refusal: push failed: stream <stream-id> append at seq <seq> has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)
+   ```
+   Per section 11.4 item 6: the writer could not prove whether the append at `seq` landed,
+   so it fences the stream exactly as it would for item 2's `412`, rather than resend or
+   re-read the key to find out.
+8. **Conditional Append With Unknown Outcome (Meta Stream):**
+   ```
+   refusal: meta operation failed: stream _meta append at seq <seq> has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)
+   ```
+   The meta-stream counterpart to item 7, the same way item 3 is to item 1 and item 4 is to
+   item 2.
 
-These six messages, the `If-None-Match: *` precondition, and the derivation of the append target key are pinned by [`fixtures/conditional_append.json`](fixtures/conditional_append.json).
+These eight messages, the `If-None-Match: *` precondition, and the derivation of the append target key are pinned by [`fixtures/conditional_append.json`](fixtures/conditional_append.json).
 
 ---
 

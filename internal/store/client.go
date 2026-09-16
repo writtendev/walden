@@ -17,11 +17,13 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/refusal"
 )
 
@@ -36,6 +38,20 @@ var (
 	ErrStorageRefused = errors.New("object storage refused request")
 	// ErrObjectNotFound marks a GET against a key that does not exist.
 	ErrObjectNotFound = errors.New("object not found")
+	// ErrPrecondition marks a conditional write's target key already
+	// existing (412): the same identity as journal.ErrPreconditionFailed,
+	// so one sentinel exists, not two (the same pattern as
+	// journal.ErrStreamFenced = ErrFenced). It means "you have been
+	// fenced" - the opposite of ErrStorageUnavailable's "try again" - and
+	// PutIfAbsent never retries it.
+	ErrPrecondition = journal.ErrPreconditionFailed
+	// ErrOutcomeUnknown marks a conditional write whose outcome could not
+	// be proven either way: the attempt may or may not have been applied.
+	// It deliberately does not wrap ErrStorageUnavailable, whose contract
+	// is "the caller can simply try again" - that is exactly wrong here,
+	// because a resend risks a 412 caused by this writer's own earlier,
+	// unacknowledged attempt. See classify and PutIfAbsent.
+	ErrOutcomeUnknown = errors.New("object storage write outcome unknown")
 )
 
 const (
@@ -133,6 +149,33 @@ func (c *Client) Put(ctx context.Context, key string, body io.ReaderAt, size int
 	return nil
 }
 
+// PutIfAbsent uploads body (size bytes long) to key, journal-relative,
+// conditioned on key not already existing: it sends If-None-Match: *
+// (journal.HeaderIfNoneMatch, journal.IfNoneMatchWildcard) rather than a
+// literal header. A 412 comes back as ErrPrecondition and is never
+// retried - it is definitive proof the key already exists (spec/journal/v1
+// section 11.4.2). Unlike Put, a retryable failure is resent only when
+// this attempt is proven not to have been applied; otherwise PutIfAbsent
+// stops at once with ErrOutcomeUnknown rather than risk a resend whose own
+// 412 would be caused by this writer's earlier attempt. See classify and
+// this package's WALD-22 plan for the full rule.
+func (c *Client) PutIfAbsent(ctx context.Context, key string, body io.ReaderAt, size int64) error {
+	header := http.Header{journal.HeaderIfNoneMatch: []string{journal.IfNoneMatchWildcard}}
+	resp, err := c.do(ctx, objectRequest{
+		method:      http.MethodPut,
+		key:         key,
+		body:        body,
+		size:        size,
+		header:      header,
+		conditional: true,
+	})
+	if err != nil {
+		return err
+	}
+	closeBody(resp)
+	return nil
+}
+
 // Get retrieves key, journal-relative, and retries until it has a 2xx
 // response, then returns the body as it streams; the caller must Close
 // it. A read error after that point is not retried - it is instead
@@ -178,6 +221,12 @@ type objectRequest struct {
 	header http.Header
 	body   io.ReaderAt // nil for no body
 	size   int64
+	// conditional marks a request whose classify rule differs from an
+	// idempotent Put/Get: a retryable cause is resent only when this
+	// attempt is proven not to have been applied (see classify). It is
+	// explicit rather than inferred from header, matching this package's
+	// WALD-22 plan.
+	conditional bool
 }
 
 // do sends r, signing and retrying under the rules described atop this
@@ -190,8 +239,8 @@ func (c *Client) do(ctx context.Context, r objectRequest) (*http.Response, error
 			return nil, c.refuse(r, attempts-1, fmt.Errorf("%w: %w", ErrStorageUnavailable, err))
 		}
 
-		resp, sendErr := c.send(ctx, r, c.now())
-		retry, cause := classify(resp, sendErr)
+		resp, wrote, sendErr := c.send(ctx, r, c.now())
+		retry, cause := classify(r, resp, sendErr, wrote)
 
 		if !retry {
 			if cause == nil {
@@ -229,8 +278,16 @@ func (c *Client) do(ctx context.Context, r objectRequest) (*http.Response, error
 }
 
 // send builds and signs one attempt at r and sends it. Each attempt gets a
-// freshly built request and is signed again with now.
-func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (*http.Response, error) {
+// freshly built request and is signed again with now. The returned bool,
+// wrote, reports whether the request was fully written to the connection
+// before a send error or response arrived (httptrace.ClientTrace's
+// WroteRequest, recording info.Err == nil) - classify's only use for it is
+// deciding, for a conditional request, whether a transport error proves
+// the attempt was not applied. send deliberately never sets req.GetBody or
+// an Idempotency-Key header: either one would let net/http silently replay
+// a request on its own, which would defeat the "proven unapplied" rule
+// PutIfAbsent depends on (WALD-22's plan).
+func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp *http.Response, wrote bool, err error) {
 	u := c.objectURL(r.key)
 	if len(r.query) > 0 {
 		q := u.Query()
@@ -300,7 +357,23 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (*htt
 		req.Body = io.NopCloser(newChunkedBody(section, chunkSize, key, scope, now, seed))
 	}
 
-	return c.http.Do(req.WithContext(ctx))
+	var traced bool
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			traced = true
+			wrote = info.Err == nil
+		},
+	}
+	resp, err = c.http.Do(req.WithContext(httptrace.WithClientTrace(ctx, trace)))
+	if !traced {
+		// WroteRequest is documented to always fire once RoundTrip returns,
+		// successful or not, for every http.RoundTripper net/http itself
+		// provides. This guard exists only so a future custom
+		// RoundTripper's failure to call it reads as "not proven written"
+		// rather than silently as "written".
+		wrote = false
+	}
+	return resp, wrote, err
 }
 
 // objectURL builds the URL for key against c.journal's endpoint, bucket,
@@ -348,36 +421,76 @@ func (c *Client) objectURL(key string) *url.URL {
 
 // classify decides whether a response or send error is worth retrying and
 // which sentinel it sorts under. resp is non-nil exactly when err is nil.
-// A nil cause with retry false means success: the caller owns resp.
+// A nil cause with retry false means success: the caller owns resp. wrote
+// is send's httptrace signal, consulted only when r.conditional.
 //
-// Retried: transient transport errors (see retryableTransportError), 408,
-// 429, 500, 502, 503, 504, and 400 with S3 Code "RequestTimeout". An
-// unconditional PUT to a fixed key and a GET are both idempotent, so
-// retrying them is safe.
+// Retried, for r.conditional == false (Put, Get - both idempotent, so
+// retrying is always safe): transient transport errors (see
+// retryableTransportError), 408, 429, 500, 502, 503, 504, and 400 with S3
+// Code "RequestTimeout". A 409 with Code "ConditionalRequestConflict" is
+// also retried, though only a conditional request can provoke it in
+// practice.
 //
-// Permanent: every other status, including 301 (wrong region), other 400s,
-// 403, 404 (NoSuchBucket, on a PUT), and 501. A 404 with S3 Code
-// "NoSuchKey" is ErrObjectNotFound rather than ErrStorageRefused.
+// Permanent: every other status, including 301 (wrong region), other 400s
+// and 409s, 403, 404 (NoSuchBucket, on a PUT), and 501. A 404 with S3 Code
+// "NoSuchKey" is ErrObjectNotFound rather than ErrStorageRefused. A 412 is
+// always ErrPrecondition, decided by status code alone: the body is never
+// consulted, so an empty or garbage body still yields ErrPrecondition, and
+// the case is global rather than gated on r.conditional (spec/journal/v1
+// section 11.4.2 - a 412 can only occur for a conditional request in
+// practice, but the mapping from status code is unconditional too).
 //
 // A send error (resp == nil) is retried only when it is one of the
 // transport errors named above or ctx ending; everything else - an
 // untrusted TLS certificate, a caller ReaderAt shorter than size, a
 // malformed request - is permanent, since retrying it can never succeed.
-func classify(resp *http.Response, err error) (retry bool, cause error) {
+//
+// For r.conditional == true (PutIfAbsent), a cause that would otherwise be
+// retried is retried only when this attempt is proven not to have been
+// applied - the decision the WALD-22 plan settles: a transport error with
+// wrote == false (the request never fully reached storage), or a status
+// storage returns only for a request it rejected before evaluating the
+// write (408, 429, 503, 400 RequestTimeout, 409 ConditionalRequestConflict).
+// Every other retryable cause - a transport error after the full request
+// was written (reset, EOF, ResponseHeaderTimeout, ctx cancelled mid-flight),
+// or 500/502/504 - becomes (false, ErrOutcomeUnknown) instead: resending it
+// risks a 412 caused by this writer's own earlier, unacknowledged attempt.
+// ErrOutcomeUnknown wraps the raw cause (the transport error, or the status
+// and Code), never the ErrStorageUnavailable-wrapped one, so it does not
+// itself match ErrStorageUnavailable and errors.Is(err, context.Canceled)
+// and friends still see through it. Outcome: at most one attempt is ever
+// ambiguous, and it is always the last one, so any 412 PutIfAbsent does see
+// is definitive proof of a concurrent writer, never of itself.
+func classify(r objectRequest, resp *http.Response, err error, wrote bool) (retry bool, cause error) {
 	if err != nil {
-		if retryableTransportError(err) {
-			return true, fmt.Errorf("%w: %w", ErrStorageUnavailable, err)
+		if !retryableTransportError(err) {
+			return false, fmt.Errorf("%w: %s", ErrStorageRefused, err.Error())
 		}
-		return false, fmt.Errorf("%w: %s", ErrStorageRefused, err.Error())
+		if r.conditional && wrote {
+			return false, fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
+		}
+		return true, fmt.Errorf("%w: %w", ErrStorageUnavailable, err)
 	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return false, nil
+	case resp.StatusCode == http.StatusPreconditionFailed:
+		return false, fmt.Errorf("%w: %s", ErrPrecondition, statusDetail(resp))
 	case isRetryableStatus(resp.StatusCode):
-		return true, fmt.Errorf("%w: %s", ErrStorageUnavailable, statusDetail(resp))
+		detail := statusDetail(resp)
+		if r.conditional && !provenUnappliedStatus(resp.StatusCode) {
+			return false, fmt.Errorf("%w: %s", ErrOutcomeUnknown, detail)
+		}
+		return true, fmt.Errorf("%w: %s", ErrStorageUnavailable, detail)
 	case resp.StatusCode == http.StatusBadRequest:
 		code := s3Code(resp)
 		if code == "RequestTimeout" {
+			return true, fmt.Errorf("%w: %d %s", ErrStorageUnavailable, resp.StatusCode, code)
+		}
+		return false, fmt.Errorf("%w: %d %s", ErrStorageRefused, resp.StatusCode, code)
+	case resp.StatusCode == http.StatusConflict:
+		code := s3Code(resp)
+		if code == "ConditionalRequestConflict" {
 			return true, fmt.Errorf("%w: %d %s", ErrStorageUnavailable, resp.StatusCode, code)
 		}
 		return false, fmt.Errorf("%w: %d %s", ErrStorageRefused, resp.StatusCode, code)
@@ -389,6 +502,21 @@ func classify(resp *http.Response, err error) (retry bool, cause error) {
 		return false, fmt.Errorf("%w: %d %s", ErrStorageRefused, resp.StatusCode, code)
 	default:
 		return false, fmt.Errorf("%w: %s", ErrStorageRefused, statusDetail(resp))
+	}
+}
+
+// provenUnappliedStatus reports whether status is a retryable status that
+// storage returns only for a request it rejected before evaluating the
+// write, so the attempt provably did not land: 408, 429, and 503. The
+// other statuses isRetryableStatus retries - 500, 502, 504 - can be
+// returned after storage received and evaluated a request whose response
+// never reached this client, so they do not qualify.
+func provenUnappliedStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -549,13 +677,14 @@ func closeBody(resp *http.Response) {
 
 // refuse builds the one-line *refusal.Refusal for a failed request: verb,
 // journal-relative key, and cause (already naming the status/Code or
-// transport error) in why, with the attempt count appended only when cause
-// traces to ErrStorageUnavailable - a permanent refusal never retries, so
-// there is nothing to count.
+// transport error) in why, with the attempt count appended when cause
+// traces to ErrStorageUnavailable or ErrOutcomeUnknown - the two causes
+// that record how many attempts were made before stopping. Every other
+// cause is permanent from the first attempt, so there is nothing to count.
 func (c *Client) refuse(r objectRequest, attempts int, cause error) error {
 	what := r.method + " " + r.key
 	why := cause.Error()
-	if errors.Is(cause, ErrStorageUnavailable) {
+	if errors.Is(cause, ErrStorageUnavailable) || errors.Is(cause, ErrOutcomeUnknown) {
 		why = fmt.Sprintf("%s after %d attempt%s", why, attempts, plural(attempts))
 	}
 	return refusal.RefuseWithCause(what, why, fixFor(cause), cause)
@@ -571,6 +700,11 @@ func plural(n int) string {
 func fixFor(cause error) string {
 	switch {
 	case errors.Is(cause, ErrObjectNotFound):
+		return ""
+	case errors.Is(cause, ErrPrecondition), errors.Is(cause, ErrOutcomeUnknown):
+		// The journal layer supplies the operator-facing fix for both: a
+		// fenced writer's remedy is "restart to re-materialize", which
+		// store has no business stating on the journal package's behalf.
 		return ""
 	case errors.Is(cause, ErrStorageUnavailable):
 		return "pushes succeed when storage returns"

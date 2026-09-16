@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/store"
 )
 
@@ -1436,5 +1437,468 @@ func TestPutRetriesServerClosedIdleConnection(t *testing.T) {
 	}
 	if reqCount != 2 {
 		t.Errorf("server saw %d requests, want 2 (the injected failure must never reach it)", reqCount)
+	}
+}
+
+// -----------------------------------------------------------------------
+// WALD-22: PutIfAbsent - conditional PUT and the precondition-failed error.
+//
+// classify's retry rule differs from Put/Get's here: a conditional PUT is
+// resent only after an attempt proven not to have been applied. These
+// tests exercise that rule directly, per the ticket's "how to know it
+// worked" list.
+// -----------------------------------------------------------------------
+
+// newDialFailureClient returns an *http.Client whose Transport dials a
+// closed listener's address: nothing is listening, so every attempt fails
+// at connect time (ECONNREFUSED) before any bytes are written - the
+// "provably did not reach storage" case, independent of platform-specific
+// error spellings.
+func newDialFailureClient(t *testing.T) *http.Client {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+	}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func TestPutIfAbsentHeaderAndSignature(t *testing.T) {
+	for _, useTLS := range []bool{false, true} {
+		name := "http-aws-chunked"
+		if useTLS {
+			name = "https-unsigned"
+		}
+		t.Run(name, func(t *testing.T) {
+			var sigErr error
+			var gotHeader string
+			var reqCount int32
+			handler := func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&reqCount, 1)
+				gotHeader = r.Header.Get("If-None-Match")
+				io.Copy(io.Discard, r.Body)
+				sigErr = verifySignature(t, r)
+				w.WriteHeader(http.StatusOK)
+			}
+			client := newFakeServer(t, useTLS, handler)
+			scheme := "http"
+			if useTLS {
+				scheme = "https"
+			}
+			j := testJournal(scheme+"://s3.fake.test", "test-bucket", "v1", true)
+			c := store.NewClientForTest(j, client, fixedClock(time.Date(2015, 8, 30, 12, 36, 0, 0, time.UTC)))
+
+			body := []byte("conditional create")
+			if err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body))); err != nil {
+				t.Fatalf("PutIfAbsent: %v", err)
+			}
+			if atomic.LoadInt32(&reqCount) != 1 {
+				t.Fatalf("server saw %d requests, want 1", atomic.LoadInt32(&reqCount))
+			}
+			if gotHeader != "*" {
+				t.Errorf("If-None-Match = %q, want %q", gotHeader, "*")
+			}
+			if sigErr != nil {
+				t.Errorf("signature verification failed: %v", sigErr)
+			}
+		})
+	}
+}
+
+func TestPutIfAbsentCreate(t *testing.T) {
+	var got []byte
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		got, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}
+	// https, so the body arrives as exact bytes (UNSIGNED-PAYLOAD) rather
+	// than aws-chunked framing: this test is about PutIfAbsent's bytes and
+	// status handling, not about re-decoding the streaming envelope (see
+	// TestRetriesRecover).
+	client := newFakeServer(t, true, handler)
+	j := testJournal("https://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	body := []byte("first record on an absent key")
+	if err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body))); err != nil {
+		t.Fatalf("PutIfAbsent: %v", err)
+	}
+	if atomic.LoadInt32(&reqCount) != 1 {
+		t.Errorf("server saw %d requests, want 1", atomic.LoadInt32(&reqCount))
+	}
+	if !bytes.Equal(got, body) {
+		t.Errorf("server received %q, want %q", got, body)
+	}
+}
+
+func TestPutIfAbsentPreconditionFailedIsTyped(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"s3-error-body", xmlError("PreconditionFailed")},
+		{"empty-body", nil},
+		{"non-xml-body", []byte("<html>not xml the fixture cares about</html>")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var reqCount int32
+			handler := func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&reqCount, 1)
+				io.Copy(io.Discard, r.Body)
+				w.WriteHeader(http.StatusPreconditionFailed)
+				if tc.body != nil {
+					w.Write(tc.body)
+				}
+			}
+			client := newFakeServer(t, false, handler)
+			j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+			c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+			body := []byte("x")
+			err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+			if err == nil {
+				t.Fatal("PutIfAbsent succeeded, want ErrPrecondition")
+			}
+			if !errors.Is(err, store.ErrPrecondition) {
+				t.Errorf("errors.Is(err, ErrPrecondition) = false, err = %v", err)
+			}
+			if !errors.Is(err, journal.ErrPreconditionFailed) {
+				t.Errorf("errors.Is(err, journal.ErrPreconditionFailed) = false, err = %v", err)
+			}
+			if errors.Is(err, store.ErrStorageUnavailable) {
+				t.Errorf("ErrPrecondition must not also be ErrStorageUnavailable: %v", err)
+			}
+			if errors.Is(err, store.ErrOutcomeUnknown) {
+				t.Errorf("ErrPrecondition must not also be ErrOutcomeUnknown: %v", err)
+			}
+			if atomic.LoadInt32(&reqCount) != 1 {
+				t.Errorf("server saw %d requests, want 1 (a 412 is never retried)", atomic.LoadInt32(&reqCount))
+			}
+			if strings.ContainsAny(err.Error(), "\n\r") {
+				t.Errorf("error message is not a single line: %q", err.Error())
+			}
+		})
+	}
+}
+
+func TestPutIfAbsentProvenUnappliedRetries(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	t.Run("503-then-200", func(t *testing.T) {
+		var reqCount int32
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			n := atomic.AddInt32(&reqCount, 1)
+			if n == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write(xmlError("SlowDown"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+		client := newFakeServer(t, false, handler)
+		j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+		c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+		body := []byte("x")
+		if err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body))); err != nil {
+			t.Fatalf("PutIfAbsent: %v", err)
+		}
+		if atomic.LoadInt32(&reqCount) != 2 {
+			t.Errorf("server saw %d requests, want 2", atomic.LoadInt32(&reqCount))
+		}
+	})
+
+	t.Run("429-then-412", func(t *testing.T) {
+		var reqCount int32
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			n := atomic.AddInt32(&reqCount, 1)
+			if n == 1 {
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			w.WriteHeader(http.StatusPreconditionFailed)
+			w.Write(xmlError("PreconditionFailed"))
+		}
+		client := newFakeServer(t, false, handler)
+		j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+		c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+		body := []byte("x")
+		err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+		if !errors.Is(err, store.ErrPrecondition) {
+			t.Fatalf("errors.Is(err, ErrPrecondition) = false, err = %v", err)
+		}
+		if atomic.LoadInt32(&reqCount) != 2 {
+			t.Errorf("server saw %d requests, want 2", atomic.LoadInt32(&reqCount))
+		}
+	})
+
+	t.Run("409-conditional-request-conflict-then-200", func(t *testing.T) {
+		var reqCount int32
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			io.Copy(io.Discard, r.Body)
+			n := atomic.AddInt32(&reqCount, 1)
+			if n == 1 {
+				w.WriteHeader(http.StatusConflict)
+				w.Write(xmlError("ConditionalRequestConflict"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+		client := newFakeServer(t, false, handler)
+		j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+		c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+		body := []byte("x")
+		if err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body))); err != nil {
+			t.Fatalf("PutIfAbsent: %v", err)
+		}
+		if atomic.LoadInt32(&reqCount) != 2 {
+			t.Errorf("server saw %d requests, want 2", atomic.LoadInt32(&reqCount))
+		}
+	})
+}
+
+// TestPutIfAbsentAmbiguousStopsAtOnce is the self-caused-412 regression
+// test: a server that applies the write, drops the connection before
+// responding, and would answer 412 on a resend must yield ErrOutcomeUnknown
+// after exactly one attempt - never ErrPrecondition, and never a second
+// request that could observe that self-caused 412.
+func TestPutIfAbsentAmbiguousStopsAtOnce(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	t.Run("applied-then-connection-dropped", func(t *testing.T) {
+		var reqCount int32
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&reqCount, 1)
+			// The full body is read - standing in for "storage durably
+			// applied the write" - before the connection is dropped
+			// without a response, so a resend's 412 would be this
+			// client's own doing.
+			io.ReadAll(r.Body)
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("ResponseWriter does not support hijacking")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("Hijack: %v", err)
+			}
+			conn.Close()
+		}
+		client := newFakeServer(t, false, handler)
+		j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+		c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+		body := []byte("x")
+		err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+		if !errors.Is(err, store.ErrOutcomeUnknown) {
+			t.Fatalf("errors.Is(err, ErrOutcomeUnknown) = false, err = %v", err)
+		}
+		if errors.Is(err, store.ErrStorageUnavailable) {
+			t.Errorf("ErrOutcomeUnknown must not also be ErrStorageUnavailable: %v", err)
+		}
+		if errors.Is(err, store.ErrPrecondition) {
+			t.Errorf("ErrOutcomeUnknown must not also be ErrPrecondition: %v", err)
+		}
+		if atomic.LoadInt32(&reqCount) != 1 {
+			t.Errorf("server saw %d requests, want 1 (an ambiguous attempt must never be resent)", atomic.LoadInt32(&reqCount))
+		}
+	})
+
+	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusGatewayTimeout} {
+		t.Run(fmt.Sprintf("status-%d", status), func(t *testing.T) {
+			var reqCount int32
+			handler := func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&reqCount, 1)
+				io.Copy(io.Discard, r.Body)
+				w.WriteHeader(status)
+			}
+			client := newFakeServer(t, false, handler)
+			j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+			c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+			body := []byte("x")
+			err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+			if !errors.Is(err, store.ErrOutcomeUnknown) {
+				t.Fatalf("errors.Is(err, ErrOutcomeUnknown) = false, err = %v", err)
+			}
+			if errors.Is(err, store.ErrStorageUnavailable) {
+				t.Errorf("ErrOutcomeUnknown must not also be ErrStorageUnavailable: %v", err)
+			}
+			if errors.Is(err, store.ErrPrecondition) {
+				t.Errorf("ErrOutcomeUnknown must not also be ErrPrecondition: %v", err)
+			}
+			if atomic.LoadInt32(&reqCount) != 1 {
+				t.Errorf("server saw %d requests, want 1", atomic.LoadInt32(&reqCount))
+			}
+		})
+	}
+}
+
+func TestPutIfAbsentDialFailureRetries(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	client := newDialFailureClient(t)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	body := []byte("x")
+	err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+	if !errors.Is(err, store.ErrStorageUnavailable) {
+		t.Fatalf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+	}
+	if errors.Is(err, store.ErrOutcomeUnknown) {
+		t.Errorf("a dial failure must never be ErrOutcomeUnknown: %v", err)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("after %d attempt", store.MaxAttemptsForTest)) {
+		t.Errorf("error = %q, want it to name %d attempts", err.Error(), store.MaxAttemptsForTest)
+	}
+}
+
+func TestPutIfAbsentDeadline(t *testing.T) {
+	// A plain defer, not t.Cleanup: see TestDeadline's comment on why this
+	// must unblock the handler before newFakeServer's own t.Cleanup runs.
+	block := make(chan struct{})
+	defer close(block)
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		<-block
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, time.Now)
+
+	t.Run("deadline-during-attempt", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		body := []byte("x")
+		err := c.PutIfAbsent(ctx, "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+		elapsed := time.Since(start)
+
+		if elapsed > time.Second {
+			t.Errorf("PutIfAbsent took %s, want well under 1s", elapsed)
+		}
+		if !errors.Is(err, store.ErrOutcomeUnknown) {
+			t.Errorf("errors.Is(err, ErrOutcomeUnknown) = false, err = %v", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("errors.Is(err, context.DeadlineExceeded) = false, err = %v", err)
+		}
+		if errors.Is(err, store.ErrStorageUnavailable) {
+			t.Errorf("ErrOutcomeUnknown must not also be ErrStorageUnavailable: %v", err)
+		}
+	})
+
+	t.Run("ctx-already-done", func(t *testing.T) {
+		var reqCount int32
+		handler2 := func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&reqCount, 1)
+			io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusOK)
+		}
+		client2 := newFakeServer(t, false, handler2)
+		j2 := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+		c2 := store.NewClientForTest(j2, client2, time.Now)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		body := []byte("x")
+		err := c2.PutIfAbsent(ctx, "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+		if !errors.Is(err, store.ErrStorageUnavailable) {
+			t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+		}
+		if atomic.LoadInt32(&reqCount) != 0 {
+			t.Errorf("server saw %d requests, want 0", atomic.LoadInt32(&reqCount))
+		}
+	})
+}
+
+func TestPutIfAbsentErrorMessagesOneLineNoSecrets(t *testing.T) {
+	sessionToken := "FQoGZXIvYXdzEB0aDPS3SECRETTOKENVALUE"
+	j := &store.Journal{
+		Endpoint:  "http://s3.fake.test",
+		Region:    testRegion,
+		Bucket:    "test-bucket",
+		Prefix:    "v1",
+		PathStyle: true,
+		Credentials: store.Credentials{
+			AccessKeyID:     testCreds.AccessKeyID,
+			SecretAccessKey: testCreds.SecretAccessKey,
+			SessionToken:    sessionToken,
+		},
+	}
+
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{
+			name: "precondition-failed",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				w.WriteHeader(http.StatusPreconditionFailed)
+				w.Write(xmlError("PreconditionFailed"))
+			},
+		},
+		{
+			name: "outcome-unknown",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newFakeServer(t, false, tc.handler)
+			c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+			body := []byte("x")
+			err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+			if err == nil {
+				t.Fatal("PutIfAbsent succeeded, want an error")
+			}
+			msg := err.Error()
+			if strings.ContainsAny(msg, "\n\r") {
+				t.Errorf("error message contains a newline: %q", msg)
+			}
+			if strings.Contains(msg, j.Credentials.SecretAccessKey) {
+				t.Errorf("error message leaks the secret access key: %q", msg)
+			}
+			if strings.Contains(msg, sessionToken) {
+				t.Errorf("error message leaks the session token: %q", msg)
+			}
+			if strings.Contains(strings.ToLower(msg), "authorization=") {
+				t.Errorf("error message leaks an Authorization value: %q", msg)
+			}
+		})
 	}
 }

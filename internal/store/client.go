@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/writtendev/walden/internal/journal"
@@ -288,24 +289,34 @@ func (c *Client) do(ctx context.Context, r objectRequest) (*http.Response, error
 // a request on its own, which would defeat the "proven unapplied" rule
 // PutIfAbsent depends on (WALD-22's plan).
 //
-// wrote is read through a channel, not a plain captured variable: for a
-// request with a body, net/http's Transport writes the request and reads
-// the response in two different goroutines, and WroteRequest is called
-// from the write goroutine. When the response arrives before the write
-// goroutine finishes (RoundTrip's own select races the two), RoundTrip can
-// return before WroteRequest has run, and a plain shared bool would be a
-// genuine data race between that goroutine and this one - caught by
-// go test -race, not a false positive. A buffered channel makes the
-// hand-off safe either way. Whenever err != nil because the write itself
-// failed, net/http always signals WroteRequest before propagating that
-// error (Request.write's deferred call happens-before the write-error
-// channel send inside persistConn.writeLoop), so the non-blocking receive
-// below reliably has a value by then; it is only "no value yet" for a
-// send that never reached the write path at all (a dial failure, where
-// nothing was ever written) or one whose outcome this func does not use
-// wrote for anyway (a successful response). Either way, send must never
-// block waiting for it - a custom or future RoundTripper that does not
-// invoke httptrace hooks at all must not hang this call forever.
+// wrote is read through an atomic.Bool, not a plain captured variable and
+// not a channel: for a request with a body, net/http's Transport writes
+// the request and reads the response in two different goroutines, and
+// WroteRequest is called from the write goroutine. A plain shared bool
+// would be a genuine data race between that goroutine and this one -
+// caught by go test -race, not a false positive. atomic Store/Load hands
+// the signal off safely without that race, and - unlike an earlier
+// version of this func that used a 1-slot buffered channel - a Store can
+// never block: net/http's own internal retry (a GET replayed on a fresh
+// connection after a reused, server-closed idle connection, say) calls
+// WroteRequest a second time for the same attempt, and a channel send
+// with no reader yet - send only reads after Do returns - would then
+// block the write goroutine forever, hanging Do past ctx's deadline. An
+// atomic Store is instead overwritten in place, so any number of
+// WroteRequest calls resolve to the most recent one's Err, and send never
+// blocks waiting for it - a custom or future RoundTripper that does not
+// invoke httptrace hooks at all must not hang this call forever either.
+//
+// Reading wroteOK only after Do returns is still sound for the one thing
+// classify uses wrote for: proving, for a conditional request, that a
+// failure came after a full write. Whenever err != nil because the write
+// itself failed, net/http always signals WroteRequest before propagating
+// that error (Request.write's deferred call happens-before the
+// write-error channel send inside persistConn.writeLoop), so wroteOK is
+// reliably set by then; it reads as unset (false) only for a send that
+// never reached the write path at all (a dial failure, where nothing was
+// ever written) or one whose outcome this func does not use wrote for
+// anyway (a successful response).
 func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp *http.Response, wrote bool, err error) {
 	u := c.objectURL(r.key)
 	if len(r.query) > 0 {
@@ -376,22 +387,14 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp
 		req.Body = io.NopCloser(newChunkedBody(section, chunkSize, key, scope, now, seed))
 	}
 
-	wroteCh := make(chan bool, 1)
+	var wroteOK atomic.Bool
 	trace := &httptrace.ClientTrace{
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
-			wroteCh <- info.Err == nil
+			wroteOK.Store(info.Err == nil)
 		},
 	}
 	resp, err = c.http.Do(req.WithContext(httptrace.WithClientTrace(ctx, trace)))
-	select {
-	case wrote = <-wroteCh:
-	default:
-		// No signal yet: either WroteRequest will never fire for this
-		// attempt (see the comment above send), or resp is non-nil and
-		// classify never consults wrote for a successful response.
-		wrote = false
-	}
-	return resp, wrote, err
+	return resp, wroteOK.Load(), err
 }
 
 // objectURL builds the URL for key against c.journal's endpoint, bucket,

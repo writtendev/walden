@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
@@ -1437,6 +1438,89 @@ func TestPutRetriesServerClosedIdleConnection(t *testing.T) {
 	}
 	if reqCount != 2 {
 		t.Errorf("server saw %d requests, want 2 (the injected failure must never reach it)", reqCount)
+	}
+}
+
+// -----------------------------------------------------------------------
+// 17. WroteRequest firing twice in one Client.Do call must never hang
+//     send. net/http calls httptrace.ClientTrace.WroteRequest once per
+//     physical write of a request, and net/http retries a request
+//     internally - transparently, inside a single Do call - when a
+//     reused, pooled connection turns out to have been closed by the
+//     server: a GET replayed on a fresh connection after that race is
+//     exactly a second WroteRequest for the one logical attempt. An
+//     earlier version of send (this package's round 2 review) handed
+//     the signal through a 1-slot buffered channel read only after Do
+//     returns; the second WroteRequest call then blocked forever on a
+//     full, undrained channel, and because that block happens inside
+//     net/http's own write goroutine, Do itself never returned - past
+//     ctx's deadline, not just slow.
+//
+//     Reproducing that race through a real reused-and-closed connection
+//     is exactly the timing gamble section 16 above already rejected
+//     for retryableTransportError (9 real hits in 1500 PUTs there); the
+//     same OS/network non-determinism applies here, only for the two
+//     WroteRequest calls landing in the window before Do returns rather
+//     than for the close itself. So, as in section 16, this drives the
+//     exact callback shape net/http produces - WroteRequest firing a
+//     second time for one Do call - directly, through a RoundTripper
+//     that fires it once itself before delegating to the real
+//     transport, rather than depending on winning that race in CI.
+// -----------------------------------------------------------------------
+
+// doubleWroteRequest wraps a real http.RoundTripper and fires the
+// request's httptrace WroteRequest callback once itself (Err == nil)
+// before delegating, so the real transport's own later call to the same
+// callback - once the real write completes - is the second call within
+// one Client.Do. It models net/http's internal retry firing
+// WroteRequest twice without depending on the reused-idle-connection
+// race actually landing.
+type doubleWroteRequest struct {
+	inner http.RoundTripper
+}
+
+func (rt *doubleWroteRequest) RoundTrip(req *http.Request) (*http.Response, error) {
+	if trace := httptrace.ContextClientTrace(req.Context()); trace != nil && trace.WroteRequest != nil {
+		trace.WroteRequest(httptrace.WroteRequestInfo{})
+	}
+	return rt.inner.RoundTrip(req)
+}
+
+// TestGetSurvivesDoubleWroteRequestSignal pins the round 2 fix: send must
+// never block handing off the WroteRequest signal, no matter how many
+// times net/http calls it for one attempt. Against the buffered-channel
+// version this func replaced, this test hangs past its own deadline
+// instead of failing cleanly - the write goroutine blocks on the second,
+// undrained send and Do never returns.
+func TestGetSurvivesDoubleWroteRequestSignal(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("body"))
+	}
+	client := newFakeServer(t, false, handler)
+	client.Transport = &doubleWroteRequest{inner: client.Transport}
+
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		rc, err := c.Get(ctx, "v1/streams/x.pack")
+		if err == nil {
+			rc.Close()
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("Get did not return within 4s of a 2s ctx: a second WroteRequest call blocked send (WALD-22 round 2)")
 	}
 }
 

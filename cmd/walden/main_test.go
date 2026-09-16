@@ -424,7 +424,7 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			wantExit0: false,
 			// The relocated '@' is refused by the gate, and nothing of
 			// the URL is echoed on the way out.
-			wantErrSub: "walden: invalid journal: URL is malformed; it is not echoed because it may carry credentials",
+			wantErrSub: "walden: invalid journal: URL has an '@' after its credentials end; it is not echoed because it may carry credentials",
 			wantErrNot: []string{"p@ss", "ss/w0rd", "w0rd", "minio.internal"},
 		},
 		{
@@ -468,7 +468,7 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			cmdPath:    binPath,
 			args:       []string{"serve", "--journal", "s3://PUBLICKEYIDEXAMPLE:/zzTOPSECRETzz@bucket/prefix"},
 			wantExit0:  false,
-			wantErrSub: "walden: invalid journal: URL is malformed; it is not echoed because it may carry credentials",
+			wantErrSub: "walden: invalid journal: URL has an '@' after its credentials end; it is not echoed because it may carry credentials",
 			wantErrNot: []string{"zzTOPSECRETzz", "zzT", "PUBLICKEYIDEXAMPLE"},
 		},
 		{

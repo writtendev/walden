@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
@@ -209,7 +210,7 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 		// all. The journal URL may carry an object-storage secret and
 		// this line goes to stderr, so the URL is not echoed.
 		return nil, refuseJournal(
-			"URL is malformed; it is not echoed because it may carry credentials",
+			"URL does not parse; it is not echoed because it may carry credentials",
 			"expected a URL such as s3://bucket/prefix")
 	}
 	// Everything below may quote a value read out of the URL. This is the one
@@ -307,13 +308,30 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 				fmt.Sprintf("expected an endpoint such as s3.<region>.%s", rule.suffix))
 		}
 
+		// S3 Transfer Acceleration fronts every region through one endpoint
+		// and is virtual-hosted only: it does not accept path-style requests
+		// or a bucket name containing a period. This follows the same rule
+		// walden already applies to a dotted bucket: when the style is
+		// implicit, walden chooses the one that can work; when the operator
+		// explicitly asks for one that cannot, walden refuses.
+		accelerate := rule.provider == "AWS S3" && isAccelerateEndpoint(endpointHost)
+
 		switch style {
 		case "path":
+			if accelerate {
+				return nil, refuseJournal(
+					fmt.Sprintf("style=path conflicts with accelerate endpoint %q", endpointHost),
+					"S3 Transfer Acceleration is virtual-hosted only; drop style=path")
+			}
 			j.PathStyle = true
 		case "virtual":
 			j.PathStyle = false
 		default:
-			j.PathStyle = bucketLabel == ""
+			if accelerate {
+				j.PathStyle = false
+			} else {
+				j.PathStyle = bucketLabel == ""
+			}
 		}
 
 		// Where the bucket is written and how the request addresses it are
@@ -329,6 +347,16 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 			}
 			j.Bucket = segments[0]
 			j.Prefix = strings.Join(segments[1:], "/")
+		}
+
+		// Checked here, before the general dotted-bucket fallback to
+		// path-style below, which would otherwise quietly override it: that
+		// fallback would make an accelerate URL boot with a bucket name
+		// Transfer Acceleration cannot actually address.
+		if accelerate && strings.Contains(j.Bucket, ".") {
+			return nil, refuseJournal(
+				fmt.Sprintf("bucket %q contains a '.', which S3 Transfer Acceleration does not allow", j.Bucket),
+				"use a bucket name without periods")
 		}
 
 		hostRegion, hostNamesRegion := rule.regionFromHost(endpointHost)
@@ -408,17 +436,29 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 // differently from the operator who wrote it, and the bytes in front of that
 // '@' are the secret. Refuse there, once, without echoing anything.
 //
+// The literal and the percent-encoded cases get distinct wording (B and C).
+// The literal case is refused because the credentials genuinely need
+// percent-encoding; the encoded case is refused even though nothing was
+// misencoded — %40 outside the userinfo means the operator wrote a literal
+// '@' in a host, bucket, or prefix, none of which may ever contain one, and
+// telling them to percent-encode credentials they never supplied would be
+// false.
+//
 // Past this gate the credentials are confined to u.User, which no refusal
 // prints, and every other field of the URL is free of them.
 func guardCredentials(raw string, u *url.URL) error {
 	tail := raw[credentialsEnd(raw):]
 	if strings.Contains(tail, "@") {
-		return refuseRelocatedCredentials()
+		return refuseJournal(
+			"URL has an '@' after its credentials end; it is not echoed because it may carry credentials",
+			"percent-encode reserved characters in the credentials, as in s3://ACCESS_KEY:SEC%2FRET@bucket/prefix")
 	}
 	// Percent-encoded, an '@' reaches a refusal only after net/url decodes
 	// it back — into a host or a path segment walden would quote.
 	if decoded, err := url.PathUnescape(tail); err == nil && strings.Contains(decoded, "@") {
-		return refuseRelocatedCredentials()
+		return refuseJournal(
+			"URL has an encoded '@' (%40) outside its credentials; it is not echoed because it may carry credentials",
+			"no host, bucket, or prefix may contain '@'")
 	}
 	// The scheme is the other place a credential can land: net/url reads
 	// ACCESS_KEY://SECRET@host as scheme "ACCESS_KEY". A URL that carries
@@ -439,13 +479,6 @@ func supportedScheme(scheme string) bool {
 		return true
 	}
 	return false
-}
-
-// refuseRelocatedCredentials refuses without naming any part of the URL.
-func refuseRelocatedCredentials() error {
-	return refuseJournal(
-		"URL is malformed; it is not echoed because it may carry credentials",
-		"percent-encode reserved characters in the credentials, as in s3://ACCESS_KEY:SEC%2FRET@bucket/prefix")
 }
 
 // credentialsEnd returns the number of leading bytes of raw that hold the
@@ -627,6 +660,18 @@ func (r providerHost) regionFromHost(endpoint string) (region string, namesRegio
 	}
 }
 
+// isAccelerateEndpoint reports whether endpointHost is an AWS S3 Transfer
+// Acceleration endpoint: s3-accelerate.amazonaws.com, or with dualstack,
+// s3-accelerate.dualstack.amazonaws.com. This is deliberately not folded into
+// regionFromHost's namesRegion: a bare s3-fips host also returns
+// namesRegion=false, and the two are different constraints — fips only needs
+// a region named some other way, while accelerate refuses path-style and a
+// dotted bucket outright.
+func isAccelerateEndpoint(endpointHost string) bool {
+	label, _, _ := strings.Cut(endpointHost, ".")
+	return label == "s3-accelerate"
+}
+
 // credentialsFromURL reads credentials embedded in the journal URL's userinfo.
 func credentialsFromURL(u *url.URL) (Credentials, error) {
 	if u.User == nil {
@@ -767,7 +812,7 @@ func validateBucket(bucket string) error {
 				return refuseJournal(fmt.Sprintf("bucket %q has a '.' adjacent to a '.' or '-'", bucket), "use a valid S3 bucket name")
 			}
 		default:
-			return refuseJournal(fmt.Sprintf("bucket %q contains %q", bucket, string(c)), "bucket names hold only lowercase letters, digits, '-', and '.'")
+			return refuseJournal(fmt.Sprintf("bucket %q contains %s", bucket, quoteRuneAt(bucket, i)), "bucket names hold only lowercase letters, digits, '-', and '.'")
 		}
 	}
 	return nil
@@ -790,11 +835,25 @@ func validatePrefix(prefix string) error {
 			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
 			case c == '-' || c == '_' || c == '.':
 			default:
-				return refuseJournal(fmt.Sprintf("prefix segment %q contains %q", seg, string(c)), "prefix segments hold only letters, digits, '-', '_', and '.'")
+				return refuseJournal(fmt.Sprintf("prefix segment %q contains %s", seg, quoteRuneAt(seg, i)), "prefix segments hold only letters, digits, '-', '_', and '.'")
 			}
 		}
 	}
 	return nil
+}
+
+// quoteRuneAt quotes the rune starting at byte offset i in s, for a refusal
+// that names one offending character. Indexing byte-wise instead would let a
+// multi-byte rune be cut mid-encoding: string(byte) on the lead byte of "é"
+// prints "Ã", a character the operator never typed. An invalid UTF-8 byte
+// (not itself a lead byte of anything the operator could have meant) is
+// quoted alone, e.g. "\xff".
+func quoteRuneAt(s string, i int) string {
+	_, size := utf8.DecodeRuneInString(s[i:])
+	if size < 1 {
+		size = 1
+	}
+	return fmt.Sprintf("%q", s[i:i+size])
 }
 
 // validateRegion rejects a region that could not appear in a signing scope.
@@ -807,7 +866,7 @@ func validateRegion(region string) error {
 		switch {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-':
 		default:
-			return refuseJournal(fmt.Sprintf("region %q contains %q", region, string(c)), "regions hold only letters, digits, and '-'")
+			return refuseJournal(fmt.Sprintf("region %q contains %s", region, quoteRuneAt(region, i)), "regions hold only letters, digits, and '-'")
 		}
 	}
 	return nil

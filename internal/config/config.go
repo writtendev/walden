@@ -109,10 +109,10 @@ func (c *Config) Validate() error {
 		// carry an object-storage secret, and stderr is a container log.
 		u, err := url.Parse(journal)
 		if err != nil {
-			return errors.New("invalid journal: URL is malformed; it is not echoed because it may carry credentials (expected s3://bucket/path)")
+			return errors.New("invalid journal: URL does not parse; it is not echoed because it may carry credentials (expected a URL such as s3://bucket/prefix)")
 		}
 		if u.Scheme == "" {
-			return errors.New("invalid journal: missing URL scheme (e.g. s3://bucket/path)")
+			return errors.New("invalid journal: URL has no scheme (expected s3://, https://, or http://)")
 		}
 	}
 

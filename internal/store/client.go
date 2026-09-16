@@ -58,6 +58,17 @@ const (
 	dialTimeout           = 10 * time.Second
 	tlsHandshakeTimeout   = 10 * time.Second
 	responseHeaderTimeout = 30 * time.Second
+
+	// idleConnTimeout caps how long a pooled connection sits idle before
+	// this client closes it first. Set comfortably below the keep-alive
+	// timeouts object storage providers typically run (60s or more), it
+	// shrinks the window in which a connection this client still
+	// considers idle-and-reusable is, at that same moment, being closed
+	// by the server for the same reason - see retryableTransportError for
+	// how the request that loses that race is still recovered rather
+	// than shrinking the window to zero, which isn't possible from the
+	// client side.
+	idleConnTimeout = 30 * time.Second
 )
 
 // backoffBase and backoffCap set the full-jitter retry schedule: a random
@@ -87,6 +98,7 @@ func NewClient(j *Journal) *Client {
 				DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
 				TLSHandshakeTimeout:   tlsHandshakeTimeout,
 				ResponseHeaderTimeout: responseHeaderTimeout,
+				IdleConnTimeout:       idleConnTimeout,
 			},
 			// A PUT answered with a 3xx would otherwise be replayed by
 			// net/http as a bodyless GET to Location: if that GET comes
@@ -390,14 +402,16 @@ func isRetryableStatus(status int) bool {
 
 // retryableTransportError reports whether err - a failure to send a
 // request or read its response, before any status line arrived - is worth
-// retrying: ctx ending, a per-attempt transport timeout, an EOF, or a
+// retrying: ctx ending, a per-attempt transport timeout, an EOF, a
 // connection-level failure (reset, refused, broken pipe, or a
-// locally-observed close mid read/write). The OS spells that last case's
-// specific errno differently by platform and by which side of the
-// connection noticed first - ECONNRESET, EPIPE, and net.ErrClosed have all
-// been observed for the same underlying "the connection died" event from
-// WALD-20's plan - so this checks for a *net.OpError (the type net/http
-// wraps every one of those in) rather than enumerating every spelling.
+// locally-observed close mid read/write), or the server closing a pooled
+// connection just as this client reused it from idle. The OS spells the
+// connection-level case's specific errno differently by platform and by
+// which side of the connection noticed first - ECONNRESET, EPIPE, and
+// net.ErrClosed have all been observed for the same underlying "the
+// connection died" event from WALD-20's plan - so this checks for a
+// *net.OpError (the type net/http wraps every one of those in) rather than
+// enumerating every spelling.
 //
 // Not every *net.OpError is connection-level, though, and three permanent
 // cases are excluded before that check fires: a DNS name that does not
@@ -414,6 +428,11 @@ func isRetryableStatus(status int) bool {
 // shorter than the declared size, a malformed request) is permanent for
 // the same reason: no number of retries changes the outcome, so classify
 // must not guess "storage is down" and tell the operator to wait.
+//
+// serverClosedIdleConn is checked separately, before the *net.OpError
+// check: it is net/http's own errServerClosedIdle, which is not a
+// *net.OpError, a net.Error, or an EOF - see that function's comment for
+// why matching it needs its own case.
 func retryableTransportError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
@@ -423,6 +442,9 @@ func retryableTransportError(err error) bool {
 		return true
 	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if serverClosedIdleConn(err) {
 		return true
 	}
 
@@ -441,6 +463,45 @@ func retryableTransportError(err error) bool {
 			return false
 		}
 		return true
+	}
+	return false
+}
+
+// errServerClosedIdleText is the exact message of net/http's unexported
+// errServerClosedIdle sentinel (net/http/transport.go): the error a
+// *http.Transport hands back, undecorated, when it reuses a pooled idle
+// connection for a request that races the server closing that same
+// connection for its own keep-alive timeout (or sends an unsolicited 408
+// on it) - persistConn.readLoopPeekFailLocked detects the close and
+// persistConn.roundTrip returns the sentinel as-is ("Don't decorate", says
+// that code). net/http will not replay the request itself when it has a
+// body and no GetBody (persistConn.shouldRetryRequest requires
+// req.isReplayable()); WALD-20 deliberately never sets GetBody - see
+// send's PUT branches - because WALD-22's conditional PUT needs net/http
+// to never replay a request on its own, so walden's own retry loop must
+// recognize this case instead.
+//
+// There is no exported sentinel to compare against with errors.Is:
+// errServerClosedIdle is an unexported package-level value, so identity
+// comparison is unavailable outside net/http, and a locally constructed
+// errors.New with the same text would still not compare equal to it (an
+// error without an Is method falls back to ==, and two errors.New calls
+// never share a pointer). The message has been stable since the sentinel
+// was added for https://github.com/golang/go/issues/19943 in Go 1.11, and
+// net/http still returns it "undecorated" per the comment above, so
+// matching that exact text at the end of the unwrap chain - after
+// (*http.Client).do wraps whatever the transport returns in a *url.Error -
+// is the most stable option available from outside the package.
+const errServerClosedIdleText = "http: server closed idle connection"
+
+// serverClosedIdleConn reports whether err, or anything it wraps, is
+// net/http's errServerClosedIdle.
+func serverClosedIdleConn(err error) bool {
+	for err != nil {
+		if err.Error() == errServerClosedIdleText {
+			return true
+		}
+		err = errors.Unwrap(err)
 	}
 	return false
 }

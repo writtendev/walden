@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -1338,5 +1339,81 @@ func TestPermanentRefusalIncludesCode(t *testing.T) {
 				t.Errorf("error = %q, want it to contain %q", err.Error(), tt.code)
 			}
 		})
+	}
+}
+
+// -----------------------------------------------------------------------
+// 16. A PUT that reuses a pooled connection just as the server closes it
+//     for keep-alive is retried, not sorted as a permanent refusal. The
+//     real race is OS/network timing (the round 3 finding reproduced it 9
+//     times out of 1500 real PUTs over a raw TCP listener), so this pins
+//     the exact failure net/http hands back - errServerClosedIdle,
+//     undecorated, inside the *url.Error (*http.Client).do always wraps a
+//     transport error in - through a RoundTripper that injects it on a
+//     chosen call. Every run exercises the same code path
+//     retryableTransportError must classify, deterministically.
+// -----------------------------------------------------------------------
+
+// idleCloseOnce wraps a real http.RoundTripper and, on its failOn'th call,
+// returns net/http's own shape for "a pooled connection the server closed
+// while idle" instead of forwarding the request - modeling the race
+// without depending on its real timing. Every other call goes to inner
+// untouched.
+type idleCloseOnce struct {
+	inner  http.RoundTripper
+	failOn int
+	calls  int
+}
+
+func (rt *idleCloseOnce) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.calls++
+	if rt.calls == rt.failOn {
+		if req.Body != nil {
+			req.Body.Close()
+		}
+		return nil, &url.Error{Op: req.Method, URL: req.URL.String(), Err: errors.New("http: server closed idle connection")}
+	}
+	return rt.inner.RoundTrip(req)
+}
+
+func TestPutRetriesServerClosedIdleConnection(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}
+	client := newFakeServer(t, false, handler)
+
+	// Call 1 is the first Put, over the real fake server: it succeeds and
+	// leaves its connection pooled as idle. Call 2 is the first attempt
+	// of the second Put, reusing that connection - this is where the
+	// injected failure lands, standing in for the server closing it for
+	// keep-alive at that same moment. Call 3 is that Put's retry, which
+	// must succeed within the attempt budget for the fix to hold.
+	rt := &idleCloseOnce{inner: client.Transport, failOn: 2}
+	client.Transport = rt
+
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	first := []byte("first push, leaves a connection pooled as idle")
+	if err := c.Put(context.Background(), "v1/streams/a.pack", bytes.NewReader(first), int64(len(first))); err != nil {
+		t.Fatalf("first Put: %v", err)
+	}
+
+	second := []byte("second push, races the server's keep-alive close")
+	if err := c.Put(context.Background(), "v1/streams/b.pack", bytes.NewReader(second), int64(len(second))); err != nil {
+		t.Fatalf("second Put (must retry past the idle-close race): %v", err)
+	}
+
+	if rt.calls != 3 {
+		t.Errorf("RoundTrip called %d times, want 3 (first Put, the injected idle-close failure, the retry that recovers it)", rt.calls)
+	}
+	if reqCount != 2 {
+		t.Errorf("server saw %d requests, want 2 (the injected failure must never reach it)", reqCount)
 	}
 }

@@ -759,13 +759,44 @@ func (j *Journal) String() string {
 		credentials = "(unresolved)"
 	}
 	keyID := j.Credentials.AccessKeyID
-	if keyID == "" {
+	switch {
+	case keyID == "":
 		keyID = "(not read; see journal-credentials)"
+	case keyIDNeedsQuoting(keyID):
+		// Every other field here is charset-restricted before it ever
+		// reaches String() (see validateBucket, validatePrefix,
+		// validateRegion): a prefix of "wal%0Aden" is refused outright.
+		// The access key ID is not restricted the same way, because
+		// credentialsFromURL accepts whatever net/url's percent-decoding
+		// hands it. Left unchecked here, a URL like
+		// s3://AKIA%0Ajournal-credentials%3A...@bucket forges an extra
+		// "journal-*" line, and one with %1B sends a raw escape sequence
+		// to the operator's terminal. A key ID like that still parses,
+		// so walden still boots and only fails at sign time —
+		// --print-config is what an operator reaches for to debug that,
+		// so this quotes the value instead of refusing to print it: the
+		// report stays both accurate and safe to read.
+		keyID = fmt.Sprintf("%q", keyID)
 	}
 	return fmt.Sprintf(
 		"journal-provider: %s\njournal-endpoint: %s\njournal-region: %s\njournal-bucket: %s\njournal-prefix: %s\njournal-style: %s\njournal-credentials: %s\njournal-access-key-id: %s",
 		provider, j.Endpoint, j.Region, j.Bucket, prefix, style, credentials, keyID,
 	)
+}
+
+// keyIDNeedsQuoting reports whether id contains a byte String() cannot print
+// as-is: a C0 control character (including the newline and carriage return
+// that would forge an extra --print-config line) or DEL. It does not flag
+// non-ASCII bytes — those cannot forge a line or an escape sequence, and
+// quoting them would make an otherwise ordinary key ID harder to read for no
+// safety gain.
+func keyIDNeedsQuoting(id string) bool {
+	for i := 0; i < len(id); i++ {
+		if c := id[i]; c < 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // pathSegments splits a URL path into its non-empty segments.

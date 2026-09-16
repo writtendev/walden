@@ -875,6 +875,74 @@ func TestJournalStringHidesSecret(t *testing.T) {
 	}
 }
 
+// TestJournalStringQuotesControlBytesInAccessKeyID is the regression for a
+// URL that smuggles a control byte into the access key ID. Every other field
+// Journal.String() prints is charset-restricted before it ever gets there
+// (validateBucket, validatePrefix, validateRegion); the access key ID is not,
+// because credentialsFromURL accepts whatever net/url's percent-decoding
+// produces. A key ID like this still parses and walden still boots — it only
+// fails at sign time, and --print-config is what an operator reaches for to
+// debug that — so String() quotes the value rather than refusing to print
+// it, which would misreport a URL that in fact boots.
+func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		// forbidByte is a raw byte that must not survive quoting, beyond
+		// the '\n' between fields that the 8-line check below already
+		// covers. 0 skips the check.
+		forbidByte byte
+	}{
+		{
+			// Unquoted, the decoded key ID's embedded newline plus
+			// "journal-credentials: AWS_ACCESS_KEY_ID" would forge a
+			// second, fake journal-credentials line under the real one.
+			name: "embedded newline forges an extra line",
+			raw:  "s3://AKIA%0Ajournal-credentials%3A%20AWS_ACCESS_KEY_ID:secret@bucket/walden",
+		},
+		{
+			// Unquoted, the decoded key ID's raw ESC "[2J" would clear
+			// the operator's terminal screen.
+			name:       "embedded escape byte reaches the terminal raw",
+			raw:        "s3://AKIA%1B%5B2J:topsecret@bucket/walden",
+			forbidByte: 0x1b,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			j, err := store.ResolveJournal(tt.raw, nil)
+			if err != nil {
+				t.Fatalf("ResolveJournal(%q) failed: %v", tt.raw, err)
+			}
+			out := j.String()
+
+			if tt.forbidByte != 0 && strings.IndexByte(out, tt.forbidByte) != -1 {
+				t.Errorf("Journal.String() = %q, contains raw byte %#x", out, tt.forbidByte)
+			}
+
+			// The 8 real fields are '\n'-joined, so a key ID whose
+			// embedded newline survived unescaped would add a 9th line
+			// here instead of staying inside the 8th field's value.
+			lines := strings.Split(out, "\n")
+			if len(lines) != 8 {
+				t.Errorf("Journal.String() = %q, want exactly 8 lines, got %d", out, len(lines))
+			}
+			for _, line := range lines {
+				if !strings.HasPrefix(line, "journal-") {
+					t.Errorf("Journal.String() line %q is not a journal-* field: the access key ID forged a line", line)
+				}
+			}
+
+			if strings.Contains(out, "secret") || strings.Contains(out, "topsecret") {
+				t.Errorf("Journal.String() leaked the secret: %q", out)
+			}
+			if !strings.Contains(out, `journal-access-key-id: "AKIA`) {
+				t.Errorf("Journal.String() = %q, want the access key ID quoted", out)
+			}
+		})
+	}
+}
+
 // TestProviderHostsRefuseWithoutCAS checks that each host rule behaves at boot
 // the way its CAS bit claims: a rule marked cas=false refuses with
 // ErrProviderUnsupported, and one marked cas=true does not.

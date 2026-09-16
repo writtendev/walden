@@ -139,12 +139,15 @@ func TestConfigValidationErrors(t *testing.T) {
 		{
 			name:       "invalid-journal-no-scheme",
 			args:       []string{"--journal", "no-scheme-bucket/path"},
-			wantErrSub: "invalid journal: missing URL scheme",
+			wantErrSub: "invalid journal: URL has no scheme (expected s3://, https://, or http://)",
 		},
 		{
+			// The full line, not just "invalid journal:" — the old
+			// substring matched any journal refusal whatsoever and pinned
+			// nothing about the message it was named for.
 			name:       "invalid-journal-bad-url",
 			args:       []string{"--journal", "://invalid-url"},
-			wantErrSub: "invalid journal:",
+			wantErrSub: "invalid journal: URL does not parse; it is not echoed because it may carry credentials (expected a URL such as s3://bucket/prefix)",
 		},
 		{
 			name:       "invalid-auth-trust-whitespace",

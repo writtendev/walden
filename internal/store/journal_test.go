@@ -278,7 +278,9 @@ func TestParseJournalURLLocations(t *testing.T) {
 		},
 		{
 			// Accelerate names no region, so the operator must. With
-			// ?region= there is nothing left to guess.
+			// ?region= there is nothing left to guess. Style resolves
+			// virtual-hosted even though the bucket is written in the path:
+			// S3 Transfer Acceleration does not accept path-style requests.
 			name:      "aws-accelerate-with-explicit-region",
 			raw:       "https://s3-accelerate.amazonaws.com/my-bucket/walden?region=eu-west-1",
 			provider:  "AWS S3",
@@ -286,7 +288,29 @@ func TestParseJournalURLLocations(t *testing.T) {
 			region:    "eu-west-1",
 			bucket:    "my-bucket",
 			prefix:    "walden",
-			pathStyle: true,
+			pathStyle: false,
+		},
+		{
+			// The bucket may also be named in the hostname; either way,
+			// accelerate resolves virtual-hosted.
+			name:      "aws-accelerate-virtual-hosted-with-explicit-region",
+			raw:       "https://my-bucket.s3-accelerate.amazonaws.com/walden?region=eu-west-1",
+			provider:  "AWS S3",
+			endpoint:  "https://s3-accelerate.amazonaws.com",
+			region:    "eu-west-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: false,
+		},
+		{
+			name:      "aws-accelerate-dualstack-with-explicit-region",
+			raw:       "https://s3-accelerate.dualstack.amazonaws.com/my-bucket/walden?region=eu-west-1",
+			provider:  "AWS S3",
+			endpoint:  "https://s3-accelerate.dualstack.amazonaws.com",
+			region:    "eu-west-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: false,
 		},
 		{
 			name:      "aws-dualstack",
@@ -521,10 +545,11 @@ func TestParseJournalURLLocations(t *testing.T) {
 
 func TestParseJournalURLRefusals(t *testing.T) {
 	tests := []struct {
-		name    string
-		raw     string
-		wantErr error
-		wantSub string
+		name       string
+		raw        string
+		wantErr    error
+		wantSub    string
+		wantNotSub string // if set, the refusal must not contain this
 	}{
 		{name: "empty", raw: "", wantErr: store.ErrInvalidJournal, wantSub: "URL is empty"},
 		{name: "whitespace-only", raw: "   ", wantErr: store.ErrInvalidJournal, wantSub: "URL is empty"},
@@ -574,6 +599,28 @@ func TestParseJournalURLRefusals(t *testing.T) {
 		// and no default that is not a guess.
 		{name: "accelerate-names-no-region", raw: "https://s3-accelerate.amazonaws.com/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "fronts every region and names none"},
 		{name: "accelerate-dualstack-names-no-region", raw: "https://s3-accelerate.dualstack.amazonaws.com/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "fronts every region and names none"},
+		// S3 Transfer Acceleration is virtual-hosted only: an explicit
+		// style=path asks for a shape it cannot serve.
+		{name: "accelerate-style-path-conflicts", raw: "https://s3-accelerate.amazonaws.com/my-bucket/walden?region=eu-west-1&style=path", wantErr: store.ErrInvalidJournal, wantSub: `style=path conflicts with accelerate endpoint "s3-accelerate.amazonaws.com"`},
+		{name: "accelerate-virtual-hosted-style-path-conflicts", raw: "https://my-bucket.s3-accelerate.amazonaws.com/walden?region=eu-west-1&style=path", wantErr: store.ErrInvalidJournal, wantSub: `style=path conflicts with accelerate endpoint "s3-accelerate.amazonaws.com"`},
+		// A dotted bucket cannot be addressed by Transfer Acceleration,
+		// which is virtual-hosted-only and has no path-style fallback for
+		// it to resolve to, unlike an ordinary dotted bucket.
+		{name: "accelerate-dotted-bucket", raw: "https://s3-accelerate.amazonaws.com/my.dotted.bucket/walden?region=eu-west-1", wantErr: store.ErrInvalidJournal, wantSub: `bucket "my.dotted.bucket" contains a '.', which S3 Transfer Acceleration does not allow`},
+		// Message B: a literal '@' surviving outside the userinfo, because
+		// an unencoded '/' in the secret ended the authority early and
+		// relocated the tail of the secret into the prefix.
+		{name: "relocated-credentials-literal-at", raw: "s3://KEY:/SECRET@bucket/prefix", wantErr: store.ErrInvalidJournal, wantSub: "URL has an '@' after its credentials end; it is not echoed because it may carry credentials"},
+		// Message C: an encoded '@' outside the userinfo is not a
+		// relocated credential at all — %40 in a prefix segment carries no
+		// credentials, and telling the operator to percent-encode
+		// credentials they never supplied would be false.
+		{name: "encoded-at-in-prefix-is-not-credentials", raw: "s3://bucket/pre%40fix", wantErr: store.ErrInvalidJournal, wantSub: "URL has an encoded '@' (%40) outside its credentials; it is not echoed because it may carry credentials", wantNotSub: "percent-encode reserved characters in the credentials"},
+		// A multi-byte rune in a prefix segment is quoted whole, not cut at
+		// a single byte: the old code reported the second byte of "é" as
+		// "Ã", a character the operator never typed.
+		{name: "prefix-multibyte-rune-quoted-whole", raw: "s3://my-bucket/pr%C3%A9fix", wantErr: store.ErrInvalidJournal, wantSub: `contains "é"`},
+		{name: "prefix-invalid-utf8-byte", raw: "s3://my-bucket/pre%FFfix", wantErr: store.ErrInvalidJournal, wantSub: `contains "\xff"`},
 	}
 
 	for _, tt := range tests {
@@ -588,6 +635,9 @@ func TestParseJournalURLRefusals(t *testing.T) {
 			assertOneLineRefusal(t, err)
 			if !strings.Contains(err.Error(), tt.wantSub) {
 				t.Errorf("error %q does not contain %q", err.Error(), tt.wantSub)
+			}
+			if tt.wantNotSub != "" && strings.Contains(err.Error(), tt.wantNotSub) {
+				t.Errorf("error %q contains %q, want it absent", err.Error(), tt.wantNotSub)
 			}
 			if !strings.HasPrefix(err.Error(), "invalid journal: ") {
 				t.Errorf("error %q does not name the journal knob", err.Error())

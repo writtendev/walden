@@ -124,6 +124,19 @@ func TestConfigListenAliases(t *testing.T) {
 	}
 }
 
+// TestConfigListenPortZeroIsValid asserts that port 0 -- the only
+// race-free way for a subprocess test to obtain an ephemeral socket -- is
+// a legal listen address, not a validation failure.
+func TestConfigListenPortZeroIsValid(t *testing.T) {
+	cfg, _, err := config.LoadWithEnv([]string{"--listen", "127.0.0.1:0"}, func(string) (string, bool) { return "", false })
+	if err != nil {
+		t.Fatalf("unexpected error for port 0: %v", err)
+	}
+	if cfg.ListenAddr != "127.0.0.1:0" {
+		t.Errorf("expected ListenAddr 127.0.0.1:0, got %q", cfg.ListenAddr)
+	}
+}
+
 func TestConfigValidationErrors(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -167,12 +180,12 @@ func TestConfigValidationErrors(t *testing.T) {
 		{
 			name:       "invalid-listen-port-out-of-range",
 			args:       []string{"--listen", ":70000"},
-			wantErrSub: "invalid listen: port must be between 1 and 65535",
+			wantErrSub: "invalid listen: port must be between 0 and 65535",
 		},
 		{
 			name:       "invalid-listen-non-numeric-port",
 			args:       []string{"--listen", ":abc"},
-			wantErrSub: "invalid listen: port must be between 1 and 65535",
+			wantErrSub: "invalid listen: port must be between 0 and 65535",
 		},
 		{
 			name: "invalid-env-listen",

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"go/parser"
 	"go/token"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +15,21 @@ import (
 	"testing"
 
 	"github.com/writtendev/walden/internal/auth"
+	"github.com/writtendev/walden/internal/journal"
 )
+
+// cancelledContext returns a context that is already done, so a caller
+// (like runServe's own goroutine that closes the listener on ctx.Done())
+// observes it as immediately cancelled. Note this must never be threaded
+// into githttp.AssertGitFloor: exec.CommandContext refuses to even start
+// a subprocess against an already-done context, which is exactly why
+// runServe uses context.Background() for that one preflight check
+// instead of the ctx it is otherwise threaded through with.
+func cancelledContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
 
 func TestRunUsageAndVersion(t *testing.T) {
 	tests := []struct {
@@ -172,9 +187,13 @@ func TestRunUsageAndVersion(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.useTempDataDir {
 				t.Setenv("WALDEN_DATA_DIR", t.TempDir())
+				// Only the serve cases in this table reach the listener;
+				// 127.0.0.1:0 keeps them from racing each other (or a
+				// concurrent test) for the default :8470 port.
+				t.Setenv("WALDEN_LISTEN_ADDR", "127.0.0.1:0")
 			}
 			var stdout, stderr bytes.Buffer
-			err := run(tt.args, &stdout, &stderr)
+			err := run(cancelledContext(), tt.args, &stdout, &stderr)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("run(%v) error = %v, wantErr %v", tt.args, err, tt.wantErr)
 			}
@@ -195,13 +214,13 @@ func TestRunUsageAndVersion(t *testing.T) {
 func TestRunServeOutputIncludesGitVersion(t *testing.T) {
 	t.Setenv("WALDEN_DATA_DIR", t.TempDir())
 	var stdout, stderr bytes.Buffer
-	err := runServe(nil, &stdout, &stderr)
+	err := runServe(cancelledContext(), []string{"--listen", "127.0.0.1:0"}, &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("runServe failed: %v", err)
 	}
 
 	out := stdout.String()
-	if !strings.Contains(out, "walden server starting on :8470") {
+	if !strings.Contains(out, "walden server starting on 127.0.0.1:") {
 		t.Errorf("expected listen address in output, got %q", out)
 	}
 	if !strings.Contains(out, "git: ") {
@@ -223,7 +242,7 @@ func TestRunServeGitFloorRefusal(t *testing.T) {
 	defer os.Setenv("PATH", origPath)
 
 	var stdout, stderr bytes.Buffer
-	err := runServe(nil, &stdout, &stderr)
+	err := runServe(context.Background(), nil, &stdout, &stderr)
 	if err == nil {
 		t.Fatalf("expected runServe to fail when git is below floor, got success")
 	}
@@ -801,7 +820,7 @@ func TestNoStackTraceOrWrappedChainToOperator(t *testing.T) {
 // TestRefusalConventionFormat asserts that all refusals produced by walden
 // follow the standard format: "<what>: <why> (<fix>)".
 func TestRefusalConventionFormat(t *testing.T) {
-	errUnknown := run([]string{"walden", "invalid"}, &bytes.Buffer{}, &bytes.Buffer{})
+	errUnknown := run(context.Background(), []string{"walden", "invalid"}, &bytes.Buffer{}, &bytes.Buffer{})
 	if errUnknown == nil {
 		t.Fatal("expected error")
 	}
@@ -810,7 +829,7 @@ func TestRefusalConventionFormat(t *testing.T) {
 		t.Errorf("refusal format mismatch: %q (expected '<what>: <why> (<fix>)')", errStr)
 	}
 
-	errToken := run([]string{"walden", "token"}, &bytes.Buffer{}, &bytes.Buffer{})
+	errToken := run(context.Background(), []string{"walden", "token"}, &bytes.Buffer{}, &bytes.Buffer{})
 	if errToken == nil {
 		t.Fatal("expected error")
 	}
@@ -823,7 +842,7 @@ func TestRefusalConventionFormat(t *testing.T) {
 func TestServeFirstBootMintsAdminToken(t *testing.T) {
 	dataDir := t.TempDir()
 	var stdout, stderr bytes.Buffer
-	err := runServe([]string{"--data-dir", dataDir}, &stdout, &stderr)
+	err := runServe(cancelledContext(), []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0"}, &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("runServe failed: %v", err)
 	}
@@ -832,7 +851,7 @@ func TestServeFirstBootMintsAdminToken(t *testing.T) {
 	if !strings.Contains(out, "admin token: walden_") {
 		t.Fatalf("expected stdout to contain 'admin token: walden_', got:\n%s", out)
 	}
-	if !strings.Contains(out, "walden server starting on :8470") {
+	if !strings.Contains(out, "walden server starting on 127.0.0.1:") {
 		t.Errorf("expected server starting line in output, got:\n%s", out)
 	}
 
@@ -888,7 +907,7 @@ func TestServeSecondBootDoesNotMintOrPrint(t *testing.T) {
 
 	// Boot 1
 	var stdout1, stderr1 bytes.Buffer
-	if err := runServe([]string{"--data-dir", dataDir}, &stdout1, &stderr1); err != nil {
+	if err := runServe(cancelledContext(), []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0"}, &stdout1, &stderr1); err != nil {
 		t.Fatalf("first runServe failed: %v", err)
 	}
 	if !strings.Contains(stdout1.String(), "admin token: walden_") {
@@ -903,13 +922,13 @@ func TestServeSecondBootDoesNotMintOrPrint(t *testing.T) {
 
 	// Boot 2
 	var stdout2, stderr2 bytes.Buffer
-	if err := runServe([]string{"--data-dir", dataDir}, &stdout2, &stderr2); err != nil {
+	if err := runServe(cancelledContext(), []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0"}, &stdout2, &stderr2); err != nil {
 		t.Fatalf("second runServe failed: %v", err)
 	}
 	if strings.Contains(stdout2.String(), "admin token: ") {
 		t.Errorf("second runServe should not output admin token, got:\n%s", stdout2.String())
 	}
-	if !strings.Contains(stdout2.String(), "walden server starting on :8470") {
+	if !strings.Contains(stdout2.String(), "walden server starting on 127.0.0.1:") {
 		t.Errorf("second runServe missing server start line, got:\n%s", stdout2.String())
 	}
 
@@ -924,8 +943,14 @@ func TestServeSecondBootDoesNotMintOrPrint(t *testing.T) {
 
 func TestServeDelegatedModeDoesNotMint(t *testing.T) {
 	dataDir := t.TempDir()
+	_, pub, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	trustKey := journal.FormatPublicKey(pub)
+
 	var stdout, stderr bytes.Buffer
-	err := runServe([]string{"--data-dir", dataDir, "--auth-trust", "ed25519:test-public-key"}, &stdout, &stderr)
+	err = runServe(cancelledContext(), []string{"--data-dir", dataDir, "--auth-trust", trustKey, "--listen", "127.0.0.1:0"}, &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("runServe with auth-trust failed: %v", err)
 	}
@@ -933,7 +958,7 @@ func TestServeDelegatedModeDoesNotMint(t *testing.T) {
 	if strings.Contains(stdout.String(), "admin token: ") {
 		t.Errorf("delegated mode must not mint or print admin token, got:\n%s", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "walden server starting on :8470") {
+	if !strings.Contains(stdout.String(), "walden server starting on 127.0.0.1:") {
 		t.Errorf("delegated mode missing server start line, got:\n%s", stdout.String())
 	}
 
@@ -946,7 +971,7 @@ func TestServeDelegatedModeDoesNotMint(t *testing.T) {
 func TestServePrintConfigDoesNotMint(t *testing.T) {
 	dataDir := t.TempDir()
 	var stdout, stderr bytes.Buffer
-	err := runServe([]string{"--data-dir", dataDir, "--print-config"}, &stdout, &stderr)
+	err := runServe(context.Background(), []string{"--data-dir", dataDir, "--print-config"}, &stdout, &stderr)
 	if err != nil {
 		t.Fatalf("runServe --print-config failed: %v", err)
 	}
@@ -976,7 +1001,7 @@ func TestServeConcurrentBootSingleToken(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			var stdout, stderr bytes.Buffer
-			errs[idx] = runServe([]string{"--data-dir", dataDir}, &stdout, &stderr)
+			errs[idx] = runServe(cancelledContext(), []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0"}, &stdout, &stderr)
 			outputs[idx] = stdout.String()
 		}()
 	}
@@ -989,7 +1014,7 @@ func TestServeConcurrentBootSingleToken(t *testing.T) {
 		if errs[i] != nil {
 			t.Fatalf("goroutine %d failed: %v", i, errs[i])
 		}
-		if !strings.Contains(outputs[i], "walden server starting on :8470") {
+		if !strings.Contains(outputs[i], "walden server starting on 127.0.0.1:") {
 			t.Errorf("goroutine %d missing server starting line: %q", i, outputs[i])
 		}
 		if strings.Contains(outputs[i], "admin token: ") {
@@ -1033,7 +1058,7 @@ func TestServeDataDirCreationFailure(t *testing.T) {
 	invalidDataDir := filepath.Join(tmpFile, "cannot_mkdir")
 
 	var stdout, stderr bytes.Buffer
-	err := runServe([]string{"--data-dir", invalidDataDir}, &stdout, &stderr)
+	err := runServe(context.Background(), []string{"--data-dir", invalidDataDir}, &stdout, &stderr)
 	if err == nil {
 		t.Fatalf("expected runServe to fail when data dir cannot be created")
 	}
@@ -1044,4 +1069,95 @@ func TestServeDataDirCreationFailure(t *testing.T) {
 	if strings.Contains(errStr, "\n") {
 		t.Errorf("expected single-line error, got: %q", errStr)
 	}
+}
+
+// TestServeInvalidTrustKeyRefuses asserts that a malformed --auth-trust
+// value refuses in one line and mints nothing: auth.NewAuthorizer is the
+// only place the auth mode is decided, and its refusal must reach the
+// operator before the built-in token path is ever considered.
+func TestServeInvalidTrustKeyRefuses(t *testing.T) {
+	dataDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	err := runServe(context.Background(), []string{"--data-dir", dataDir, "--auth-trust", "not-a-valid-key"}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected runServe to refuse an invalid auth-trust key")
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, "\n") {
+		t.Errorf("expected single-line error, got: %q", errStr)
+	}
+
+	tokensFile := filepath.Join(dataDir, "tokens.json")
+	if _, statErr := os.Stat(tokensFile); !os.IsNotExist(statErr) {
+		t.Errorf("tokens.json should not exist after an invalid auth-trust refusal, stat err: %v", statErr)
+	}
+}
+
+// TestServeListenInUseRefuses asserts that a busy listen address is a
+// one-line refusal naming the --listen knob, returned promptly (binding
+// happens before minting), with no tokens.json left behind.
+func TestServeListenInUseRefuses(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to hold a listener: %v", err)
+	}
+	defer held.Close()
+
+	dataDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	err = runServe(context.Background(), []string{"--data-dir", dataDir, "--listen", held.Addr().String()}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected runServe to refuse a listen address already in use")
+	}
+	if !strings.Contains(err.Error(), "listen") || !strings.Contains(err.Error(), "--listen") {
+		t.Errorf("expected refusal naming the listen knob, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("expected single-line error, got: %q", err.Error())
+	}
+
+	tokensFile := filepath.Join(dataDir, "tokens.json")
+	if _, statErr := os.Stat(tokensFile); !os.IsNotExist(statErr) {
+		t.Errorf("tokens.json should not exist after a listen refusal, stat err: %v", statErr)
+	}
+}
+
+// TestServeJournalWarning asserts the loud, exactly-once warning
+// ARCHITECTURE.md promises for journal-less mode, and its absence once a
+// journal is configured.
+func TestServeJournalWarning(t *testing.T) {
+	const warning = "walden: WARNING: journal-less mode: WALDEN_JOURNAL is unset, so durability is this disk alone"
+
+	t.Run("unset", func(t *testing.T) {
+		dataDir := t.TempDir()
+		var stdout, stderr bytes.Buffer
+		err := runServe(cancelledContext(), []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0"}, &stdout, &stderr)
+		if err != nil {
+			t.Fatalf("runServe failed: %v", err)
+		}
+		out := stderr.String()
+		if strings.Count(out, warning) != 1 {
+			t.Errorf("expected the journal-less warning exactly once on stderr, got:\n%s", out)
+		}
+	})
+
+	t.Run("configured", func(t *testing.T) {
+		dataDir := t.TempDir()
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "topsecret")
+		t.Setenv("AWS_REGION", "us-east-1")
+
+		var stdout, stderr bytes.Buffer
+		err := runServe(cancelledContext(), []string{
+			"--data-dir", dataDir,
+			"--listen", "127.0.0.1:0",
+			"--journal", "s3://my-bucket/prefix",
+		}, &stdout, &stderr)
+		if err != nil {
+			t.Fatalf("runServe failed: %v", err)
+		}
+		if strings.Contains(stderr.String(), "journal-less mode") {
+			t.Errorf("expected no journal-less warning when journal is configured, got:\n%s", stderr.String())
+		}
+	})
 }

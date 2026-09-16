@@ -122,12 +122,35 @@ jobs:
             exit 1
           fi
 
-          # Verify container runs walden serve as PID 1 and asserts pinned git version
-          OUTPUT="$(docker run --rm walden:build1)"
-          echo "Container startup output: ${OUTPUT}"
+          # Verify container runs walden serve as PID 1, asserts pinned git
+          # version, and now actually blocks serving instead of exiting:
+          # `docker run --rm` (without -d) would hang this step forever
+          # once runServe stopped returning immediately after boot.
+          docker run -d --name walden-smoke walden:build1
 
-          if ! echo "${OUTPUT}" | grep -q "walden server starting on :8470 (data: /data, git: 2.47.2)"; then
+          BOOTED=""
+          for _ in $(seq 1 30); do
+            LOGS="$(docker logs walden-smoke 2>&1)"
+            if echo "${LOGS}" | grep -q "walden server starting on :8470 (data: /data, git: 2.47.2)"; then
+              BOOTED=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -z "${BOOTED}" ]; then
             echo "Error: unexpected startup message from container"
+            echo "Container logs: ${LOGS}"
+            docker rm -f walden-smoke
             exit 1
           fi
+
+          if [ "$(docker inspect -f '{{.State.Running}}' walden-smoke)" != "true" ]; then
+            echo "Error: walden-smoke container is no longer running after boot"
+            docker logs walden-smoke
+            docker rm -f walden-smoke
+            exit 1
+          fi
+
+          docker rm -f walden-smoke
 

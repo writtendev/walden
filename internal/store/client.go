@@ -287,6 +287,25 @@ func (c *Client) do(ctx context.Context, r objectRequest) (*http.Response, error
 // an Idempotency-Key header: either one would let net/http silently replay
 // a request on its own, which would defeat the "proven unapplied" rule
 // PutIfAbsent depends on (WALD-22's plan).
+//
+// wrote is read through a channel, not a plain captured variable: for a
+// request with a body, net/http's Transport writes the request and reads
+// the response in two different goroutines, and WroteRequest is called
+// from the write goroutine. When the response arrives before the write
+// goroutine finishes (RoundTrip's own select races the two), RoundTrip can
+// return before WroteRequest has run, and a plain shared bool would be a
+// genuine data race between that goroutine and this one - caught by
+// go test -race, not a false positive. A buffered channel makes the
+// hand-off safe either way. Whenever err != nil because the write itself
+// failed, net/http always signals WroteRequest before propagating that
+// error (Request.write's deferred call happens-before the write-error
+// channel send inside persistConn.writeLoop), so the non-blocking receive
+// below reliably has a value by then; it is only "no value yet" for a
+// send that never reached the write path at all (a dial failure, where
+// nothing was ever written) or one whose outcome this func does not use
+// wrote for anyway (a successful response). Either way, send must never
+// block waiting for it - a custom or future RoundTripper that does not
+// invoke httptrace hooks at all must not hang this call forever.
 func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp *http.Response, wrote bool, err error) {
 	u := c.objectURL(r.key)
 	if len(r.query) > 0 {
@@ -357,20 +376,19 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp
 		req.Body = io.NopCloser(newChunkedBody(section, chunkSize, key, scope, now, seed))
 	}
 
-	var traced bool
+	wroteCh := make(chan bool, 1)
 	trace := &httptrace.ClientTrace{
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
-			traced = true
-			wrote = info.Err == nil
+			wroteCh <- info.Err == nil
 		},
 	}
 	resp, err = c.http.Do(req.WithContext(httptrace.WithClientTrace(ctx, trace)))
-	if !traced {
-		// WroteRequest is documented to always fire once RoundTrip returns,
-		// successful or not, for every http.RoundTripper net/http itself
-		// provides. This guard exists only so a future custom
-		// RoundTripper's failure to call it reads as "not proven written"
-		// rather than silently as "written".
+	select {
+	case wrote = <-wroteCh:
+	default:
+		// No signal yet: either WroteRequest will never fire for this
+		// attempt (see the comment above send), or resp is non-nil and
+		// classify never consults wrote for a successful response.
 		wrote = false
 	}
 	return resp, wrote, err

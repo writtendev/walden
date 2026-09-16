@@ -92,6 +92,14 @@ func TestListManyPagesInOrder(t *testing.T) {
 		if q.Get("prefix") != fullPrefix {
 			t.Errorf("request %d: prefix = %q, want %q", n, q.Get("prefix"), fullPrefix)
 		}
+		// LIST must address the bucket root, never an object path formed
+		// by joining Journal.Prefix onto the request - that would route a
+		// real S3 provider to GetObject instead of ListObjectsV2 (see
+		// objectURL in client.go and the path-style/virtual-hosted
+		// assertions in TestListVirtualHostedAddressesBucketRoot).
+		if r.URL.Path != "/test-bucket" {
+			t.Errorf("request %d: path = %q, want %q (LIST must address the bucket root, not the journal prefix)", n, r.URL.Path, "/test-bucket")
+		}
 
 		page := n - 1
 		start := page * pageSize
@@ -466,6 +474,15 @@ func TestListPermanentFailureSurfacesErrStorageRefused(t *testing.T) {
 	if errors.Is(err, store.ErrStorageUnavailable) {
 		t.Errorf("a permanent 403 must not also be ErrStorageUnavailable: %v", err)
 	}
+	// The refusal must name the listing, not do's "GET <key>" wording -
+	// key is always "" for a listing, so an unfixed refusal reads "GET :
+	// ..." with neither the verb nor the prefix an operator needs.
+	if !strings.HasPrefix(err.Error(), "LIST streams/repo-alpha/tx/:") {
+		t.Errorf("error = %q, want it to start with %q", err.Error(), "LIST streams/repo-alpha/tx/:")
+	}
+	if strings.HasPrefix(err.Error(), "GET") {
+		t.Errorf("error = %q, must not surface do's bare GET naming", err.Error())
+	}
 }
 
 func TestListContextCancelledBetweenPages(t *testing.T) {
@@ -586,5 +603,217 @@ func TestListContinuationTokenRoundTripsWithReservedCharacters(t *testing.T) {
 	}
 	if sigErr != nil {
 		t.Errorf("signature verification failed: %v", sigErr)
+	}
+}
+
+// -----------------------------------------------------------------------
+// 8. LIST addresses the bucket root in both addressing styles, never an
+//    object path formed by joining Journal.Prefix - the path-style half
+//    of this is asserted inline in TestListManyPagesInOrder above.
+// -----------------------------------------------------------------------
+
+func TestListVirtualHostedAddressesBucketRoot(t *testing.T) {
+	const fullPrefix = "v1/streams/repo-alpha/tx/"
+	page := listKeys(fullPrefix, 0, 1)
+
+	var gotPath, gotHost, gotPrefix string
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		gotPath = r.URL.Path
+		gotHost = r.Host
+		gotPrefix = r.URL.Query().Get("prefix")
+		w.WriteHeader(http.StatusOK)
+		w.Write(listPageXML(page, false, ""))
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", false) // virtual-hosted
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	err := c.List(context.Background(), "streams/repo-alpha/tx/", "", func(key string) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if reqCount != 1 {
+		t.Fatalf("server saw %d requests, want 1", reqCount)
+	}
+	if gotHost != "test-bucket.s3.fake.test" {
+		t.Errorf("host = %q, want %q", gotHost, "test-bucket.s3.fake.test")
+	}
+	if gotPath != "/" {
+		t.Errorf("path = %q, want %q (bucket root, not the journal prefix)", gotPath, "/")
+	}
+	if gotPrefix != fullPrefix {
+		t.Errorf("prefix param = %q, want %q", gotPrefix, fullPrefix)
+	}
+}
+
+// -----------------------------------------------------------------------
+// 9. Listing the whole journal (prefix == "") must not also return a
+//    sibling journal's keys sharing the same bucket, e.g. "v1-staging"
+//    next to "v1". The S3 prefix= sent must be the journal prefix with a
+//    trailing "/", and any key not starting with that is refused.
+// -----------------------------------------------------------------------
+
+func TestListEmptyPrefixExcludesSiblingJournal(t *testing.T) {
+	var gotPrefix string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		gotPrefix = r.URL.Query().Get("prefix")
+		w.WriteHeader(http.StatusOK)
+		// Simulates what a real S3 prefix of bare "v1" (no trailing
+		// slash) would additionally match: a sibling journal's key.
+		w.Write(listPageXML([]string{"v1-staging/streams/repo-alpha/tx/00000000000000000000.json"}, false, ""))
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	var called bool
+	err := c.List(context.Background(), "", "", func(key string) error {
+		called = true
+		return nil
+	})
+	if gotPrefix != "v1/" {
+		t.Errorf("prefix param = %q, want %q (trailing slash, so it cannot match a sibling journal)", gotPrefix, "v1/")
+	}
+	if err == nil {
+		t.Fatal("List succeeded, want a refusal for a key outside the journal")
+	}
+	if !errors.Is(err, store.ErrListInconsistent) {
+		t.Errorf("errors.Is(err, ErrListInconsistent) = false, err = %v", err)
+	}
+	if called {
+		t.Error("fn was called with a sibling journal's key")
+	}
+}
+
+// -----------------------------------------------------------------------
+// 10. A 2xx response whose XML root is not ListBucketResult must not be
+//     silently treated as a complete, empty listing.
+// -----------------------------------------------------------------------
+
+func TestListWrongXMLRootIsRefused(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult></ListAllMyBucketsResult>`))
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	var called bool
+	err := c.List(context.Background(), "streams/repo-alpha/tx/", "", func(key string) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("List succeeded on a non-ListBucketResult root, want a refusal")
+	}
+	if !errors.Is(err, store.ErrStorageUnavailable) {
+		t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+	}
+	if called {
+		t.Error("fn was called from a page that never decoded as ListBucketResult")
+	}
+}
+
+// -----------------------------------------------------------------------
+// 11. A page body over the bound, or a single key over S3's own key-length
+//     limit, is refused instead of decoded and handed to fn.
+// -----------------------------------------------------------------------
+
+func TestListPageBodyOverBoundIsRefused(t *testing.T) {
+	hugeKey := "v1/streams/repo-alpha/tx/" + strings.Repeat("x", 9<<20) // 9 MiB, over the 8 MiB bound
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(listPageXML([]string{hugeKey}, false, ""))
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	var called bool
+	err := c.List(context.Background(), "streams/repo-alpha/tx/", "", func(key string) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("List succeeded on an oversized page, want a refusal")
+	}
+	if !errors.Is(err, store.ErrStorageUnavailable) {
+		t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+	}
+	if called {
+		t.Error("fn was called with a key from an oversized page")
+	}
+}
+
+func TestListKeyLongerThanS3LimitIsRefused(t *testing.T) {
+	const fullPrefix = "v1/streams/repo-alpha/tx/"
+	longKey := fullPrefix + strings.Repeat("x", 1025) // over S3's 1024-byte key limit, well under the page-body bound
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write(listPageXML([]string{longKey}, false, ""))
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	var called bool
+	err := c.List(context.Background(), "streams/repo-alpha/tx/", "", func(key string) error {
+		called = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("List succeeded on a key over S3's length limit, want a refusal")
+	}
+	if !errors.Is(err, store.ErrListInconsistent) {
+		t.Errorf("errors.Is(err, ErrListInconsistent) = false, err = %v", err)
+	}
+	if called {
+		t.Error("fn was called with a key over S3's length limit")
+	}
+}
+
+// -----------------------------------------------------------------------
+// 12. A continuation token that repeats one from an earlier page - not
+//     just the immediately preceding one - is refused instead of spinning:
+//     a provider alternating "A, B, A, B" across empty truncated pages
+//     passes the immediate-repeat check and the key-ordering check (there
+//     are no keys), so only remembering every token seen closes the loop.
+// -----------------------------------------------------------------------
+
+func TestListNonAdjacentRepeatedTokenIsRefused(t *testing.T) {
+	const fullPrefix = "v1/streams/repo-alpha/tx/"
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&reqCount, 1)
+		w.WriteHeader(http.StatusOK)
+		if n%2 == 1 {
+			w.Write(listPageXML(nil, true, "A"))
+		} else {
+			w.Write(listPageXML(nil, true, "B"))
+		}
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	err := c.List(context.Background(), "streams/repo-alpha/tx/", "", func(key string) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("List succeeded on a cycling continuation token, want a refusal")
+	}
+	if !errors.Is(err, store.ErrListInconsistent) {
+		t.Errorf("errors.Is(err, ErrListInconsistent) = false, err = %v", err)
+	}
+	// Must stop within a handful of requests, not spin: token "A" (request
+	// 1), "B" (request 2), then "A" again (request 3) is where the repeat
+	// is detected.
+	if reqCount > 4 {
+		t.Errorf("server saw %d requests, want at most 4 (List must stop as soon as a token repeats, not spin)", reqCount)
 	}
 }

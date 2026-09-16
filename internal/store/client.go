@@ -306,7 +306,10 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (*htt
 // objectURL builds the URL for key against c.journal's endpoint, bucket,
 // and prefix, in whichever addressing style the journal resolved to. key
 // is journal-relative; objectURL joins Journal.Prefix onto it. An empty
-// key addresses the bucket root, which only WALD-21's LIST uses.
+// key addresses the bucket root - regardless of Journal.Prefix, which
+// plays no part in a bucket-root request - which only WALD-21's LIST
+// uses: LIST scopes to the journal through its prefix= query parameter,
+// never through the path.
 func (c *Client) objectURL(key string) *url.URL {
 	j := c.journal
 
@@ -315,10 +318,10 @@ func (c *Client) objectURL(key string) *url.URL {
 	endpoint, _ := url.Parse(j.Endpoint)
 
 	var segs []string
-	if j.Prefix != "" {
-		segs = append(segs, j.Prefix)
-	}
 	if key != "" {
+		if j.Prefix != "" {
+			segs = append(segs, j.Prefix)
+		}
 		segs = append(segs, key)
 	}
 	joined := strings.Join(segs, "/")

@@ -2067,3 +2067,138 @@ func TestPutIfAbsentErrorMessagesOneLineNoSecrets(t *testing.T) {
 		})
 	}
 }
+
+// finalReadErrorReaderAt returns the full requested bytes on its last read
+// - the call that reaches the end of the declared size - together with a
+// non-nil error, the way an *os.File wrapper might surface
+// io.ErrUnexpectedEOF once its own bookkeeping disagrees with size even
+// though the file itself has that many bytes to give. WALD-22 review:
+// io.Copy still writes the bytes it was handed before a non-EOF source
+// error stops the copy loop, so the whole body reaches storage even
+// though this shape of error exists - send must not read it as proof the
+// write failed.
+type finalReadErrorReaderAt struct {
+	data []byte
+	err  error
+}
+
+func (f finalReadErrorReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(f.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.data[off:])
+	if int64(off)+int64(n) >= int64(len(f.data)) {
+		return n, f.err
+	}
+	return n, nil
+}
+
+// TestPutIfAbsentFinalReadErrorIsAmbiguousNotResent pins a WALD-22 review
+// finding: a caller ReaderAt whose last read reports the full remaining
+// bytes together with a non-nil error (io.ErrUnexpectedEOF, say) must not
+// make PutIfAbsent treat the attempt as unwritten.
+//
+// Over https, req.Body wraps the section reader directly (send's unsigned
+// UNSIGNED-PAYLOAD path). Before the fix, wrote came only from
+// WroteRequest's trace, which net/http fires with a non-nil Err in
+// exactly this shape - io.Copy already wrote every byte to the connection
+// before the source's trailing error stopped its loop - so classify
+// resent an already-applied conditional PUT and got back a self-inflicted
+// 412 (ErrPrecondition) instead of ErrOutcomeUnknown. This subtest is the
+// literal reproduction: exactly one PUT reaches the server, and the
+// result is ErrOutcomeUnknown.
+//
+// Over http, req.Body instead wraps the section in chunkedReader
+// (sigv4.go's aws-chunked framer). chunkedReader.fill reads each chunk
+// with io.ReadFull and, deliberately, treats io.EOF and io.ErrUnexpectedEOF
+// from the underlying body as ordinary end-of-data (see its doc comment),
+// the same way it would a caller ReaderAt that reports a short final read
+// with io.EOF. That absorption happens before net/http's own Copy ever
+// sees an error, so this specific error shape was never ambiguous on the
+// http path to begin with - confirmed here by asserting the framed body
+// arrives whole and PutIfAbsent succeeds outright, still in exactly one
+// PUT. It is covered here as documentation of that boundary, not as a
+// second reproduction of the bug the https subtest pins.
+func TestPutIfAbsentFinalReadErrorIsAmbiguousNotResent(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	body := make([]byte, 200*1024)
+	for i := range body {
+		body[i] = byte(i)
+	}
+
+	t.Run("https", func(t *testing.T) {
+		var reqCount int32
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&reqCount, 1)
+			got, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("server failed to read body: %v", err)
+			}
+			if n == 1 {
+				if !bytes.Equal(got, body) {
+					t.Errorf("server received %d bytes, want the full %d-byte body", len(got), len(body))
+				}
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			// A resend of an already-applied conditional PUT: a real S3
+			// would answer this the same way - the key now exists.
+			w.WriteHeader(http.StatusPreconditionFailed)
+			w.Write(xmlError("PreconditionFailed"))
+		}
+		client := newFakeServer(t, true, handler)
+		j := testJournal("https://s3.fake.test", "test-bucket", "v1", true)
+		c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+		readerAt := finalReadErrorReaderAt{data: body, err: io.ErrUnexpectedEOF}
+		err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", readerAt, int64(len(body)))
+
+		if !errors.Is(err, store.ErrOutcomeUnknown) {
+			t.Fatalf("errors.Is(err, ErrOutcomeUnknown) = false, err = %v", err)
+		}
+		if errors.Is(err, store.ErrPrecondition) {
+			t.Errorf("ErrOutcomeUnknown must not also be ErrPrecondition: %v", err)
+		}
+		if errors.Is(err, store.ErrStorageRefused) {
+			t.Errorf("ErrOutcomeUnknown must not also be ErrStorageRefused: %v", err)
+		}
+		if errors.Is(err, store.ErrStorageUnavailable) {
+			t.Errorf("ErrOutcomeUnknown must not also be ErrStorageUnavailable: %v", err)
+		}
+		if got := atomic.LoadInt32(&reqCount); got != 1 {
+			t.Errorf("server saw %d requests, want 1 (an already-delivered body must never be resent)", got)
+		}
+	})
+
+	t.Run("http", func(t *testing.T) {
+		wantLen := store.ChunkedLengthForTest(int64(len(body)), 64<<10)
+
+		var reqCount int32
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&reqCount, 1)
+			got, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("server failed to read body: %v", err)
+			}
+			if int64(len(got)) != wantLen {
+				t.Errorf("server received %d framed bytes, want %d (the full aws-chunked body)", len(got), wantLen)
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+		client := newFakeServer(t, false, handler)
+		j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+		c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+		readerAt := finalReadErrorReaderAt{data: body, err: io.ErrUnexpectedEOF}
+		err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", readerAt, int64(len(body)))
+
+		if err != nil {
+			t.Fatalf("PutIfAbsent = %v, want success: chunkedReader absorbs io.ErrUnexpectedEOF as ordinary end-of-data", err)
+		}
+		if got := atomic.LoadInt32(&reqCount); got != 1 {
+			t.Errorf("server saw %d requests, want 1", got)
+		}
+	})
+}

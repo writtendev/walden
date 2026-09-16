@@ -317,6 +317,26 @@ func (c *Client) do(ctx context.Context, r objectRequest) (*http.Response, error
 // never reached the write path at all (a dial failure, where nothing was
 // ever written) or one whose outcome this func does not use wrote for
 // anyway (a successful response).
+//
+// wroteOK alone is not the whole story: a caller's ReaderAt is free to
+// return a full final read together with a non-nil error (an *os.File
+// wrapper that surfaces io.ErrUnexpectedEOF once its own bookkeeping
+// disagrees with size, say). io.Copy still writes those bytes to the
+// connection - a non-EOF error from the source only stops the copy loop
+// after the last successful Write - so the whole body reaches storage,
+// but WroteRequest's info.Err is non-nil because net/http reports that
+// same copy error, and wroteOK.Load() alone would read false. Review
+// caught this on WALD-22: for a conditional request it meant a write
+// storage had already applied got resent, and the resend's own 412 came
+// back as a self-inflicted ErrPrecondition (or, when the caller's error
+// did not happen to be one retryableTransportError recognizes,
+// ErrStorageRefused - either way wrong, since the write may have landed).
+// bodyCounter (below) counts bytes actually read from the section this
+// func hands the request writer, independent of what error rides along
+// with the last of them; delivered reports whether that count reached
+// r.size. The returned wrote is wroteOK.Load() || delivered, so either
+// signal proving the body got there is enough - classify still only
+// consults it when r.conditional.
 func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp *http.Response, wrote bool, err error) {
 	u := c.objectURL(r.key)
 	if len(r.query) > 0 {
@@ -345,6 +365,14 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp
 	creds := c.journal.Credentials
 	region := c.journal.Region
 
+	// bodyCounter counts the bytes send actually reads from r.body (via
+	// the section reader below) to hand to the request writer, on
+	// whichever of the two branches below builds req.Body. It stays nil
+	// for a bodyless request or a zero-length one (http.NoBody), neither
+	// of which this func needs a delivered signal for - see the doc
+	// comment above.
+	var bodyCounter *countingReader
+
 	switch {
 	case r.body == nil:
 		signV4(req, creds, region, "s3", emptySHA256, now)
@@ -364,13 +392,15 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp
 			req.Body = http.NoBody
 		} else {
 			section := io.NewSectionReader(r.body, 0, r.size)
-			req.Body = io.NopCloser(section)
+			bodyCounter = &countingReader{r: section}
+			req.Body = io.NopCloser(bodyCounter)
 		}
 		signV4(req, creds, region, "s3", unsignedPayload, now)
 	default:
 		// Plain http has no transport integrity, so the body is signed
 		// here via aws-chunked streaming.
 		section := io.NewSectionReader(r.body, 0, r.size)
+		bodyCounter = &countingReader{r: section}
 		req.Header.Set("Content-Encoding", "aws-chunked")
 		req.Header.Set("X-Amz-Decoded-Content-Length", strconv.FormatInt(r.size, 10))
 		// Both the header and req.ContentLength are set to the same
@@ -384,7 +414,11 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp
 		dateStamp := now.UTC().Format(dateFormat)
 		scope := scopeString(dateStamp, region, "s3")
 		key := signingKey(creds.SecretAccessKey, dateStamp, region, "s3")
-		req.Body = io.NopCloser(newChunkedBody(section, chunkSize, key, scope, now, seed))
+		// bodyCounter sits under the chunk encoder, so it counts raw
+		// content bytes read from section - the same r.size units the
+		// https branch above counts - not the larger aws-chunked framing
+		// newChunkedBody wraps them in.
+		req.Body = io.NopCloser(newChunkedBody(bodyCounter, chunkSize, key, scope, now, seed))
 	}
 
 	var wroteOK atomic.Bool
@@ -394,7 +428,29 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp
 		},
 	}
 	resp, err = c.http.Do(req.WithContext(httptrace.WithClientTrace(ctx, trace)))
-	return resp, wroteOK.Load(), err
+	delivered := bodyCounter != nil && bodyCounter.n.Load() >= r.size
+	return resp, wroteOK.Load() || delivered, err
+}
+
+// countingReader counts the bytes Read off r, so send can tell whether a
+// request's body was fully handed to the request writer even when
+// net/http's WroteRequest trace reports a non-nil Err for the attempt (see
+// send's doc comment). n is an atomic.Int64, not a plain int64, for the
+// same reason wroteOK above is an atomic.Bool: Read is called from
+// net/http's write goroutine, and send's caller reads n only after Do
+// returns, on a different goroutine - a plain field would be a data race
+// go test -race catches.
+type countingReader struct {
+	r io.Reader
+	n atomic.Int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		c.n.Add(int64(n))
+	}
+	return n, err
 }
 
 // objectURL builds the URL for key against c.journal's endpoint, bucket,
@@ -443,7 +499,10 @@ func (c *Client) objectURL(key string) *url.URL {
 // classify decides whether a response or send error is worth retrying and
 // which sentinel it sorts under. resp is non-nil exactly when err is nil.
 // A nil cause with retry false means success: the caller owns resp. wrote
-// is send's httptrace signal, consulted only when r.conditional.
+// is send's combined signal - its httptrace WroteRequest trace, or proof
+// the body's bytes were all delivered to the request writer regardless of
+// what error rides along with the last of them (send's doc comment) -
+// consulted only when r.conditional.
 //
 // Retried, for r.conditional == false (Put, Get - both idempotent, so
 // retrying is always safe): transient transport errors (see

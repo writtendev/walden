@@ -1926,20 +1926,54 @@ func TestPutIfAbsentDialFailureRetries(t *testing.T) {
 	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
 	defer restore()
 
-	client := newDialFailureClient(t)
-	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
-	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+	// A zero-length body must not fool send's "delivered" signal: send's
+	// plain-http branch builds a countingReader even when r.size == 0, so
+	// without requiring r.size > 0 in that check, n.Load() >= r.size reads
+	// as true (0 >= 0) before the dial - which always fails here - ever
+	// runs. That would wrongly report the body as delivered and classify
+	// a refused dial as ErrOutcomeUnknown instead of retrying it as
+	// ErrStorageUnavailable. Covered for both schemes since only the
+	// plain-http branch unconditionally builds the counter, while the
+	// https branch already special-cases size == 0 to http.NoBody.
+	cases := []struct {
+		name string
+		size int
+	}{
+		{name: "non-empty-body", size: 1},
+		{name: "zero-length-body", size: 0},
+	}
 
-	body := []byte("x")
-	err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
-	if !errors.Is(err, store.ErrStorageUnavailable) {
-		t.Fatalf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
-	}
-	if errors.Is(err, store.ErrOutcomeUnknown) {
-		t.Errorf("a dial failure must never be ErrOutcomeUnknown: %v", err)
-	}
-	if !strings.Contains(err.Error(), fmt.Sprintf("after %d attempt", store.MaxAttemptsForTest)) {
-		t.Errorf("error = %q, want it to name %d attempts", err.Error(), store.MaxAttemptsForTest)
+	for _, tc := range cases {
+		for _, useTLS := range []bool{false, true} {
+			tc := tc
+			useTLS := useTLS
+			name := tc.name + "-http"
+			scheme := "http"
+			if useTLS {
+				name = tc.name + "-https"
+				scheme = "https"
+			}
+			t.Run(name, func(t *testing.T) {
+				client := newDialFailureClient(t)
+				j := testJournal(scheme+"://s3.fake.test", "test-bucket", "v1", true)
+				c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+				body := make([]byte, tc.size)
+				for i := range body {
+					body[i] = 'x'
+				}
+				err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(tc.size))
+				if !errors.Is(err, store.ErrStorageUnavailable) {
+					t.Fatalf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+				}
+				if errors.Is(err, store.ErrOutcomeUnknown) {
+					t.Errorf("a dial failure must never be ErrOutcomeUnknown: %v", err)
+				}
+				if !strings.Contains(err.Error(), fmt.Sprintf("after %d attempt", store.MaxAttemptsForTest)) {
+					t.Errorf("error = %q, want it to name %d attempts", err.Error(), store.MaxAttemptsForTest)
+				}
+			})
+		}
 	}
 }
 

@@ -428,7 +428,12 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (resp
 		},
 	}
 	resp, err = c.http.Do(req.WithContext(httptrace.WithClientTrace(ctx, trace)))
-	delivered := bodyCounter != nil && bodyCounter.n.Load() >= r.size
+	// r.size > 0 matters here even though the https branch above already
+	// special-cases a zero-length body to http.NoBody (bodyCounter stays
+	// nil there): the plain-http branch always builds a countingReader,
+	// zero-length or not, so without this check delivered would read
+	// 0 >= 0 as true before a single byte - or dial attempt - happened.
+	delivered := bodyCounter != nil && r.size > 0 && bodyCounter.n.Load() >= r.size
 	return resp, wroteOK.Load() || delivered, err
 }
 

@@ -644,23 +644,44 @@ func TestDeadline(t *testing.T) {
 	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
 	c := store.NewClientForTest(j, client, time.Now)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
+	t.Run("put", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
 
-	start := time.Now()
-	body := []byte("x")
-	err := c.Put(ctx, "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
-	elapsed := time.Since(start)
+		start := time.Now()
+		body := []byte("x")
+		err := c.Put(ctx, "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
+		elapsed := time.Since(start)
 
-	if elapsed > time.Second {
-		t.Errorf("Put took %s, want well under 1s", elapsed)
-	}
-	if !errors.Is(err, store.ErrStorageUnavailable) {
-		t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("errors.Is(err, context.DeadlineExceeded) = false, err = %v", err)
-	}
+		if elapsed > time.Second {
+			t.Errorf("Put took %s, want well under 1s", elapsed)
+		}
+		if !errors.Is(err, store.ErrStorageUnavailable) {
+			t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("errors.Is(err, context.DeadlineExceeded) = false, err = %v", err)
+		}
+	})
+
+	t.Run("get", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		_, err := c.Get(ctx, "v1/streams/x.json")
+		elapsed := time.Since(start)
+
+		if elapsed > time.Second {
+			t.Errorf("Get took %s, want well under 1s", elapsed)
+		}
+		if !errors.Is(err, store.ErrStorageUnavailable) {
+			t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("errors.Is(err, context.DeadlineExceeded) = false, err = %v", err)
+		}
+	})
 }
 
 func TestGetBodyStallAbortedByContext(t *testing.T) {
@@ -699,6 +720,9 @@ func TestGetBodyStallAbortedByContext(t *testing.T) {
 	}
 	if !errors.Is(err, store.ErrStorageUnavailable) {
 		t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(err, context.DeadlineExceeded) = false, err = %v", err)
 	}
 }
 
@@ -986,10 +1010,15 @@ func TestZeroByteHTTPSPut(t *testing.T) {
 
 // -----------------------------------------------------------------------
 // 13. Transport errors are retried only when transient. An untrusted TLS
-//     certificate and a caller ReaderAt shorter than the declared size are
-//     both permanent - retrying either can never succeed - so they must
+//     certificate, a caller ReaderAt shorter than the declared size, a DNS
+//     name that does not exist, a port number that cannot exist, and a TLS
+//     alert (protocol mismatch, a required client certificate) are all
+//     permanent - retrying any of them can never succeed - so they must
 //     classify as ErrStorageRefused, not ErrStorageUnavailable, and must
-//     not be retried maxAttempts times.
+//     not be retried maxAttempts times. The last three all surface as
+//     *net.OpError, the same as the connection-level failures that must
+//     still be retried, so classify has to tell them apart by more than
+//     the type alone.
 // -----------------------------------------------------------------------
 
 func TestTLSCertificateErrorIsPermanent(t *testing.T) {
@@ -1075,6 +1104,138 @@ func TestShortReaderAtIsPermanent(t *testing.T) {
 	}
 	if errors.Is(err, store.ErrStorageUnavailable) {
 		t.Errorf("a short ReaderAt must not be classified as transient: %v", err)
+	}
+}
+
+// TestDNSNotFoundIsPermanent uses the .invalid TLD, which RFC 2606 reserves
+// as guaranteed never to resolve, so the lookup fails the same way a typo
+// in a journal URL (or virtual-hosted addressing against a bucket with no
+// wildcard DNS) would. The backoff is set to an hour: if classify ever
+// regresses to retrying this, the test - bounded by ctx - fails instead of
+// hanging.
+func TestDNSNotFoundIsPermanent(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Hour, time.Hour)
+	defer restore()
+
+	j := testJournal("http://walden-nonexistent.invalid", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, http.DefaultClient, fixedClock(time.Now()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	body := []byte("x")
+	err := c.Put(ctx, "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Put succeeded against a DNS name that does not exist")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Put took %s, want a single fast attempt (a retry would sleep up to 1h)", elapsed)
+	}
+	if !errors.Is(err, store.ErrStorageRefused) {
+		t.Errorf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
+	}
+	if errors.Is(err, store.ErrStorageUnavailable) {
+		t.Errorf("a nonexistent DNS name must not be classified as transient: %v", err)
+	}
+}
+
+// TestInvalidPortIsPermanent uses a port number outside 0-65535, which
+// net.Dial rejects locally (an *net.AddrError) before any network I/O, the
+// same way a malformed journal URL would.
+func TestInvalidPortIsPermanent(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Hour, time.Hour)
+	defer restore()
+
+	j := testJournal("http://s3.fake.test:99999", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, http.DefaultClient, fixedClock(time.Now()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	body := []byte("x")
+	err := c.Put(ctx, "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Put succeeded against an impossible port")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Put took %s, want a single fast attempt (a retry would sleep up to 1h)", elapsed)
+	}
+	if !errors.Is(err, store.ErrStorageRefused) {
+		t.Errorf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
+	}
+	if errors.Is(err, store.ErrStorageUnavailable) {
+		t.Errorf("an invalid port must not be classified as transient: %v", err)
+	}
+}
+
+// TestTLSAlertIsPermanent points a client that refuses to negotiate above
+// TLS 1.2 at a server that requires TLS 1.3, so the server sends a
+// protocol-version alert while parsing ClientHello - before either side
+// considers the handshake complete - and crypto/tls wraps it as
+// *net.OpError{Op: "remote error"}, the same shape any other alert takes.
+// (A ClientAuth-required-but-absent repro was tried first and rejected: in
+// TLS 1.3 the client's Handshake call can return success before the server
+// finishes validating the (absent) client certificate, so the failure
+// racily surfaces as a local "write: use of closed network connection"
+// instead of the alert this test needs.)
+func TestTLSAlertIsPermanent(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Hour, time.Hour)
+	defer restore()
+
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(handler))
+	srv.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+	srv.StartTLS()
+	defer srv.Close()
+
+	addr := srv.Listener.Addr().String()
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			MaxVersion:         tls.VersionTLS12,
+		},
+	}
+	client := &http.Client{Transport: transport}
+
+	j := testJournal("https://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	body := []byte("x")
+	err := c.Put(ctx, "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Put succeeded despite a TLS version the server does not accept")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Put took %s, want a single fast attempt (a retry would sleep up to 1h)", elapsed)
+	}
+	if !errors.Is(err, store.ErrStorageRefused) {
+		t.Errorf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
+	}
+	if errors.Is(err, store.ErrStorageUnavailable) {
+		t.Errorf("a TLS alert must not be classified as transient: %v", err)
+	}
+	if reqCount != 0 {
+		t.Errorf("server handler ran %d times, want 0 (the TLS handshake must fail first)", reqCount)
 	}
 }
 

@@ -150,7 +150,7 @@ func (b *getBody) Read(p []byte) (int, error) {
 			b.r.method+" "+b.r.key,
 			err.Error(),
 			fixFor(ErrStorageUnavailable),
-			ErrStorageUnavailable,
+			fmt.Errorf("%w: %w", ErrStorageUnavailable, err),
 		)
 	}
 	return n, err
@@ -398,11 +398,22 @@ func isRetryableStatus(status int) bool {
 // been observed for the same underlying "the connection died" event from
 // WALD-20's plan - so this checks for a *net.OpError (the type net/http
 // wraps every one of those in) rather than enumerating every spelling.
-// Anything else (an untrusted TLS certificate - a
-// *tls.CertificateVerificationError, not a *net.OpError - a caller
-// ReaderAt shorter than the declared size, a malformed request) is
-// permanent: no number of retries changes the outcome, so classify must
-// not guess "storage is down" and tell the operator to wait.
+//
+// Not every *net.OpError is connection-level, though, and three permanent
+// cases are excluded before that check fires: a DNS name that does not
+// exist (*net.DNSError with IsNotFound - a typo in the journal URL, or
+// virtual-hosted addressing against a bucket with no wildcard DNS), a port
+// number that cannot exist (*net.AddrError), and a TLS alert (crypto/tls
+// wraps both the alert it received and the alert it sent as a
+// *net.OpError, with Op "remote error" and "local error" respectively - an
+// unsupported protocol version, a required client certificate, and so on).
+// None of those three can ever succeed on retry.
+//
+// Anything that is not a *net.OpError at all (an untrusted TLS
+// certificate - a *tls.CertificateVerificationError - a caller ReaderAt
+// shorter than the declared size, a malformed request) is permanent for
+// the same reason: no number of retries changes the outcome, so classify
+// must not guess "storage is down" and tell the operator to wait.
 func retryableTransportError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
@@ -414,8 +425,21 @@ func retryableTransportError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return false
+	}
+	var addrErr *net.AddrError
+	if errors.As(err, &addrErr) {
+		return false
+	}
+
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
+		if opErr.Op == "remote error" || opErr.Op == "local error" {
+			return false
+		}
 		return true
 	}
 	return false

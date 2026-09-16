@@ -1127,8 +1127,18 @@ In accordance with Walden's operator-facing refusal convention (`refusal.Refusal
    ```
    refusal: journal append failed: storage provider does not support compare-and-swap (CAS) conditional writes (verify bucket provider compatibility in spec)
    ```
+6. **Journal URL Names a Provider Known to Lack CAS (boot pre-flight):**
+   ```
+   invalid journal: <provider> does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.1)
+   ```
+   This is a different condition from item 5, not the same one reworded. It is refused at
+   boot, from the journal URL's hostname alone, before any request reaches the bucket — so
+   it names the `WALDEN_JOURNAL` knob rather than opening with `refusal:`, and it names the
+   provider. It is a fast pre-flight against a table of providers already known to lack CAS,
+   not the compare-and-swap check itself; that check is a boot-time probe of the bucket and
+   is not implemented yet (see section 11.2).
 
-These five messages, the `If-None-Match: *` precondition, and the derivation of the append target key are pinned by [`fixtures/conditional_append.json`](fixtures/conditional_append.json).
+These six messages, the `If-None-Match: *` precondition, and the derivation of the append target key are pinned by [`fixtures/conditional_append.json`](fixtures/conditional_append.json).
 
 ---
 

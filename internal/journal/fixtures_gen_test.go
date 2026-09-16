@@ -755,10 +755,11 @@ func txKeyRow(stream journal.StreamID, seq journal.Seq, description string) txKe
 }
 
 type fencingRefusableFixture struct {
-	Case    string           `json:"case"`
-	Stream  journal.StreamID `json:"stream,omitempty"`
-	Seq     *journal.Seq     `json:"seq,omitempty"`
-	Message string           `json:"message"`
+	Case     string           `json:"case"`
+	Stream   journal.StreamID `json:"stream,omitempty"`
+	Seq      *journal.Seq     `json:"seq,omitempty"`
+	Provider string           `json:"provider,omitempty"`
+	Message  string           `json:"message"`
 }
 
 func buildConditionalAppendFixture() conditionalAppendFixture {
@@ -788,6 +789,7 @@ func buildConditionalAppendFixture() conditionalAppendFixture {
 			{Case: "fenced_by_conflict_meta_stream", Stream: journal.MetaStreamID, Seq: &seq7, Message: journal.RefuseStreamFenced(journal.MetaStreamID, seq7).Error()},
 			{Case: "permanently_fenced_meta_stream", Stream: journal.MetaStreamID, Message: journal.RefusePermanentlyFenced(journal.MetaStreamID).Error()},
 			{Case: "storage_provider_lacks_cas", Message: journal.RefuseCASNotSupported().Error()},
+			{Case: "provider_known_without_cas", Provider: "Wasabi", Message: journal.RefuseProviderLacksCAS("Wasabi").Error()},
 		},
 	}
 }

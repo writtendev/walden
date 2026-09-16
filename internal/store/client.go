@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/writtendev/walden/internal/refusal"
@@ -87,6 +88,18 @@ func NewClient(j *Journal) *Client {
 				DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
 				TLSHandshakeTimeout:   tlsHandshakeTimeout,
 				ResponseHeaderTimeout: responseHeaderTimeout,
+			},
+			// A PUT answered with a 3xx would otherwise be replayed by
+			// net/http as a bodyless GET to Location: if that GET comes
+			// back 2xx, classify would see success and Put would return
+			// nil having written nothing - an acknowledged push that
+			// never reached the journal. A GET redirected cross-host
+			// would also carry X-Amz-Security-Token to whatever Location
+			// names, since net/http only strips Authorization on
+			// cross-host redirects, not custom headers. Every 3xx must
+			// instead reach classify as a response, never be followed.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
 			},
 		},
 		now: time.Now,
@@ -184,7 +197,16 @@ func (c *Client) do(ctx context.Context, r objectRequest) (*http.Response, error
 			break
 		}
 
-		timer := time.NewTimer(backoff(attempts))
+		wait := backoff(attempts)
+		if d, ok := ctx.Deadline(); ok && time.Until(d) < wait {
+			// ctx will end before the planned wake-up. Stop now rather
+			// than sleep into the deadline: report the real cause (a 503,
+			// say) instead of letting it be replaced by a context error
+			// once ctx.Done fires mid-sleep.
+			return nil, c.refuse(r, attempts, lastCause)
+		}
+
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -233,9 +255,19 @@ func (c *Client) send(ctx context.Context, r objectRequest, now time.Time) (*htt
 		// every provider in the support matrix accepts; aws-chunked is
 		// not (GCS's XML API, for example). This has not been verified
 		// against every provider walden supports - see WALD-20's plan.
-		section := io.NewSectionReader(r.body, 0, r.size)
 		req.ContentLength = r.size
-		req.Body = io.NopCloser(section)
+		if r.size == 0 {
+			// For client requests, Go treats ContentLength == 0 with a
+			// non-nil Body as "length unknown" and sends
+			// Transfer-Encoding: chunked instead of Content-Length: 0.
+			// S3 answers a chunked, Content-Length-less PUT with 411
+			// MissingContentLength. http.NoBody makes Go send
+			// Content-Length: 0 with no body and no chunking.
+			req.Body = http.NoBody
+		} else {
+			section := io.NewSectionReader(r.body, 0, r.size)
+			req.Body = io.NopCloser(section)
+		}
 		signV4(req, creds, region, "s3", unsignedPayload, now)
 	default:
 		// Plain http has no transport integrity, so the body is signed
@@ -304,16 +336,25 @@ func (c *Client) objectURL(key string) *url.URL {
 // which sentinel it sorts under. resp is non-nil exactly when err is nil.
 // A nil cause with retry false means success: the caller owns resp.
 //
-// Retried: transport errors, 408, 429, 500, 502, 503, 504, and 400 with S3
-// Code "RequestTimeout". An unconditional PUT to a fixed key and a GET are
-// both idempotent, so retrying them is safe.
+// Retried: transient transport errors (see retryableTransportError), 408,
+// 429, 500, 502, 503, 504, and 400 with S3 Code "RequestTimeout". An
+// unconditional PUT to a fixed key and a GET are both idempotent, so
+// retrying them is safe.
 //
 // Permanent: every other status, including 301 (wrong region), other 400s,
 // 403, 404 (NoSuchBucket, on a PUT), and 501. A 404 with S3 Code
 // "NoSuchKey" is ErrObjectNotFound rather than ErrStorageRefused.
+//
+// A send error (resp == nil) is retried only when it is one of the
+// transport errors named above or ctx ending; everything else - an
+// untrusted TLS certificate, a caller ReaderAt shorter than size, a
+// malformed request - is permanent, since retrying it can never succeed.
 func classify(resp *http.Response, err error) (retry bool, cause error) {
 	if err != nil {
-		return true, fmt.Errorf("%w: %w", ErrStorageUnavailable, err)
+		if retryableTransportError(err) {
+			return true, fmt.Errorf("%w: %w", ErrStorageUnavailable, err)
+		}
+		return false, fmt.Errorf("%w: %s", ErrStorageRefused, err.Error())
 	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
@@ -333,7 +374,7 @@ func classify(resp *http.Response, err error) (retry bool, cause error) {
 		}
 		return false, fmt.Errorf("%w: %d %s", ErrStorageRefused, resp.StatusCode, code)
 	default:
-		return false, fmt.Errorf("%w: %s", ErrStorageRefused, resp.Status)
+		return false, fmt.Errorf("%w: %s", ErrStorageRefused, statusDetail(resp))
 	}
 }
 
@@ -346,6 +387,31 @@ func isRetryableStatus(status int) bool {
 	default:
 		return false
 	}
+}
+
+// retryableTransportError reports whether err - a failure to send a
+// request or read its response, before any status line arrived - is worth
+// retrying: ctx ending, a per-attempt transport timeout, a connection reset
+// or refused, or an EOF. Those are the transient cases named in WALD-20's
+// plan. Anything else (an untrusted TLS certificate, a caller ReaderAt
+// shorter than the declared size, a malformed request) is permanent: no
+// number of retries changes the outcome, so classify must not guess
+// "storage is down" and tell the operator to wait.
+func retryableTransportError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	return false
 }
 
 // statusDetail names a retryable non-2xx response for the why line: the

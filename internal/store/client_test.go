@@ -63,6 +63,13 @@ func newFakeServer(t *testing.T, useTLS bool, handler http.HandlerFunc) *http.Cl
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
 	client.Transport = transport
+	// Match production's NewClient: never follow a redirect. Without this,
+	// a fake server's 3xx with a Location header would be silently
+	// followed by this *http.Client itself, and a test could never observe
+	// what classify actually does with a 3xx response.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	return client
 }
 
@@ -851,6 +858,323 @@ func TestObjectURLBuilding(t *testing.T) {
 			}
 			if strings.Contains(tt.key, " ") && strings.Contains(gotRawPath, " ") {
 				t.Errorf("RawPath %q was not percent-encoded", gotRawPath)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------
+// 11. Redirects are never followed. NewClient itself blocks them, and a
+//     PUT or GET answered with a 3xx-plus-Location sees the 3xx as
+//     classify does - a permanent refusal - instead of net/http silently
+//     replaying it as a GET to Location.
+// -----------------------------------------------------------------------
+
+func TestNewClientBlocksRedirects(t *testing.T) {
+	j := testJournal("https://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClient(j)
+	if err := store.CheckRedirectForTest(c); err != http.ErrUseLastResponse {
+		t.Fatalf("CheckRedirect = %v, want http.ErrUseLastResponse", err)
+	}
+}
+
+func TestPutRedirectNotFollowed(t *testing.T) {
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		if r.Method == http.MethodPut {
+			io.Copy(io.Discard, r.Body)
+			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+			return
+		}
+		// Only reached if the redirect was followed: a bodyless GET to
+		// Location that a broken client would see as a successful write.
+		w.WriteHeader(http.StatusOK)
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	body := []byte("x")
+	err := c.Put(context.Background(), "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
+	if err == nil {
+		t.Fatal("Put succeeded following a redirect: nothing was actually written")
+	}
+	if !errors.Is(err, store.ErrStorageRefused) {
+		t.Errorf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
+	}
+	if errors.Is(err, store.ErrStorageUnavailable) {
+		t.Errorf("a redirect must not read as ErrStorageUnavailable (retryable): %v", err)
+	}
+	if reqCount != 1 {
+		t.Errorf("server saw %d requests, want 1 (the redirect must not be followed)", reqCount)
+	}
+}
+
+func TestGetRedirectNotFollowedNoLeak(t *testing.T) {
+	var reqCount int32
+	var foreignHit bool
+	var foreignToken string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		if strings.Contains(r.URL.Path, "foreign") {
+			// Only reached if the redirect was followed: a request that
+			// would otherwise never happen, carrying whatever credentials
+			// net/http chose to forward.
+			foreignHit = true
+			foreignToken = r.Header.Get("X-Amz-Security-Token")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("evil bytes"))
+			return
+		}
+		http.Redirect(w, r, "http://evil.test/foreign", http.StatusMovedPermanently)
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	j.Credentials.SessionToken = "FQoGZXIvYXdzEB0aDPS3SECRETTOKENVALUE"
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	rc, err := c.Get(context.Background(), "v1/streams/x.json")
+	if err == nil {
+		rc.Close()
+		t.Fatal("Get succeeded following a redirect")
+	}
+	if !errors.Is(err, store.ErrStorageRefused) {
+		t.Errorf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
+	}
+	if foreignHit {
+		t.Errorf("the redirect target was contacted, X-Amz-Security-Token = %q", foreignToken)
+	}
+	if reqCount != 1 {
+		t.Errorf("server saw %d requests, want 1 (the redirect must not be followed)", reqCount)
+	}
+}
+
+// -----------------------------------------------------------------------
+// 12. A zero-byte PUT over https sends Content-Length: 0 with no
+//     Transfer-Encoding, so S3 does not answer 411 MissingContentLength.
+// -----------------------------------------------------------------------
+
+func TestZeroByteHTTPSPut(t *testing.T) {
+	var gotContentLength int64
+	var gotTransferEncoding []string
+	var gotBodyLen int
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		gotContentLength = r.ContentLength
+		gotTransferEncoding = r.TransferEncoding
+		got, _ := io.ReadAll(r.Body)
+		gotBodyLen = len(got)
+		w.WriteHeader(http.StatusOK)
+	}
+	client := newFakeServer(t, true, handler)
+	j := testJournal("https://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	if err := c.Put(context.Background(), "v1/streams/empty.pack", bytes.NewReader(nil), 0); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if gotContentLength != 0 {
+		t.Errorf("Content-Length = %d, want 0", gotContentLength)
+	}
+	if len(gotTransferEncoding) != 0 {
+		t.Errorf("Transfer-Encoding = %v, want none", gotTransferEncoding)
+	}
+	if gotBodyLen != 0 {
+		t.Errorf("server received %d body bytes, want 0", gotBodyLen)
+	}
+}
+
+// -----------------------------------------------------------------------
+// 13. Transport errors are retried only when transient. An untrusted TLS
+//     certificate and a caller ReaderAt shorter than the declared size are
+//     both permanent - retrying either can never succeed - so they must
+//     classify as ErrStorageRefused, not ErrStorageUnavailable, and must
+//     not be retried maxAttempts times.
+// -----------------------------------------------------------------------
+
+func TestTLSCertificateErrorIsPermanent(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}
+	srv := httptest.NewTLSServer(http.HandlerFunc(handler))
+	defer srv.Close()
+
+	addr := srv.Listener.Addr().String()
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+		// Deliberately no InsecureSkipVerify and no custom RootCAs: the
+		// fake server's self-signed leaf must fail real verification, the
+		// same as a misconfigured endpoint or a private CA walden was
+		// never told to trust.
+	}
+	client := &http.Client{Transport: transport}
+
+	j := testJournal("https://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	body := []byte("x")
+	err := c.Put(context.Background(), "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
+	if err == nil {
+		t.Fatal("Put succeeded against an untrusted certificate")
+	}
+	if !errors.Is(err, store.ErrStorageRefused) {
+		t.Errorf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
+	}
+	if errors.Is(err, store.ErrStorageUnavailable) {
+		t.Errorf("an untrusted certificate must not be classified as transient: %v", err)
+	}
+	if reqCount != 0 {
+		t.Errorf("server handler ran %d times, want 0 (the TLS handshake must fail first)", reqCount)
+	}
+}
+
+// shortReaderAt reports fewer bytes than a caller-declared size, the way a
+// pack file truncated on disk after the caller measured it would.
+type shortReaderAt struct {
+	data []byte
+}
+
+func (s shortReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func TestShortReaderAtIsPermanent(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	// Declares 10 bytes but the ReaderAt only ever has 3.
+	err := c.Put(context.Background(), "v1/streams/short.pack", shortReaderAt{data: []byte("abc")}, 10)
+	if err == nil {
+		t.Fatal("Put succeeded reading past the end of a short ReaderAt")
+	}
+	if !errors.Is(err, store.ErrStorageRefused) {
+		t.Errorf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
+	}
+	if errors.Is(err, store.ErrStorageUnavailable) {
+		t.Errorf("a short ReaderAt must not be classified as transient: %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------
+// 14. A deadline shorter than the next backoff stops at once instead of
+//     sleeping past it, and reports the real cause (a 503) rather than
+//     letting it be replaced by a context error. Both Put and Get.
+// -----------------------------------------------------------------------
+
+func TestDeadlineShorterThanBackoffStopsWithoutSleeping(t *testing.T) {
+	// base == cap == 1h makes the planned wait, uniformly random in
+	// [0, 1h], overwhelmingly likely to exceed the 300ms deadline below;
+	// the failure probability is about 300ms/1h (~1 in 12000).
+	restore := store.SetBackoffForTest(time.Hour, time.Hour)
+	defer restore()
+
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write(xmlError("SlowDown"))
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	t.Run("put", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		body := []byte("x")
+		err := c.Put(ctx, "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
+		elapsed := time.Since(start)
+
+		if elapsed > time.Second {
+			t.Errorf("Put took %s, want well under 1s (must not sleep into the deadline)", elapsed)
+		}
+		if !errors.Is(err, store.ErrStorageUnavailable) {
+			t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+		}
+		if !strings.Contains(err.Error(), "503") {
+			t.Errorf("error = %q, want the 503 cause preserved instead of a context error", err.Error())
+		}
+	})
+
+	t.Run("get", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		_, err := c.Get(ctx, "v1/streams/x.json")
+		elapsed := time.Since(start)
+
+		if elapsed > time.Second {
+			t.Errorf("Get took %s, want well under 1s (must not sleep into the deadline)", elapsed)
+		}
+		if !errors.Is(err, store.ErrStorageUnavailable) {
+			t.Errorf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+		}
+		if !strings.Contains(err.Error(), "503") {
+			t.Errorf("error = %q, want the 503 cause preserved instead of a context error", err.Error())
+		}
+	})
+}
+
+// -----------------------------------------------------------------------
+// 15. A permanent refusal's why line names the S3 Code, not just the HTTP
+//     status text, for every status - including the default branch that
+//     previously dropped it.
+// -----------------------------------------------------------------------
+
+func TestPermanentRefusalIncludesCode(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		code   string
+	}{
+		{"403-access-denied", http.StatusForbidden, "AccessDenied"},
+		{"403-signature-does-not-match", http.StatusForbidden, "SignatureDoesNotMatch"},
+		{"403-request-time-too-skewed", http.StatusForbidden, "RequestTimeTooSkewed"},
+		{"301-permanent-redirect", http.StatusMovedPermanently, "PermanentRedirect"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := func(w http.ResponseWriter, r *http.Request) {
+				io.Copy(io.Discard, r.Body)
+				w.WriteHeader(tt.status)
+				w.Write(xmlError(tt.code))
+			}
+			client := newFakeServer(t, false, handler)
+			j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+			c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+			body := []byte("x")
+			err := c.Put(context.Background(), "v1/streams/x.pack", bytes.NewReader(body), int64(len(body)))
+			if err == nil {
+				t.Fatal("Put succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), tt.code) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tt.code)
 			}
 		})
 	}

@@ -124,3 +124,12 @@ func SetBackoffForTest(base, cap time.Duration) (restore func()) {
 
 // MaxAttemptsForTest exposes maxAttempts.
 const MaxAttemptsForTest = maxAttempts
+
+// CheckRedirectForTest calls c's underlying http.Client.CheckRedirect (as
+// NewClient built it) and reports the error it returns, so a test can
+// confirm production blocks redirects - http.ErrUseLastResponse - without
+// following them, independent of whatever client a test injects through
+// NewClientForTest.
+func CheckRedirectForTest(c *Client) error {
+	return c.http.CheckRedirect(nil, nil)
+}

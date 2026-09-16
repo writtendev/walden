@@ -80,7 +80,8 @@ func (c *Config) String() string {
 // Kubernetes secret file holding one newline, or a Helm value that renders
 // blank, is a mistake, not a decision to run without a journal — and walden's
 // first promise is that an acknowledged push is in the journal. Journal-less
-// mode stays reachable by leaving the knob unset, deliberately.
+// mode stays reachable by leaving the flag unset, or by an unset or empty
+// WALDEN_JOURNAL, deliberately.
 func refuseWhitespaceJournal(raw string) error {
 	if raw == "" || strings.TrimSpace(raw) != "" {
 		return nil
@@ -192,8 +193,16 @@ func LoadWithEnv(args []string, lookupEnv func(string) (string, bool)) (*Config,
 	// Trimmed once, here, so that every later reader — Validate, String,
 	// and the deep parse in internal/store — sees the same value. A value
 	// that was given and is only whitespace is refused rather than trimmed
-	// down to unset; see refuseWhitespaceJournal.
+	// down to unset; see refuseWhitespaceJournal. An empty --journal is
+	// refused too: fs.Visit proves the operator typed the flag, so booting
+	// journal-less silently would be the same failure by another route. An
+	// empty WALDEN_JOURNAL is treated as unset instead — docker run -e
+	// WALDEN_JOURNAL with nothing set on the host leaves it empty for a
+	// variable nobody meant to set, not a decision to run without a journal.
 	if setFlags["journal"] {
+		if flagJournal == "" {
+			return nil, flagPrintConfig, errors.New("invalid journal: --journal was given an empty value (give a URL such as s3://bucket/prefix, or leave the journal unset for journal-less mode)")
+		}
 		if err := refuseWhitespaceJournal(flagJournal); err != nil {
 			return nil, flagPrintConfig, err
 		}

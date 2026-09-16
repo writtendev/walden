@@ -355,6 +355,75 @@ func TestWhitespaceOnlyJournalIsRefused(t *testing.T) {
 	}
 }
 
+// TestEmptyJournalFlagIsRefused is the regression for the last silent way to
+// get a durability-free walden: unlike WALDEN_JOURNAL, an empty --journal
+// cannot be a variable nobody meant to set — fs.Visit proves the operator
+// typed the flag, so an empty value is refused rather than treated as unset.
+// WALDEN_JOURNAL keeps the opposite answer on purpose: empty stays unset, so
+// docker run -e WALDEN_JOURNAL with nothing set on the host still boots
+// journal-less.
+func TestEmptyJournalFlagIsRefused(t *testing.T) {
+	const wantSub = "invalid journal:"
+
+	assertRefusal := func(t *testing.T, what string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s accepted an empty --journal", what)
+		}
+		if !strings.Contains(err.Error(), wantSub) {
+			t.Errorf("%s error = %q, want substring %q", what, err.Error(), wantSub)
+		}
+		if !strings.Contains(err.Error(), "--journal") {
+			t.Errorf("%s error = %q, want it to name --journal", what, err.Error())
+		}
+		if strings.ContainsAny(err.Error(), "\n\r") {
+			t.Errorf("%s error %q is not a single line", what, err.Error())
+		}
+	}
+
+	emptyEnv := func(string) (string, bool) { return "", false }
+
+	_, _, err := config.LoadWithEnv([]string{"--journal", ""}, emptyEnv)
+	assertRefusal(t, "LoadWithEnv(--journal '')", err)
+
+	_, _, err = config.LoadWithEnv([]string{"--journal="}, emptyEnv)
+	assertRefusal(t, "LoadWithEnv(--journal=)", err)
+
+	// The flag wins over a real WALDEN_JOURNAL, and must not silently turn
+	// that journal off instead of refusing.
+	_, _, err = config.LoadWithEnv([]string{"--journal", ""}, func(key string) (string, bool) {
+		if key == config.EnvJournal {
+			return "s3://env-bucket/walden", true
+		}
+		return "", false
+	})
+	assertRefusal(t, "LoadWithEnv(--journal '') over WALDEN_JOURNAL", err)
+
+	// --print-config does not bypass the refusal.
+	_, printConfig, err := config.LoadWithEnv([]string{"--journal", "", "--print-config"}, emptyEnv)
+	assertRefusal(t, "LoadWithEnv(--journal '' --print-config)", err)
+	if !printConfig {
+		t.Errorf("printConfig = false, want true even on refusal")
+	}
+
+	// WALDEN_JOURNAL set to empty is unchanged: still unset, still journal-less.
+	cfg, _, err := config.LoadWithEnv(nil, func(key string) (string, bool) {
+		if key == config.EnvJournal {
+			return "", true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatalf("LoadWithEnv with empty WALDEN_JOURNAL refused: %v", err)
+	}
+	if cfg.JournalURL != "" {
+		t.Errorf("JournalURL = %q, want empty for an empty WALDEN_JOURNAL", cfg.JournalURL)
+	}
+	if got, want := cfg.String(), "journal: (disabled)"; !strings.Contains(got, want) {
+		t.Errorf("String() = %q, want it to contain %q", got, want)
+	}
+}
+
 // TestJournalURLIsTrimmed is the regression for the least actionable refusal
 // walden could produce. A journal URL out of a file-backed Kubernetes secret or
 // a .env line arrives with a trailing newline; walden refused it as "malformed,

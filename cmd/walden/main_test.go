@@ -71,6 +71,12 @@ func TestRunUsageAndVersion(t *testing.T) {
 			wantErrSub: "invalid listen:",
 		},
 		{
+			name:       "serve-empty-journal-flag",
+			args:       []string{"walden", "serve", "--journal", "", "--print-config"},
+			wantErr:    true,
+			wantErrSub: "invalid journal:",
+		},
+		{
 			name:       "version",
 			args:       []string{"walden", "version"},
 			wantErr:    false,

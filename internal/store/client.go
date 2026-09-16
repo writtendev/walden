@@ -391,12 +391,14 @@ func isRetryableStatus(status int) bool {
 
 // retryableTransportError reports whether err - a failure to send a
 // request or read its response, before any status line arrived - is worth
-// retrying: ctx ending, a per-attempt transport timeout, a connection reset
-// or refused, or an EOF. Those are the transient cases named in WALD-20's
-// plan. Anything else (an untrusted TLS certificate, a caller ReaderAt
-// shorter than the declared size, a malformed request) is permanent: no
-// number of retries changes the outcome, so classify must not guess
-// "storage is down" and tell the operator to wait.
+// retrying: ctx ending, a per-attempt transport timeout, a connection reset,
+// refused, or otherwise gone (net.ErrClosed - Go's own sentinel for "the
+// connection ended under us", however the platform spelled it), or an EOF.
+// Those are the transient cases named in WALD-20's plan. Anything else (an
+// untrusted TLS certificate, a caller ReaderAt shorter than the declared
+// size, a malformed request) is permanent: no number of retries changes the
+// outcome, so classify must not guess "storage is down" and tell the
+// operator to wait.
 func retryableTransportError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
@@ -409,6 +411,9 @@ func retryableTransportError(err error) bool {
 		return true
 	}
 	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
 	return false

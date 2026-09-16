@@ -76,6 +76,28 @@ func RefusePermanentlyFenced(stream StreamID) error {
 	)
 }
 
+// RefuseAppendOutcomeUnknown returns a single-line operator-facing refusal when a
+// conditional append's outcome could not be proven either way (store.ErrOutcomeUnknown,
+// WALD-22). The instance treats the stream as fenced exactly as it does for a 412
+// (spec/journal/v1 section 11.4 item 6): a resend risks a 412 caused by this writer's own
+// earlier, unacknowledged attempt, so it never resends, never re-reads the key, and stops.
+func RefuseAppendOutcomeUnknown(stream StreamID, seq Seq) error {
+	if stream == MetaStreamID {
+		return refusal.RefuseWithCause(
+			"refusal: meta operation failed",
+			fmt.Sprintf("stream %s append at seq %d has unknown outcome", stream, seq),
+			"instance is fenced for this stream; restart walden process to re-materialize from journal",
+			ErrFenced,
+		)
+	}
+	return refusal.RefuseWithCause(
+		"refusal: push failed",
+		fmt.Sprintf("stream %s append at seq %d has unknown outcome", stream, seq),
+		"instance is fenced for this stream; restart walden process to re-materialize from journal",
+		ErrFenced,
+	)
+}
+
 // RefuseCASNotSupported returns a single-line operator-facing refusal when the storage provider does not support CAS.
 func RefuseCASNotSupported() error {
 	return refusal.RefuseWithCause(
@@ -102,7 +124,10 @@ func RefuseProviderLacksCAS(provider string) error {
 
 // Fencer tracks single-writer per-stream fencing state in-memory on a walden instance.
 // When a writer receives HTTP 412 Precondition Failed during a conditional write to tx/<seq>.json,
-// the stream permanently transitions to fenced on this instance.
+// the stream permanently transitions to fenced on this instance. The same happens when a
+// conditional write's outcome cannot be proven either way (see HandleOutcomeUnknown) - the
+// journal package cannot import store (that would cycle), so the mapping from
+// store.ErrOutcomeUnknown to HandleOutcomeUnknown is the caller's job (WALD-29).
 // Fencing is strictly isolated per stream: fencing stream A leaves stream B and _meta unaffected.
 type Fencer struct {
 	mu     sync.RWMutex
@@ -179,6 +204,15 @@ func (f *Fencer) CheckWritable(stream StreamID) error {
 func (f *Fencer) HandleConflict(stream StreamID, seq Seq) error {
 	f.FenceStream(stream, seq)
 	return RefuseStreamFenced(stream, seq)
+}
+
+// HandleOutcomeUnknown transitions the stream to fenced at sequence seq and returns
+// RefuseAppendOutcomeUnknown, mirroring HandleConflict for a proven 412. Unlike HandleConflict,
+// this fires when the append's outcome could not be proven either way; the fencing response is
+// identical either way, by spec/journal/v1 section 11.4 item 6.
+func (f *Fencer) HandleOutcomeUnknown(stream StreamID, seq Seq) error {
+	f.FenceStream(stream, seq)
+	return RefuseAppendOutcomeUnknown(stream, seq)
 }
 
 // Reset clears all fenced streams. Used primarily in test suites.

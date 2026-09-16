@@ -102,6 +102,28 @@ func TestRefusalMessagesSingleLineAndFormat(t *testing.T) {
 	if msgProviderCAS != expectedProviderCAS {
 		t.Errorf("refusal mismatch:\ngot:  %q\nwant: %q", msgProviderCAS, expectedProviderCAS)
 	}
+
+	// 7. RefuseAppendOutcomeUnknown on repository stream
+	errOutcome := journal.RefuseAppendOutcomeUnknown("repo-alpha", 3)
+	msgOutcome := errOutcome.Error()
+	if strings.ContainsAny(msgOutcome, "\n\r") {
+		t.Errorf("refusal message is not a single line: %q", msgOutcome)
+	}
+	expectedOutcome := "refusal: push failed: stream repo-alpha append at seq 3 has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)"
+	if msgOutcome != expectedOutcome {
+		t.Errorf("refusal mismatch:\ngot:  %q\nwant: %q", msgOutcome, expectedOutcome)
+	}
+
+	// 8. RefuseAppendOutcomeUnknown on meta stream
+	errOutcomeMeta := journal.RefuseAppendOutcomeUnknown(journal.MetaStreamID, 7)
+	msgOutcomeMeta := errOutcomeMeta.Error()
+	if strings.ContainsAny(msgOutcomeMeta, "\n\r") {
+		t.Errorf("refusal message is not a single line: %q", msgOutcomeMeta)
+	}
+	expectedOutcomeMeta := "refusal: meta operation failed: stream _meta append at seq 7 has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)"
+	if msgOutcomeMeta != expectedOutcomeMeta {
+		t.Errorf("refusal mismatch:\ngot:  %q\nwant: %q", msgOutcomeMeta, expectedOutcomeMeta)
+	}
 }
 
 func TestFencerLifecycleAndStreamIsolation(t *testing.T) {
@@ -342,6 +364,50 @@ func TestSentinelErrorsUnificationAndErrorsIs(t *testing.T) {
 	errConflict := f.HandleConflict("repo-y", 2)
 	if !errors.Is(errConflict, journal.ErrFenced) {
 		t.Errorf("expected HandleConflict to match ErrFenced")
+	}
+}
+
+func TestHandleOutcomeUnknownFencesOnlyThatStream(t *testing.T) {
+	f := journal.NewFencer()
+
+	err := f.HandleOutcomeUnknown("repo-1", 10)
+	if err == nil {
+		t.Fatalf("expected error from HandleOutcomeUnknown, got nil")
+	}
+	if !strings.Contains(err.Error(), "stream repo-1 append at seq 10 has unknown outcome") {
+		t.Errorf("unexpected HandleOutcomeUnknown error format: %v", err)
+	}
+	if !errors.Is(err, journal.ErrFenced) {
+		t.Errorf("expected HandleOutcomeUnknown to match ErrFenced")
+	}
+
+	if !f.IsFenced("repo-1") {
+		t.Errorf("expected repo-1 to be fenced")
+	}
+	seq, ok := f.FencedSeq("repo-1")
+	if !ok || seq != 10 {
+		t.Errorf("expected FencedSeq(repo-1) = (10, true), got (%d, %v)", seq, ok)
+	}
+
+	// Stream isolation: an unrelated repo stream and _meta stay writable.
+	if f.IsFenced("repo-2") {
+		t.Errorf("stream isolation violated: repo-2 is fenced when only repo-1 was fenced")
+	}
+	if f.IsFenced(journal.MetaStreamID) {
+		t.Errorf("stream isolation violated: _meta is fenced when only repo-1 was fenced")
+	}
+	if err := f.CheckWritable("repo-2"); err != nil {
+		t.Errorf("expected repo-2 to remain writable, got %v", err)
+	}
+
+	// A subsequent write attempt on the now-fenced stream is refused without
+	// a further HandleOutcomeUnknown call, same as after HandleConflict.
+	errWritable := f.CheckWritable("repo-1")
+	if errWritable == nil {
+		t.Fatalf("expected CheckWritable(repo-1) to fail, got nil")
+	}
+	if !strings.Contains(errWritable.Error(), "stream repo-1 is permanently fenced on this instance") {
+		t.Errorf("unexpected CheckWritable refusal message: %v", errWritable)
 	}
 }
 

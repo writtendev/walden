@@ -1143,8 +1143,8 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		}
 	}
 
-	if len(fixture.Refusals) != 6 {
-		t.Fatalf("expected the six section 11.5 refusals, got %d", len(fixture.Refusals))
+	if len(fixture.Refusals) != 8 {
+		t.Fatalf("expected the eight section 11.5 refusals, got %d", len(fixture.Refusals))
 	}
 	for _, tc := range fixture.Refusals {
 		var want string
@@ -1165,6 +1165,12 @@ func TestFixtureConditionalAppend(t *testing.T) {
 				continue
 			}
 			want = journal.RefuseProviderLacksCAS(tc.Provider).Error()
+		case "append_outcome_unknown_repo_stream", "append_outcome_unknown_meta_stream":
+			if tc.Seq == nil {
+				t.Errorf("refusal %q must name the sequence", tc.Case)
+				continue
+			}
+			want = journal.RefuseAppendOutcomeUnknown(tc.Stream, *tc.Seq).Error()
 		default:
 			t.Errorf("unknown refusal case %q", tc.Case)
 			continue

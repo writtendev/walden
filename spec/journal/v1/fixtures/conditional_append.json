@@ -82,6 +82,18 @@
       "case": "provider_known_without_cas",
       "provider": "Wasabi",
       "message": "invalid journal: Wasabi does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.1)"
+    },
+    {
+      "case": "append_outcome_unknown_repo_stream",
+      "stream": "repo-alpha",
+      "seq": "3",
+      "message": "refusal: push failed: stream repo-alpha append at seq 3 has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)"
+    },
+    {
+      "case": "append_outcome_unknown_meta_stream",
+      "stream": "_meta",
+      "seq": "7",
+      "message": "refusal: meta operation failed: stream _meta append at seq 7 has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)"
     }
   ]
 }

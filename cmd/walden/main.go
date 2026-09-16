@@ -207,7 +207,12 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	fmt.Fprintf(stdout, "walden server starting on %s (data: %s, git: %s)\n", boundAddr, cfg.DataDir, gitVer)
 
 	h := githttp.NewHandler(authorizer, store.New(cfg.DataDir), cfg.JournalURL)
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: time.Minute}
+	// IdleTimeout closes keep-alive connections that go quiet, so an
+	// unauthenticated client can't pin a file descriptor forever by
+	// opening a connection and never sending a second request.
+	// ReadTimeout/WriteTimeout are deliberately unset: git transfers
+	// can legitimately run long once a request is underway.
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: time.Minute, IdleTimeout: time.Minute}
 
 	go func() {
 		<-ctx.Done()

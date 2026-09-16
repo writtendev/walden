@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -739,8 +740,8 @@ func envCredentialSource(lookupEnv func(string) (string, bool)) string {
 	return "(none found)"
 }
 
-// String renders the resolved journal for walden serve --print-config.
-// It never prints the secret.
+// String renders the resolved journal for walden serve --print-config. It
+// prints the access key ID, a public identifier, but never the secret.
 func (j *Journal) String() string {
 	style := "virtual-hosted"
 	if j.PathStyle {
@@ -758,10 +759,85 @@ func (j *Journal) String() string {
 	if credentials == "" {
 		credentials = "(unresolved)"
 	}
+	keyID := j.Credentials.AccessKeyID
+	switch {
+	case keyID == "":
+		keyID = "(not read; see journal-credentials)"
+	default:
+		// Every other field here is charset-restricted before it ever
+		// reaches String() (see validateBucket, validatePrefix,
+		// validateRegion): a prefix of "wal%0Aden" is refused outright.
+		// The access key ID is not restricted the same way, because
+		// credentialsFromURL accepts whatever net/url's percent-decoding
+		// hands it. A key ID like that still parses, so walden still
+		// boots and only fails at sign time — --print-config is what an
+		// operator reaches for to debug that — so this quotes the value
+		// instead of refusing to print it: the report stays both
+		// accurate and safe to read.
+		//
+		// This is a closed allowlist, not a blocklist of bytes known to
+		// be dangerous: a bare key ID may only contain
+		// accessKeyIDSafeByte bytes, and anything else — including
+		// every non-ASCII byte — is quoted. A blocklist keeps growing
+		// one review round at a time: C0 controls and DEL first, then
+		// C1 controls and NEL reached via percent-decoded UTF-8 (%C2%9B,
+		// %C2%85), then format characters like U+202E right-to-left
+		// override, then a comparison against strconv.Quote's own
+		// output to catch invalid UTF-8 and a literal '"' or '\\' — and
+		// still missed a trailing space, a Cyrillic homoglyph, an
+		// invisible filler letter, a bare combining mark, and a key ID
+		// that spells out the "(not read; ...)" placeholder verbatim.
+		// None of those change what strconv.Quote or strconv.IsPrint
+		// would escape, because they are all printable. The allowlist
+		// closes the class in one check instead of adding another
+		// exception for each new lookalike: only visible ASCII
+		// letters, digits, '-', '_', and '.' print bare, so a bare key
+		// ID can never contain a space or the parentheses the
+		// placeholder is built from, and can never be mistaken for a
+		// quoted string.
+		//
+		// The quoted form uses QuoteToASCII rather than Quote so a
+		// homoglyph or invisible character inside the quotes is also
+		// escaped instead of printing unchanged next to the ASCII
+		// quoting around it.
+		// keyID is non-empty here (the empty case is handled above).
+		safe := true
+		for i := 0; i < len(keyID); i++ {
+			if !accessKeyIDSafeByte(keyID[i]) {
+				safe = false
+				break
+			}
+		}
+		if !safe {
+			keyID = strconv.QuoteToASCII(keyID)
+		}
+	}
 	return fmt.Sprintf(
-		"journal-provider: %s\njournal-endpoint: %s\njournal-region: %s\njournal-bucket: %s\njournal-prefix: %s\njournal-style: %s\njournal-credentials: %s",
-		provider, j.Endpoint, j.Region, j.Bucket, prefix, style, credentials,
+		"journal-provider: %s\njournal-endpoint: %s\njournal-region: %s\njournal-bucket: %s\njournal-prefix: %s\njournal-style: %s\njournal-credentials: %s\njournal-access-key-id: %s",
+		provider, j.Endpoint, j.Region, j.Bucket, prefix, style, credentials, keyID,
 	)
+}
+
+// accessKeyIDSafeByte reports whether b may appear in an access key ID that
+// Journal.String prints bare. It is deliberately a closed allowlist rather
+// than a blocklist: only visible ASCII letters, digits, '-', '_', and '.'
+// pass. Everything else — every non-ASCII byte (which can encode a
+// homoglyph, an invisible filler character, or a bare combining mark, none
+// of which strconv.Quote or strconv.IsPrint would flag), the ASCII space,
+// parentheses, and the quote and backslash bytes — forces the quoted path.
+// Excluding space and parentheses also means a bare key ID can never equal
+// the "(not read; see journal-credentials)" placeholder, and excluding the
+// quote and backslash means a bare key ID can never be mistaken for a
+// quoted one.
+func accessKeyIDSafeByte(b byte) bool {
+	switch {
+	case b >= 'A' && b <= 'Z', b >= 'a' && b <= 'z', b >= '0' && b <= '9':
+		return true
+	case b == '-' || b == '_' || b == '.':
+		return true
+	default:
+		return false
+	}
 }
 
 // pathSegments splits a URL path into its non-empty segments.

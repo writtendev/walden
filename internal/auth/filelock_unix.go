@@ -73,9 +73,9 @@ func acquireStoreLock(ctx context.Context, path string) (*storeLock, error) {
 		case <-ctx.Done():
 			f.Close()
 			return nil, refusal.RefuseWithCause(
-				"token store locked",
-				fmt.Sprintf("waiting for %s: %s", path, ctx.Err().Error()),
-				"another walden process is writing the token store; retry once it is not shutting down",
+				"boot interrupted",
+				fmt.Sprintf("stop signal received while waiting for %s", path),
+				"retry once the token store lock is free",
 				ctx.Err(),
 			)
 		case <-ticker.C:

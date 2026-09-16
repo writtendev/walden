@@ -545,10 +545,11 @@ func TestParseJournalURLLocations(t *testing.T) {
 
 func TestParseJournalURLRefusals(t *testing.T) {
 	tests := []struct {
-		name    string
-		raw     string
-		wantErr error
-		wantSub string
+		name       string
+		raw        string
+		wantErr    error
+		wantSub    string
+		wantNotSub string // if set, the refusal must not contain this
 	}{
 		{name: "empty", raw: "", wantErr: store.ErrInvalidJournal, wantSub: "URL is empty"},
 		{name: "whitespace-only", raw: "   ", wantErr: store.ErrInvalidJournal, wantSub: "URL is empty"},
@@ -614,7 +615,7 @@ func TestParseJournalURLRefusals(t *testing.T) {
 		// relocated credential at all — %40 in a prefix segment carries no
 		// credentials, and telling the operator to percent-encode
 		// credentials they never supplied would be false.
-		{name: "encoded-at-in-prefix-is-not-credentials", raw: "s3://bucket/pre%40fix", wantErr: store.ErrInvalidJournal, wantSub: "URL has an encoded '@' (%40) outside its credentials; it is not echoed because it may carry credentials"},
+		{name: "encoded-at-in-prefix-is-not-credentials", raw: "s3://bucket/pre%40fix", wantErr: store.ErrInvalidJournal, wantSub: "URL has an encoded '@' (%40) outside its credentials; it is not echoed because it may carry credentials", wantNotSub: "percent-encode reserved characters in the credentials"},
 		// A multi-byte rune in a prefix segment is quoted whole, not cut at
 		// a single byte: the old code reported the second byte of "é" as
 		// "Ã", a character the operator never typed.
@@ -634,6 +635,9 @@ func TestParseJournalURLRefusals(t *testing.T) {
 			assertOneLineRefusal(t, err)
 			if !strings.Contains(err.Error(), tt.wantSub) {
 				t.Errorf("error %q does not contain %q", err.Error(), tt.wantSub)
+			}
+			if tt.wantNotSub != "" && strings.Contains(err.Error(), tt.wantNotSub) {
+				t.Errorf("error %q contains %q, want it absent", err.Error(), tt.wantNotSub)
 			}
 			if !strings.HasPrefix(err.Error(), "invalid journal: ") {
 				t.Errorf("error %q does not name the journal knob", err.Error())

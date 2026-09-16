@@ -1757,6 +1757,87 @@ func TestPutIfAbsentAmbiguousStopsAtOnce(t *testing.T) {
 	}
 }
 
+// TestPutIfAbsentMalformedResponseAfterWriteIsAmbiguous is the other half
+// of the self-caused-412 regression: a reply classify cannot even parse as
+// HTTP - a malformed status line, a malformed header, or a reply that is
+// not HTTP at all - arriving after storage received the full request must
+// still yield ErrOutcomeUnknown, never ErrStorageRefused. ErrStorageRefused
+// tells the caller the write definitely failed and a resend is safe; that
+// is backwards once storage may already have applied it, and the resend's
+// own 412 would be misreported as a concurrent writer (spec/journal/v1
+// section 11.4 item 6). Covered over both http and https, since a TLS
+// connection hijacked mid-response encrypts these same malformed bytes
+// rather than bypassing classify's decision.
+func TestPutIfAbsentMalformedResponseAfterWriteIsAmbiguous(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	cases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"malformed-status-line", []byte("BOGUS 200 OK\r\n\r\n")},
+		{"malformed-header", []byte("HTTP/1.1 200 OK\r\nNo-Colon-Here\r\n\r\n")},
+		{"non-http-reply", []byte("+OK fake-protocol-greeting\r\n")},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		for _, useTLS := range []bool{false, true} {
+			useTLS := useTLS
+			name := tc.name + "-http"
+			if useTLS {
+				name = tc.name + "-https"
+			}
+			t.Run(name, func(t *testing.T) {
+				var reqCount int32
+				handler := func(w http.ResponseWriter, r *http.Request) {
+					atomic.AddInt32(&reqCount, 1)
+					// The full body is read - standing in for "storage
+					// durably applied the write" - before a reply classify
+					// cannot parse as HTTP at all is written back.
+					io.ReadAll(r.Body)
+					hj, ok := w.(http.Hijacker)
+					if !ok {
+						t.Fatal("ResponseWriter does not support hijacking")
+					}
+					conn, _, err := hj.Hijack()
+					if err != nil {
+						t.Fatalf("Hijack: %v", err)
+					}
+					conn.Write(tc.raw)
+					conn.Close()
+				}
+				client := newFakeServer(t, useTLS, handler)
+				scheme := "http"
+				if useTLS {
+					scheme = "https"
+				}
+				j := testJournal(scheme+"://s3.fake.test", "test-bucket", "v1", true)
+				c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+				body := []byte("x")
+				err := c.PutIfAbsent(context.Background(), "v1/streams/repo-alpha/tx/00000000000000000000.json", bytes.NewReader(body), int64(len(body)))
+				if !errors.Is(err, store.ErrOutcomeUnknown) {
+					t.Fatalf("errors.Is(err, ErrOutcomeUnknown) = false, err = %v", err)
+				}
+				if errors.Is(err, store.ErrStorageRefused) {
+					t.Errorf("ErrOutcomeUnknown must not also be ErrStorageRefused: %v", err)
+				}
+				if errors.Is(err, store.ErrStorageUnavailable) {
+					t.Errorf("ErrOutcomeUnknown must not also be ErrStorageUnavailable: %v", err)
+				}
+				if errors.Is(err, store.ErrPrecondition) {
+					t.Errorf("ErrOutcomeUnknown must not also be ErrPrecondition: %v", err)
+				}
+				if atomic.LoadInt32(&reqCount) != 1 {
+					t.Errorf("server saw %d requests, want 1 (an ambiguous attempt must never be resent)", atomic.LoadInt32(&reqCount))
+				}
+			})
+		}
+	}
+}
+
 func TestPutIfAbsentDialFailureRetries(t *testing.T) {
 	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
 	defer restore()

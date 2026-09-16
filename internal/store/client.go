@@ -462,30 +462,53 @@ func (c *Client) objectURL(key string) *url.URL {
 // transport errors named above or ctx ending; everything else - an
 // untrusted TLS certificate, a caller ReaderAt shorter than size, a
 // malformed request - is permanent, since retrying it can never succeed.
+// That is the r.conditional == false story in full; r.conditional == true
+// changes it, below.
 //
-// For r.conditional == true (PutIfAbsent), a cause that would otherwise be
-// retried is retried only when this attempt is proven not to have been
-// applied - the decision the WALD-22 plan settles: a transport error with
-// wrote == false (the request never fully reached storage), or a status
-// storage returns only for a request it rejected before evaluating the
-// write (408, 429, 503, 400 RequestTimeout, 409 ConditionalRequestConflict).
-// Every other retryable cause - a transport error after the full request
-// was written (reset, EOF, ResponseHeaderTimeout, ctx cancelled mid-flight),
-// or 500/502/504 - becomes (false, ErrOutcomeUnknown) instead: resending it
-// risks a 412 caused by this writer's own earlier, unacknowledged attempt.
-// ErrOutcomeUnknown wraps the raw cause (the transport error, or the status
-// and Code), never the ErrStorageUnavailable-wrapped one, so it does not
-// itself match ErrStorageUnavailable and errors.Is(err, context.Canceled)
-// and friends still see through it. Outcome: at most one attempt is ever
-// ambiguous, and it is always the last one, so any 412 PutIfAbsent does see
-// is definitive proof of a concurrent writer, never of itself.
+// For r.conditional == true (PutIfAbsent), wrote is checked before either
+// of the two paragraphs above ever gets a say: once wrote == true, the
+// request reached storage, so no failure past that point - retryable or
+// not, a status or a send error, a cause classify can name or one it
+// cannot even parse - is retried. It becomes (false, ErrOutcomeUnknown)
+// instead: resending risks a 412 caused by this writer's own earlier,
+// unacknowledged attempt. This covers every send error with wrote == true,
+// not only the ones retryableTransportError recognizes - a malformed
+// status line, a malformed header, a reply that is not HTTP at all, or a
+// TLS alert while reading the response are all sorted the same way a
+// connection reset or EOF is, because none of them prove the write did
+// not land. With wrote == false (the request never fully reached
+// storage), or a status storage returns only for a request it rejected
+// before evaluating the write (408, 429, 503, 400 RequestTimeout, 409
+// ConditionalRequestConflict), the attempt is proven unapplied and the
+// normal retry rule above applies unchanged. ErrOutcomeUnknown wraps the
+// raw cause (the transport error, or the status and Code), never the
+// ErrStorageUnavailable-wrapped one, so it does not itself match
+// ErrStorageUnavailable and errors.Is(err, context.Canceled) and friends
+// still see through it. Outcome: at most one attempt is ever ambiguous,
+// and it is always the last one, so any 412 PutIfAbsent does see is
+// definitive proof of a concurrent writer, never of itself.
 func classify(r objectRequest, resp *http.Response, err error, wrote bool) (retry bool, cause error) {
 	if err != nil {
-		if !retryableTransportError(err) {
-			return false, fmt.Errorf("%w: %s", ErrStorageRefused, err.Error())
-		}
+		// wrote is checked before retryableTransportError, not after: for a
+		// conditional request, wrote == true already means the request
+		// reached storage, so ANY failure past that point - however
+		// retryableTransportError would otherwise sort it - can no longer
+		// be treated as proof the write was not applied. That includes a
+		// response classify cannot even parse (a malformed status line, a
+		// malformed header, a reply that is not HTTP at all) or a TLS
+		// alert while reading the response, none of which
+		// retryableTransportError recognizes as transient, so an earlier
+		// version of this function sorted them under ErrStorageRefused
+		// first - telling the caller the write had definitely failed and
+		// was safe to redo, exactly backwards when storage may have
+		// already applied it: the resend's own 412 would then be
+		// misreported as a concurrent writer (spec/journal/v1 section 11.4
+		// item 6).
 		if r.conditional && wrote {
 			return false, fmt.Errorf("%w: %w", ErrOutcomeUnknown, err)
+		}
+		if !retryableTransportError(err) {
+			return false, fmt.Errorf("%w: %s", ErrStorageRefused, err.Error())
 		}
 		return true, fmt.Errorf("%w: %w", ErrStorageUnavailable, err)
 	}

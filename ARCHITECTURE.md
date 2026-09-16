@@ -211,13 +211,16 @@ on the first push. That hostname check is a pre-flight refusal, not the
 compare-and-swap check itself; the check itself is a boot-time probe of the
 bucket, and it is not implemented yet.
 
-The journal is off only when the knob is absent. `--journal` given an empty
-or whitespace-only value is refused, naming the flag, because `fs.Visit`
-proves the operator typed it — booting journal-less silently on an explicit
-act would break walden's first promise. `WALDEN_JOURNAL` set to the empty
-string is treated as unset, so `docker run -e WALDEN_JOURNAL` with nothing
-set on the host still boots journal-less; a whitespace-only value is refused
-regardless, since that is a failed substitution rather than an unset variable.
+The journal is off only when the knob is absent, or when `WALDEN_JOURNAL` is
+set to an empty string — so `docker run -e WALDEN_JOURNAL` with nothing set
+on the host still boots journal-less. `--journal` given an empty value is
+refused, naming the flag, because `fs.Visit` proves the operator typed it —
+booting journal-less silently on an explicit act would break walden's first
+promise. A whitespace-only value is refused too, from either source, but by
+the check the two paths share, which reports only that the value is
+whitespace and names neither `--journal` nor `WALDEN_JOURNAL`; that is still
+a failed substitution, not a decision to run without a journal, so it is
+refused rather than treated as unset.
 
 Object-storage credentials are not a sixth knob. They resolve through one
 documented order, first hit wins: credentials in the journal URL's userinfo

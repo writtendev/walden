@@ -897,6 +897,15 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 		// percent-decoded UTF-8, rather than a single raw byte). 0 skips
 		// the check.
 		forbidRune rune
+		// wantKeyIDLine, when set, is the exact "journal-access-key-id: "
+		// line String() must produce. It is used for cases where every
+		// byte is individually printable -- so neither forbidByte nor
+		// forbidRune would catch an unquoted leak -- and only the closed
+		// allowlist in accessKeyIDSafeByte forces quoting: a trailing or
+		// leading space, a homoglyph, an invisible filler character, a
+		// bare combining mark, and a key ID that spells out the
+		// "(not read; ...)" placeholder verbatim. "" skips the check.
+		wantKeyIDLine string
 	}{
 		{
 			// Unquoted, the decoded key ID's embedded newline plus
@@ -916,11 +925,11 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 			// %C2%9B percent-decodes to U+009B, the UTF-8 encoding of the
 			// C1 control CSI. A terminal reading UTF-8 turns that into the
 			// same "ESC [" it would read from a raw 0x1b 0x5b, so unquoted
-			// "AKIA2J" clears the screen exactly like the C0 case
+			// "AKIA<U+009B>2J" clears the screen exactly like the C0 case
 			// above.
 			name:       "embedded C1 control reaches the terminal via UTF-8",
 			raw:        "s3://AKIA%C2%9B2J:secret@bucket/walden",
-			forbidRune: '',
+			forbidRune: '\u009b',
 		},
 		{
 			// %C2%85 percent-decodes to U+0085, NEL. Terminals and log
@@ -930,7 +939,7 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 			// newline case above.
 			name:       "embedded NEL forges an extra line via UTF-8",
 			raw:        "s3://AKIA%C2%85journal-credentials%3A%20AWS_ACCESS_KEY_ID:secret@bucket/walden",
-			forbidRune: '',
+			forbidRune: '\u0085',
 		},
 		{
 			// %E2%80%AE percent-decodes to U+202E, RIGHT-TO-LEFT
@@ -939,7 +948,7 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 			// one walden actually signs with.
 			name:       "embedded bidi override changes the displayed key ID",
 			raw:        "s3://AKIA%E2%80%AEELPMAXE:secret@bucket/walden",
-			forbidRune: '‮',
+			forbidRune: '\u202e',
 		},
 		{
 			// %FF is not a valid UTF-8 continuation on its own, so the
@@ -949,6 +958,56 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 			name:       "invalid UTF-8 byte is escaped rather than passed through",
 			raw:        "s3://AKIA%FF:secret@bucket/walden",
 			forbidByte: 0xff,
+		},
+		{
+			// A trailing space is invisible in a terminal, so
+			// "AKIAEXAMPLE" and "AKIAEXAMPLE " print identically unless
+			// the second is quoted. Stray whitespace pasted into a key
+			// ID is a common cause of "wrong credentials".
+			name:          "trailing space stays hidden unless quoted",
+			raw:           "s3://AKIAEXAMPLE%20:secret@bucket/walden",
+			wantKeyIDLine: `journal-access-key-id: "AKIAEXAMPLE "`,
+		},
+		{
+			// Same as above, leading rather than trailing.
+			name:          "leading space stays hidden unless quoted",
+			raw:           "s3://%20AKIAEXAMPLE:secret@bucket/walden",
+			wantKeyIDLine: `journal-access-key-id: " AKIAEXAMPLE"`,
+		},
+		{
+			// %D0%90 decodes to U+0410, CYRILLIC CAPITAL LETTER A, which
+			// renders identically to ASCII 'A' in most fonts. Unquoted,
+			// "AKI<CYRILLIC A>EXAMPLE" is indistinguishable from
+			// "AKIAEXAMPLE".
+			name:          "Cyrillic homoglyph looks like the ASCII letter it replaces",
+			raw:           "s3://AKI%D0%90EXAMPLE:secret@bucket/walden",
+			wantKeyIDLine: `journal-access-key-id: "AKI\u0410EXAMPLE"`,
+		},
+		{
+			// %E3%85%A4 decodes to U+3164, HANGUL FILLER, which most
+			// fonts render as blank. Unquoted, it is an invisible
+			// character appended to what looks like a clean key ID.
+			name:          "invisible filler character is not visibly different",
+			raw:           "s3://AKIAEXAMPLE%E3%85%A4:secret@bucket/walden",
+			wantKeyIDLine: `journal-access-key-id: "AKIAEXAMPLE\u3164"`,
+		},
+		{
+			// %CC%81 decodes to U+0301, COMBINING ACUTE ACCENT, a bare
+			// combining mark with no base character of its own. Unquoted,
+			// it attaches to whatever precedes it on the terminal line
+			// rather than standing out as an extra character.
+			name:          "bare combining mark attaches to the printed key ID",
+			raw:           "s3://AKIAEXAMPLE%CC%81:secret@bucket/walden",
+			wantKeyIDLine: `journal-access-key-id: "AKIAEXAMPLE\u0301"`,
+		},
+		{
+			// A URL-supplied key ID equal to the placeholder text used
+			// for an unresolved key ID. Quoted, it can never be confused
+			// with the real placeholder, which is never wrapped in
+			// quotes.
+			name:          "key ID equal to the unresolved placeholder is still quoted",
+			raw:           "s3://(not%20read;%20see%20journal-credentials):secret@bucket/walden",
+			wantKeyIDLine: `journal-access-key-id: "(not read; see journal-credentials)"`,
 		},
 	}
 	for _, tt := range tests {
@@ -982,8 +1041,18 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 			if strings.Contains(out, "secret") || strings.Contains(out, "topsecret") {
 				t.Errorf("Journal.String() leaked the secret: %q", out)
 			}
-			if !strings.Contains(out, `journal-access-key-id: "AKIA`) {
-				t.Errorf("Journal.String() = %q, want the access key ID quoted", out)
+			switch {
+			case tt.wantKeyIDLine != "":
+				if !strings.Contains(out, tt.wantKeyIDLine) {
+					t.Errorf("Journal.String() = %q, want line %q", out, tt.wantKeyIDLine)
+				}
+				if strings.Contains(out, "journal-access-key-id: (not read; see journal-credentials)") {
+					t.Errorf("Journal.String() = %q, quoted key ID collided with the bare unresolved placeholder", out)
+				}
+			default:
+				if !strings.Contains(out, `journal-access-key-id: "AKIA`) {
+					t.Errorf("Journal.String() = %q, want the access key ID quoted", out)
+				}
 			}
 		})
 	}

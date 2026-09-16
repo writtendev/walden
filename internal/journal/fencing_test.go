@@ -91,6 +91,17 @@ func TestRefusalMessagesSingleLineAndFormat(t *testing.T) {
 	if msgCAS != expectedCAS {
 		t.Errorf("refusal mismatch:\ngot:  %q\nwant: %q", msgCAS, expectedCAS)
 	}
+
+	// 6. RefuseProviderLacksCAS
+	errProviderCAS := journal.RefuseProviderLacksCAS("Wasabi")
+	msgProviderCAS := errProviderCAS.Error()
+	if strings.Contains(msgProviderCAS, "\n") {
+		t.Errorf("refusal message contains newline: %q", msgProviderCAS)
+	}
+	expectedProviderCAS := "invalid journal: Wasabi does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.1)"
+	if msgProviderCAS != expectedProviderCAS {
+		t.Errorf("refusal mismatch:\ngot:  %q\nwant: %q", msgProviderCAS, expectedProviderCAS)
+	}
 }
 
 func TestFencerLifecycleAndStreamIsolation(t *testing.T) {
@@ -291,6 +302,15 @@ func TestSentinelErrorsUnificationAndErrorsIs(t *testing.T) {
 	errCAS := journal.RefuseCASNotSupported()
 	if !errors.Is(errCAS, journal.ErrCASNotSupported) {
 		t.Errorf("expected RefuseCASNotSupported to match ErrCASNotSupported")
+	}
+
+	// 4a. RefuseProviderLacksCAS (the boot pre-flight) shares the same cause sentinel
+	// as RefuseCASNotSupported (the append-time refusal): the two are distinct,
+	// differently-worded conditions, but both are the CAS capability problem, and a
+	// caller checking errors.Is(err, journal.ErrCASNotSupported) should catch either.
+	errProviderCAS := journal.RefuseProviderLacksCAS("Wasabi")
+	if !errors.Is(errProviderCAS, journal.ErrCASNotSupported) {
+		t.Errorf("expected RefuseProviderLacksCAS to match ErrCASNotSupported")
 	}
 
 	// 4b. Refusals with distinct causes stay distinct in both directions, so a

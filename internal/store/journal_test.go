@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/refusal"
 	"github.com/writtendev/walden/internal/store"
 )
@@ -889,6 +890,27 @@ func TestProviderHostsRefuseWithoutCAS(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBootRefusalMatchesRefuseProviderLacksCAS ties the real boot path to the
+// wording pinned by spec/journal/v1/README.md section 11.5 item 6 and by
+// conditional_append.json's "provider_known_without_cas" case. The two
+// packages must agree byte for byte, or an operator who greps the spec for
+// the refusal they hit finds nothing (WALD-101).
+func TestBootRefusalMatchesRefuseProviderLacksCAS(t *testing.T) {
+	const raw = "https://s3.eu-central-1.wasabisys.com/my-bucket/walden"
+	_, err := store.ParseJournalURL(raw, envLookup(creds))
+	if err == nil {
+		t.Fatalf("ParseJournalURL(%q) succeeded, want the CAS pre-flight refusal", raw)
+	}
+	want := journal.RefuseProviderLacksCAS("Wasabi").Error()
+	if err.Error() != want {
+		t.Errorf("ParseJournalURL(%q) error:\n got: %s\nwant: %s", raw, err.Error(), want)
+	}
+	if !errors.Is(err, store.ErrProviderUnsupported) {
+		t.Errorf("ParseJournalURL(%q) error does not match ErrProviderUnsupported", raw)
+	}
+	assertOneLineRefusal(t, err)
 }
 
 // TestJournalRefusalsHideTheSecret is the regression for the leak that let a

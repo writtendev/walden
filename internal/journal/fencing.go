@@ -86,6 +86,20 @@ func RefuseCASNotSupported() error {
 	)
 }
 
+// RefuseProviderLacksCAS returns a single-line operator-facing refusal for the boot-time
+// pre-flight: WALDEN_JOURNAL names a provider already known not to support compare-and-swap.
+// It is distinct from RefuseCASNotSupported (spec section 11.5 item 5): this one fires while
+// the journal URL is being resolved, before any request reaches the bucket, so it names the
+// knob rather than opening with "refusal:", and it names the provider.
+func RefuseProviderLacksCAS(provider string) error {
+	return refusal.RefuseWithCause(
+		"invalid journal",
+		fmt.Sprintf("%s does not support compare-and-swap (CAS) conditional writes", provider),
+		"choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.1",
+		ErrCASNotSupported,
+	)
+}
+
 // Fencer tracks single-writer per-stream fencing state in-memory on a walden instance.
 // When a writer receives HTTP 412 Precondition Failed during a conditional write to tx/<seq>.json,
 // the stream permanently transitions to fenced on this instance.

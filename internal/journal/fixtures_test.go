@@ -1079,10 +1079,11 @@ func TestFixtureConditionalAppend(t *testing.T) {
 			Description string           `json:"description"`
 		} `json:"tx_keys"`
 		Refusals []struct {
-			Case    string           `json:"case"`
-			Stream  journal.StreamID `json:"stream"`
-			Seq     *journal.Seq     `json:"seq"`
-			Message string           `json:"message"`
+			Case     string           `json:"case"`
+			Stream   journal.StreamID `json:"stream"`
+			Seq      *journal.Seq     `json:"seq"`
+			Provider string           `json:"provider"`
+			Message  string           `json:"message"`
 		} `json:"refusals"`
 	}
 	if err := json.Unmarshal(data, &fixture); err != nil {
@@ -1142,8 +1143,8 @@ func TestFixtureConditionalAppend(t *testing.T) {
 		}
 	}
 
-	if len(fixture.Refusals) != 5 {
-		t.Fatalf("expected the five section 11.5 refusals, got %d", len(fixture.Refusals))
+	if len(fixture.Refusals) != 6 {
+		t.Fatalf("expected the six section 11.5 refusals, got %d", len(fixture.Refusals))
 	}
 	for _, tc := range fixture.Refusals {
 		var want string
@@ -1158,6 +1159,12 @@ func TestFixtureConditionalAppend(t *testing.T) {
 			want = journal.RefusePermanentlyFenced(tc.Stream).Error()
 		case "storage_provider_lacks_cas":
 			want = journal.RefuseCASNotSupported().Error()
+		case "provider_known_without_cas":
+			if tc.Provider == "" {
+				t.Errorf("refusal %q must name the provider", tc.Case)
+				continue
+			}
+			want = journal.RefuseProviderLacksCAS(tc.Provider).Error()
 		default:
 			t.Errorf("unknown refusal case %q", tc.Case)
 			continue

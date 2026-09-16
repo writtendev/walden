@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/refusal"
 )
 
@@ -43,8 +44,11 @@ var (
 	// ErrInvalidJournal indicates a WALDEN_JOURNAL value walden cannot resolve.
 	ErrInvalidJournal = errors.New("invalid journal URL")
 
-	// ErrProviderUnsupported indicates a provider without compare-and-swap.
-	ErrProviderUnsupported = errors.New("storage provider does not support compare-and-swap (CAS) conditional writes")
+	// ErrProviderUnsupported indicates a provider without compare-and-swap. It is the
+	// same sentinel as journal.ErrCASNotSupported so that errors.Is matches either
+	// RefuseProviderLacksCAS (this package's boot pre-flight) or RefuseCASNotSupported
+	// (the journal package's append-time refusal); the text is already identical.
+	ErrProviderUnsupported = journal.ErrCASNotSupported
 
 	// ErrNoCredentials indicates that no journal credentials could be resolved.
 	ErrNoCredentials = errors.New("no journal credentials")
@@ -292,12 +296,7 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 		j.Provider = rule.provider
 
 		if !rule.cas {
-			return nil, refusal.RefuseWithCause(
-				"invalid journal",
-				fmt.Sprintf("%s does not support compare-and-swap (CAS) conditional writes", rule.provider),
-				"see the provider support matrix in spec/journal/v1",
-				ErrProviderUnsupported,
-			)
+			return nil, journal.RefuseProviderLacksCAS(rule.provider)
 		}
 		if !isEndpoint {
 			// A provider host with no "s3" label anywhere in it is not an

@@ -472,7 +472,7 @@ func (s *FileTokenStore) CreateToken(ctx context.Context, record *TokenRecord) e
 		return err
 	}
 
-	lock, err := acquireStoreLock(s.lockPath)
+	lock, err := acquireStoreLock(ctx, s.lockPath)
 	if err != nil {
 		return err
 	}
@@ -520,7 +520,7 @@ func (s *FileTokenStore) CreateToken(ctx context.Context, record *TokenRecord) e
 // included, on the request path), where paying a uniqueness scan is a worse trade than
 // catching the shape at the one mutation that can act on it wrongly.
 func (s *FileTokenStore) RevokeToken(ctx context.Context, tokenID string, at time.Time) error {
-	lock, err := acquireStoreLock(s.lockPath)
+	lock, err := acquireStoreLock(ctx, s.lockPath)
 	if err != nil {
 		return err
 	}

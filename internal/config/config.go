@@ -132,8 +132,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid listen: %w", err)
 	}
 	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("invalid listen: port must be between 1 and 65535, got %q", portStr)
+	if err != nil || port < 0 || port > 65535 {
+		return fmt.Errorf("invalid listen: port must be between 0 and 65535, got %q", portStr)
 	}
 
 	return nil

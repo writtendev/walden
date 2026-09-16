@@ -5,9 +5,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/config"
@@ -20,15 +26,15 @@ import (
 var Version = "dev"
 
 func main() {
-	if err := run(os.Args, os.Stdout, os.Stderr); err != nil {
+	if err := run(context.Background(), os.Args, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "walden: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return runServe(nil, stdout, stderr)
+		return dispatchServe(ctx, nil, stdout, stderr)
 	}
 
 	prog := filepath.Base(args[0])
@@ -39,12 +45,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	if len(args) < 2 {
-		return runServe(args[1:], stdout, stderr)
+		return dispatchServe(ctx, args[1:], stdout, stderr)
 	}
 
 	switch args[1] {
 	case "serve":
-		return runServe(args[2:], stdout, stderr)
+		return dispatchServe(ctx, args[2:], stdout, stderr)
 	case "token":
 		return runToken(args[2:], stdout, stderr)
 	case "pre-receive":
@@ -57,10 +63,23 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return nil
 	default:
 		if strings.HasPrefix(args[1], "-") {
-			return runServe(args[1:], stdout, stderr)
+			return dispatchServe(ctx, args[1:], stdout, stderr)
 		}
 		return refusal.Refuse("unknown command", args[1], "run 'walden help' for usage")
 	}
+}
+
+// dispatchServe installs the SIGINT/SIGTERM handling that runServe relies on
+// to close its listener and return -- scoped to the serve path alone.
+// Installing it any earlier (once in main, ahead of the dispatch above)
+// would leave every subcommand's process catching those signals whether or
+// not it reads ctx: token create/list/revoke and the pre-receive hook don't,
+// so a blocked tokens.lock wait would swallow Ctrl-C and SIGTERM instead of
+// exiting on them the way the Go default handler does.
+func dispatchServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return runServe(ctx, args, stdout, stderr)
 }
 
 func printUsage(w io.Writer) {
@@ -83,9 +102,16 @@ Commands for token:
   revoke [flags] <id>   Revoke an authentication token`)
 }
 
-func runServe(args []string, stdout, stderr io.Writer) error {
-	ctx := context.Background()
-	gitVer, err := githttp.AssertGitFloor(ctx, githttp.MinGitVersion)
+func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	// Deliberately context.Background(), not ctx: this is a one-off,
+	// sub-second preflight check with nothing yet to gracefully stop, and
+	// exec.CommandContext refuses to even start a subprocess when handed
+	// a context that is already done (as ctx legitimately may be here --
+	// see the end-to-end test's use of an already-cancelled ctx to make
+	// boot return once it has bound and printed). Tying this check to the
+	// shutdown context would make the git-floor probe spuriously fail
+	// whenever serve is asked to stop before this line runs.
+	gitVer, err := githttp.AssertGitFloor(context.Background(), githttp.MinGitVersion)
 	if err != nil {
 		return err
 	}
@@ -121,18 +147,45 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 
+	// The local repository store needs the data directory in both auth
+	// modes, so this refusal is hoisted above the mode branch below rather
+	// than living inside it.
+	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
+		return refusal.RefuseWithCause(
+			"token store unavailable",
+			fmt.Sprintf("cannot create data directory %s: %s", cfg.DataDir, err.Error()),
+			"verify the data directory path and permissions",
+			auth.ErrStoreUnavailable,
+		)
+	}
+
+	// The authorizer's mode is decided exactly once, here: an empty
+	// AuthTrustKey selects the built-in token store, a non-empty one
+	// selects delegated capability verification. No other construction
+	// site decides which mode is live.
+	tokenStore := auth.NewFileTokenStore(cfg.DataDir)
+	authorizer, err := auth.NewAuthorizer(cfg.AuthTrustKey, tokenStore)
+	if err != nil {
+		return err
+	}
+
+	// Bind before minting: a boot refused for a busy port has no side
+	// effects -- no tokens.json written, and no admin token printed and
+	// then thrown away.
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return refusal.RefuseWithCause(
+			"listen unavailable",
+			err.Error(),
+			"choose a free address with --listen or WALDEN_LISTEN_ADDR",
+			err,
+		)
+	}
+
 	if cfg.AuthTrustKey == "" {
-		if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
-			return refusal.RefuseWithCause(
-				"token store unavailable",
-				fmt.Sprintf("cannot create data directory %s: %s", cfg.DataDir, err.Error()),
-				"verify the data directory path and permissions",
-				auth.ErrStoreUnavailable,
-			)
-		}
-		tokenStore := auth.NewFileTokenStore(cfg.DataDir)
 		adminToken, err := auth.EnsureAdminToken(ctx, tokenStore)
 		if err != nil {
+			ln.Close()
 			return err
 		}
 		if adminToken != "" {
@@ -140,7 +193,35 @@ func runServe(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 
-	fmt.Fprintf(stdout, "walden server starting on %s (data: %s, git: %s)\n", cfg.ListenAddr, cfg.DataDir, gitVer)
+	if cfg.JournalURL == "" {
+		fmt.Fprintln(stderr, "walden: WARNING: journal-less mode: WALDEN_JOURNAL is unset, so durability is this disk alone")
+	}
+
+	// cfg.ListenAddr already passed config.Validate's net.SplitHostPort
+	// check, so the host is well-formed here. Printing
+	// net.JoinHostPort(host, <bound port>) rather than cfg.ListenAddr
+	// itself means a fixed address like ":8470" still prints ":8470", and
+	// a ":0"-style address prints the port the kernel actually chose.
+	host, _, _ := net.SplitHostPort(cfg.ListenAddr)
+	boundAddr := net.JoinHostPort(host, strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
+	fmt.Fprintf(stdout, "walden server starting on %s (data: %s, git: %s)\n", boundAddr, cfg.DataDir, gitVer)
+
+	h := githttp.NewHandler(authorizer, store.New(cfg.DataDir), cfg.JournalURL)
+	// IdleTimeout closes keep-alive connections that go quiet, so an
+	// unauthenticated client can't pin a file descriptor forever by
+	// opening a connection and never sending a second request.
+	// ReadTimeout/WriteTimeout are deliberately unset: git transfers
+	// can legitimately run long once a request is underway.
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: time.Minute, IdleTimeout: time.Minute}
+
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
+
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return refusal.RefuseWithCause("serve failed", err.Error(), "check the listen address", err)
+	}
 	return nil
 }
 

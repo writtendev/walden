@@ -3,9 +3,11 @@
 package auth
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
@@ -24,11 +26,23 @@ type storeLock struct {
 	f *os.File
 }
 
+// storeLockPollInterval is how often acquireStoreLock retries a non-blocking flock attempt
+// while it waits for ctx to still be live. flock(2) has no way to interrupt a blocking
+// LOCK_EX wait from outside the blocked thread, so a plain blocking call cannot honor ctx at
+// all -- a signal delivered while `walden serve` boot is waiting on tokens.lock inside
+// EnsureAdminToken would otherwise be caught by signal.NotifyContext (dispatchServe, in
+// cmd/walden/main.go) and then simply ignored until the lock happened to free up on its own.
+// Polling with LOCK_NB trades a small, bounded latency between the lock actually freeing and
+// this process noticing (at most one interval) for a wait that ctx can actually cancel.
+const storeLockPollInterval = 20 * time.Millisecond
+
 // acquireStoreLock blocks until it holds an exclusive lock on path, creating the file if
-// necessary. Concurrent writers therefore serialize rather than race or fail outright: a
-// second `walden token create` invoked while another is in flight waits its turn instead of
-// losing the first one's update.
-func acquireStoreLock(path string) (*storeLock, error) {
+// necessary, or until ctx is done, whichever comes first. Concurrent writers therefore
+// serialize rather than race or fail outright: a second `walden token create` invoked while
+// another is in flight waits its turn instead of losing the first one's update -- but a
+// caller whose ctx is cancelled while waiting (serve shutting down on SIGINT/SIGTERM) gets
+// back ctx.Err() promptly instead of blocking until the lock happens to free up.
+func acquireStoreLock(ctx context.Context, path string) (*storeLock, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, refusal.RefuseWithCause(
@@ -38,16 +52,35 @@ func acquireStoreLock(path string) (*storeLock, error) {
 			ErrStoreUnavailable,
 		)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, refusal.RefuseWithCause(
-			"token store locked",
-			fmt.Sprintf("cannot lock %s: %s", path, err.Error()),
-			"retry; another walden process may be writing the token store",
-			ErrStoreUnavailable,
-		)
+
+	ticker := time.NewTicker(storeLockPollInterval)
+	defer ticker.Stop()
+	for {
+		flockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if flockErr == nil {
+			return &storeLock{f: f}, nil
+		}
+		if flockErr != syscall.EWOULDBLOCK {
+			f.Close()
+			return nil, refusal.RefuseWithCause(
+				"token store locked",
+				fmt.Sprintf("cannot lock %s: %s", path, flockErr.Error()),
+				"retry; another walden process may be writing the token store",
+				ErrStoreUnavailable,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, refusal.RefuseWithCause(
+				"boot interrupted",
+				fmt.Sprintf("stop signal received while waiting for %s", path),
+				"retry once the token store lock is free",
+				ctx.Err(),
+			)
+		case <-ticker.C:
+		}
 	}
-	return &storeLock{f: f}, nil
 }
 
 // release drops the lock. The kernel would do this on its own once f closes, but callers

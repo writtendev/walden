@@ -103,3 +103,33 @@ const (
 	AmzDateFormatForTest = amzDateFormat
 	DateFormatForTest    = dateFormat
 )
+
+// NewClientForTest builds a Client with an injected http.Client (typically
+// pointed at an httptest server) and clock, so a test can hold time still
+// and exercise real signing and retries without touching production DNS or
+// TLS trust roots.
+func NewClientForTest(j *Journal, httpClient *http.Client, now func() time.Time) *Client {
+	return &Client{journal: j, http: httpClient, now: now}
+}
+
+// SetBackoffForTest overrides the retry backoff's base and cap so a test's
+// retries run in milliseconds instead of seconds. It returns a func that
+// restores the production schedule. The schedule is package state, so
+// tests using it must not run in parallel with each other.
+func SetBackoffForTest(base, cap time.Duration) (restore func()) {
+	prevBase, prevCap := backoffBase, backoffCap
+	backoffBase, backoffCap = base, cap
+	return func() { backoffBase, backoffCap = prevBase, prevCap }
+}
+
+// MaxAttemptsForTest exposes maxAttempts.
+const MaxAttemptsForTest = maxAttempts
+
+// CheckRedirectForTest calls c's underlying http.Client.CheckRedirect (as
+// NewClient built it) and reports the error it returns, so a test can
+// confirm production blocks redirects - http.ErrUseLastResponse - without
+// following them, independent of whatever client a test injects through
+// NewClientForTest.
+func CheckRedirectForTest(c *Client) error {
+	return c.http.CheckRedirect(nil, nil)
+}

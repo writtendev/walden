@@ -739,8 +739,8 @@ func envCredentialSource(lookupEnv func(string) (string, bool)) string {
 	return "(none found)"
 }
 
-// String renders the resolved journal for walden serve --print-config.
-// It never prints the secret.
+// String renders the resolved journal for walden serve --print-config. It
+// prints the access key ID, a public identifier, but never the secret.
 func (j *Journal) String() string {
 	style := "virtual-hosted"
 	if j.PathStyle {
@@ -758,9 +758,13 @@ func (j *Journal) String() string {
 	if credentials == "" {
 		credentials = "(unresolved)"
 	}
+	keyID := j.Credentials.AccessKeyID
+	if keyID == "" {
+		keyID = "(not read; see journal-credentials)"
+	}
 	return fmt.Sprintf(
-		"journal-provider: %s\njournal-endpoint: %s\njournal-region: %s\njournal-bucket: %s\njournal-prefix: %s\njournal-style: %s\njournal-credentials: %s",
-		provider, j.Endpoint, j.Region, j.Bucket, prefix, style, credentials,
+		"journal-provider: %s\njournal-endpoint: %s\njournal-region: %s\njournal-bucket: %s\njournal-prefix: %s\njournal-style: %s\njournal-credentials: %s\njournal-access-key-id: %s",
+		provider, j.Endpoint, j.Region, j.Bucket, prefix, style, credentials, keyID,
 	)
 }
 

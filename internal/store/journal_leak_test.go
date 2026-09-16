@@ -214,7 +214,7 @@ func journalOutputs(t *testing.T, raw string) []output {
 		// location. Credentials.SecretAccessKey is where the secret
 		// belongs and is the one field not checked.
 		outs = append(outs,
-			output{origin: entry.name + " String()", text: j.String()},
+			output{origin: entry.name + " String()", text: j.String(), publicKeyID: true},
 			output{origin: entry.name + " Provider", text: j.Provider},
 			output{origin: entry.name + " Endpoint", text: j.Endpoint},
 			output{origin: entry.name + " Region", text: j.Region},

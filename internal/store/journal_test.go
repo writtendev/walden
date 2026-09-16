@@ -825,8 +825,25 @@ func TestParseJournalURLNamesTheCredentialSource(t *testing.T) {
 			if j.Credentials.Source != tt.wantSource {
 				t.Errorf("Source = %q, want %q", j.Credentials.Source, tt.wantSource)
 			}
-			if got := j.String(); strings.Contains(got, "envsecret") || strings.Contains(got, "urlsecret") {
+			got := j.String()
+			if strings.Contains(got, "envsecret") || strings.Contains(got, "urlsecret") {
 				t.Errorf("Journal.String() leaked the secret: %q", got)
+			}
+			switch tt.name {
+			case "environment":
+				// ParseJournalURL never reads the environment, so the key ID
+				// is not available here: --print-config must say so honestly
+				// rather than reading AKIAENV to prove credentials exist.
+				if !strings.Contains(got, "journal-access-key-id: (not read; see journal-credentials)") {
+					t.Errorf("Journal.String() = %q, want the unread-credentials placeholder", got)
+				}
+				if strings.Contains(got, "AKIAENV") {
+					t.Errorf("Journal.String() read the environment's access key ID: %q", got)
+				}
+			case "url-userinfo":
+				if !strings.Contains(got, "journal-access-key-id: AKIAURL") {
+					t.Errorf("Journal.String() = %q, want journal-access-key-id: AKIAURL", got)
+				}
 			}
 		})
 	}
@@ -850,6 +867,7 @@ func TestJournalStringHidesSecret(t *testing.T) {
 		"journal-prefix: walden",
 		"journal-style: virtual-hosted",
 		"journal-credentials: WALDEN_JOURNAL URL",
+		"journal-access-key-id: AKIAURL",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Journal.String() = %q, want line %q", out, want)

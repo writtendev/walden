@@ -454,17 +454,23 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			wantErrNot: []string{"p@ss", "ss/w0rd", "w0rd", "minio.internal"},
 		},
 		{
-			name:       "serve-print-config-journal-url-is-not-printed",
+			// The access key ID is a public identifier and --print-config
+			// prints it on purpose, built from the resolved
+			// Credentials.AccessKeyID rather than by re-rendering the URL.
+			// The secret stays forbidden.
+			name:       "serve-print-config-prints-key-id-not-secret",
 			cmdPath:    binPath,
 			args:       []string{"serve", "--journal", "s3://AKIAEXAMPLE:topsecret@my-bucket/walden", "--print-config"},
 			wantExit0:  true,
-			wantOutSub: "journal: (configured)",
-			wantErrNot: []string{"topsecret", "AKIAEXAMPLE"},
+			wantOutSub: "journal-credentials: WALDEN_JOURNAL URL\njournal-access-key-id: AKIAEXAMPLE",
+			wantErrNot: []string{"topsecret"},
 		},
 		{
 			// --print-config names where the credentials come from, so it
 			// cannot report an unresolved journal that would in fact boot.
-			// It names the source, never the secret.
+			// It names the source, never the secret, and calling
+			// ParseJournalURL rather than ResolveJournal means it never
+			// reads the environment's access key ID either.
 			name:    "serve-print-config-names-the-credential-source",
 			cmdPath: binPath,
 			args:    []string{"serve", "--journal", "s3://my-bucket/walden", "--print-config"},
@@ -474,6 +480,7 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			),
 			wantExit0:  true,
 			wantOutSub: "journal-credentials: AWS_ACCESS_KEY_ID",
+			wantErrNot: []string{"AKIAEXAMPLE", "topsecret"},
 		},
 		{
 			// A self-hosted endpoint written as s3://host:port silently

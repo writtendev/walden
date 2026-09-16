@@ -8,6 +8,8 @@ suite:
 - Commit: `c4bc791ac6985eedb503e882cd450cc5b344c2f2`
 - License: Apache License 2.0 (same as walden; see the upstream `LICENSE`
   file, not reproduced here)
+- Attribution: `NOTICE`, alongside this README, is the upstream `NOTICE`
+  file at that same commit, committed verbatim per Apache-2.0 §4(d)
 
 Fetched once and committed; walden's test suite never downloads these at
 test time. File names inside each case directory are unchanged from

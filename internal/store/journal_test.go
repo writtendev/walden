@@ -892,6 +892,11 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 		// the '\n' between fields that the 8-line check below already
 		// covers. 0 skips the check.
 		forbidByte byte
+		// forbidRune is a decoded rune that must not survive quoting
+		// unescaped (a control or format character reached through
+		// percent-decoded UTF-8, rather than a single raw byte). 0 skips
+		// the check.
+		forbidRune rune
 	}{
 		{
 			// Unquoted, the decoded key ID's embedded newline plus
@@ -907,6 +912,44 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 			raw:        "s3://AKIA%1B%5B2J:topsecret@bucket/walden",
 			forbidByte: 0x1b,
 		},
+		{
+			// %C2%9B percent-decodes to U+009B, the UTF-8 encoding of the
+			// C1 control CSI. A terminal reading UTF-8 turns that into the
+			// same "ESC [" it would read from a raw 0x1b 0x5b, so unquoted
+			// "AKIA2J" clears the screen exactly like the C0 case
+			// above.
+			name:       "embedded C1 control reaches the terminal via UTF-8",
+			raw:        "s3://AKIA%C2%9B2J:secret@bucket/walden",
+			forbidRune: '',
+		},
+		{
+			// %C2%85 percent-decodes to U+0085, NEL. Terminals and log
+			// viewers that treat NEL as a line break would show the
+			// forged "journal-credentials: AWS_ACCESS_KEY_ID" that
+			// follows as its own line, the same forgery as the C0
+			// newline case above.
+			name:       "embedded NEL forges an extra line via UTF-8",
+			raw:        "s3://AKIA%C2%85journal-credentials%3A%20AWS_ACCESS_KEY_ID:secret@bucket/walden",
+			forbidRune: '',
+		},
+		{
+			// %E2%80%AE percent-decodes to U+202E, RIGHT-TO-LEFT
+			// OVERRIDE. Unquoted, it would make the access key ID render
+			// back-to-front, so the key ID an operator reads is not the
+			// one walden actually signs with.
+			name:       "embedded bidi override changes the displayed key ID",
+			raw:        "s3://AKIA%E2%80%AEELPMAXE:secret@bucket/walden",
+			forbidRune: '‮',
+		},
+		{
+			// %FF is not a valid UTF-8 continuation on its own, so the
+			// decoded key ID is invalid UTF-8. strconv.Quote escapes the
+			// byte rather than passing it through, keeping the printed
+			// line valid, readable text.
+			name:       "invalid UTF-8 byte is escaped rather than passed through",
+			raw:        "s3://AKIA%FF:secret@bucket/walden",
+			forbidByte: 0xff,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -918,6 +961,9 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 
 			if tt.forbidByte != 0 && strings.IndexByte(out, tt.forbidByte) != -1 {
 				t.Errorf("Journal.String() = %q, contains raw byte %#x", out, tt.forbidByte)
+			}
+			if tt.forbidRune != 0 && strings.ContainsRune(out, tt.forbidRune) {
+				t.Errorf("Journal.String() = %q, contains unescaped rune %U", out, tt.forbidRune)
 			}
 
 			// The 8 real fields are '\n'-joined, so a key ID whose
@@ -940,6 +986,44 @@ func TestJournalStringQuotesControlBytesInAccessKeyID(t *testing.T) {
 				t.Errorf("Journal.String() = %q, want the access key ID quoted", out)
 			}
 		})
+	}
+}
+
+// TestJournalStringDistinguishesQuotedLookFromRealQuoting is the regression
+// for a key ID that merely looks quoted. Before this fix, only a fixed set
+// of bytes (C0, DEL) triggered quoting, so an access key ID that is
+// literally the six characters `"AKIA\n"` — a quote, the letters, a
+// backslash, an 'n', a quote — passed through String() unquoted and became
+// indistinguishable from AKIA followed by a real, escaped newline: both
+// printed as `journal-access-key-id: "AKIA\n"`. An operator reading
+// --print-config output could not tell which key ID was actually in use.
+// Quoting now triggers whenever strconv.Quote would change the value at
+// all, which includes a literal '"' or '\\', so the two cases now produce
+// different, unambiguous output.
+func TestJournalStringDistinguishesQuotedLookFromRealQuoting(t *testing.T) {
+	literal, err := store.ResolveJournal(`s3://%22AKIA%5Cn%22:secret@bucket/walden`, nil)
+	if err != nil {
+		t.Fatalf("ResolveJournal (literal quote) failed: %v", err)
+	}
+	real, err := store.ResolveJournal("s3://AKIA%0A:secret@bucket/walden", nil)
+	if err != nil {
+		t.Fatalf("ResolveJournal (real newline) failed: %v", err)
+	}
+
+	literalOut := literal.String()
+	realOut := real.String()
+
+	if literalOut == realOut {
+		t.Fatalf("Journal.String() prints the same line for a literal-quote key ID and a real-newline key ID: %q", literalOut)
+	}
+
+	wantLiteral := `journal-access-key-id: "\"AKIA\\n\""`
+	if !strings.Contains(literalOut, wantLiteral) {
+		t.Errorf("Journal.String() = %q, want line containing %q", literalOut, wantLiteral)
+	}
+	wantReal := `journal-access-key-id: "AKIA\n"`
+	if !strings.Contains(realOut, wantReal) {
+		t.Errorf("Journal.String() = %q, want line containing %q", realOut, wantReal)
 	}
 }
 

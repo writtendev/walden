@@ -628,3 +628,70 @@ func TestSigV4CanonicalHeadersOnlyCollapseASCIIWhitespace(t *testing.T) {
 		})
 	}
 }
+
+// -----------------------------------------------------------------------
+// 6. Session token: signV4 sets X-Amz-Security-Token from
+// Credentials.SessionToken and signs it, the same way it always sets and
+// signs X-Amz-Content-Sha256 (see
+// TestSigV4UnsignedPayloadSetsContentSha256). Credentials, region,
+// service, and timestamp are the published get-vanilla-with-session-token
+// suite vector (testdata/sigv4/suite); that case's own fixture files
+// aren't reused byte for byte because it signs for a generic "service"
+// that, per its sign_body: false, never signs x-amz-content-sha256, where
+// production signV4 always does (its payload is empty here regardless, so
+// the hash it signs is the same emptySHA256 value either way).
+// -----------------------------------------------------------------------
+
+func TestSigV4SessionTokenIsSetAndSigned(t *testing.T) {
+	const (
+		accessKeyID     = "AKIDEXAMPLE"
+		secretAccessKey = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+		sessionToken    = "6e86291e8372ff2a2260956d9b8aae1d763fbf315fa00fa31553b73ebf194267"
+		region          = "us-east-1"
+		service         = "service"
+	)
+	now, err := time.Parse(time.RFC3339, "2015-08-30T12:36:00Z")
+	if err != nil {
+		t.Fatalf("parse timestamp: %v", err)
+	}
+
+	req, err := http.NewRequest("GET", "https://example.amazonaws.com/", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Host = "example.amazonaws.com"
+
+	creds := store.Credentials{AccessKeyID: accessKeyID, SecretAccessKey: secretAccessKey, SessionToken: sessionToken}
+	signature := store.SignV4ForTest(req, creds, region, service, store.EmptySHA256ForTest, now)
+
+	if got := req.Header.Get("X-Amz-Security-Token"); got != sessionToken {
+		t.Fatalf("X-Amz-Security-Token = %q, want %q", got, sessionToken)
+	}
+
+	// Recompute independently through the low-level functions, from req's
+	// now fully-populated headers, and confirm signV4 signed the same
+	// bytes it sent. This is what catches a security token that lands on
+	// req only after signV4's internal canonicalRequest call already ran
+	// (e.g. moved after that call): the header would be on req, but
+	// absent from signedHeaders and from the signature signV4 actually
+	// returned, so the two would disagree below.
+	creq, signedHeaders := store.CanonicalRequestForTest(req.Method, req.URL.Path, req.URL.Query(), req.Header, req.Host, store.EmptySHA256ForTest)
+	if !strings.Contains(signedHeaders, "x-amz-security-token") {
+		t.Fatalf("signed headers = %q, want it to contain x-amz-security-token", signedHeaders)
+	}
+
+	dateStamp := now.UTC().Format(store.DateFormatForTest)
+	scope := store.ScopeStringForTest(dateStamp, region, service)
+	sts := store.StringToSignForTest(now, scope, creq)
+	key := store.SigningKeyForTest(secretAccessKey, dateStamp, region, service)
+	want := store.SignatureForTest(key, sts)
+
+	if signature != want {
+		t.Fatalf("signature = %s, want %s", signature, want)
+	}
+
+	wantAuthz := store.AuthorizationHeaderForTest(accessKeyID, scope, signedHeaders, want)
+	if authz := req.Header.Get("Authorization"); authz != wantAuthz {
+		t.Fatalf("Authorization = %q, want %q", authz, wantAuthz)
+	}
+}

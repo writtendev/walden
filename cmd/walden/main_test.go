@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/journal"
@@ -986,6 +987,17 @@ func TestServePrintConfigDoesNotMint(t *testing.T) {
 	}
 }
 
+// TestServeConcurrentBootSingleToken exercises 16 concurrent `walden serve` boots against the
+// same data directory to confirm the tokens.lock-guarded admin-token race resolves to exactly
+// one minted token. It cannot use cancelledContext() the way every other boot test in this
+// file does: acquireStoreLock (internal/auth/filelock_unix.go) now honors ctx while it waits
+// on tokens.lock, so a real SIGINT/SIGTERM during that wait aborts boot instead of being
+// silently swallowed until the lock frees up. An already-cancelled context would make whichever
+// goroutines lose the race for the lock abort with ctx.Err() instead of waiting their turn,
+// which is a different thing than what this test probes. Each goroutine instead gets its own
+// bounded-but-live context: generous enough that lock contention among 16 local flock waiters
+// (each polling at storeLockPollInterval) never legitimately times out, but still bounded so a
+// regression here fails the test instead of hanging it.
 func TestServeConcurrentBootSingleToken(t *testing.T) {
 	dataDir := t.TempDir()
 	const concurrency = 16
@@ -1000,8 +1012,10 @@ func TestServeConcurrentBootSingleToken(t *testing.T) {
 		idx := i
 		go func() {
 			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
 			var stdout, stderr bytes.Buffer
-			errs[idx] = runServe(cancelledContext(), []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0"}, &stdout, &stderr)
+			errs[idx] = runServe(ctx, []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0"}, &stdout, &stderr)
 			outputs[idx] = stdout.String()
 		}()
 	}

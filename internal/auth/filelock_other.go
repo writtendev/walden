@@ -2,7 +2,11 @@
 
 package auth
 
-import "github.com/writtendev/walden/internal/refusal"
+import (
+	"context"
+
+	"github.com/writtendev/walden/internal/refusal"
+)
 
 // storeLock has no implementation outside unix. walden ships in a Linux container and is
 // developed on darwin — both unix, both with flock(2) — so a portable cross-process locking
@@ -10,8 +14,10 @@ import "github.com/writtendev/walden/internal/refusal"
 // over building one nothing in production needs.
 type storeLock struct{}
 
-// acquireStoreLock always refuses on a non-unix platform: there is no lock to take.
-func acquireStoreLock(path string) (*storeLock, error) {
+// acquireStoreLock always refuses on a non-unix platform: there is no lock to take. ctx is
+// accepted only to match the unix build's signature (see filelock_unix.go); it is never
+// consulted since this always returns before there is anything to wait on.
+func acquireStoreLock(ctx context.Context, path string) (*storeLock, error) {
 	return nil, refusal.Refuse(
 		"token store locked",
 		"cross-process locking is only implemented for unix",

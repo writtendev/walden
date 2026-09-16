@@ -584,3 +584,47 @@ func TestSigV4UnsignedPayloadSetsContentSha256(t *testing.T) {
 		t.Fatalf("signature = %s, want %s", signature, want)
 	}
 }
+
+// -----------------------------------------------------------------------
+// 5. CanonicalHeaders Trim() collapses ASCII space and tab only. S3 does
+// not treat other Unicode whitespace — e.g. U+00A0 (NBSP) or U+0085
+// (NEL) — as trimmable or collapsible, so a header value carrying one
+// must reach the canonical request unchanged, aside from ASCII trimming
+// and collapsing around it.
+// -----------------------------------------------------------------------
+
+func TestSigV4CanonicalHeadersOnlyCollapseASCIIWhitespace(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{
+			name:  "NBSP is not a separator",
+			value: "foo bar",
+			want:  "foo bar",
+		},
+		{
+			name:  "NEL is not a separator",
+			value: "foobar",
+			want:  "foobar",
+		},
+		{
+			name:  "ASCII space/tab trimmed and collapsed around non-ASCII whitespace",
+			value: " foo bar\tbaz ",
+			want:  "foo bar baz",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := http.Header{"X-Test": {tt.value}}
+			creq, _ := store.CanonicalRequestForTest("GET", "/", url.Values{}, headers, "example.com", store.EmptySHA256ForTest)
+
+			wantLine := "x-test:" + tt.want + "\n"
+			if !strings.Contains(creq, wantLine) {
+				t.Fatalf("canonical request does not contain %q\ngot:\n%s", wantLine, creq)
+			}
+		})
+	}
+}

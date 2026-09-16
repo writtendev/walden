@@ -113,11 +113,33 @@ func canonicalRequest(method, path string, query url.Values, headers http.Header
 }
 
 // collapseSpaces trims a header value and collapses every internal run of
-// whitespace to a single space, per the CanonicalHeaders Trim() rule.
-// strings.Fields already does both: it splits on runs of whitespace and
-// drops empty leading/trailing fields.
+// ASCII space and tab to a single space, per the CanonicalHeaders Trim()
+// rule. It does not use strings.Fields: that splits on any Unicode
+// whitespace, including U+00A0 (NBSP) and U+0085 (NEL), which S3 does not
+// trim or collapse. Treating one of those as plain ASCII space would sign
+// a value S3 does not, and the request would fail with
+// SignatureDoesNotMatch.
 func collapseSpaces(v string) string {
-	return strings.Join(strings.Fields(v), " ")
+	var b strings.Builder
+	b.Grow(len(v))
+	pendingSpace := false
+	wrote := false
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if c == ' ' || c == '\t' {
+			if wrote {
+				pendingSpace = true
+			}
+			continue
+		}
+		if pendingSpace {
+			b.WriteByte(' ')
+			pendingSpace = false
+		}
+		b.WriteByte(c)
+		wrote = true
+	}
+	return b.String()
 }
 
 // canonicalQueryString URI-encodes every key and value in query (encoding

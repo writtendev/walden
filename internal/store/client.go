@@ -20,7 +20,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/writtendev/walden/internal/refusal"
@@ -391,14 +390,19 @@ func isRetryableStatus(status int) bool {
 
 // retryableTransportError reports whether err - a failure to send a
 // request or read its response, before any status line arrived - is worth
-// retrying: ctx ending, a per-attempt transport timeout, a connection reset,
-// refused, or otherwise gone (net.ErrClosed - Go's own sentinel for "the
-// connection ended under us", however the platform spelled it), or an EOF.
-// Those are the transient cases named in WALD-20's plan. Anything else (an
-// untrusted TLS certificate, a caller ReaderAt shorter than the declared
-// size, a malformed request) is permanent: no number of retries changes the
-// outcome, so classify must not guess "storage is down" and tell the
-// operator to wait.
+// retrying: ctx ending, a per-attempt transport timeout, an EOF, or a
+// connection-level failure (reset, refused, broken pipe, or a
+// locally-observed close mid read/write). The OS spells that last case's
+// specific errno differently by platform and by which side of the
+// connection noticed first - ECONNRESET, EPIPE, and net.ErrClosed have all
+// been observed for the same underlying "the connection died" event from
+// WALD-20's plan - so this checks for a *net.OpError (the type net/http
+// wraps every one of those in) rather than enumerating every spelling.
+// Anything else (an untrusted TLS certificate - a
+// *tls.CertificateVerificationError, not a *net.OpError - a caller
+// ReaderAt shorter than the declared size, a malformed request) is
+// permanent: no number of retries changes the outcome, so classify must
+// not guess "storage is down" and tell the operator to wait.
 func retryableTransportError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
@@ -410,10 +414,8 @@ func retryableTransportError(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) {
-		return true
-	}
-	if errors.Is(err, net.ErrClosed) {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
 		return true
 	}
 	return false

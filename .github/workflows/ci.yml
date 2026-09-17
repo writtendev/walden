@@ -133,6 +133,32 @@ jobs:
             echo "Error: a conformance test skipped with WALDEN_CONFORMANCE_JOURNAL set"; exit 1
           fi
 
+          # `-run` matching nothing (a rename, a move to another package, a
+          # build tag added to conformance_test.go) prints "no tests to
+          # run" and exits 0 with no --- SKIP: line, so the check above
+          # alone would report success having exercised no object storage.
+          # Require every expected conformance test to show up as a PASS.
+          EXPECTED_TESTS=(
+            TestConformancePutIfAbsentCreatesThenRefuses
+            TestConformancePutIfAbsentConcurrentSingleWinner
+            TestConformanceRoundTrip
+            TestConformanceListPagesInOrder
+            TestConformanceOutcomeUnknownIsNotResent
+          )
+          MISSING=()
+          for T in "${EXPECTED_TESTS[@]}"; do
+            # Anchor on the trailing " (" so a rename with this name as a
+            # prefix (e.g. TestConformanceRoundTripX) doesn't match.
+            if ! grep -qE -- "^--- PASS: ${T} \(" conformance.out; then
+              MISSING+=("${T}")
+            fi
+          done
+          if [ "${#MISSING[@]}" -ne 0 ]; then
+            echo "Error: expected conformance test(s) did not run and pass (renamed, moved, or gated out by a build tag?):"
+            printf '  %s\n' "${MISSING[@]}"
+            exit 1
+          fi
+
       - name: MinIO logs on failure
         if: failure()
         run: docker logs walden-minio || true

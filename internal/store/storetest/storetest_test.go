@@ -8,11 +8,14 @@
 package storetest_test
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -65,6 +68,85 @@ func s3Code(t *testing.T, body []byte) string {
 		t.Fatalf("unmarshaling S3 error body %q: %v", body, err)
 	}
 	return parsed.Code
+}
+
+// doList sends a GET against the bucket root with the given raw query
+// string, the same shape TestListPagination already builds by hand -
+// factored out here so the query-rejection and start-after tests below
+// don't each re-duplicate it.
+func doList(t *testing.T, fake *storetest.Fake, query string) response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, fake.URL()+"/"+fake.Bucket()+"?"+query, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "x")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	return response{status: resp.StatusCode, body: b, header: resp.Header}
+}
+
+// rawConn opens a raw TCP connection to fake. Tests that need to put
+// bytes on the wire net/http's own client would refuse to send - a body
+// shorter than its declared Content-Length, or aws-chunked framing with
+// deliberately wrong terminators - dial this instead of using doRequest.
+func rawConn(t *testing.T, fake *storetest.Fake) (conn net.Conn, addr string) {
+	t.Helper()
+	addr = strings.TrimPrefix(fake.URL(), "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	return conn, addr
+}
+
+// rawPut sends a PUT of exactly body's bytes - no more, no less - as a
+// raw TCP request to fake, with headers set verbatim (the caller supplies
+// Content-Length itself, since the whole point is sending a length that
+// may not match what a well-behaved client would compute). It half-closes
+// the connection's write side once body is written so the server sees a
+// clean EOF instead of hanging, then reads back the response.
+func rawPut(t *testing.T, fake *storetest.Fake, key string, headers map[string]string, body []byte) (status int, respBody []byte) {
+	t.Helper()
+	conn, addr := rawConn(t, fake)
+	defer conn.Close()
+
+	var req bytes.Buffer
+	fmt.Fprintf(&req, "PUT /%s/%s HTTP/1.1\r\n", fake.Bucket(), key)
+	fmt.Fprintf(&req, "Host: %s\r\n", addr)
+	req.WriteString("Authorization: x\r\n")
+	req.WriteString("Connection: close\r\n")
+	for k, v := range headers {
+		fmt.Fprintf(&req, "%s: %s\r\n", k, v)
+	}
+	req.WriteString("\r\n")
+	if _, err := conn.Write(req.Bytes()); err != nil {
+		t.Fatalf("writing request head: %v", err)
+	}
+	if _, err := conn.Write(body); err != nil {
+		t.Fatalf("writing request body: %v", err)
+	}
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		cw.CloseWrite()
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	return resp.StatusCode, b
 }
 
 // TestConditionalCreateThenPrecondition covers case 1: a conditional
@@ -184,32 +266,40 @@ func TestUnsupportedConditionsAndAuth(t *testing.T) {
 }
 
 // TestShortBodyStoresNothing covers case 4: a body shorter than its
-// declared Content-Length stores nothing, and an aws-chunked body decodes
-// to the same bytes a raw body would.
+// declared length - raw Content-Length for an unencoded body, or a
+// truncated aws-chunked stream - stores nothing and answers 400, and a
+// well-formed aws-chunked body decodes to the same bytes a raw body
+// would.
+//
+// This drives the fake over a raw TCP connection (rawPut) rather than
+// net/http's client: net/http itself refuses to send a request whose
+// body is shorter than its declared Content-Length ("http:
+// ContentLength=10 with Body length 2"), so a test built on
+// http.NewRequest never reaches the fake at all - 0 calls, and
+// decodeAWSChunked plus readPutBody's short-body path both go untested.
 func TestShortBodyStoresNothing(t *testing.T) {
 	fake := storetest.New(t)
 
-	req, err := http.NewRequest(http.MethodPut, fake.URL()+"/"+fake.Bucket()+"/short", strings.NewReader("ab"))
-	if err != nil {
-		t.Fatalf("NewRequest: %v", err)
-	}
-	req.ContentLength = 10 // lies: only 2 bytes will actually be sent
-	req.Header.Set("Authorization", "x")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		// net/http may itself fail to send a body shorter than declared;
-		// either way nothing may be stored.
-		if _, ok := fake.Object("short"); ok {
-			t.Fatalf("short body stored an object despite send error %v", err)
-		}
-		return
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("short body: status = %d, want 400", resp.StatusCode)
+	status, _ := rawPut(t, fake, "short", map[string]string{"Content-Length": "10"}, []byte("ab"))
+	if status != http.StatusBadRequest {
+		t.Errorf("short raw body: status = %d, want 400", status)
 	}
 	if _, ok := fake.Object("short"); ok {
-		t.Errorf("short body stored an object, want none")
+		t.Errorf("short raw body stored an object, want none")
+	}
+
+	full := encodeChunked(t, []byte("hello world"))
+	truncated := full[:len(full)-5] // cuts off the final chunk's terminator
+	chunkedStatus, _ := rawPut(t, fake, "shortchunked", map[string]string{
+		"Content-Length":               strconv.Itoa(len(full)),
+		"Content-Encoding":             "aws-chunked",
+		"X-Amz-Decoded-Content-Length": "11",
+	}, truncated)
+	if chunkedStatus != http.StatusBadRequest {
+		t.Errorf("truncated aws-chunked body: status = %d, want 400", chunkedStatus)
+	}
+	if _, ok := fake.Object("shortchunked"); ok {
+		t.Errorf("truncated aws-chunked body stored an object, want none")
 	}
 
 	raw := doRequest(t, fake, http.MethodPut, "raw", []byte("hello world"), nil)
@@ -400,5 +490,316 @@ func TestDelayEvaluatesRegardless(t *testing.T) {
 	}
 	if b, ok := fake.Object("k"); !ok || string(b) != "v" {
 		t.Errorf("Object(%q) = %q, %v, want %q, true", "k", b, ok, "v")
+	}
+}
+
+// TestLandRespectsCondition is the round-1 major-finding regression test:
+// Fault.Land must evaluate the same condition a normal request would
+// before storing anything, never overwrite unconditionally just because
+// Land is set. Reproduces the original bug directly - a conditional
+// create against an existing key, with Land+500, used to store the new
+// bytes anyway - and checks the unconditional, rival, and IgnoreCondition
+// cases land (or don't) the same way a real CAS provider would.
+func TestLandRespectsCondition(t *testing.T) {
+	t.Run("unconditional PUT always lands", func(t *testing.T) {
+		fake := storetest.New(t)
+		fake.Inject(storetest.Rule{
+			Op: storetest.OpPut, Key: "k", Call: 1,
+			Fault: storetest.Fault{Land: true, Status: http.StatusInternalServerError, Code: "InternalError"},
+		})
+		resp := doRequest(t, fake, http.MethodPut, "k", []byte("new"), nil)
+		if resp.status != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", resp.status)
+		}
+		if b, ok := fake.Object("k"); !ok || string(b) != "new" {
+			t.Errorf("Object(%q) = %q, %v, want %q, true (unconditional PUT lands even under a fault)", "k", b, ok, "new")
+		}
+	})
+
+	t.Run("conditional create against an existing key never lands, even with Land set", func(t *testing.T) {
+		fake := storetest.New(t)
+		fake.SetObject("k", []byte("orig"))
+		fake.Inject(storetest.Rule{
+			Op: storetest.OpPutIfAbsent, Key: "k", Call: 1,
+			Fault: storetest.Fault{Land: true, Status: http.StatusInternalServerError, Code: "InternalError"},
+		})
+		resp := doRequest(t, fake, http.MethodPut, "k", []byte("new!"), map[string]string{"If-None-Match": "*"})
+		if resp.status != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", resp.status)
+		}
+		if b, ok := fake.Object("k"); !ok || string(b) != "orig" {
+			t.Errorf("Object(%q) = %q, %v, want %q, true (the condition failed, so Land must not overwrite)", "k", b, ok, "orig")
+		}
+		calls := fake.Calls()
+		if len(calls) != 1 || calls[0].Landed {
+			t.Errorf("Calls() = %+v, want one entry with Landed = false", calls)
+		}
+	})
+
+	t.Run("a rival write plus Land never clobbers the rival", func(t *testing.T) {
+		fake := storetest.New(t)
+		fake.Inject(storetest.Rule{
+			Op: storetest.OpPutIfAbsent, Key: "k", Call: 1,
+			Fault: storetest.Fault{Rival: []byte("rival"), Land: true, Status: http.StatusInternalServerError, Code: "InternalError"},
+		})
+		resp := doRequest(t, fake, http.MethodPut, "k", []byte("mine"), map[string]string{"If-None-Match": "*"})
+		if resp.status != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", resp.status)
+		}
+		if b, ok := fake.Object("k"); !ok || string(b) != "rival" {
+			t.Errorf("Object(%q) = %q, %v, want %q, true (Land must not clobber the rival's bytes)", "k", b, ok, "rival")
+		}
+	})
+
+	t.Run("IgnoreCondition plus Land overwrites, matching the non-CAS provider case", func(t *testing.T) {
+		fake := storetest.New(t)
+		fake.SetObject("k", []byte("orig"))
+		fake.Inject(storetest.Rule{
+			Op: storetest.OpPutIfAbsent, Key: "k", Call: 1,
+			Fault: storetest.Fault{IgnoreCondition: true, Land: true, Status: http.StatusInternalServerError, Code: "InternalError"},
+		})
+		resp := doRequest(t, fake, http.MethodPut, "k", []byte("new"), map[string]string{"If-None-Match": "*"})
+		if resp.status != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", resp.status)
+		}
+		if b, ok := fake.Object("k"); !ok || string(b) != "new" {
+			t.Errorf("Object(%q) = %q, %v, want %q, true", "k", b, ok, "new")
+		}
+	})
+}
+
+// TestInjectPanicsOnZeroCall covers the round-1 finding that a Rule with
+// Call left at its zero value never fires: rs.matched is always at least
+// 1 once a request has arrived, so "matched < 0+count" is false and the
+// rule silently never matches anything. Inject refuses such a rule
+// outright rather than accept the false confidence of a test believing
+// it injected a fault when it injected nothing.
+func TestInjectPanicsOnZeroCall(t *testing.T) {
+	fake := storetest.New(t)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Inject did not panic on a Rule with Call == 0")
+		}
+	}()
+	fake.Inject(storetest.Rule{Op: storetest.OpPut, Key: "k", Fault: storetest.Fault{Status: http.StatusServiceUnavailable, Code: "SlowDown"}})
+}
+
+// TestUnsupportedQueryParamsRejected covers the round-1 finding that
+// unrecognised queries were accepted despite the package doc and plan
+// promising 501 for "any other method or query": a LIST with delimiter,
+// max-keys, or encoding-type; a GET with a ?acl subresource; a PUT with a
+// ?tagging subresource. Only the query keys store.Client actually sends
+// (list-type, prefix, start-after, continuation-token for LIST; none at
+// all for object GET/PUT) are accepted - anything else is 501, and in
+// particular a rejected ?tagging PUT must never apply.
+func TestUnsupportedQueryParamsRejected(t *testing.T) {
+	fake := storetest.New(t)
+	fake.SetObject("a/b/c", []byte("v"))
+	fake.SetObject("a/d", []byte("v"))
+
+	list := doList(t, fake, "list-type=2&delimiter=/&prefix=a/&max-keys=1&encoding-type=url")
+	if list.status != http.StatusNotImplemented {
+		t.Errorf("LIST with delimiter/max-keys/encoding-type: status = %d, want 501", list.status)
+	}
+
+	acl := doRequest(t, fake, http.MethodGet, "a/d?acl", nil, nil)
+	if acl.status != http.StatusNotImplemented {
+		t.Errorf("GET ?acl: status = %d, want 501", acl.status)
+	}
+
+	tagging := doRequest(t, fake, http.MethodPut, "a/d?tagging", []byte("<Tagging/>"), nil)
+	if tagging.status != http.StatusNotImplemented {
+		t.Errorf("PUT ?tagging: status = %d, want 501", tagging.status)
+	}
+	if b, _ := fake.Object("a/d"); string(b) != "v" {
+		t.Errorf("Object(%q) = %q, want unchanged %q (a rejected ?tagging PUT must not apply)", "a/d", b, "v")
+	}
+}
+
+// TestTruncatedGetFailsMidStream covers the round-1 finding that
+// Fault.TruncateBody on a GET sent zero body bytes regardless of N,
+// because hijackDrop's conn.Close() discarded whatever was still sitting
+// in the ResponseWriter's own buffer - only the already-flushed header
+// block ever reached the wire. This reads the response over a raw TCP
+// connection (net/http's client hides a short body behind an error,
+// which would not prove how many bytes actually arrived) and asserts
+// exactly N body bytes were received before the cut.
+func TestTruncatedGetFailsMidStream(t *testing.T) {
+	fake := storetest.New(t)
+	obj := []byte("0123456789abcdefghi") // 20 bytes
+	fake.SetObject("k", obj)
+	const n = 7
+	fake.Inject(storetest.Rule{Op: storetest.OpGet, Key: "k", Call: 1, Fault: storetest.Fault{TruncateBody: n}})
+
+	conn, addr := rawConn(t, fake)
+	defer conn.Close()
+	fmt.Fprintf(conn, "GET /%s/k HTTP/1.1\r\nHost: %s\r\nAuthorization: x\r\nConnection: close\r\n\r\n", fake.Bucket(), addr)
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body) // an error after the cut is expected; only the byte count matters
+	if len(got) != n {
+		t.Fatalf("received %d body bytes before the cut, want %d (got %q)", len(got), n, got)
+	}
+	if !bytes.Equal(got, obj[:n]) {
+		t.Errorf("received bytes = %q, want %q", got, obj[:n])
+	}
+}
+
+// TestListStartAfter covers plan case 5, never exercised in round 1:
+// start-after resumes a list after the given key.
+func TestListStartAfter(t *testing.T) {
+	fake := storetest.New(t)
+	for _, k := range []string{"p/00", "p/01", "p/02", "p/03"} {
+		fake.SetObject(k, []byte("v"))
+	}
+
+	resp := doList(t, fake, "list-type=2&prefix=p/&start-after=p/01")
+	if resp.status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.status)
+	}
+	var result struct {
+		Contents []struct {
+			Key string `xml:"Key"`
+		} `xml:"Contents"`
+	}
+	if err := xml.Unmarshal(resp.body, &result); err != nil {
+		t.Fatalf("unmarshaling: %v", err)
+	}
+	var got []string
+	for _, c := range result.Contents {
+		got = append(got, c.Key)
+	}
+	want := []string{"p/02", "p/03"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("keys = %v, want %v", got, want)
+	}
+}
+
+// TestListStartAfterIgnoredWithContinuationToken covers the package doc's
+// claim that start-after is "ignored once a continuation token is
+// present": a request carrying both a stale start-after and a real
+// continuation token must resume from the token, not the start-after.
+func TestListStartAfterIgnoredWithContinuationToken(t *testing.T) {
+	fake := storetest.New(t)
+	fake.PageSize = 2
+	for _, k := range []string{"p/00", "p/01", "p/02", "p/03"} {
+		fake.SetObject(k, []byte("v"))
+	}
+
+	first := doList(t, fake, "list-type=2&prefix=p/")
+	var page1 struct {
+		IsTruncated           bool   `xml:"IsTruncated"`
+		NextContinuationToken string `xml:"NextContinuationToken"`
+	}
+	if err := xml.Unmarshal(first.body, &page1); err != nil {
+		t.Fatalf("unmarshaling first page: %v", err)
+	}
+	if !page1.IsTruncated || page1.NextContinuationToken == "" {
+		t.Fatalf("first page = %+v, want truncated with a continuation token", page1)
+	}
+
+	// start-after=p/00 alone would resume after p/00 (giving p/01, p/02);
+	// the real continuation token resumes after p/01, where the first
+	// page actually ended. The token must win.
+	second := doList(t, fake, "list-type=2&prefix=p/&start-after=p/00&continuation-token="+page1.NextContinuationToken)
+	if second.status != http.StatusOK {
+		t.Fatalf("second page: status = %d, want 200", second.status)
+	}
+	var result struct {
+		Contents []struct {
+			Key string `xml:"Key"`
+		} `xml:"Contents"`
+	}
+	if err := xml.Unmarshal(second.body, &result); err != nil {
+		t.Fatalf("unmarshaling second page: %v", err)
+	}
+	var got []string
+	for _, c := range result.Contents {
+		got = append(got, c.Key)
+	}
+	want := []string{"p/02", "p/03"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("second page keys = %v, want %v (continuation-token must win over start-after)", got, want)
+	}
+}
+
+// TestCallsRecordedAtArrival covers the round-1 finding that Calls()
+// entries were appended on completion, not arrival, contradicting the
+// doc comment ("the call log, in arrival order"). A PUT delayed 150ms
+// followed 30ms later by an unrelated PUT that returns immediately must
+// still show up in the log in the order they arrived, not the order they
+// finished.
+func TestCallsRecordedAtArrival(t *testing.T) {
+	fake := storetest.New(t)
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpPut, Key: "slow", Call: 1,
+		Fault: storetest.Fault{Delay: 150 * time.Millisecond},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		doRequest(t, fake, http.MethodPut, "slow", []byte("x"), nil)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	doRequest(t, fake, http.MethodPut, "fast", []byte("y"), nil)
+	<-done
+
+	calls := fake.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("Calls() returned %d entries, want 2", len(calls))
+	}
+	if calls[0].Key != "slow" || calls[0].N != 1 {
+		t.Errorf("calls[0] = %+v, want Key \"slow\", N 1 (arrival order, not completion order)", calls[0])
+	}
+	if calls[1].Key != "fast" || calls[1].N != 2 {
+		t.Errorf("calls[1] = %+v, want Key \"fast\", N 2", calls[1])
+	}
+}
+
+// TestAWSChunkedMalformedFramingRejected covers the round-1 finding that
+// decodeAWSChunked accepted framing real S3 would reject: a bare "\n"
+// terminator instead of "\r\n", junk bytes before the terminator, and a
+// missing final CRLF after the zero-length chunk. Each must be refused
+// with 400 and store nothing, never silently decoded.
+func TestAWSChunkedMalformedFramingRejected(t *testing.T) {
+	sig := strings.Repeat("0", 64)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "bare LF instead of CRLF after chunk data",
+			body: "5;chunk-signature=" + sig + "\r\nhello\n0;chunk-signature=" + sig + "\r\n\r\n",
+		},
+		{
+			name: "junk after chunk data before the terminator",
+			body: "5;chunk-signature=" + sig + "\r\nhelloXX\r\n0;chunk-signature=" + sig + "\r\n\r\n",
+		},
+		{
+			name: "missing final CRLF after the zero-length chunk",
+			body: "5;chunk-signature=" + sig + "\r\nhello\r\n0;chunk-signature=" + sig + "\r\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := storetest.New(t)
+			body := []byte(c.body)
+			status, _ := rawPut(t, fake, "malformed", map[string]string{
+				"Content-Length":               strconv.Itoa(len(body)),
+				"Content-Encoding":             "aws-chunked",
+				"X-Amz-Decoded-Content-Length": "5",
+			}, body)
+			if status != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400", status)
+			}
+			if _, ok := fake.Object("malformed"); ok {
+				t.Errorf("malformed framing stored an object, want none")
+			}
+		})
 	}
 }

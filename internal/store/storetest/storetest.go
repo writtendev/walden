@@ -82,6 +82,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -177,7 +178,9 @@ type Rule struct {
 	Key string
 	// Call is the 1-based index, among requests matching Op and Key, that
 	// this rule starts firing on. Retries count as calls: a client's
-	// second attempt at the same key is call 2.
+	// second attempt at the same key is call 2. Call must be >= 1: a zero
+	// Call would never match any request's 1-based count and so would
+	// silently never fire, which Inject refuses rather than accept.
 	Call int
 	// Count is the burst length: Call through Call+Count-1 all fire. 0 and
 	// 1 both mean a single call.
@@ -297,7 +300,15 @@ func (f *Fake) Calls() []Call {
 // Inject adds r to the fault rule table. Rules are evaluated in the order
 // they were injected; the first whose Op, Key, and Call/Count window match
 // a given request is the one that fires for it.
+//
+// Inject panics if r.Call <= 0. Such a rule can never match a request's
+// 1-based arrival count, so it would silently never fire - exactly the
+// false confidence (a test that believes it injected a fault when it
+// injected nothing) this package exists to prevent.
 func (f *Fake) Inject(r Rule) {
+	if r.Call <= 0 {
+		panic(fmt.Sprintf("storetest: Inject: Rule.Call must be >= 1, got %d (Op %v, Key %q); a zero Call would never fire", r.Call, r.Op, r.Key))
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rules = append(f.rules, &ruleState{rule: r})
@@ -306,9 +317,17 @@ func (f *Fake) Inject(r Rule) {
 // matchRule advances the arrival counter and every rule whose Op and Key
 // match this request, and returns the first fault whose Call/Count window
 // the resulting count falls in (nil if none), plus this call's arrival
-// index. It holds the state lock only long enough to do the bookkeeping —
-// never across Fault.Delay or any I/O — so "a rule's call counter and the
-// call log sit under the same lock as the objects" without that lock ever
+// index. It also appends this call's entry to the call log immediately,
+// in arrival order, with Faulted already known but Landed/Status still
+// zero - updateCall fills those in once the request has actually been
+// resolved, which can happen well after arrival (Fault.Delay, a slow
+// body). Recording at arrival rather than completion is what makes
+// Calls() "in arrival order" true under concurrency, not just when
+// requests happen to complete in the order they arrived.
+//
+// It holds the state lock only long enough to do the bookkeeping - never
+// across Fault.Delay or any I/O - so "a rule's call counter and the call
+// log sit under the same lock as the objects" without that lock ever
 // serializing unrelated concurrent requests behind a sleep.
 func (f *Fake) matchRule(op Op, key string) (fault *Fault, n int) {
 	f.mu.Lock()
@@ -332,13 +351,19 @@ func (f *Fake) matchRule(op Op, key string) (fault *Fault, n int) {
 			fault = &fCopy
 		}
 	}
+	f.calls = append(f.calls, Call{N: n, Op: op, Key: key, Faulted: fault != nil})
 	return fault, n
 }
 
-// logCall appends one entry to the call log.
-func (f *Fake) logCall(n int, op Op, key string, faulted, landed bool, status int) {
+// updateCall fills in the Landed and Status fields of the call log entry
+// matchRule already recorded for arrival index n, once the request has
+// actually been resolved. n is 1-based and calls are only ever appended,
+// never removed or reordered, so n-1 is always a valid, stable index into
+// f.calls regardless of how many later calls have arrived since.
+func (f *Fake) updateCall(n int, landed bool, status int) {
 	f.mu.Lock()
-	f.calls = append(f.calls, Call{N: n, Op: op, Key: key, Faulted: faulted, Landed: landed, Status: status})
+	f.calls[n-1].Landed = landed
+	f.calls[n-1].Status = status
 	f.mu.Unlock()
 }
 
@@ -355,15 +380,45 @@ func (f *Fake) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
-	case r.Method == http.MethodPut && key != "":
+	case r.Method == http.MethodPut && key != "" && r.URL.RawQuery == "":
 		f.handlePut(w, r, key)
-	case r.Method == http.MethodGet && key != "":
+	case r.Method == http.MethodGet && key != "" && r.URL.RawQuery == "":
 		f.handleGet(w, r, key)
-	case r.Method == http.MethodGet && key == "" && r.URL.Query().Get("list-type") == "2":
+	case r.Method == http.MethodGet && key == "" && isListQuery(r.URL.Query()):
 		f.handleList(w, r)
 	default:
 		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "unsupported method or query")
 	}
+}
+
+// listQueryParams are the only query keys ListObjectsV2 requests ever
+// carry in this fake: what store.Client's List (list.go) actually sends.
+// walden never asks for a delimiter, max-keys, or encoding-type, so this
+// fake does not model them; a request naming one gets 501, the same as
+// any other unsupported sub-resource or parameter, rather than a
+// silently-accepted response real S3 would answer differently.
+var listQueryParams = map[string]bool{
+	"list-type":          true,
+	"prefix":             true,
+	"start-after":        true,
+	"continuation-token": true,
+}
+
+// isListQuery reports whether q is exactly a ListObjectsV2 request this
+// fake understands: list-type=2 and nothing outside listQueryParams. A PUT
+// or GET against an object key never carries a query string at all here
+// (walden's client never sends one, so ?acl, ?tagging, and the like all
+// fall through to the unsupported-method-or-query default and get 501).
+func isListQuery(q url.Values) bool {
+	if q.Get("list-type") != "2" {
+		return false
+	}
+	for k := range q {
+		if !listQueryParams[k] {
+			return false
+		}
+	}
+	return true
 }
 
 // parsePath splits a path-style request path "/bucket[/key...]" into its
@@ -407,14 +462,14 @@ func (f *Fake) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 	// that.
 	if fault != nil && fault.TruncateBody > 0 {
 		io.CopyN(io.Discard, r.Body, int64(fault.TruncateBody))
-		f.logCall(n, op, key, true, false, 0)
+		f.updateCall(n, false, 0)
 		hijackDrop(w)
 		return
 	}
 
 	body, err := readPutBody(r)
 	if err != nil {
-		f.logCall(n, op, key, fault != nil, false, http.StatusBadRequest)
+		f.updateCall(n, false, http.StatusBadRequest)
 		writeS3Error(w, http.StatusBadRequest, "IncompleteBody", err.Error())
 		return
 	}
@@ -428,36 +483,47 @@ func (f *Fake) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 		f.mu.Unlock()
 	}
 
+	ignoreCondition := fault != nil && fault.IgnoreCondition
+
 	if fault != nil && (fault.Status != 0 || fault.Drop) {
+		// Land means "the write actually happens, under the same
+		// condition a normal request would enforce, before the fault
+		// response lies about the result" - never an unconditional
+		// overwrite. A conditional PUT against an existing key (and no
+		// IgnoreCondition) must leave that key untouched even when Land
+		// is set, exactly as a real CAS provider would: the condition is
+		// evaluated first, and only a passing condition lands anything.
 		landed := false
 		if fault.Land {
 			f.mu.Lock()
-			f.objects[key] = append([]byte(nil), body...)
+			_, exists := f.objects[key]
+			if !(conditional && exists && !ignoreCondition) {
+				f.objects[key] = append([]byte(nil), body...)
+				landed = true
+			}
 			f.mu.Unlock()
-			landed = true
 		}
 		if fault.Drop {
-			f.logCall(n, op, key, true, landed, 0)
+			f.updateCall(n, landed, 0)
 			hijackDrop(w)
 			return
 		}
-		f.logCall(n, op, key, true, landed, fault.Status)
+		f.updateCall(n, landed, fault.Status)
 		writeS3Error(w, fault.Status, fault.Code, "injected fault")
 		return
 	}
 
-	ignoreCondition := fault != nil && fault.IgnoreCondition
 	f.mu.Lock()
 	_, exists := f.objects[key]
 	if conditional && exists && !ignoreCondition {
 		f.mu.Unlock()
-		f.logCall(n, op, key, fault != nil, false, http.StatusPreconditionFailed)
+		f.updateCall(n, false, http.StatusPreconditionFailed)
 		writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold")
 		return
 	}
 	f.objects[key] = append([]byte(nil), body...)
 	f.mu.Unlock()
-	f.logCall(n, op, key, fault != nil, true, http.StatusOK)
+	f.updateCall(n, true, http.StatusOK)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -476,11 +542,11 @@ func (f *Fake) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 
 	if fault != nil && (fault.Status != 0 || fault.Drop) {
 		if fault.Drop {
-			f.logCall(n, OpGet, key, true, false, 0)
+			f.updateCall(n, false, 0)
 			hijackDrop(w)
 			return
 		}
-		f.logCall(n, OpGet, key, true, false, fault.Status)
+		f.updateCall(n, false, fault.Status)
 		writeS3Error(w, fault.Status, fault.Code, "injected fault")
 		return
 	}
@@ -490,13 +556,13 @@ func (f *Fake) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 	f.mu.Unlock()
 
 	if !exists {
-		f.logCall(n, OpGet, key, fault != nil, false, http.StatusNotFound)
+		f.updateCall(n, false, http.StatusNotFound)
 		writeS3Error(w, http.StatusNotFound, "NoSuchKey", "the specified key does not exist")
 		return
 	}
 
 	if fault != nil && fault.TruncateBody > 0 {
-		f.logCall(n, OpGet, key, true, true, http.StatusOK)
+		f.updateCall(n, true, http.StatusOK)
 		cut := fault.TruncateBody
 		if cut > len(obj) {
 			cut = len(obj)
@@ -504,11 +570,20 @@ func (f *Fake) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(obj)))
 		w.WriteHeader(http.StatusOK)
 		w.Write(obj[:cut])
+		// Flush before hijacking: without it, the N bytes just written
+		// are still sitting in the ResponseWriter's own buffer, and
+		// hijackDrop's conn.Close() discards them unsent - the client
+		// would see headers followed immediately by EOF regardless of N,
+		// never the "headers + N bytes, then drop" this fault promises
+		// to model.
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
 		hijackDrop(w)
 		return
 	}
 
-	f.logCall(n, OpGet, key, fault != nil, true, http.StatusOK)
+	f.updateCall(n, true, http.StatusOK)
 	w.Header().Set("Content-Length", strconv.Itoa(len(obj)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(obj)
@@ -529,11 +604,11 @@ func (f *Fake) handleList(w http.ResponseWriter, r *http.Request) {
 
 	if fault != nil && (fault.Status != 0 || fault.Drop) {
 		if fault.Drop {
-			f.logCall(n, OpList, prefix, true, false, 0)
+			f.updateCall(n, false, 0)
 			hijackDrop(w)
 			return
 		}
-		f.logCall(n, OpList, prefix, true, false, fault.Status)
+		f.updateCall(n, false, fault.Status)
 		writeS3Error(w, fault.Status, fault.Code, "injected fault")
 		return
 	}
@@ -568,7 +643,7 @@ func (f *Fake) handleList(w http.ResponseWriter, r *http.Request) {
 		next = page[len(page)-1]
 	}
 
-	f.logCall(n, OpList, prefix, fault != nil, true, http.StatusOK)
+	f.updateCall(n, true, http.StatusOK)
 	writeListResult(w, f.bucket, prefix, page, truncated, next)
 }
 
@@ -628,7 +703,12 @@ func readPutBody(r *http.Request) ([]byte, error) {
 // decodeAWSChunked reads the aws-chunked framing newChunkedBody (sigv4.go)
 // writes — hex(len);chunk-signature=<sig>\r\n<data>\r\n, ending with a
 // zero-length final chunk — and returns the concatenated chunk data.
-// Signatures are not checked; see the package comment for why.
+// Signatures are not checked; see the package comment for why. The
+// terminator after each chunk's data, and after the final zero-length
+// chunk's header, must be exactly "\r\n": readCRLF rejects a bare "\n",
+// junk before the newline, or a connection that ends before the
+// terminator arrives, rather than accepting anything short of an outright
+// read error the way a bare "any line" scan would.
 func decodeAWSChunked(r io.Reader) ([]byte, error) {
 	br := bufio.NewReader(r)
 	var out bytes.Buffer
@@ -646,7 +726,7 @@ func decodeAWSChunked(r io.Reader) ([]byte, error) {
 			return nil, fmt.Errorf("aws-chunked: invalid chunk size %q: %w", sizeField, err)
 		}
 		if size == 0 {
-			if _, err := br.ReadString('\n'); err != nil && err != io.EOF {
+			if err := readCRLF(br); err != nil {
 				return nil, fmt.Errorf("aws-chunked: reading final chunk terminator: %w", err)
 			}
 			return out.Bytes(), nil
@@ -656,10 +736,26 @@ func decodeAWSChunked(r io.Reader) ([]byte, error) {
 			return nil, fmt.Errorf("aws-chunked: reading chunk data: %w", err)
 		}
 		out.Write(buf)
-		if _, err := br.ReadString('\n'); err != nil {
+		if err := readCRLF(br); err != nil {
 			return nil, fmt.Errorf("aws-chunked: reading chunk terminator: %w", err)
 		}
 	}
+}
+
+// readCRLF reads exactly two bytes from r and requires them to be "\r\n".
+// aws-chunked framing always uses CRLF terminators (real S3, and
+// newChunkedBody in sigv4.go, both do); a bare "\n", stray bytes before
+// the newline, or the stream ending early are all malformed framing this
+// fake refuses rather than silently tolerates.
+func readCRLF(r io.Reader) error {
+	var buf [2]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return fmt.Errorf("want CRLF: %w", err)
+	}
+	if buf[0] != '\r' || buf[1] != '\n' {
+		return fmt.Errorf("want CRLF, got %q", buf[:])
+	}
+	return nil
 }
 
 // s3Error is the minimal S3 XML error body: the fake's Client only ever

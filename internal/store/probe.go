@@ -41,10 +41,15 @@ const probeBody = "walden compare-and-swap probe\n"
 // those as a compare-and-swap capability problem would be wrong, and
 // never matches ErrProviderUnsupported.
 //
-// ProbeCAS always attempts to delete the probe key once its first write
-// has landed, whether the probe passed or refused. cleanup is a separate,
-// non-nil error - never a refusal to boot - when that delete fails; the
-// caller (cmd/walden/main.go) prints it as a warning and boots past it. A
+// ProbeCAS always attempts to delete the probe key once its first write is
+// not provably unapplied - a success, or ErrOutcomeUnknown, per classify's
+// r.conditional rule in client.go: once a conditional request has reached
+// storage, no failure past that point proves the write was rejected, so
+// the key may exist even though this write returned an error - whether the
+// probe otherwise passed or refused. cleanup is a separate, non-nil error -
+// never a refusal to boot - when that delete fails, or is skipped because
+// the first write is proven never to have landed; the caller
+// (cmd/walden/main.go) prints it as a warning and boots past it. A
 // stranded probe key is litter, not a durability problem, and nothing
 // under v1/streams/ is ever deleted by this or any other operation.
 func (c *Client) ProbeCAS(ctx context.Context) (cleanup, err error) {
@@ -55,10 +60,17 @@ func (c *Client) ProbeCAS(ctx context.Context) (cleanup, err error) {
 
 	body := []byte(probeBody)
 	if err := c.PutIfAbsent(ctx, key, bytes.NewReader(body), int64(len(body))); err != nil {
-		// The first write never proven to have landed - see classify's
-		// r.conditional rule in client.go - so there is nothing to clean
-		// up yet.
-		return nil, wrapProbeFailure(err)
+		if !errors.Is(err, ErrOutcomeUnknown) {
+			// The first write is proven never to have landed - see
+			// classify's r.conditional rule in client.go - so there is
+			// nothing to clean up.
+			return nil, wrapProbeFailure(err)
+		}
+		// The first write's outcome is unknown: it may have landed even
+		// though this attempt came back an error, so attempt cleanup
+		// rather than stranding v1/probe/<hex> forever (spec section
+		// 11.6 item 6).
+		return c.cleanupProbeKey(ctx, key), wrapProbeFailure(err)
 	}
 
 	err = c.PutIfAbsent(ctx, key, bytes.NewReader(body), int64(len(body)))
@@ -109,7 +121,7 @@ func wrapProbeFailure(cause error) error {
 // probe's first write has landed, whether the probe otherwise passed or
 // refused.
 func (c *Client) cleanupProbeKey(ctx context.Context, key string) error {
-	if err := c.Delete(ctx, key); err != nil {
+	if err := c.delete(ctx, key); err != nil {
 		return refusal.RefuseWithCause("journal probe cleanup", "left "+key+" behind: "+err.Error(), "", err)
 	}
 	return nil

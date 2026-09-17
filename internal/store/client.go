@@ -190,15 +190,17 @@ func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return &getBody{ReadCloser: resp.Body, r: r}, nil
 }
 
-// Delete removes key, journal-relative, from object storage. It exists only
-// for the boot probe's cleanup (ProbeCAS, probe.go) - nothing under
-// v1/streams/ is ever deleted. An unconditional DELETE is idempotent
+// delete removes key, journal-relative, from object storage. It is
+// unexported: it exists only for the boot probe's own cleanup
+// (cleanupProbeKey, probe.go) of its own v1/probe/<hex> key - nothing under
+// v1/streams/ is ever deleted, and no caller outside this package has any
+// business deleting an object. An unconditional DELETE is idempotent
 // (there is nothing to lose by asking storage to remove an already-absent
 // key), so, like Put and Get, it is retried through do rather than
 // treated as a conditional request; ErrObjectNotFound counts as success
 // rather than an error, so a client-side retry after a dropped response -
 // whose delete may have already landed - is never mistaken for a failure.
-func (c *Client) Delete(ctx context.Context, key string) error {
+func (c *Client) delete(ctx context.Context, key string) error {
 	resp, err := c.do(ctx, objectRequest{method: http.MethodDelete, key: key})
 	if err != nil {
 		if errors.Is(err, ErrObjectNotFound) {

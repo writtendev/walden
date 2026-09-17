@@ -420,12 +420,12 @@ func TestGetNotFound(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
-// 3a. Delete (WALD-23, added for the boot probe's own cleanup): sends
-//     DELETE to the right key, retries a 503, treats a 404 NoSuchKey as
-//     success (idempotent - a retried delete after a dropped response
-//     must never be mistaken for a failure), and refuses a 403. Delete is
-//     unconditional, so - like Put and Get - none of this needs
-//     r.conditional.
+// 3a. delete (WALD-23, added for the boot probe's own cleanup; unexported -
+//     see DeleteForTest in export_test.go): sends DELETE to the right key,
+//     retries a 503, treats a 404 NoSuchKey as success (idempotent - a
+//     retried delete after a dropped response must never be mistaken for a
+//     failure), and refuses a 403. delete is unconditional, so - like Put
+//     and Get - none of this needs r.conditional.
 // -----------------------------------------------------------------------
 
 func TestDeleteSendsDeleteMethod(t *testing.T) {
@@ -445,7 +445,7 @@ func TestDeleteSendsDeleteMethod(t *testing.T) {
 	j := testJournal("http://s3.fake.test", "test-bucket", "", true)
 	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
 
-	if err := c.Delete(context.Background(), "v1/probe/deadbeef"); err != nil {
+	if err := store.DeleteForTest(c, context.Background(), "v1/probe/deadbeef"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if gotMethod != http.MethodDelete {
@@ -475,7 +475,7 @@ func TestDeleteRetries503(t *testing.T) {
 	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
 	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
 
-	if err := c.Delete(context.Background(), "v1/probe/deadbeef"); err != nil {
+	if err := store.DeleteForTest(c, context.Background(), "v1/probe/deadbeef"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	if reqCount != 3 {
@@ -494,7 +494,7 @@ func TestDeleteNotFoundIsSuccess(t *testing.T) {
 	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
 	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
 
-	if err := c.Delete(context.Background(), "v1/probe/already-gone"); err != nil {
+	if err := store.DeleteForTest(c, context.Background(), "v1/probe/already-gone"); err != nil {
 		t.Fatalf("Delete of an already-absent key must succeed (idempotent), got: %v", err)
 	}
 	if reqCount != 1 {
@@ -511,7 +511,7 @@ func TestDeleteRefusesForbidden(t *testing.T) {
 	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
 	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
 
-	err := c.Delete(context.Background(), "v1/probe/deadbeef")
+	err := store.DeleteForTest(c, context.Background(), "v1/probe/deadbeef")
 	if !errors.Is(err, store.ErrStorageRefused) {
 		t.Fatalf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
 	}

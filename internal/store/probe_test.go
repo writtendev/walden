@@ -266,3 +266,81 @@ func TestProbeCASDeleteFailureIsWarning(t *testing.T) {
 		t.Errorf("cleanup warning %q does not name the stranded key %q", cleanup.Error(), keys[0])
 	}
 }
+
+// 6. ErrOutcomeUnknown on the FIRST write (a 500 that actually landed the
+// object, per Fault.Land - the exact ambiguity classify's r.conditional
+// rule describes): the probe cannot prove the write never landed, so it
+// must still attempt cleanup rather than stranding v1/probe/<hex> forever
+// (spec/journal/v1 section 11.6 item 6), and must not resend the write.
+func TestProbeCASFirstWriteAmbiguousCleansUp(t *testing.T) {
+	c, fake := newProbeClient(t, "")
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpPutIfAbsent, Call: 1,
+		Fault: storetest.Fault{Status: http.StatusInternalServerError, Code: "InternalError", Land: true},
+	})
+
+	cleanup, err := c.ProbeCAS(context.Background())
+	if !errors.Is(err, store.ErrOutcomeUnknown) {
+		t.Fatalf("errors.Is(err, ErrOutcomeUnknown) = false, err = %v", err)
+	}
+	if errors.Is(err, store.ErrProviderUnsupported) {
+		t.Errorf("an ambiguous first write must not match ErrProviderUnsupported: %v", err)
+	}
+	assertSingleLine(t, err)
+
+	keys := putIfAbsentKeys(fake)
+	if len(keys) != 1 {
+		t.Fatalf("fake saw %d PutIfAbsent calls, want exactly 1 (no resend of an ambiguous first write)", len(keys))
+	}
+
+	var deletes int
+	for _, call := range fake.Calls() {
+		if call.Op == storetest.OpDelete {
+			deletes++
+			if got := strings.TrimPrefix(call.Key, testPrefix+"/"); got != keys[0] {
+				t.Errorf("DELETE key = %q, want %q", got, keys[0])
+			}
+		}
+	}
+	if deletes != 1 {
+		t.Errorf("fake saw %d DELETE calls, want 1 (cleanup attempted despite the ambiguous first write)", deletes)
+	}
+	if cleanup != nil {
+		t.Errorf("cleanup = %v, want nil (the fake honours DELETE)", cleanup)
+	}
+	if _, ok := fake.Object(testPrefix + "/" + keys[0]); ok {
+		t.Errorf("probe key %q still present after cleanup", keys[0])
+	}
+}
+
+// 7. Same ambiguous first write, but cleanup's own DELETE fails: a warning
+// naming the stranded key, never a refusal - ProbeCAS's own err is still
+// ErrOutcomeUnknown, unaffected by the cleanup failure.
+func TestProbeCASFirstWriteAmbiguousCleanupFails(t *testing.T) {
+	c, fake := newProbeClient(t, "")
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpPutIfAbsent, Call: 1,
+		Fault: storetest.Fault{Status: http.StatusInternalServerError, Code: "InternalError", Land: true},
+	})
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpDelete, Call: 1,
+		Fault: storetest.Fault{Status: http.StatusForbidden, Code: "AccessDenied"},
+	})
+
+	cleanup, err := c.ProbeCAS(context.Background())
+	if !errors.Is(err, store.ErrOutcomeUnknown) {
+		t.Fatalf("errors.Is(err, ErrOutcomeUnknown) = false, err = %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("cleanup = nil, want a warning naming the stranded key")
+	}
+	assertSingleLine(t, cleanup)
+
+	keys := putIfAbsentKeys(fake)
+	if len(keys) != 1 {
+		t.Fatalf("fake saw %d PutIfAbsent calls, want exactly 1", len(keys))
+	}
+	if !strings.Contains(cleanup.Error(), keys[0]) {
+		t.Errorf("cleanup warning %q does not name the stranded key %q", cleanup.Error(), keys[0])
+	}
+}

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/hex"
 	"io"
 	"net/http"
@@ -131,4 +132,12 @@ const MaxAttemptsForTest = maxAttempts
 // NewClientForTest.
 func CheckRedirectForTest(c *Client) error {
 	return c.http.CheckRedirect(nil, nil)
+}
+
+// DeleteForTest exposes delete (unexported: it exists only for the boot
+// probe's own cleanup of its own key, probe.go) to the external test
+// package, so client_test.go can drive its retry/idempotent behaviour
+// directly rather than only indirectly through ProbeCAS.
+func DeleteForTest(c *Client, ctx context.Context, key string) error {
+	return c.delete(ctx, key)
 }

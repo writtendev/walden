@@ -567,7 +567,8 @@ func journalQuery(u *url.URL) (region, style string, err error) {
 
 // matchProviderHost returns the longest-suffix provider rule matching host.
 // An unrecognised host gets a rule that says: path-style, no fixed region, and
-// no provider name, so there is nothing for the pre-flight refusal to match.
+// no provider name, so (*Client).providerName (probe.go) falls back to
+// naming the endpoint's host[:port] instead in any refusal ProbeCAS produces.
 func matchProviderHost(host string) (providerHost, bool) {
 	best := providerHost{}
 	found := false

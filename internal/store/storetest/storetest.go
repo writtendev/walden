@@ -62,10 +62,11 @@
 //     default, S3's own default) so a test can exercise pagination without
 //     seeding a thousand keys.
 //   - DELETE removes the key unconditionally and returns 204, whether or
-//     not the key existed (idempotent, matching real S3 and
-//     store.Client.Delete's contract). WALD-23 added this for the boot
-//     probe's cleanup; it is otherwise unconditional and carries no
-//     precondition handling of its own.
+//     not the key existed (idempotent, matching real S3 and the store
+//     client's own DELETE contract - unexported outside package store,
+//     used only by the boot probe's own cleanup). WALD-23 added this for
+//     the boot probe's cleanup; it is otherwise unconditional and carries
+//     no precondition handling of its own.
 //   - Any other method or query — an unrecognised list query, an object
 //     PUT carrying a query string — returns 501 NotImplemented, so a
 //     missing capability fails loudly rather than silently passing.
@@ -618,10 +619,11 @@ func (f *Fake) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 }
 
 // handleDelete serves an unconditional DELETE of one object. It is
-// idempotent, matching store.Client.Delete's contract: a key that does not
-// exist still answers 204, never 404 - real S3 behaves the same way, and
-// walden relies on it so a retried delete after a dropped response is never
-// mistaken for a failure.
+// idempotent, matching the store client's own DELETE contract (unexported
+// outside package store; used only by the boot probe's own cleanup): a key
+// that does not exist still answers 204, never 404 - real S3 behaves the
+// same way, and walden relies on it so a retried delete after a dropped
+// response is never mistaken for a failure.
 func (f *Fake) handleDelete(w http.ResponseWriter, r *http.Request, key string) {
 	fault, n := f.matchRule(OpDelete, key)
 

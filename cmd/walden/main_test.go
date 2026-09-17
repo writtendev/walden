@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1174,4 +1175,117 @@ func TestServeJournalWarning(t *testing.T) {
 			t.Errorf("expected no journal-less warning when journal is configured, got:\n%s", stderr.String())
 		}
 	})
+}
+
+// TestServeProbeRefusesProviderLacksCAS asserts the boot-level shape of the
+// WALD-23 probe's refusal (spec/journal/v1 section 11.5 item 6): a backend
+// that ignores If-None-Match: * makes runServe return the one-line
+// RefuseProviderLacksCAS refusal naming the endpoint's host[:port] (this
+// fake's host is unrecognised, so it never resolves to a known provider
+// name), and boot stops before os.MkdirAll ever runs - the data directory
+// must not exist afterward. Moving the probe below os.MkdirAll/net.Listen,
+// dropping the `journal != nil` guard's effect on this path, or dropping
+// the probe's `return err` would all let dataDir come into existence, which
+// is exactly what this test's final assertion catches.
+func TestServeProbeRefusesProviderLacksCAS(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "topsecret")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	fake := storetest.New(t)
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpPutIfAbsent, Call: 1, Count: 2,
+		Fault: storetest.Fault{IgnoreCondition: true},
+	})
+	journalURL := fake.URL() + "/" + fake.Bucket() + "/prefix"
+
+	var stdout, stderr bytes.Buffer
+	err := runServe(cancelledContext(), []string{
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("runServe succeeded, want a refusal (the fake does not honour If-None-Match)")
+	}
+	if !errors.Is(err, journal.ErrCASNotSupported) {
+		t.Errorf("errors.Is(err, journal.ErrCASNotSupported) = false, err = %v", err)
+	}
+	host := strings.TrimPrefix(fake.URL(), "http://")
+	want := journal.RefuseProviderLacksCAS(host).Error()
+	if err.Error() != want {
+		t.Errorf("runServe error:\n got: %s\nwant: %s", err.Error(), want)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+
+	if _, statErr := os.Stat(dataDir); !os.IsNotExist(statErr) {
+		t.Errorf("data dir %s must not exist after a boot refused by the probe (which must run before os.MkdirAll), stat err = %v", dataDir, statErr)
+	}
+}
+
+// TestServeProbePrintConfigMakesNoRequest asserts --print-config never
+// reaches the boot-time probe: it resolves the journal's location but exits
+// before the `if journal != nil` probe block, so it never makes a single
+// request to the bucket even when a --journal is given. A regression that
+// hoisted the probe ahead of the --print-config return, or ran it
+// regardless of printConfig, would show up here as a nonzero call count.
+func TestServeProbePrintConfigMakesNoRequest(t *testing.T) {
+	dataDir := t.TempDir()
+	fake := storetest.New(t)
+	journalURL := fake.URL() + "/" + fake.Bucket() + "/prefix"
+
+	var stdout, stderr bytes.Buffer
+	err := runServe(context.Background(), []string{
+		"--data-dir", dataDir,
+		"--journal", journalURL,
+		"--print-config",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runServe --print-config failed: %v", err)
+	}
+
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("--print-config made %d request(s) to the journal bucket, want 0: %+v", len(calls), calls)
+	}
+}
+
+// TestServeProbeCleanupFailureIsWarning asserts a failed probe-cleanup
+// DELETE surfaces as exactly one `walden: WARNING: journal probe cleanup:`
+// line on stderr, never a refusal, and boot continues past it (the probe
+// itself passes: the fake otherwise honours If-None-Match).
+func TestServeProbeCleanupFailureIsWarning(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "topsecret")
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	fake := storetest.New(t)
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpDelete, Call: 1,
+		Fault: storetest.Fault{Status: http.StatusForbidden, Code: "AccessDenied"},
+	})
+	journalURL := fake.URL() + "/" + fake.Bucket() + "/prefix"
+
+	var stdout, stderr bytes.Buffer
+	err := runServe(cancelledContext(), []string{
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runServe failed: %v", err)
+	}
+
+	const wantPrefix = "walden: WARNING: journal probe cleanup:"
+	out := stderr.String()
+	if got := strings.Count(out, wantPrefix); got != 1 {
+		t.Errorf("expected exactly one %q line on stderr, got %d:\n%s", wantPrefix, got, out)
+	}
+
+	if !strings.Contains(stdout.String(), "walden server starting on") {
+		t.Errorf("expected boot to continue past the cleanup warning and bind, got stdout:\n%s", stdout.String())
+	}
 }

@@ -326,8 +326,9 @@ func TestSentinelErrorsUnificationAndErrorsIs(t *testing.T) {
 		t.Errorf("expected RefuseCASNotSupported to match ErrCASNotSupported")
 	}
 
-	// 4a. RefuseProviderLacksCAS (the boot pre-flight) shares the same cause sentinel
-	// as RefuseCASNotSupported (the append-time refusal): the two are distinct,
+	// 4a. RefuseProviderLacksCAS (the boot-time compare-and-swap probe,
+	// store.(*Client).ProbeCAS) shares the same cause sentinel as
+	// RefuseCASNotSupported (the append-time refusal): the two are distinct,
 	// differently-worded conditions, but both are the CAS capability problem, and a
 	// caller checking errors.Is(err, journal.ErrCASNotSupported) should catch either.
 	errProviderCAS := journal.RefuseProviderLacksCAS("Wasabi")

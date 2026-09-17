@@ -45,9 +45,10 @@ var (
 	// ErrInvalidJournal indicates a WALDEN_JOURNAL value walden cannot resolve.
 	ErrInvalidJournal = errors.New("invalid journal URL")
 
-	// ErrProviderUnsupported indicates a provider without compare-and-swap. It is the
+	// ErrProviderUnsupported indicates a bucket without compare-and-swap. It is the
 	// same sentinel as journal.ErrCASNotSupported so that errors.Is matches either
-	// RefuseProviderLacksCAS (this package's boot pre-flight) or RefuseCASNotSupported
+	// RefuseProviderLacksCAS (returned by (*Client).ProbeCAS, probe.go, once the boot
+	// probe proves the bucket does not honor If-None-Match) or RefuseCASNotSupported
 	// (the journal package's append-time refusal); the text is already identical.
 	ErrProviderUnsupported = journal.ErrCASNotSupported
 
@@ -129,10 +130,6 @@ type providerHost struct {
 	// fixedRegion is the provider's only region, if it has one. It beats
 	// the environment so a stray AWS_REGION cannot break signing.
 	fixedRegion string
-
-	// cas reports whether the provider supports the conditional writes the
-	// journal is built on. A provider without them is refused at boot.
-	cas bool
 }
 
 // providerHosts reads a hostname into an endpoint, a region, and an addressing
@@ -140,21 +137,18 @@ type providerHost struct {
 // hostnames; they are the unrecognised, path-style default rather than entries
 // here.
 //
-// The cas bit is a fast pre-flight refusal for a provider already known not to
-// support conditional writes, not the compare-and-swap check. A hostname cannot
-// see a proxy in front of the bucket or a build too old to honour the
-// precondition, and the three self-hosted implementations above — where support
-// is version-gated rather than vendor-gated — do not appear here at all. CAS
-// will be settled at boot by probing the real bucket (WALD-23); until that
-// lands there is no CAS enforcement, and nothing writes to the bucket either.
-// See spec/journal/v1 section 11.2.
+// The table carries no compare-and-swap bit. CAS is settled at boot by
+// (*Client).ProbeCAS (probe.go) probing the real bucket, not by matching a
+// hostname: a hostname cannot see a proxy in front of the bucket or a build
+// too old to honour the precondition. spec/journal/v1 section 11.2's support
+// matrix is documentation for choosing a provider, never itself enforcement.
 var providerHosts = []providerHost{
-	{suffix: "amazonaws.com", provider: "AWS S3", endpointLabels: -1, cas: true},
-	{suffix: "backblazeb2.com", provider: "Backblaze B2", endpointLabels: -1, cas: true},
-	{suffix: "wasabisys.com", provider: "Wasabi", endpointLabels: -1, cas: false},
-	{suffix: "storage.googleapis.com", provider: "Google Cloud Storage", endpointLabels: 3, fixedRegion: "auto", cas: true},
-	{suffix: "r2.cloudflarestorage.com", provider: "Cloudflare R2", endpointLabels: 4, fixedRegion: "auto", cas: true},
-	{suffix: "blob.core.windows.net", provider: "Azure Blob Storage", endpointLabels: 5, fixedRegion: "auto", cas: true},
+	{suffix: "amazonaws.com", provider: "AWS S3", endpointLabels: -1},
+	{suffix: "backblazeb2.com", provider: "Backblaze B2", endpointLabels: -1},
+	{suffix: "wasabisys.com", provider: "Wasabi", endpointLabels: -1},
+	{suffix: "storage.googleapis.com", provider: "Google Cloud Storage", endpointLabels: 3, fixedRegion: "auto"},
+	{suffix: "r2.cloudflarestorage.com", provider: "Cloudflare R2", endpointLabels: 4, fixedRegion: "auto"},
+	{suffix: "blob.core.windows.net", provider: "Azure Blob Storage", endpointLabels: 5, fixedRegion: "auto"},
 }
 
 // ResolveJournal resolves a WALDEN_JOURNAL value into a complete Journal:
@@ -296,9 +290,6 @@ func ParseJournalURL(raw string, lookupEnv func(string) (string, bool)) (*Journa
 		}
 		j.Provider = rule.provider
 
-		if !rule.cas {
-			return nil, journal.RefuseProviderLacksCAS(rule.provider)
-		}
 		if !isEndpoint {
 			// A provider host with no "s3" label anywhere in it is not an
 			// endpoint. Read as one, https://amazonaws.com/bucket/walden
@@ -578,7 +569,7 @@ func journalQuery(u *url.URL) (region, style string, err error) {
 // An unrecognised host gets a rule that says: path-style, no fixed region, and
 // no provider name, so there is nothing for the pre-flight refusal to match.
 func matchProviderHost(host string) (providerHost, bool) {
-	best := providerHost{cas: true}
+	best := providerHost{}
 	found := false
 	for _, rule := range providerHosts {
 		if host != rule.suffix && !strings.HasSuffix(host, "."+rule.suffix) {

@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/refusal"
 	"github.com/writtendev/walden/internal/store"
 )
@@ -419,6 +418,52 @@ func TestParseJournalURLLocations(t *testing.T) {
 			prefix:   "walden",
 		},
 
+		// Wasabi: WALD-79 deleted the per-provider cas bit, so these are now
+		// success rows — CAS is settled by the boot probe (WALD-23), not by
+		// this table. All four cover the case-folding and root-anchored-FQDN
+		// handling TestS3SchemeBucketKeepsItsCase used to prove indirectly
+		// through the now-deleted CAS refusal.
+		{
+			name:      "wasabi-path-style",
+			raw:       "https://s3.eu-central-1.wasabisys.com/my-bucket/walden",
+			provider:  "Wasabi",
+			endpoint:  "https://s3.eu-central-1.wasabisys.com",
+			region:    "eu-central-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			name:     "wasabi-virtual-hosted",
+			raw:      "https://my-bucket.s3.wasabisys.com/walden",
+			provider: "Wasabi",
+			endpoint: "https://s3.wasabisys.com",
+			region:   "us-east-1",
+			bucket:   "my-bucket",
+			prefix:   "walden",
+		},
+		{
+			// A root-anchored FQDN names the same host as the bare form, so
+			// it must reach the same provider rule.
+			name:      "wasabi-root-anchored-fqdn",
+			raw:       "https://s3.wasabisys.com./my-bucket/walden",
+			provider:  "Wasabi",
+			endpoint:  "https://s3.wasabisys.com",
+			region:    "us-east-1",
+			bucket:    "my-bucket",
+			prefix:    "walden",
+			pathStyle: true,
+		},
+		{
+			name:     "wasabi-root-anchored-virtual-hosted",
+			raw:      "https://my-bucket.s3.wasabisys.com./walden",
+			provider: "Wasabi",
+			endpoint: "https://s3.wasabisys.com",
+			region:   "us-east-1",
+			bucket:   "my-bucket",
+			prefix:   "walden",
+		},
+
 		// Azure Blob Storage: the label in front of the suffix is the
 		// account, and the container is the first path segment.
 		{
@@ -579,12 +624,6 @@ func TestParseJournalURLRefusals(t *testing.T) {
 		{name: "userinfo-no-secret", raw: "s3://AKIAEXAMPLE@my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "no secret"},
 		{name: "userinfo-no-key-id", raw: "s3://:secret@my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "no access key ID"},
 		{name: "userinfo-empty", raw: "s3://@my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "empty credentials"},
-		{name: "wasabi-no-cas", raw: "https://s3.eu-central-1.wasabisys.com/my-bucket/walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
-		{name: "wasabi-virtual-hosted-no-cas", raw: "https://my-bucket.s3.wasabisys.com/walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
-		// A root-anchored FQDN must not walk past the provider table and
-		// the compare-and-swap gate behind it.
-		{name: "wasabi-root-anchored-fqdn-no-cas", raw: "https://s3.wasabisys.com./my-bucket/walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
-		{name: "wasabi-root-anchored-virtual-hosted-no-cas", raw: "https://my-bucket.s3.wasabisys.com./walden", wantErr: store.ErrProviderUnsupported, wantSub: "compare-and-swap"},
 		// s3:// always addresses AWS, so a port has nowhere to go. Dropping
 		// it silently resolved a self-hosted endpoint to a bucket at Amazon.
 		{name: "s3-scheme-with-port", raw: "s3://minio.local:9000/my-bucket/walden", wantErr: store.ErrInvalidJournal, wantSub: "s3:// URL carries a port"},
@@ -1096,62 +1135,6 @@ func TestJournalStringDistinguishesQuotedLookFromRealQuoting(t *testing.T) {
 	}
 }
 
-// TestProviderHostsRefuseWithoutCAS checks that each host rule behaves at boot
-// the way its CAS bit claims: a rule marked cas=false refuses with
-// ErrProviderUnsupported, and one marked cas=true does not.
-//
-// This test used to bind the table to journal.ProviderSupportMatrix as well.
-// That matrix is gone (WALD-79): a hostname is not a capability, so CAS will be
-// settled by the boot probe against the real bucket (WALD-23) — until then
-// there is no CAS enforcement — and spec §11.2 is documentation rather than
-// something Go re-derives. What remains here is
-// the half that was never table-against-table — that the code refuses what it
-// says it refuses.
-func TestProviderHostsRefuseWithoutCAS(t *testing.T) {
-	rows := store.ProviderHostsForTest()
-	if len(rows) == 0 {
-		t.Fatal("the provider host table is empty")
-	}
-
-	for _, row := range rows {
-		t.Run(row.Provider, func(t *testing.T) {
-			// The bare suffix is a host of the right provider family,
-			// which is all this assertion needs. It is not necessarily a
-			// usable endpoint — https://amazonaws.com names no S3
-			// endpoint and is refused as such — so the only thing
-			// checked here is the compare-and-swap bit. Whether a host
-			// resolves, and to what, is TestParseJournalURLLocations.
-			raw := "https://" + row.Suffix + "/my-bucket/walden"
-			_, err := store.ParseJournalURL(raw, envLookup(creds))
-			refused := errors.Is(err, store.ErrProviderUnsupported)
-			if refused == row.CAS {
-				t.Errorf("ParseJournalURL(%q) refused=%v, want %v (err: %v)", raw, refused, !row.CAS, err)
-			}
-		})
-	}
-}
-
-// TestBootRefusalMatchesRefuseProviderLacksCAS ties the real boot path to the
-// wording pinned by spec/journal/v1/README.md section 11.5 item 6 and by
-// conditional_append.json's "provider_known_without_cas" case. The two
-// packages must agree byte for byte, or an operator who greps the spec for
-// the refusal they hit finds nothing (WALD-101).
-func TestBootRefusalMatchesRefuseProviderLacksCAS(t *testing.T) {
-	const raw = "https://s3.eu-central-1.wasabisys.com/my-bucket/walden"
-	_, err := store.ParseJournalURL(raw, envLookup(creds))
-	if err == nil {
-		t.Fatalf("ParseJournalURL(%q) succeeded, want the CAS pre-flight refusal", raw)
-	}
-	want := journal.RefuseProviderLacksCAS("Wasabi").Error()
-	if err.Error() != want {
-		t.Errorf("ParseJournalURL(%q) error:\n got: %s\nwant: %s", raw, err.Error(), want)
-	}
-	if !errors.Is(err, store.ErrProviderUnsupported) {
-		t.Errorf("ParseJournalURL(%q) error does not match ErrProviderUnsupported", raw)
-	}
-	assertOneLineRefusal(t, err)
-}
-
 // TestJournalRefusalsHideTheSecret is the regression for the leak that let a
 // WALDEN_JOURNAL value reach stderr with its userinfo intact.
 //
@@ -1286,11 +1269,15 @@ func TestS3SchemeBucketKeepsItsCase(t *testing.T) {
 
 	// The host is still folded for the provider table, which matches
 	// hostnames and is case-insensitive. This is the case round 3 verified:
-	// an uppercase, root-anchored Wasabi host must still reach the
-	// compare-and-swap gate.
-	_, err := store.ParseJournalURL("https://S3.WASABISYS.COM./my-bucket/walden", envLookup(creds))
-	if !errors.Is(err, store.ErrProviderUnsupported) {
-		t.Errorf("an uppercase Wasabi host gave %v, want the compare-and-swap refusal", err)
+	// an uppercase, root-anchored Wasabi host must still resolve to the
+	// Wasabi provider rule rather than falling through to the unrecognised-
+	// host default (which would leave Provider empty).
+	j, err := store.ParseJournalURL("https://S3.WASABISYS.COM./my-bucket/walden", envLookup(creds))
+	if err != nil {
+		t.Fatalf("ParseJournalURL of an uppercase, root-anchored Wasabi host failed: %v", err)
+	}
+	if j.Provider != "Wasabi" {
+		t.Errorf("Provider = %q, want %q (case-folding must still reach the provider table)", j.Provider, "Wasabi")
 	}
 }
 

@@ -420,6 +420,107 @@ func TestGetNotFound(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------
+// 3a. Delete (WALD-23, added for the boot probe's own cleanup): sends
+//     DELETE to the right key, retries a 503, treats a 404 NoSuchKey as
+//     success (idempotent - a retried delete after a dropped response
+//     must never be mistaken for a failure), and refuses a 403. Delete is
+//     unconditional, so - like Put and Get - none of this needs
+//     r.conditional.
+// -----------------------------------------------------------------------
+
+func TestDeleteSendsDeleteMethod(t *testing.T) {
+	var gotMethod, gotPath string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}
+	client := newFakeServer(t, false, handler)
+	// Prefix is deliberately empty here, unlike this file's other tests:
+	// the probe key already starts with the literal "v1" format-version
+	// segment (journal.VersionPrefix), and a non-empty Journal.Prefix would
+	// be the operator's own configured prefix layered in front of it, which
+	// this test does not need in order to check the method and the key
+	// reach the wire unchanged.
+	j := testJournal("http://s3.fake.test", "test-bucket", "", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	if err := c.Delete(context.Background(), "v1/probe/deadbeef"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %q, want DELETE", gotMethod)
+	}
+	const wantPath = "/test-bucket/v1/probe/deadbeef"
+	if gotPath != wantPath {
+		t.Errorf("path = %q, want %q", gotPath, wantPath)
+	}
+}
+
+func TestDeleteRetries503(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	defer restore()
+
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&reqCount, 1)
+		if n <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write(xmlError("SlowDown"))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	if err := c.Delete(context.Background(), "v1/probe/deadbeef"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if reqCount != 3 {
+		t.Errorf("server saw %d requests, want 3", reqCount)
+	}
+}
+
+func TestDeleteNotFoundIsSuccess(t *testing.T) {
+	var reqCount int32
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		w.WriteHeader(http.StatusNotFound)
+		w.Write(xmlError("NoSuchKey"))
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	if err := c.Delete(context.Background(), "v1/probe/already-gone"); err != nil {
+		t.Fatalf("Delete of an already-absent key must succeed (idempotent), got: %v", err)
+	}
+	if reqCount != 1 {
+		t.Errorf("server saw %d requests, want 1 (NoSuchKey is not retried)", reqCount)
+	}
+}
+
+func TestDeleteRefusesForbidden(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write(xmlError("AccessDenied"))
+	}
+	client := newFakeServer(t, false, handler)
+	j := testJournal("http://s3.fake.test", "test-bucket", "v1", true)
+	c := store.NewClientForTest(j, client, fixedClock(time.Now()))
+
+	err := c.Delete(context.Background(), "v1/probe/deadbeef")
+	if !errors.Is(err, store.ErrStorageRefused) {
+		t.Fatalf("errors.Is(err, ErrStorageRefused) = false, err = %v", err)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+}
+
+// -----------------------------------------------------------------------
 // 4. Retries recover: 503, 503, 200 succeeds after 3 requests, and the PUT
 //    body is identical on every attempt.
 // -----------------------------------------------------------------------

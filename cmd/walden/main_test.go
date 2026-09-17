@@ -17,6 +17,7 @@ import (
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/journal"
+	"github.com/writtendev/walden/internal/store/storetest"
 )
 
 // cancelledContext returns a context that is already done, so a caller
@@ -417,13 +418,6 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			wantErrSub: "walden: invalid journal: unsupported URL scheme \"ftp\"",
 		},
 		{
-			name:       "serve-journal-provider-without-cas-exits-error",
-			cmdPath:    binPath,
-			args:       []string{"serve", "--journal", "https://s3.eu-central-1.wasabisys.com/my-bucket/walden"},
-			wantExit0:  false,
-			wantErrSub: "walden: invalid journal: Wasabi does not support compare-and-swap",
-		},
-		{
 			// --print-config resolves the location but not the
 			// credentials, so a URL can be checked on a machine that
 			// holds no secrets.
@@ -559,15 +553,6 @@ func TestBinaryArgvDispatch(t *testing.T) {
 			args:       []string{"serve", "--journal", "https://s3-accelerate.amazonaws.com/my-bucket/walden"},
 			wantExit0:  false,
 			wantErrSub: "walden: invalid journal: endpoint host \"s3-accelerate.amazonaws.com\" fronts every region and names none",
-		},
-		{
-			// A root-anchored FQDN must not walk past the provider table
-			// and the compare-and-swap gate behind it.
-			name:       "serve-journal-root-anchored-fqdn-without-cas-exits-error",
-			cmdPath:    binPath,
-			args:       []string{"serve", "--journal", "https://s3.wasabisys.com./my-bucket/walden"},
-			wantExit0:  false,
-			wantErrSub: "walden: invalid journal: Wasabi does not support compare-and-swap",
 		},
 	}
 
@@ -1168,11 +1153,19 @@ func TestServeJournalWarning(t *testing.T) {
 		t.Setenv("AWS_SECRET_ACCESS_KEY", "topsecret")
 		t.Setenv("AWS_REGION", "us-east-1")
 
+		// A real s3:// journal would now reach the boot-time compare-and-
+		// swap probe (WALD-23), which would in turn make a real network
+		// request. Pointed at a local fake that honours If-None-Match
+		// instead, so this test - which is about the journal-less warning,
+		// not the probe - stays offline.
+		fake := storetest.New(t)
+		journalURL := fake.URL() + "/" + fake.Bucket() + "/prefix"
+
 		var stdout, stderr bytes.Buffer
 		err := runServe(cancelledContext(), []string{
 			"--data-dir", dataDir,
 			"--listen", "127.0.0.1:0",
-			"--journal", "s3://my-bucket/prefix",
+			"--journal", journalURL,
 		}, &stdout, &stderr)
 		if err != nil {
 			t.Fatalf("runServe failed: %v", err)

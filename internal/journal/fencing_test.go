@@ -98,7 +98,7 @@ func TestRefusalMessagesSingleLineAndFormat(t *testing.T) {
 	if strings.Contains(msgProviderCAS, "\n") {
 		t.Errorf("refusal message contains newline: %q", msgProviderCAS)
 	}
-	expectedProviderCAS := "invalid journal: Wasabi does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.1)"
+	expectedProviderCAS := "invalid journal: Wasabi does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.2)"
 	if msgProviderCAS != expectedProviderCAS {
 		t.Errorf("refusal mismatch:\ngot:  %q\nwant: %q", msgProviderCAS, expectedProviderCAS)
 	}

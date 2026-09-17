@@ -25,6 +25,13 @@ import (
 // Version can be set via ldflags at build time.
 var Version = "dev"
 
+// probeTimeout bounds the boot-time compare-and-swap probe (ProbeCAS).
+// Not a knob: walden's five knobs don't include tuning this, so there is
+// no flag or env var. The client's own transport timeouts and retry cap
+// bound each individual request anyway; this is a backstop on the whole
+// probe (two writes and a delete, retries included).
+const probeTimeout = 2 * time.Minute
+
 func main() {
 	if err := run(context.Background(), os.Args, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "walden: %v\n", err)
@@ -145,6 +152,34 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			fmt.Fprintln(stdout, journal.String())
 		}
 		return nil
+	}
+
+	// The boot-time compare-and-swap probe (WALD-23, spec/journal/v1
+	// section 11.6) is the sole enforcement of the CAS requirement: it
+	// replaces a hostname pre-flight with two real conditional writes
+	// against the real bucket, and doubles as the credentials and
+	// reachability check. It runs here, before anything else has side
+	// effects (no data dir, no tokens.json, no admin token, no bound
+	// port), so a refused probe leaves nothing behind to clean up.
+	// Deliberately after the --print-config return above (--print-config
+	// makes no request to the bucket) and only when a journal is
+	// configured at all (journal-less mode never probes). Like the
+	// git-floor check above, this uses context.Background() rather than
+	// ctx: it is a bounded, sub-second-to-low-second preflight with
+	// nothing yet to gracefully stop, and the end-to-end tests boot with
+	// an already-cancelled ctx to make boot return once it has bound and
+	// printed - tying the probe to that ctx would make it spuriously fail
+	// before it ever reaches the bucket.
+	if journal != nil {
+		probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		cleanup, err := store.NewClient(journal).ProbeCAS(probeCtx)
+		cancel()
+		if cleanup != nil {
+			fmt.Fprintf(stderr, "walden: WARNING: %v\n", cleanup)
+		}
+		if err != nil {
+			return err
+		}
 	}
 
 	// The local repository store needs the data directory in both auth

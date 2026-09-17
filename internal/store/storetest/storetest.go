@@ -1,7 +1,8 @@
 // Package storetest is an in-memory, S3-speaking fake of the object storage
-// the journal lives in: PUT, conditional PUT (If-None-Match: *), GET, and
-// ListObjectsV2, running as a real http.Handler on an httptest.Server. It
-// exists so store.Client (sigv4, aws-chunked, retry/classify — see
+// the journal lives in: PUT, conditional PUT (If-None-Match: *), GET,
+// ListObjectsV2, and DELETE, running as a real http.Handler on an
+// httptest.Server. It exists so store.Client (sigv4, aws-chunked, retry/
+// classify — see
 // client.go's file comment) can be pointed at something that behaves like
 // object storage, including on purpose behaving badly: a Rule table fires
 // injected faults — latency, 5xx bursts, dropped connections, truncated
@@ -60,9 +61,14 @@
 //     are in strict ascending key order. Fake.PageSize caps a page (1000 by
 //     default, S3's own default) so a test can exercise pagination without
 //     seeding a thousand keys.
-//   - Any other method or query — a DELETE probe, an unrecognised list
-//     query — returns 501 NotImplemented, so a missing capability fails
-//     loudly rather than silently passing.
+//   - DELETE removes the key unconditionally and returns 204, whether or
+//     not the key existed (idempotent, matching real S3 and
+//     store.Client.Delete's contract). WALD-23 added this for the boot
+//     probe's cleanup; it is otherwise unconditional and carries no
+//     precondition handling of its own.
+//   - Any other method or query — an unrecognised list query, an object
+//     PUT carrying a query string — returns 501 NotImplemented, so a
+//     missing capability fails loudly rather than silently passing.
 //
 // "Partial write" never means a half-stored object: real S3 PUT is atomic,
 // and a fake that stored a prefix of a write would not enforce "the same
@@ -112,6 +118,8 @@ const (
 	// OpList is a ListObjectsV2 request (list-type=2) against the bucket
 	// root.
 	OpList
+	// OpDelete is an unconditional DELETE of one object.
+	OpDelete
 )
 
 // String renders o the way a test failure or Calls() dump wants to read it.
@@ -125,6 +133,8 @@ func (o Op) String() string {
 		return "GET"
 	case OpList:
 		return "LIST"
+	case OpDelete:
+		return "DELETE"
 	default:
 		return fmt.Sprintf("Op(%d)", int(o))
 	}
@@ -396,6 +406,8 @@ func (f *Fake) handle(w http.ResponseWriter, r *http.Request) {
 		f.handleGet(w, r, key)
 	case r.Method == http.MethodGet && key == "" && isListQuery(r.URL.Query()):
 		f.handleList(w, r)
+	case r.Method == http.MethodDelete && key != "" && r.URL.RawQuery == "":
+		f.handleDelete(w, r, key)
 	default:
 		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "unsupported method or query")
 	}
@@ -603,6 +615,46 @@ func (f *Fake) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(obj)))
 	w.WriteHeader(http.StatusOK)
 	w.Write(obj)
+}
+
+// handleDelete serves an unconditional DELETE of one object. It is
+// idempotent, matching store.Client.Delete's contract: a key that does not
+// exist still answers 204, never 404 - real S3 behaves the same way, and
+// walden relies on it so a retried delete after a dropped response is never
+// mistaken for a failure.
+func (f *Fake) handleDelete(w http.ResponseWriter, r *http.Request, key string) {
+	fault, n := f.matchRule(OpDelete, key)
+
+	if fault != nil && fault.Delay > 0 {
+		time.Sleep(fault.Delay)
+	}
+
+	if fault != nil && (fault.Status != 0 || fault.Drop) {
+		landed := false
+		if fault.Land {
+			f.mu.Lock()
+			_, existed := f.objects[key]
+			delete(f.objects, key)
+			f.mu.Unlock()
+			landed = existed
+		}
+		if fault.Drop {
+			f.updateCall(n, landed, 0)
+			hijackDrop(w)
+			return
+		}
+		f.updateCall(n, landed, fault.Status)
+		writeS3Error(w, fault.Status, fault.Code, "injected fault")
+		return
+	}
+
+	f.mu.Lock()
+	_, existed := f.objects[key]
+	delete(f.objects, key)
+	f.mu.Unlock()
+
+	f.updateCall(n, existed, http.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleList serves a ListObjectsV2 request against the bucket root.

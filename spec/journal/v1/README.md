@@ -963,6 +963,11 @@ v1/streams/<stream-id>/
 - **`snapshots/<sha256>.pack`:** Consolidated packfile from background compaction.
 - **`marker.json`:** Replay baseline marker pointing to snapshot pack and compacted sequence.
 
+The boot-time compare-and-swap probe (section 11.6) writes and then deletes a
+transient key at `v1/probe/<32-hex>`, outside this `v1/streams/<stream-id>/`
+tree entirely. A reader ignores anything outside `v1/streams/`, so the probe
+key is invisible to materialization and to a stream `LIST`.
+
 ---
 
 ## 10. Lexicographical Ordering Guarantees
@@ -1000,7 +1005,7 @@ If an object storage provider does not natively support atomic conditional write
 
 The following matrix documents the compatibility of major S3-compatible object storage providers with walden's compare-and-swap requirement.
 
-**This table is documentation, not enforcement.** It exists so an operator can choose a provider before deploying; walden's enforcement of the requirement above will be a boot-time probe of the bucket itself rather than this table — a hostname is not a capability — and that probe is not implemented yet.
+**This table is documentation, not enforcement.** It exists so an operator can choose a provider before deploying; walden's enforcement of the requirement above is a boot-time probe of the bucket itself rather than this table — a hostname is not a capability. See section 11.6.
 
 | Provider | Conditional Header Mechanism | Conflict Response Status & Code | Support Status | Notes & Compatibility Details |
 | :--- | :--- | :--- | :---: | :--- |
@@ -1133,16 +1138,19 @@ In accordance with Walden's operator-facing refusal convention (`refusal.Refusal
    ```
    refusal: journal append failed: storage provider does not support compare-and-swap (CAS) conditional writes (verify bucket provider compatibility in spec)
    ```
-6. **Journal URL Names a Provider Known to Lack CAS (boot pre-flight):**
+6. **Bucket Fails the Boot Compare-and-Swap Probe:**
    ```
-   invalid journal: <provider> does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.1)
+   invalid journal: <provider> does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.2)
    ```
    This is a different condition from item 5, not the same one reworded. It is refused at
-   boot, from the journal URL's hostname alone, before any request reaches the bucket — so
-   it names the `WALDEN_JOURNAL` knob rather than opening with `refusal:`, and it names the
-   provider. It is a fast pre-flight against a table of providers already known to lack CAS,
-   not the compare-and-swap check itself; that check is a boot-time probe of the bucket and
-   is not implemented yet (see section 11.2).
+   boot, once the boot-time compare-and-swap probe of section 11.6 proves the bucket does
+   not honor `If-None-Match: *` — so it names the `WALDEN_JOURNAL` knob rather than opening
+   with `refusal:`, and it names the provider. `<provider>` is the name from the support
+   matrix of section 11.2 when the journal URL's host resolves to a known one, or the
+   endpoint's `host[:port]` otherwise, since a self-hosted endpoint (MinIO, Ceph RGW,
+   Garage) has no provider name to give. This is a real check against the real bucket, not
+   a guess from the hostname: section 11.2's table is advice for choosing a provider before
+   deploying, never itself the enforcement.
 7. **Conditional Append With Unknown Outcome (Repository Stream):**
    ```
    refusal: push failed: stream <stream-id> append at seq <seq> has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)
@@ -1158,6 +1166,53 @@ In accordance with Walden's operator-facing refusal convention (`refusal.Refusal
    item 2.
 
 These eight messages, the `If-None-Match: *` precondition, and the derivation of the append target key are pinned by [`fixtures/conditional_append.json`](fixtures/conditional_append.json).
+
+---
+
+### 11.6 Boot-Time Compare-and-Swap Probe
+
+Before enabling the journal, a writer MUST probe the bucket itself to confirm
+the compare-and-swap contract of section 11.1, rather than trust the
+support-matrix table of section 11.2, which is advice for choosing a
+provider and not enforcement. The probe is the sole gate: a writer MUST NOT
+infer compare-and-swap support from the journal URL's hostname.
+
+1. Choose a fresh key `v1/probe/<32 lowercase hex characters>`, outside
+   `v1/streams/` (section 9.2), with the hex suffix drawn from a
+   cryptographically random source. A fresh key per boot means two writers
+   starting against the same journal prefix at the same time never race the
+   same probe key.
+2. `PUT` the key with `If-None-Match: *`. This attempt MUST succeed; any
+   other outcome (an error status, an unreachable endpoint, or an ambiguous
+   outcome per section 11.4 item 6) fails the probe and MUST refuse boot,
+   though not necessarily with item 6 of section 11.5 — this first write's
+   failure means the bucket or the credentials are wrong, not that
+   compare-and-swap is unsupported, since nothing has yet proven the target
+   key existed.
+3. `PUT` the same key again, with the same `If-None-Match: *` header. This
+   second attempt MUST come back `412 Precondition Failed`. A `412` is the
+   proof the probe exists to collect: the writer proceeds, and the journal
+   is enabled.
+4. A `200` (or any other success) on the second write is proof the bucket
+   silently overwrote instead of honouring the precondition. The writer
+   MUST refuse to enable the journal, with the single-line message of
+   section 11.5 item 6.
+5. As with any conditional append (section 11.4 item 6), a writer MUST NOT
+   resend a probe write whose outcome is unknown, and MUST NOT `GET` or
+   `LIST` the key to find out. An ambiguous second write is refused the same
+   way a definite failure is: never as proof of a `412` it did not actually
+   observe.
+6. Once the probe has run — pass or refuse — the writer MUST attempt to
+   delete the probe key. A failed delete MUST NOT itself refuse boot: it is
+   a one-line warning, and the writer proceeds (or, if the probe otherwise
+   refused, stays refused) regardless. A stranded probe key is litter, never
+   a durability problem, and nothing under `v1/streams/` is ever deleted by
+   this or any other operation.
+
+This probe is the only enforcement of section 11.1 a writer performs. It
+also doubles as a credentials and reachability check: a wrong access key, an
+unreachable endpoint, or missing write permission on the prefix all surface
+here, at boot, before the server binds a listening port or accepts a push.
 
 ---
 

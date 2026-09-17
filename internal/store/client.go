@@ -190,6 +190,26 @@ func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return &getBody{ReadCloser: resp.Body, r: r}, nil
 }
 
+// Delete removes key, journal-relative, from object storage. It exists only
+// for the boot probe's cleanup (ProbeCAS, probe.go) - nothing under
+// v1/streams/ is ever deleted. An unconditional DELETE is idempotent
+// (there is nothing to lose by asking storage to remove an already-absent
+// key), so, like Put and Get, it is retried through do rather than
+// treated as a conditional request; ErrObjectNotFound counts as success
+// rather than an error, so a client-side retry after a dropped response -
+// whose delete may have already landed - is never mistaken for a failure.
+func (c *Client) Delete(ctx context.Context, key string) error {
+	resp, err := c.do(ctx, objectRequest{method: http.MethodDelete, key: key})
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			return nil
+		}
+		return err
+	}
+	closeBody(resp)
+	return nil
+}
+
 // getBody wraps a GET's streamed response body so a read error after do
 // already committed to a 2xx response - a connection reset mid-stream,
 // say - surfaces as ErrStorageUnavailable instead of a bare transport

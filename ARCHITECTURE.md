@@ -71,7 +71,8 @@ lies.
 
 Object storage requires compare-and-swap (conditional write) support from the
 bucket provider. The provider support table in [spec/](spec/) documents which
-providers have it — advice for choosing one, not the check.
+providers have it — advice for choosing one, not the check. The check is a
+boot-time probe of the bucket itself (see "Configuration surface" below).
 
 ### What gets written
 
@@ -205,11 +206,17 @@ endpoint, region, bucket, and prefix, in either addressing style —
 reading for any host walden does not recognise), or
 `https://bucket.endpoint/prefix` (virtual-hosted). Two query parameters, and
 only two, may override what the host implies: `region` and `style`. The URL is
-resolved at boot, so a malformed value — or a hostname belonging to a provider
-already known to lack compare-and-swap — stops walden immediately rather than
-on the first push. That hostname check is a pre-flight refusal, not the
-compare-and-swap check itself; the check itself is a boot-time probe of the
-bucket, and it is not implemented yet.
+resolved at boot, so a malformed value stops walden immediately rather than
+on the first push. Once resolved, walden runs a boot-time probe against the
+bucket itself: two conditional writes to a transient key prove the bucket
+honors compare-and-swap, and a bucket that does not is refused in one line.
+The same probe doubles as the credentials and reachability check — a wrong
+access key, an unreachable endpoint, or missing write permission on the
+prefix all surface here, at boot, rather than on the first push.
+`--print-config` resolves the location and names the credential source only;
+it makes no request to the bucket, so a URL can be checked on a machine that
+holds no secrets. The probe cleans up the transient key it wrote; a failed
+cleanup is a one-line warning, not a refusal, and boot continues.
 
 The journal is off only when the knob is absent, or when `WALDEN_JOURNAL` is
 set to an empty string — so `docker run -e WALDEN_JOURNAL` with nothing set
@@ -275,6 +282,7 @@ By construction there are few, and each is legible:
 | append outcome unknown     | writes stop on that stream on that instance             | restart; materialization reads what landed    |
 | crash mid-push             | refs never moved; journal may hold an unreferenced pack | harmless; compaction tidies                   |
 | journal-less mode          | durability = the disk, as warned                        | enable `WALDEN_JOURNAL`                       |
+| bucket lacks compare-and-swap | walden refuses to boot, one line                     | choose a provider per spec §11.2              |
 
 Losing an acknowledged push does not appear in this table. That is the
 entire product.
@@ -298,8 +306,9 @@ implementation and may change (though, per the philosophy, it mostly won't).
 - The `git` binary (pinned in the image; security bumps are the expected
   cadence of releases).
 - The Go standard library.
-- A hand-rolled object-storage client covering PUT, GET, LIST, and
-  conditional PUT against the S3 REST API — small enough to own, kept
+- A hand-rolled object-storage client covering PUT, GET, LIST, conditional
+  PUT, and DELETE (the boot probe's cleanup only; nothing in the journal is
+  ever deleted) against the S3 REST API — small enough to own, kept
   dependency-free on purpose.
 
 The dependency graph is intended to be legible in one sitting and stable for

@@ -16,14 +16,13 @@ import (
 type ProviderHostRow struct {
 	Provider string
 	Suffix   string
-	CAS      bool
 }
 
 // ProviderHostsForTest returns the provider host table.
 func ProviderHostsForTest() []ProviderHostRow {
 	rows := make([]ProviderHostRow, 0, len(providerHosts))
 	for _, rule := range providerHosts {
-		rows = append(rows, ProviderHostRow{Provider: rule.provider, Suffix: rule.suffix, CAS: rule.cas})
+		rows = append(rows, ProviderHostRow{Provider: rule.provider, Suffix: rule.suffix})
 	}
 	return rows
 }

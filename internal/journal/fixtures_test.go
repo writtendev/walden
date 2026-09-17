@@ -1159,7 +1159,7 @@ func TestFixtureConditionalAppend(t *testing.T) {
 			want = journal.RefusePermanentlyFenced(tc.Stream).Error()
 		case "storage_provider_lacks_cas":
 			want = journal.RefuseCASNotSupported().Error()
-		case "provider_known_without_cas":
+		case "bucket_fails_cas_probe":
 			if tc.Provider == "" {
 				t.Errorf("refusal %q must name the provider", tc.Case)
 				continue

@@ -83,10 +83,12 @@ func TestAppendSegmentMatchesFixtureKeys(t *testing.T) {
 		t.Fatalf("no fixture segments found under %q", dir)
 	}
 
+	var exercised int
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".pack") {
 			continue
 		}
+		exercised++
 		wantHash := strings.TrimSuffix(entry.Name(), ".pack")
 		t.Run(wantHash, func(t *testing.T) {
 			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
@@ -112,6 +114,9 @@ func TestAppendSegmentMatchesFixtureKeys(t *testing.T) {
 				t.Errorf("stored bytes for %q do not match the fixture verbatim", wantKey)
 			}
 		})
+	}
+	if exercised == 0 {
+		t.Fatalf("no .pack fixtures under %q were exercised - directory is non-empty but nothing matched the filter (reshaped fixture tree or renamed extension?)", dir)
 	}
 }
 

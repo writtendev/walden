@@ -106,6 +106,37 @@ jobs:
       - name: Test (-race)
         run: go test -race -v ./...
 
+      - name: Start MinIO (object storage conformance)
+        run: |
+          docker run -d --name walden-minio -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER=walden -e MINIO_ROOT_PASSWORD=walden-conformance \
+            docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 \
+            server /data
+          READY=""
+          for _ in $(seq 1 60); do
+            if curl -sf -o /dev/null http://127.0.0.1:9000/minio/health/ready; then READY=1; break; fi
+            sleep 1
+          done
+          if [ -z "${READY}" ]; then echo "Error: MinIO not ready after 60s"; docker logs walden-minio; exit 1; fi
+          # Bucket via one SigV4-signed PUT: curl's --aws-sigv4, no mc image.
+          curl -sSf --aws-sigv4 "aws:amz:us-east-1:s3" --user walden:walden-conformance \
+            -X PUT http://127.0.0.1:9000/walden-conformance
+
+      - name: Object storage conformance (MinIO)
+        shell: bash
+        env:
+          WALDEN_CONFORMANCE_JOURNAL: http://walden:walden-conformance@127.0.0.1:9000/walden-conformance/ci
+        run: |
+          set -o pipefail
+          go test -race -count=1 -run '^TestConformance' -v ./internal/store/ 2>&1 | tee conformance.out
+          if grep -q -- '--- SKIP: TestConformance' conformance.out; then
+            echo "Error: a conformance test skipped with WALDEN_CONFORMANCE_JOURNAL set"; exit 1
+          fi
+
+      - name: MinIO logs on failure
+        if: failure()
+        run: docker logs walden-minio || true
+
       - name: Build and test container image (pinned git and reproducibility)
         run: |
           # Verify Dockerfile builds reproducible container image

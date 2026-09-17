@@ -344,3 +344,202 @@ func TestProbeCASFirstWriteAmbiguousCleanupFails(t *testing.T) {
 		t.Errorf("cleanup warning %q does not name the stranded key %q", cleanup.Error(), keys[0])
 	}
 }
+
+// fixClause extracts the "(...)" fix clause from a one-line refusal or
+// warning's Error(), per refusal.Refusal.Error()'s "<what>: <why> (<fix>)"
+// shape - "" if there is no trailing parenthesized clause at all (an empty
+// Fix formats with no parentheses, never "()").
+func fixClause(t *testing.T, err error) string {
+	t.Helper()
+	if err == nil {
+		t.Fatal("fixClause: err is nil")
+	}
+	s := err.Error()
+	open := strings.LastIndex(s, " (")
+	if open == -1 || !strings.HasSuffix(s, ")") {
+		return ""
+	}
+	return s[open+2 : len(s)-1]
+}
+
+// 8. wrapProbeFailure's fix clause is chosen by cause's failure class, not
+// one uniform string: transient/unreachable causes (ErrStorageUnavailable)
+// keep the boot-appropriate restart clause, permanent causes
+// (ErrStorageRefused, whatever the specific status) inherit fixFor's
+// credentials-and-bucket clause, and ErrOutcomeUnknown - on either write -
+// gets its own clause, truthful for an ambiguous boot write rather than
+// borrowed from either of the other two.
+func TestProbeCASFixClauseByFailureClass(t *testing.T) {
+	const (
+		wantUnavailable    = "restart walden once storage is reachable, or check the journal knob"
+		wantOutcomeUnknown = "restart walden - the probe key is fresh each boot, so this attempt's write, landed or not, cannot affect the next one"
+		wantRefused        = "check bucket, region and credentials"
+	)
+
+	tests := []struct {
+		name       string
+		rule       storetest.Rule
+		wantErrIs  error
+		wantClause string
+	}{
+		{
+			name: "403 AccessDenied on first write",
+			rule: storetest.Rule{
+				Op: storetest.OpPutIfAbsent, Call: 1,
+				Fault: storetest.Fault{Status: http.StatusForbidden, Code: "AccessDenied"},
+			},
+			wantErrIs:  store.ErrStorageRefused,
+			wantClause: wantRefused,
+		},
+		{
+			name: "404 NoSuchBucket on first write",
+			rule: storetest.Rule{
+				Op: storetest.OpPutIfAbsent, Call: 1,
+				Fault: storetest.Fault{Status: http.StatusNotFound, Code: "NoSuchBucket"},
+			},
+			wantErrIs:  store.ErrStorageRefused,
+			wantClause: wantRefused,
+		},
+		{
+			name: "501 NotImplemented on first write",
+			rule: storetest.Rule{
+				Op: storetest.OpPutIfAbsent, Call: 1,
+				Fault: storetest.Fault{Status: http.StatusNotImplemented, Code: "NotImplemented"},
+			},
+			wantErrIs:  store.ErrStorageRefused,
+			wantClause: wantRefused,
+		},
+		{
+			name: "503 SlowDown on every attempt (retries exhausted)",
+			rule: storetest.Rule{
+				Op: storetest.OpPutIfAbsent, Call: 1, Count: 4,
+				Fault: storetest.Fault{Status: http.StatusServiceUnavailable, Code: "SlowDown"},
+			},
+			wantErrIs:  store.ErrStorageUnavailable,
+			wantClause: wantUnavailable,
+		},
+		{
+			name: "ambiguous first write (500, landed)",
+			rule: storetest.Rule{
+				Op: storetest.OpPutIfAbsent, Call: 1,
+				Fault: storetest.Fault{Status: http.StatusInternalServerError, Code: "InternalError", Land: true},
+			},
+			wantErrIs:  store.ErrOutcomeUnknown,
+			wantClause: wantOutcomeUnknown,
+		},
+		{
+			name: "ambiguous second write (500)",
+			rule: storetest.Rule{
+				Op: storetest.OpPutIfAbsent, Call: 2,
+				Fault: storetest.Fault{Status: http.StatusInternalServerError, Code: "InternalError"},
+			},
+			wantErrIs:  store.ErrOutcomeUnknown,
+			wantClause: wantOutcomeUnknown,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c, fake := newProbeClient(t, "")
+			fake.Inject(tc.rule)
+
+			_, err := c.ProbeCAS(context.Background())
+			if err == nil {
+				t.Fatal("ProbeCAS succeeded, want a refusal")
+			}
+			if !errors.Is(err, tc.wantErrIs) {
+				t.Errorf("errors.Is(err, %v) = false, err = %v", tc.wantErrIs, err)
+			}
+			assertSingleLine(t, err)
+			if got := fixClause(t, err); got != tc.wantClause {
+				t.Errorf("fix clause = %q, want %q (err = %v)", got, tc.wantClause, err)
+			}
+		})
+	}
+}
+
+// 9. A send that never reaches storage at all - a closed port, nothing
+// listening - is the same ErrStorageUnavailable class as retries exhausted
+// against a live-but-failing backend, and gets the same restart clause:
+// the operator's remedy ("restart once storage is reachable") does not
+// change just because this attempt never got as far as a response.
+func TestProbeCASUnreachableEndpointFixClause(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	t.Cleanup(restore)
+
+	j := &store.Journal{
+		Endpoint:    "http://127.0.0.1:1",
+		Region:      "us-east-1",
+		Bucket:      "walden-test",
+		Prefix:      testPrefix,
+		PathStyle:   true,
+		Credentials: store.Credentials{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
+	}
+	c := store.NewClient(j)
+
+	_, err := c.ProbeCAS(context.Background())
+	if err == nil {
+		t.Fatal("ProbeCAS succeeded against an unreachable endpoint, want a refusal")
+	}
+	if !errors.Is(err, store.ErrStorageUnavailable) {
+		t.Fatalf("errors.Is(err, ErrStorageUnavailable) = false, err = %v", err)
+	}
+	assertSingleLine(t, err)
+	const want = "restart walden once storage is reachable, or check the journal knob"
+	if got := fixClause(t, err); got != want {
+		t.Errorf("fix clause = %q, want %q (err = %v)", got, want, err)
+	}
+}
+
+// 10. A cleanup delete that itself fails (spec/journal/v1 section 11.6: a
+// failed cleanup is a warning to note and move past, never a refusal to
+// act on) must not carry any fix clause at all - not the delete's own
+// append-time clause ("check bucket, region and credentials" for a 403),
+// which would misdirect an operator who is told elsewhere in the same
+// brief to ignore this warning.
+func TestProbeCASCleanupWarningHasNoFixClause(t *testing.T) {
+	c, fake := newProbeClient(t, "")
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpDelete, Call: 1,
+		Fault: storetest.Fault{Status: http.StatusForbidden, Code: "AccessDenied"},
+	})
+
+	cleanup, err := c.ProbeCAS(context.Background())
+	if err != nil {
+		t.Fatalf("ProbeCAS: err = %v, want nil (the probe itself passed)", err)
+	}
+	if cleanup == nil {
+		t.Fatal("cleanup = nil, want a warning naming the stranded key")
+	}
+	assertSingleLine(t, cleanup)
+	if got := fixClause(t, cleanup); got != "" {
+		t.Errorf("cleanup warning fix clause = %q, want none: %v", got, cleanup)
+	}
+	if strings.Contains(cleanup.Error(), "check bucket") || strings.Contains(cleanup.Error(), "pushes succeed") {
+		t.Errorf("cleanup warning leaked an append-time fix clause: %v", cleanup)
+	}
+}
+
+// 11. The CAS-ignored refusal (spec/journal/v1 section 11.5 item 6,
+// journal.RefuseProviderLacksCAS) is never routed through wrapProbeFailure,
+// so none of probeFailureFix's classes apply to it: its text is pinned
+// byte-for-byte by spec/journal/v1/fixtures/conditional_append.json's
+// "bucket_fails_cas_probe" case (also checked directly against the fixture
+// in internal/journal/fixtures_test.go), not by anything in this file.
+func TestProbeCASIgnoringBackendClauseIsUnwrapped(t *testing.T) {
+	c, fake := newProbeClient(t, "Wasabi")
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpPutIfAbsent, Call: 1, Count: 2,
+		Fault: storetest.Fault{IgnoreCondition: true},
+	})
+
+	_, err := c.ProbeCAS(context.Background())
+	want := journal.RefuseProviderLacksCAS("Wasabi").Error()
+	if err.Error() != want {
+		t.Errorf("ProbeCAS error:\n got: %s\nwant: %s", err.Error(), want)
+	}
+	const fixtureClause = "choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.2"
+	if got := fixClause(t, err); got != fixtureClause {
+		t.Errorf("fix clause = %q, want the fixture's own clause %q (not a probeFailureFix class)", got, fixtureClause)
+	}
+}

@@ -106,26 +106,69 @@ func (c *Client) providerName() string {
 	return c.journal.Endpoint
 }
 
-// probeFailureFix is the fix clause on every refusal wrapProbeFailure
-// produces. It is deliberately boot-appropriate rather than borrowed from
+// probeUnavailableFix is probeFailureFix's clause for the transient class -
+// ErrStorageUnavailable: retries exhausted, or a send that never reached
+// storage at all (a dial failure, a closed port, a name that does not
+// resolve). It is deliberately boot-appropriate rather than borrowed from
 // the wrapped cause: ProbeCAS runs before cmd/walden/main.go calls
 // net.Listen, so a failure here means walden has exited and bound
 // nothing, not that it is up and degrading - fixFor's "pushes succeed
 // when storage returns" (client.go) describes the latter, and would tell
 // an operator reading this refusal that requests are already being
 // served when none are.
-const probeFailureFix = "restart walden once storage is reachable, or check the journal knob"
+const probeUnavailableFix = "restart walden once storage is reachable, or check the journal knob"
+
+// probeOutcomeUnknownFix is probeFailureFix's clause for ErrOutcomeUnknown:
+// the probe cannot prove whether its write landed, but it cannot tell the
+// operator to wait for storage to "become reachable" either - the request
+// may already have been answered, just not legibly. What is true
+// regardless is that every boot draws a fresh probeKey (crypto/rand, 16
+// bytes), so a stray write from this attempt can never collide with the
+// next one: restarting is always safe, unlike probeUnavailableFix's
+// framing (which implies storage is currently down) or the permanent
+// classes below (where restarting would just repeat the same refusal).
+const probeOutcomeUnknownFix = "restart walden - the probe key is fresh each boot, so this attempt's write, landed or not, cannot affect the next one"
 
 // wrapProbeFailure wraps any ProbeCAS failure that is not itself the
 // compare-and-swap capability problem - a 403, an unreachable endpoint,
 // retries exhausted, or an ambiguous outcome - as a single "invalid
-// journal" refusal, with probeFailureFix as its fix clause. The detail
-// comes from probeFailureWhy rather than cause.Error(): a *refusal.Refusal
-// from PutIfAbsent formats its own Fix (fixFor, tuned for a running server
-// mid-push) into that string, and appending probeFailureFix alongside it
-// would stack two fix clauses - one wrong for boot - into a single line.
+// journal" refusal, with probeFailureFix(cause) as its fix clause. The
+// detail comes from probeFailureWhy rather than cause.Error(): a
+// *refusal.Refusal from PutIfAbsent formats its own Fix (fixFor, tuned for
+// a running server mid-push) into that string, and appending another fix
+// clause alongside it would stack two into a single line.
 func wrapProbeFailure(cause error) error {
-	return refusal.RefuseWithCause("invalid journal", "compare-and-swap probe: "+probeFailureWhy(cause), probeFailureFix, cause)
+	return refusal.RefuseWithCause("invalid journal", "compare-and-swap probe: "+probeFailureWhy(cause), probeFailureFix(cause), cause)
+}
+
+// probeFailureFix picks wrapProbeFailure's fix clause by cause's failure
+// class - never one uniform string, because "restart" is only true advice
+// for some of them:
+//
+//   - ErrStorageUnavailable (retries exhausted, a dial failure, an
+//     unreachable endpoint): probeUnavailableFix. Storage was not there to
+//     answer, so restarting once it is back is the actual remedy.
+//   - ErrOutcomeUnknown (an ambiguous write, on either the first or the
+//     second PutIfAbsent): probeOutcomeUnknownFix. Neither
+//     probeUnavailableFix's "once storage is reachable" (it may already be)
+//     nor the permanent classes' credentials clause (nothing said the
+//     credentials were wrong) fits, and fixFor itself returns "" here since
+//     it assumes the journal layer supplies the fix for a running server.
+//   - everything else - ErrStorageRefused (403, 404 NoSuchBucket, 501, and
+//     any other permanent status) and any cause classify cannot name -
+//     fixFor(cause), which for these lands on its own default: "check
+//     bucket, region and credentials". Storage was reachable and refused,
+//     so restarting changes nothing; the credentials-and-bucket clause is
+//     the one that actually points at what this probe exists to catch.
+func probeFailureFix(cause error) string {
+	switch {
+	case errors.Is(cause, ErrStorageUnavailable):
+		return probeUnavailableFix
+	case errors.Is(cause, ErrOutcomeUnknown):
+		return probeOutcomeUnknownFix
+	default:
+		return fixFor(cause)
+	}
 }
 
 // probeFailureWhy returns cause's detail without any fix clause of its
@@ -145,9 +188,20 @@ func probeFailureWhy(cause error) string {
 // refusal - when the delete fails. It is always safe to call once the
 // probe's first write has landed, whether the probe otherwise passed or
 // refused.
+//
+// The warning's text comes from probeFailureWhy(err), not err.Error(): the
+// delete's own *refusal.Refusal carries an append-time fix clause of its
+// own (fixFor's "pushes succeed when storage returns" for a retry-exhausted
+// delete, or "check bucket, region and credentials" for a 403) that is
+// wrong here on both counts - net.Listen has not run yet, so nothing is
+// pushing, and per spec/journal/v1 section 11.6 a failed cleanup delete is
+// litter to note and move past, not a problem for the operator to act on.
+// probeFailureWhy strips that clause, leaving no Fix at all - an empty Fix
+// formats with no trailing parentheses, which is the correct shape for a
+// warning with nothing to tell the operator to do.
 func (c *Client) cleanupProbeKey(ctx context.Context, key string) error {
 	if err := c.delete(ctx, key); err != nil {
-		return refusal.RefuseWithCause("journal probe cleanup", "left "+key+" behind: "+err.Error(), "", err)
+		return refusal.RefuseWithCause("journal probe cleanup", "left "+key+" behind: "+probeFailureWhy(err), "", err)
 	}
 	return nil
 }

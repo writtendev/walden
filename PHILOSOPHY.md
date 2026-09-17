@@ -89,7 +89,8 @@ walden is written in Go, in the most conservative dialect we can manage:
 - Standard library maximalism. net/http, crypto, os/exec cover nearly
   everything walden does.
 - Dependencies approach zero. The object-storage client surface walden needs
-  (PUT, GET, LIST, conditional PUT) is small enough to own outright.
+  (PUT, GET, LIST, conditional PUT, and DELETE for the boot probe's own
+  litter) is small enough to own outright.
 - No frameworks, no clever abstractions, no fashionable idioms. Code should
   read the same to a Go programmer in 2036 as it does today.
 

@@ -19,9 +19,12 @@
 // t.Skip - a broken URL is a broken test run, not something to silently
 // wave through.
 //
-// The store.Client has no arbitrary-key DELETE (by design: see client.go
-// and journal.go's file comments), so nothing here cleans up after
-// itself. Every test asks conformanceClient for its own random prefix - a
+// The store.Client has no exported, arbitrary-key DELETE on its production
+// API (by design: see client.go and journal.go's file comments); the
+// unexported delete exists solely for the boot probe's own key, reachable
+// here only through the test-only DeleteForTest shim (export_test.go). So
+// nothing in this file cleans up after itself. Every test asks
+// conformanceClient for its own random prefix - a
 // timestamp plus 8 bytes of crypto/rand - so repeated and concurrent runs
 // against the same bucket never collide and never need to. The CI bucket
 // dies with the job; a real provider's bucket needs a lifecycle rule,

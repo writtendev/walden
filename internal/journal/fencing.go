@@ -109,15 +109,19 @@ func RefuseCASNotSupported() error {
 }
 
 // RefuseProviderLacksCAS returns a single-line operator-facing refusal for the boot-time
-// pre-flight: WALDEN_JOURNAL names a provider already known not to support compare-and-swap.
-// It is distinct from RefuseCASNotSupported (spec section 11.5 item 5): this one fires while
-// the journal URL is being resolved, before any request reaches the bucket, so it names the
-// knob rather than opening with "refusal:", and it names the provider.
+// compare-and-swap probe (spec section 11.6, store.Client.ProbeCAS): the probe's second
+// conditional write against the bucket succeeded when a 412 was required, proving the
+// bucket does not honor If-None-Match. It is distinct from RefuseCASNotSupported (spec
+// section 11.5 item 5, the append-time refusal): this one fires at boot, once the probe has
+// already reached the bucket, so it names the WALDEN_JOURNAL knob rather than opening with
+// "refusal:". provider is the name from the support matrix (spec section 11.2) when the
+// journal URL's host resolves to a known one, or the endpoint's host[:port] otherwise, since
+// a self-hosted endpoint (MinIO, Ceph RGW, Garage) has no provider name to give.
 func RefuseProviderLacksCAS(provider string) error {
 	return refusal.RefuseWithCause(
 		"invalid journal",
 		fmt.Sprintf("%s does not support compare-and-swap (CAS) conditional writes", provider),
-		"choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.1",
+		"choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.2",
 		ErrCASNotSupported,
 	)
 }

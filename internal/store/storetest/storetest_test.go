@@ -957,3 +957,90 @@ func TestAWSChunkedNegativeChunkSizeRejected(t *testing.T) {
 		t.Errorf("negative chunk size stored an object, want none")
 	}
 }
+
+// TestDeleteRemovesObjectAndIsIdempotent covers WALD-23's DELETE support,
+// added for the boot probe's own cleanup (Client.delete). DELETE is
+// unconditional and answers 204 whether or not the key existed - real S3
+// behaves the same way, and Client.delete relies on exactly this so
+// a retried delete after a dropped response is never mistaken for a
+// failure.
+func TestDeleteRemovesObjectAndIsIdempotent(t *testing.T) {
+	fake := storetest.New(t)
+	fake.SetObject("k", []byte("v"))
+
+	resp := doRequest(t, fake, http.MethodDelete, "k", nil, nil)
+	if resp.status != http.StatusNoContent {
+		t.Fatalf("DELETE existing key: status = %d, want 204", resp.status)
+	}
+	if _, ok := fake.Object("k"); ok {
+		t.Errorf("Object(%q) still present after DELETE", "k")
+	}
+
+	// A second DELETE of the now-absent key must still succeed.
+	resp2 := doRequest(t, fake, http.MethodDelete, "k", nil, nil)
+	if resp2.status != http.StatusNoContent {
+		t.Fatalf("DELETE of an already-absent key: status = %d, want 204 (idempotent)", resp2.status)
+	}
+}
+
+// TestDeleteWithQueryStringUnsupported covers the same "only the request
+// shapes store.Client actually sends are accepted" rule
+// TestUnsupportedQueryParamsRejected proves for LIST/GET/PUT: a DELETE
+// carrying a query string (a lifecycle or versioning sub-resource, say)
+// answers 501 rather than being silently accepted as a plain delete.
+func TestDeleteWithQueryStringUnsupported(t *testing.T) {
+	fake := storetest.New(t)
+	fake.SetObject("k", []byte("v"))
+
+	resp := doRequest(t, fake, http.MethodDelete, "k?versionId=1", nil, nil)
+	if resp.status != http.StatusNotImplemented {
+		t.Errorf("DELETE with query string: status = %d, want 501", resp.status)
+	}
+	if _, ok := fake.Object("k"); !ok {
+		t.Errorf("Object(%q) removed by an unsupported DELETE, want untouched", "k")
+	}
+}
+
+// TestDeleteFaultInjectionAndCallLog covers Fault handling on OpDelete: a
+// faulted call answers the injected status without touching the object,
+// and the call log records Op, Faulted, and Landed the same way it does
+// for the other three operations.
+func TestDeleteFaultInjectionAndCallLog(t *testing.T) {
+	fake := storetest.New(t)
+	fake.SetObject("k", []byte("v"))
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpDelete, Key: "k", Call: 1,
+		Fault: storetest.Fault{Status: http.StatusForbidden, Code: "AccessDenied"},
+	})
+
+	resp := doRequest(t, fake, http.MethodDelete, "k", nil, nil)
+	if resp.status != http.StatusForbidden {
+		t.Fatalf("faulted DELETE: status = %d, want 403", resp.status)
+	}
+	if code := s3Code(t, resp.body); code != "AccessDenied" {
+		t.Errorf("faulted DELETE: Code = %q, want AccessDenied", code)
+	}
+	if _, ok := fake.Object("k"); !ok {
+		t.Errorf("Object(%q) removed by a faulted DELETE with no Land, want untouched", "k")
+	}
+
+	// The unfaulted retry actually deletes it.
+	resp2 := doRequest(t, fake, http.MethodDelete, "k", nil, nil)
+	if resp2.status != http.StatusNoContent {
+		t.Fatalf("retried DELETE: status = %d, want 204", resp2.status)
+	}
+
+	calls := fake.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("Calls() returned %d entries, want 2", len(calls))
+	}
+	if calls[0].Op != storetest.OpDelete || !calls[0].Faulted || calls[0].Landed {
+		t.Errorf("call 1 = %+v, want Op=OpDelete Faulted=true Landed=false", calls[0])
+	}
+	if calls[1].Op != storetest.OpDelete || calls[1].Faulted || !calls[1].Landed {
+		t.Errorf("call 2 = %+v, want Op=OpDelete Faulted=false Landed=true", calls[1])
+	}
+	if got := storetest.OpDelete.String(); got != "DELETE" {
+		t.Errorf("OpDelete.String() = %q, want %q", got, "DELETE")
+	}
+}

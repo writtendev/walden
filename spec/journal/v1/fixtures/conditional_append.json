@@ -79,9 +79,9 @@
       "message": "refusal: journal append failed: storage provider does not support compare-and-swap (CAS) conditional writes (verify bucket provider compatibility in spec)"
     },
     {
-      "case": "provider_known_without_cas",
+      "case": "bucket_fails_cas_probe",
       "provider": "Wasabi",
-      "message": "invalid journal: Wasabi does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.1)"
+      "message": "invalid journal: Wasabi does not support compare-and-swap (CAS) conditional writes (choose a bucket provider that supports conditional writes, per spec/journal/v1 section 11.2)"
     },
     {
       "case": "append_outcome_unknown_repo_stream",

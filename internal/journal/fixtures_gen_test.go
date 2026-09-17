@@ -789,7 +789,7 @@ func buildConditionalAppendFixture() conditionalAppendFixture {
 			{Case: "fenced_by_conflict_meta_stream", Stream: journal.MetaStreamID, Seq: &seq7, Message: journal.RefuseStreamFenced(journal.MetaStreamID, seq7).Error()},
 			{Case: "permanently_fenced_meta_stream", Stream: journal.MetaStreamID, Message: journal.RefusePermanentlyFenced(journal.MetaStreamID).Error()},
 			{Case: "storage_provider_lacks_cas", Message: journal.RefuseCASNotSupported().Error()},
-			{Case: "provider_known_without_cas", Provider: "Wasabi", Message: journal.RefuseProviderLacksCAS("Wasabi").Error()},
+			{Case: "bucket_fails_cas_probe", Provider: "Wasabi", Message: journal.RefuseProviderLacksCAS("Wasabi").Error()},
 			{Case: "append_outcome_unknown_repo_stream", Stream: fixtureRepoStream, Seq: &seq3, Message: journal.RefuseAppendOutcomeUnknown(fixtureRepoStream, seq3).Error()},
 			{Case: "append_outcome_unknown_meta_stream", Stream: journal.MetaStreamID, Seq: &seq7, Message: journal.RefuseAppendOutcomeUnknown(journal.MetaStreamID, seq7).Error()},
 		},

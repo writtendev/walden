@@ -313,9 +313,6 @@ func TestAppendSegmentCrashAndRetry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AppendSegment: %v", err)
 		}
-		if errors.Is(err, store.ErrOutcomeUnknown) {
-			t.Fatalf("AppendSegment returned ErrOutcomeUnknown - that rule belongs to conditional appends only")
-		}
 		if got != hash {
 			t.Fatalf("hash = %q, want %q", got, hash)
 		}

@@ -1203,11 +1203,14 @@ infer compare-and-swap support from the journal URL's hostname.
    way a definite failure is: never as proof of a `412` it did not actually
    observe.
 6. Once the probe has run — pass or refuse — the writer MUST attempt to
-   delete the probe key. A failed delete MUST NOT itself refuse boot: it is
-   a one-line warning, and the writer proceeds (or, if the probe otherwise
-   refused, stays refused) regardless. A stranded probe key is litter, never
-   a durability problem, and nothing under `v1/streams/` is ever deleted by
-   this or any other operation.
+   delete the probe key, except when the first write (item 2) failed with a
+   definite, non-ambiguous outcome: that write never landed, so there is no
+   key to delete, and a writer MAY skip the delete rather than attempt one
+   against a key that was never created. A failed delete MUST NOT itself
+   refuse boot: it is a one-line warning, and the writer proceeds (or, if
+   the probe otherwise refused, stays refused) regardless. A stranded probe
+   key is litter, never a durability problem, and nothing under
+   `v1/streams/` is ever deleted by this or any other operation.
 
 This probe is the only enforcement of section 11.1 a writer performs. It
 also doubles as a credentials and reachability check: a wrong access key, an

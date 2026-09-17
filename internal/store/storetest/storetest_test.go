@@ -959,9 +959,9 @@ func TestAWSChunkedNegativeChunkSizeRejected(t *testing.T) {
 }
 
 // TestDeleteRemovesObjectAndIsIdempotent covers WALD-23's DELETE support,
-// added for the boot probe's own cleanup (store.Client.Delete). DELETE is
+// added for the boot probe's own cleanup (Client.delete). DELETE is
 // unconditional and answers 204 whether or not the key existed - real S3
-// behaves the same way, and store.Client.Delete relies on exactly this so
+// behaves the same way, and Client.delete relies on exactly this so
 // a retried delete after a dropped response is never mistaken for a
 // failure.
 func TestDeleteRemovesObjectAndIsIdempotent(t *testing.T) {

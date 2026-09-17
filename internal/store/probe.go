@@ -47,9 +47,10 @@ const probeBody = "walden compare-and-swap probe\n"
 // storage, no failure past that point proves the write was rejected, so
 // the key may exist even though this write returned an error - whether the
 // probe otherwise passed or refused. cleanup is a separate, non-nil error -
-// never a refusal to boot - when that delete fails, or is skipped because
-// the first write is proven never to have landed; the caller
-// (cmd/walden/main.go) prints it as a warning and boots past it. A
+// never a refusal to boot - when that delete fails; the caller
+// (cmd/walden/main.go) prints it as a warning and boots past it. cleanup
+// is nil when the delete is skipped because the first write is proven
+// never to have landed, since there is then nothing to clean up. A
 // stranded probe key is litter, not a durability problem, and nothing
 // under v1/streams/ is ever deleted by this or any other operation.
 func (c *Client) ProbeCAS(ctx context.Context) (cleanup, err error) {

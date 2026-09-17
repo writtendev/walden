@@ -92,10 +92,12 @@ func (c *Client) ProbeCAS(ctx context.Context) (cleanup, err error) {
 	return c.cleanupProbeKey(ctx, key), err
 }
 
-// providerName names the bucket in ProbeCAS's refusal, and in the wrapped
-// refusal any other probe failure produces: c.journal.Provider when walden
-// recognises the endpoint host, or the endpoint's host[:port] otherwise -
-// MinIO, Ceph RGW, and Garage have no provider name to give.
+// providerName names the bucket in ProbeCAS's RefuseProviderLacksCAS
+// refusal - the only probe refusal that names a provider at all, since
+// every other probe failure goes through wrapProbeFailure, which names
+// only the method and key: c.journal.Provider when walden recognises the
+// endpoint host, or the endpoint's host[:port] otherwise - MinIO, Ceph
+// RGW, and Garage have no provider name to give.
 func (c *Client) providerName() string {
 	if c.journal.Provider != "" {
 		return c.journal.Provider

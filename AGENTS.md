@@ -76,6 +76,7 @@ Code review is mechanical against these rules:
 /internal
   journal       — append-only streams, ref transactions, fencing
   store         — object-storage client (PUT/GET/LIST/conditional PUT)
+    storetest   — fake S3 endpoint with fault injection (test support only)
   githttp       — smart HTTP handlers, execs git upload-pack/receive-pack
   auth          — token verification, built-in and delegated modes
   config        — the five-knob configuration surface

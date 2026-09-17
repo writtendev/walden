@@ -784,6 +784,14 @@ func TestAWSChunkedMalformedFramingRejected(t *testing.T) {
 			name: "missing final CRLF after the zero-length chunk",
 			body: "5;chunk-signature=" + sig + "\r\nhello\r\n0;chunk-signature=" + sig + "\r\n",
 		},
+		{
+			// Round 2 finding: the header-line CRLF fix from round 1 only
+			// covered chunk data/final terminators, not the chunk header
+			// line itself - ReadString('\n') plus TrimRight accepted a
+			// bare "\n" ending the "<size>;chunk-signature=..." line too.
+			name: "bare LF terminating the chunk header line",
+			body: "5;chunk-signature=" + sig + "\nhello\r\n0;chunk-signature=" + sig + "\r\n\r\n",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -801,5 +809,151 @@ func TestAWSChunkedMalformedFramingRejected(t *testing.T) {
 				t.Errorf("malformed framing stored an object, want none")
 			}
 		})
+	}
+}
+
+// httpChunkEncode wraps data in standard HTTP/1.1 "Transfer-Encoding:
+// chunked" framing (a single chunk plus the zero-length terminator) - not
+// to be confused with aws-chunked, which is a different, S3-specific
+// framing carried *inside* an HTTP body. TestAWSChunkedRequiresContentLength
+// needs both layers at once: an aws-chunked payload sent over a request
+// that declares no Content-Length at all, which is only a legal HTTP
+// request when Transfer-Encoding: chunked supplies the framing instead.
+func httpChunkEncode(data []byte) []byte {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "%x\r\n", len(data))
+	buf.Write(data)
+	buf.WriteString("\r\n0\r\n\r\n")
+	return buf.Bytes()
+}
+
+// TestListContinuationTokenIsOpaque covers the round-2 medium finding that
+// ListObjectsV2's continuation token was just the raw last key of the
+// previous page, so any string - including one a broken client fabricated
+// by copying a key straight out of a page it already saw - was accepted as
+// a valid token and silently resumed (or restarted) the listing. A
+// genuinely opaque token only resolves through the fake's own issueToken/
+// resolveToken bookkeeping; anything else must be refused outright.
+func TestListContinuationTokenIsOpaque(t *testing.T) {
+	fake := storetest.New(t)
+	fake.PageSize = 2
+	for _, k := range []string{"p/00", "p/01", "p/02", "p/03"} {
+		fake.SetObject(k, []byte("v"))
+	}
+
+	first := doList(t, fake, "list-type=2&prefix=p/")
+	if first.status != http.StatusOK {
+		t.Fatalf("first page: status = %d, want 200", first.status)
+	}
+	var page1 struct {
+		IsTruncated           bool   `xml:"IsTruncated"`
+		NextContinuationToken string `xml:"NextContinuationToken"`
+		Contents              []struct {
+			Key string `xml:"Key"`
+		} `xml:"Contents"`
+	}
+	if err := xml.Unmarshal(first.body, &page1); err != nil {
+		t.Fatalf("unmarshaling first page: %v", err)
+	}
+	if !page1.IsTruncated || page1.NextContinuationToken == "" {
+		t.Fatalf("first page = %+v, want truncated with a continuation token", page1)
+	}
+	lastKey := page1.Contents[len(page1.Contents)-1].Key
+	if page1.NextContinuationToken == lastKey {
+		t.Fatalf("continuation token %q equals the raw last key %q, want an opaque value unrelated to it", page1.NextContinuationToken, lastKey)
+	}
+
+	// A client that fabricates a token by sending the last key it saw
+	// (exactly the bug this fake must not have) is refused.
+	fabricated := doList(t, fake, "list-type=2&prefix=p/&continuation-token="+lastKey)
+	if fabricated.status != http.StatusBadRequest {
+		t.Errorf("fabricated token (raw last key %q): status = %d, want 400", lastKey, fabricated.status)
+	}
+	if code := s3Code(t, fabricated.body); code != "InvalidArgument" {
+		t.Errorf("fabricated token: Code = %q, want InvalidArgument", code)
+	}
+
+	// Plain garbage the fake never issued is refused the same way.
+	garbage := doList(t, fake, "list-type=2&prefix=p/&continuation-token=not-a-real-token")
+	if garbage.status != http.StatusBadRequest {
+		t.Errorf("garbage token: status = %d, want 400", garbage.status)
+	}
+	if code := s3Code(t, garbage.body); code != "InvalidArgument" {
+		t.Errorf("garbage token: Code = %q, want InvalidArgument", code)
+	}
+
+	// The token the fake actually issued still works and resumes correctly.
+	second := doList(t, fake, "list-type=2&prefix=p/&continuation-token="+page1.NextContinuationToken)
+	if second.status != http.StatusOK {
+		t.Fatalf("second page with the real token: status = %d, want 200", second.status)
+	}
+	var page2 struct {
+		Contents []struct {
+			Key string `xml:"Key"`
+		} `xml:"Contents"`
+	}
+	if err := xml.Unmarshal(second.body, &page2); err != nil {
+		t.Fatalf("unmarshaling second page: %v", err)
+	}
+	var got []string
+	for _, c := range page2.Contents {
+		got = append(got, c.Key)
+	}
+	want := []string{"p/02", "p/03"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("second page keys = %v, want %v", got, want)
+	}
+}
+
+// TestAWSChunkedRequiresContentLength covers the round-2 minor finding
+// that an aws-chunked PUT with no Content-Length at all was accepted:
+// readPutBody's aws-chunked branch checked X-Amz-Decoded-Content-Length
+// but never r.ContentLength. Real S3 answers 411 MissingContentLength to
+// such a request (client.go's own comment near the aws-chunked send path
+// relies on exactly that), so this sends the aws-chunked payload framed
+// only by HTTP's own Transfer-Encoding: chunked - the one way to put bytes
+// on the wire with no declared Content-Length at all.
+func TestAWSChunkedRequiresContentLength(t *testing.T) {
+	fake := storetest.New(t)
+
+	payload := encodeChunked(t, []byte("hello"))
+	status, respBody := rawPut(t, fake, "nolen", map[string]string{
+		"Content-Encoding":             "aws-chunked",
+		"X-Amz-Decoded-Content-Length": "5",
+		"Transfer-Encoding":            "chunked",
+	}, httpChunkEncode(payload))
+	if status != http.StatusLengthRequired {
+		t.Errorf("aws-chunked PUT with no Content-Length: status = %d, want 411", status)
+	}
+	if code := s3Code(t, respBody); code != "MissingContentLength" {
+		t.Errorf("aws-chunked PUT with no Content-Length: Code = %q, want MissingContentLength", code)
+	}
+	if _, ok := fake.Object("nolen"); ok {
+		t.Errorf("aws-chunked PUT with no Content-Length stored an object, want none")
+	}
+}
+
+// TestAWSChunkedNegativeChunkSizeRejected covers the round-2 minor finding
+// that a negative chunk size ("-5", which strconv.ParseInt happily accepts
+// in base 16) reached make([]byte, size) and panicked the handler -
+// net/http recovers from that by dropping the connection with no
+// response, which is indistinguishable from an injected Fault.Drop and
+// leaves store.Client treating a plain framing bug as ErrOutcomeUnknown.
+// The documented behaviour is a clean 400 IncompleteBody, and the
+// connection must not simply die.
+func TestAWSChunkedNegativeChunkSizeRejected(t *testing.T) {
+	fake := storetest.New(t)
+
+	body := []byte("-5;chunk-signature=" + strings.Repeat("0", 64) + "\r\nhello\r\n0;chunk-signature=" + strings.Repeat("0", 64) + "\r\n\r\n")
+	status, _ := rawPut(t, fake, "negsize", map[string]string{
+		"Content-Length":               strconv.Itoa(len(body)),
+		"Content-Encoding":             "aws-chunked",
+		"X-Amz-Decoded-Content-Length": "5",
+	}, body)
+	if status != http.StatusBadRequest {
+		t.Errorf("negative chunk size: status = %d, want 400", status)
+	}
+	if _, ok := fake.Object("negsize"); ok {
+		t.Errorf("negative chunk size stored an object, want none")
 	}
 }

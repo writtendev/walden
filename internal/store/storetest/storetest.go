@@ -47,13 +47,19 @@
 //     walden never sends one, so refusing is safer than silently ignoring it.
 //   - A short or malformed body — one that does not add up to the declared
 //     Content-Length, or X-Amz-Decoded-Content-Length for an aws-chunked
-//     body — stores nothing and answers 400 IncompleteBody.
+//     body — stores nothing and answers 400 IncompleteBody. An aws-chunked
+//     PUT sent with no Content-Length at all stores nothing and answers 411
+//     MissingContentLength instead, matching real S3.
 //   - GET returns 200 with the bytes, or 404 NoSuchKey.
 //   - ListObjectsV2 requires list-type=2. It honours prefix, start-after
-//     (ignored once a continuation token is present), and an opaque
-//     continuation-token, in strict ascending key order. Fake.PageSize caps
-//     a page (1000 by default, S3's own default) so a test can exercise
-//     pagination without seeding a thousand keys.
+//     (ignored once a continuation token is present), and a continuation
+//     token that is genuinely opaque: the fake mints it and is the only
+//     thing that can resolve it back to a key, so anything else — garbage,
+//     or a client fabricating one out of a key it saw in a page — answers
+//     400 InvalidArgument rather than being accepted at face value. Results
+//     are in strict ascending key order. Fake.PageSize caps a page (1000 by
+//     default, S3's own default) so a test can exercise pagination without
+//     seeding a thousand keys.
 //   - Any other method or query — a DELETE probe, an unrecognised list
 //     query — returns 501 NotImplemented, so a missing capability fails
 //     loudly rather than silently passing.
@@ -77,6 +83,8 @@ package storetest
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -235,6 +243,7 @@ type Fake struct {
 	rules   []*ruleState
 	calls   []Call
 	seq     int
+	tokens  map[string]string
 }
 
 // New starts a Fake on an httptest.Server. t.Cleanup closes it.
@@ -243,6 +252,7 @@ func New(t testing.TB) *Fake {
 	f := &Fake{
 		bucket:  "walden-fake-bucket",
 		objects: make(map[string][]byte),
+		tokens:  make(map[string]string),
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
@@ -469,8 +479,14 @@ func (f *Fake) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 
 	body, err := readPutBody(r)
 	if err != nil {
-		f.updateCall(n, false, http.StatusBadRequest)
-		writeS3Error(w, http.StatusBadRequest, "IncompleteBody", err.Error())
+		status := http.StatusBadRequest
+		code := "IncompleteBody"
+		if pbErr, ok := err.(*putBodyError); ok {
+			status = pbErr.status
+			code = pbErr.code
+		}
+		f.updateCall(n, false, status)
+		writeS3Error(w, status, code, err.Error())
 		return
 	}
 
@@ -613,6 +629,23 @@ func (f *Fake) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A continuation token is opaque: it must be one this fake actually
+	// issued (see issueToken/resolveToken), never a client-supplied
+	// string accepted at face value - real S3 answers 400 InvalidArgument
+	// to a token it did not mint, and a fake that accepted any string
+	// (including the raw last key a broken client fabricated one from)
+	// would let that bug pass.
+	after := startAfter
+	if token != "" {
+		key, ok := f.resolveToken(token)
+		if !ok {
+			f.updateCall(n, false, http.StatusBadRequest)
+			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "invalid continuation token")
+			return
+		}
+		after = key
+	}
+
 	f.mu.Lock()
 	pageSize := f.PageSize
 	keys := make([]string, 0, len(f.objects))
@@ -627,10 +660,6 @@ func (f *Fake) handleList(w http.ResponseWriter, r *http.Request) {
 		pageSize = 1000
 	}
 
-	after := startAfter
-	if token != "" {
-		after = token
-	}
 	start := sort.Search(len(keys), func(i int) bool { return keys[i] > after })
 	end := start + pageSize
 	if end > len(keys) {
@@ -640,11 +669,42 @@ func (f *Fake) handleList(w http.ResponseWriter, r *http.Request) {
 	truncated := end < len(keys)
 	next := ""
 	if truncated {
-		next = page[len(page)-1]
+		next = f.issueToken(page[len(page)-1])
 	}
 
 	f.updateCall(n, true, http.StatusOK)
 	writeListResult(w, f.bucket, prefix, page, truncated, next)
+}
+
+// issueToken mints an opaque continuation token for lastKey and records
+// the mapping so a later request carrying it can be resolved back to a
+// real key - see resolveToken. The token itself carries no derivable
+// relationship to lastKey (it is random bytes, not an encoding of it), so
+// a client cannot fabricate one from a key it happened to see in a
+// response body the way it could if the token were, say, the key itself
+// or a reversible encoding of it.
+func (f *Fake) issueToken(lastKey string) string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		panic(fmt.Sprintf("storetest: generating continuation token: %v", err))
+	}
+	token := hex.EncodeToString(buf[:])
+	f.mu.Lock()
+	f.tokens[token] = lastKey
+	f.mu.Unlock()
+	return token
+}
+
+// resolveToken looks up a continuation-token this fake actually issued via
+// issueToken. ok is false for anything else - garbage, a stale token from
+// a different Fake, or a client fabricating one out of a key it saw in an
+// earlier page - so handleList can answer 400 InvalidArgument instead of
+// silently restarting the listing or resuming from an arbitrary point.
+func (f *Fake) resolveToken(token string) (key string, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key, ok = f.tokens[token]
+	return key, ok
 }
 
 // hijackDrop closes the underlying connection with no further response.
@@ -665,6 +725,24 @@ func hijackDrop(w http.ResponseWriter) {
 	conn.Close()
 }
 
+// putBodyError carries the S3 status and error code readPutBody wants the
+// caller to answer with. Not every malformed-body case is the same error:
+// a missing Content-Length on an aws-chunked PUT is 411
+// MissingContentLength - real S3's answer to a request it cannot even
+// frame, since aws-chunked's own outer transfer still needs a declared
+// length even though the decoded payload length travels separately in
+// X-Amz-Decoded-Content-Length - while every other short-or-malformed
+// body is 400 IncompleteBody. A plain error defaults to IncompleteBody in
+// the caller, so this type only needs constructing where the status
+// actually differs.
+type putBodyError struct {
+	status int
+	code   string
+	msg    string
+}
+
+func (e *putBodyError) Error() string { return e.msg }
+
 // readPutBody reads and validates a PUT body, decoding Content-Encoding:
 // aws-chunked when present. It returns an error - never the raw bytes
 // received so far - when the decoded length does not match what the
@@ -672,6 +750,16 @@ func hijackDrop(w http.ResponseWriter) {
 // stored a short body would not model that.
 func readPutBody(r *http.Request) ([]byte, error) {
 	if r.Header.Get("Content-Encoding") == "aws-chunked" {
+		// aws-chunked framing carries its own X-Amz-Decoded-Content-Length,
+		// but the outer request must still declare Content-Length for the
+		// framed (chunk-header-and-terminator-inclusive) transfer - real S3
+		// requires this even though the two lengths differ, and answers
+		// 411 MissingContentLength to a request sent without it (typically
+		// one where Transfer-Encoding: chunked replaced the declared
+		// length entirely). client.go relies on exactly this.
+		if r.ContentLength < 0 {
+			return nil, &putBodyError{status: http.StatusLengthRequired, code: "MissingContentLength", msg: "aws-chunked PUT requires Content-Length"}
+		}
 		declared, err := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("missing or invalid X-Amz-Decoded-Content-Length")
@@ -700,6 +788,13 @@ func readPutBody(r *http.Request) ([]byte, error) {
 	return data, nil
 }
 
+// maxChunkSize bounds a single aws-chunked chunk's declared size.
+// store.Client only ever sends 64 KiB chunks (chunkSize in client.go), so
+// this is generously larger than any legitimate chunk while still small
+// enough that a malformed or hostile size field can't force decodeAWSChunked
+// into an enormous allocation.
+const maxChunkSize = 64 << 20 // 64 MiB
+
 // decodeAWSChunked reads the aws-chunked framing newChunkedBody (sigv4.go)
 // writes — hex(len);chunk-signature=<sig>\r\n<data>\r\n, ending with a
 // zero-length final chunk — and returns the concatenated chunk data.
@@ -717,13 +812,30 @@ func decodeAWSChunked(r io.Reader) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("aws-chunked: reading chunk header: %w", err)
 		}
-		sizeField := strings.TrimRight(line, "\r\n")
+		// The chunk header line must end in an exact CRLF, the same as
+		// every other framing terminator in this format - a bare "\n" is
+		// not one real S3 accepts, so TrimRight (which would silently
+		// strip a lone "\n" the same as "\r\n") is deliberately not used
+		// here.
+		if !strings.HasSuffix(line, "\r\n") {
+			return nil, fmt.Errorf("aws-chunked: chunk header line must end in CRLF, got %q", line)
+		}
+		sizeField := strings.TrimSuffix(line, "\r\n")
 		if i := strings.IndexByte(sizeField, ';'); i >= 0 {
 			sizeField = sizeField[:i]
 		}
 		size, err := strconv.ParseInt(sizeField, 16, 64)
 		if err != nil {
 			return nil, fmt.Errorf("aws-chunked: invalid chunk size %q: %w", sizeField, err)
+		}
+		// A negative size passes ParseInt (hex allows a leading '-') but
+		// would panic make() below; a chunk larger than maxChunkSize is
+		// never legitimate either - store.Client only ever sends 64 KiB
+		// chunks (chunkSize in client.go) - so both are refused the same
+		// way a malformed size field is, rather than left to crash the
+		// handler or force an enormous allocation.
+		if size < 0 || size > maxChunkSize {
+			return nil, fmt.Errorf("aws-chunked: invalid chunk size %q: out of range", sizeField)
 		}
 		if size == 0 {
 			if err := readCRLF(br); err != nil {

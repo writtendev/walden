@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/store"
@@ -246,7 +247,9 @@ func TestStreamIsolationAcrossFencing(t *testing.T) {
 	if err := putIfAbsentAt(ctx, c, journal.TxKey("repo-beta", seqB)); err != nil {
 		t.Fatalf("PutIfAbsent(repo-beta): %v", err)
 	}
-	beta.Landed(seqB)
+	if err := beta.Landed(seqB); err != nil {
+		t.Fatalf("beta.Landed: %v", err)
+	}
 	if seqB2, err := beta.Next(); err != nil || seqB2 != 1 {
 		t.Errorf("beta.Next() after Landed = (%d, %v), want (1, nil)", seqB2, err)
 	}
@@ -262,7 +265,9 @@ func TestStreamIsolationAcrossFencing(t *testing.T) {
 	if err := putIfAbsentAt(ctx, c, journal.TxKey(journal.MetaStreamID, seqM)); err != nil {
 		t.Fatalf("PutIfAbsent(_meta): %v", err)
 	}
-	meta.Landed(seqM)
+	if err := meta.Landed(seqM); err != nil {
+		t.Fatalf("meta.Landed: %v", err)
+	}
 
 	// alpha stays fenced throughout.
 	if _, err := alpha.Next(); !errors.Is(err, journal.ErrFenced) {
@@ -432,10 +437,14 @@ func TestOpenTwiceReturnsSameLeaseAndListsOnce(t *testing.T) {
 }
 
 // 8. Under -race, many goroutines against one lease never see the same
-// sequence issued twice: Next checks out the lease until the matching
-// Landed or Failed, so concurrent callers are serialized here rather than
-// left to race a real conditional PUT (and, on the loser's genuine 412,
-// wrongly fence a perfectly healthy stream over its own concurrency).
+// sequence issued twice: at most one seq is ever outstanding on a Lease at
+// a time, and Next refuses in one line - rather than block - whenever a
+// previous seq is still outstanding (round 1 review, findings 1-2: a
+// blocking design wedges the stream forever the moment any caller returns
+// without reaching Landed/Failed, so contention is resolved by refusal,
+// not by waiting). Each goroutine here retries Next until it wins the
+// outstanding slot, which is the concurrent analogue of the blocking the
+// old design did, without a lock held across the call boundary.
 func TestLeaseNextUnderConcurrencyNeverDuplicatesSequence(t *testing.T) {
 	c, _ := newLeaseClient(t)
 	leases := journal.NewLeases(c)
@@ -457,10 +466,20 @@ func TestLeaseNextUnderConcurrencyNeverDuplicatesSequence(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			seq, err := lease.Next()
-			if err != nil {
-				errCh <- fmt.Errorf("Next: %w", err)
-				return
+
+			var seq journal.Seq
+			for {
+				var nextErr error
+				seq, nextErr = lease.Next()
+				if nextErr == nil {
+					break
+				}
+				if errors.Is(nextErr, journal.ErrFenced) {
+					errCh <- fmt.Errorf("Next: unexpectedly fenced: %w", nextErr)
+					return
+				}
+				// Another goroutine's seq is still outstanding - retry
+				// rather than treat the refusal as failure.
 			}
 
 			mu.Lock()
@@ -481,7 +500,9 @@ func TestLeaseNextUnderConcurrencyNeverDuplicatesSequence(t *testing.T) {
 				}
 				return
 			}
-			lease.Landed(seq)
+			if err := lease.Landed(seq); err != nil {
+				errCh <- fmt.Errorf("Landed(%d): %v", seq, err)
+			}
 		}()
 	}
 	wg.Wait()
@@ -522,9 +543,15 @@ func TestLeaseAtMaxSequenceRefusesInsteadOfWrapping(t *testing.T) {
 // The same exhaustion guard applies when a lease reaches the maximum
 // sequence through Landed rather than through Open discovering it already
 // there - Landed(math.MaxUint64) must not silently wrap next to 0, which
-// would collide with that same stream's own already-written seq 0.
+// would collide with that same stream's own already-written seq 0. The
+// stream's head is seeded one below the maximum so Next legitimately
+// returns math.MaxUint64 itself: Landed now verifies seq against the
+// outstanding one (round 1 review, finding 3), so this test drives the
+// boundary with the real outstanding seq rather than an arbitrary one.
 func TestLeaseLandedAtMaxSequenceRefusesInsteadOfWrapping(t *testing.T) {
-	c, _ := newLeaseClient(t)
+	c, fake := newLeaseClient(t)
+	fake.SetObject(journal.TxKey("repo-eta", journal.Seq(math.MaxUint64-1)), []byte(`{}`))
+
 	leases := journal.NewLeases(c)
 	ctx := context.Background()
 
@@ -532,14 +559,16 @@ func TestLeaseLandedAtMaxSequenceRefusesInsteadOfWrapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	// Next's own returned seq is irrelevant here: Landed is called with
-	// math.MaxUint64 regardless, to drive the lease straight to the
-	// boundary this test exists to check, the same way a real caller's
-	// Landed argument is whatever seq storage just acknowledged.
-	if _, err := lease.Next(); err != nil {
+	seq, err := lease.Next()
+	if err != nil {
 		t.Fatalf("Next: %v", err)
 	}
-	lease.Landed(journal.Seq(math.MaxUint64))
+	if seq != math.MaxUint64 {
+		t.Fatalf("Next() = %d, want %d (head MaxUint64-1 + 1)", seq, uint64(math.MaxUint64))
+	}
+	if err := lease.Landed(seq); err != nil {
+		t.Fatalf("Landed(%d): %v", seq, err)
+	}
 
 	_, err = lease.Next()
 	if err == nil {
@@ -548,5 +577,210 @@ func TestLeaseLandedAtMaxSequenceRefusesInsteadOfWrapping(t *testing.T) {
 	want := "refusal: push failed: stream repo-eta has exhausted its 64-bit sequence space"
 	if err.Error() != want {
 		t.Errorf("Next() error = %q, want %q", err.Error(), want)
+	}
+}
+
+// Regression test for round 1 review finding 1: a caller that takes a seq
+// from Next and, for any reason, never calls Landed or Failed - a marshal
+// or signing error, a validation refusal, a cancelled context, a panic
+// recovered upstream, all return before ever attempting the conditional
+// PUT - must not wedge the stream forever. The reviewer reproduced a
+// second Next() still blocked after 2s with no way to cancel it; this
+// asserts a second Next() instead returns promptly with a one-line
+// refusal.
+func TestNextAfterAbandonedCheckoutRefusesRatherThanBlocks(t *testing.T) {
+	c, _ := newLeaseClient(t)
+	leases := journal.NewLeases(c)
+	ctx := context.Background()
+
+	lease, err := leases.Open(ctx, "repo-theta")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// First caller takes a seq and abandons it: simulating a marshal or
+	// signing error, a validation refusal, or a cancelled context, none
+	// of which reach Landed or Failed.
+	if _, err := lease.Next(); err != nil {
+		t.Fatalf("first Next: %v", err)
+	}
+
+	// A second Next() must return promptly with a refusal, never block.
+	done := make(chan struct{})
+	var secondErr error
+	go func() {
+		_, secondErr = lease.Next()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Next() still blocked after 2s - stream wedged for the life of the process")
+	}
+
+	if secondErr == nil {
+		t.Fatalf("expected second Next() to refuse while the first seq is outstanding, got nil")
+	}
+	if strings.ContainsAny(secondErr.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", secondErr.Error())
+	}
+	if errors.Is(secondErr, journal.ErrFenced) {
+		t.Errorf("an abandoned checkout must not fence the stream, got %v", secondErr)
+	}
+}
+
+// Regression test for round 1 review finding 2: Landed or Failed called
+// with no matching successful Next - or a second time for a checkout that
+// already cleared - must never unlock a lock nothing holds. The reviewer
+// reproduced this against the held-mutex design as an unrecoverable
+// "fatal error: sync: unlock of unlocked mutex", which kills the whole
+// walden process. It must instead refuse in one line.
+func TestFailedAndLandedWithoutMatchingNextRefuseRatherThanPanic(t *testing.T) {
+	c, _ := newLeaseClient(t)
+	leases := journal.NewLeases(c)
+	ctx := context.Background()
+
+	lease, err := leases.Open(ctx, "repo-iota")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// No Next() has ever been called: Failed and Landed both have nothing
+	// to release.
+	if err := lease.Failed(0, errors.New("boom")); err == nil {
+		t.Fatalf("expected Failed with no outstanding Next to refuse, got nil")
+	} else if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if err := lease.Landed(0); err == nil {
+		t.Fatalf("expected Landed with no outstanding Next to refuse, got nil")
+	} else if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+
+	// A legitimate Next/Failed pair releases the checkout normally - the
+	// retryable branch leaves the stream unfenced and the seq unconsumed
+	// (test 6 above covers that in detail; this only needs the release).
+	seq, err := lease.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if failErr := lease.Failed(seq, store.ErrStorageUnavailable); failErr != store.ErrStorageUnavailable {
+		t.Fatalf("Failed: got %v, want ErrStorageUnavailable unchanged", failErr)
+	}
+
+	// A second Failed for the same seq, after the checkout already
+	// cleared, must refuse rather than double-release - this is exactly
+	// the retry-loop-calls-Failed-twice trigger the reviewer named.
+	if err := lease.Failed(seq, errors.New("boom")); err == nil {
+		t.Fatalf("expected a second Failed for the same seq to refuse, got nil")
+	}
+
+	// The lease is still healthy: Next reissues the same seq (nothing was
+	// consumed by either the retryable Failed or the refused second one).
+	seq2, err := lease.Next()
+	if err != nil {
+		t.Fatalf("Next after Failed: %v", err)
+	}
+	if seq2 != seq {
+		t.Errorf("Next() after Failed = %d, want the same seq %d reissued", seq2, seq)
+	}
+}
+
+// Regression test for round 1 review finding 3: Landed must verify seq is
+// the one Next handed out. An off-by-one or otherwise stale Landed call
+// must refuse rather than silently advance next past a sequence nothing
+// wrote, which would open a permanent gap in tx/ forbidden by
+// spec/journal/v1 section 1 and section 12.
+func TestLandedRejectsSeqThatDoesNotMatchOutstanding(t *testing.T) {
+	c, _ := newLeaseClient(t)
+	leases := journal.NewLeases(c)
+	ctx := context.Background()
+
+	lease, err := leases.Open(ctx, "repo-kappa")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	seq, err := lease.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+
+	// An off-by-one Landed (seq+1, never issued by Next) must refuse
+	// rather than accept it and silently advance next past the real,
+	// unwritten seq.
+	if err := lease.Landed(seq + 1); err == nil {
+		t.Fatalf("expected Landed(seq+1) to refuse, got nil")
+	}
+
+	// The real seq is still outstanding: the mismatched call above did not
+	// clear it, so a concurrent Next() still refuses busy rather than
+	// handing out a second, overlapping seq.
+	if _, err := lease.Next(); err == nil {
+		t.Fatalf("expected Next() to still refuse while the real seq %d is outstanding", seq)
+	}
+
+	// Landed with the real seq succeeds and advances next by exactly one -
+	// no gap was opened by the earlier mismatched call.
+	if err := lease.Landed(seq); err != nil {
+		t.Fatalf("Landed(%d): %v", seq, err)
+	}
+	seq2, err := lease.Next()
+	if err != nil {
+		t.Fatalf("Next after Landed: %v", err)
+	}
+	if seq2 != seq+1 {
+		t.Errorf("Next() after Landed = %d, want %d (no gap)", seq2, seq+1)
+	}
+}
+
+// Regression test for round 1 review finding 3's other half: Failed must
+// verify seq before classifying it, so a stale seq can never be
+// interpolated into the operator-facing section 11.5 fencing refusal in
+// place of the sequence the append was actually attempted at, and must
+// never fence the stream on a mismatched report.
+func TestFailedRejectsStaleSeqAndDoesNotMisreportOrFence(t *testing.T) {
+	c, fake := newLeaseClient(t)
+	leases := journal.NewLeases(c)
+	ctx := context.Background()
+
+	lease, err := leases.Open(ctx, "repo-lambda")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	seq, err := lease.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+
+	fake.SetObject(journal.TxKey("repo-lambda", seq), []byte(`{}`))
+	putErr := putIfAbsentAt(ctx, c, journal.TxKey("repo-lambda", seq))
+	if !errors.Is(putErr, store.ErrPrecondition) {
+		t.Fatalf("PutIfAbsent: errors.Is(_, ErrPrecondition) = false, err = %v", putErr)
+	}
+
+	stale := seq + 7
+	staleErr := lease.Failed(stale, putErr)
+	if staleErr == nil {
+		t.Fatalf("expected Failed with a stale seq to refuse, got nil")
+	}
+	if strings.Contains(staleErr.Error(), fmt.Sprintf("seq %d", stale)) {
+		t.Errorf("stale seq %d leaked into the refusal: %q", stale, staleErr.Error())
+	}
+	if lease.Fencer().IsFenced("repo-lambda") {
+		t.Errorf("a stale Failed call must not fence the stream")
+	}
+
+	// The real seq, reported correctly, still fences as expected - the
+	// verification above rejected only the mismatched call, not every
+	// call.
+	failErr := lease.Failed(seq, putErr)
+	if !errors.Is(failErr, journal.ErrFenced) {
+		t.Fatalf("Failed(seq): expected ErrFenced, got %v", failErr)
+	}
+	want := fmt.Sprintf("refusal: push failed: stream repo-lambda fenced by concurrent writer at seq %d (instance is fenced for this stream; restart or check active writer)", seq)
+	if failErr.Error() != want {
+		t.Fatalf("Failed error:\ngot:  %v\nwant: %q", failErr, want)
 	}
 }

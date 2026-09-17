@@ -106,10 +106,14 @@ latency-tolerant; lost commits are none of those things.
 
 Exactly one walden process may append to a given stream at a time.
 The journal itself is the arbiter: every ref-transaction append is a
-**conditional put** carrying the expected previous sequence number. A stale
-writer — a process presumed dead that isn't, a second instance started by
-mistake — fails the condition, concludes it has been fenced, and stops
-serving writes immediately. It never guesses.
+**conditional put** of `tx/<seq>.json`, conditioned on that key not already
+existing (`If-None-Match: *`). A stale writer — a process presumed dead that
+isn't, a second instance started by mistake — gets back HTTP 412: definitive
+proof that another writer has already appended at that sequence (spec
+§11.4). It stops serving writes for that stream — not the instance —
+immediately. It never guesses: there is no previous-sequence header to
+recompute, so there is nothing to retry, and re-reading the head is
+forbidden.
 
 This is the most correctness-critical code in walden (on the order of a
 hundred lines), and it is specified by fixtures and exercised by a chaos test
@@ -279,7 +283,7 @@ By construction there are few, and each is legible:
 | machine/disk dies                            | none durable; cache lost                                                         | boot walden against the same journal          |
 | object storage unreachable (already running) | pushes fail loudly; reads keep serving                                           | pushes succeed when storage returns           |
 | object storage unreachable (at boot)         | the §11.6 probe runs before `net.Listen`; walden refuses to boot, nothing served | restart once storage is reachable             |
-| fenced-out writer                            | conditional put fails; writes stop on that instance                              | traffic already belongs to the current writer |
+| fenced-out writer                            | conditional put fails; writes stop on that stream on that instance               | restart to re-materialize from journal; traffic already belongs to the current writer |
 | append outcome unknown                       | writes stop on that stream on that instance                                      | restart; materialization reads what landed    |
 | crash mid-push                               | refs never moved; journal may hold an unreferenced pack                          | harmless; compaction tidies                   |
 | journal-less mode                            | durability = the disk, as warned                                                 | enable `WALDEN_JOURNAL`                       |

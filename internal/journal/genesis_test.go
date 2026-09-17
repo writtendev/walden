@@ -255,8 +255,8 @@ func TestLoadSigningKeyMalformed(t *testing.T) {
 
 // TestWriteSigningKeyTempThenCommit covers the two-step sequence
 // EnsureGenesis's mint path drives directly: WriteSigningKeyTemp leaves only
-// a .tmp file behind (LoadSigningKey still sees "absent"), and
-// CommitSigningKey renames it into place.
+// a temp file behind (LoadSigningKey still sees "absent"), and
+// CommitSigningKey renames the returned path into place.
 func TestWriteSigningKeyTempThenCommit(t *testing.T) {
 	dataDir := t.TempDir()
 	priv, _, err := journal.GenerateKeypair()
@@ -264,18 +264,21 @@ func TestWriteSigningKeyTempThenCommit(t *testing.T) {
 		t.Fatalf("GenerateKeypair failed: %v", err)
 	}
 
-	if err := journal.WriteSigningKeyTemp(dataDir, priv); err != nil {
+	tmpPath, err := journal.WriteSigningKeyTemp(dataDir, priv)
+	if err != nil {
 		t.Fatalf("WriteSigningKeyTemp failed: %v", err)
 	}
 	if _, err := journal.LoadSigningKey(dataDir); !os.IsNotExist(err) {
 		t.Fatalf("LoadSigningKey before commit: err = %v, want os.IsNotExist", err)
 	}
-	tmpPath := journal.SigningKeyPath(dataDir) + ".tmp"
 	if !fileExists(tmpPath) {
 		t.Fatalf("expected temp file %s to exist after WriteSigningKeyTemp", tmpPath)
 	}
+	if tmpPath == journal.SigningKeyPath(dataDir)+".tmp" {
+		t.Errorf("tmpPath = %q, want a random per-call suffix rather than the old fixed name", tmpPath)
+	}
 
-	if err := journal.CommitSigningKey(dataDir); err != nil {
+	if err := journal.CommitSigningKey(dataDir, tmpPath); err != nil {
 		t.Fatalf("CommitSigningKey failed: %v", err)
 	}
 	if fileExists(tmpPath) {
@@ -290,6 +293,54 @@ func TestWriteSigningKeyTempThenCommit(t *testing.T) {
 	}
 }
 
+// TestWriteSigningKeyTempNamesDistinctFiles covers round 1 finding 1's fix
+// directly: two calls to WriteSigningKeyTemp against the same data
+// directory (as two racing processes sharing one --data-dir would each
+// make) must never collide on the same path or overwrite each other's
+// bytes — each gets its own temp file, and each is independently readable
+// back through a rename to a distinct destination.
+func TestWriteSigningKeyTempNamesDistinctFiles(t *testing.T) {
+	dataDir := t.TempDir()
+	privA, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	privB, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+
+	tmpA, err := journal.WriteSigningKeyTemp(dataDir, privA)
+	if err != nil {
+		t.Fatalf("WriteSigningKeyTemp (A) failed: %v", err)
+	}
+	tmpB, err := journal.WriteSigningKeyTemp(dataDir, privB)
+	if err != nil {
+		t.Fatalf("WriteSigningKeyTemp (B) failed: %v", err)
+	}
+	if tmpA == tmpB {
+		t.Fatalf("two WriteSigningKeyTemp calls produced the same path %q", tmpA)
+	}
+	if !fileExists(tmpA) {
+		t.Errorf("expected %s to still exist after a second, independent WriteSigningKeyTemp call", tmpA)
+	}
+	if !fileExists(tmpB) {
+		t.Errorf("expected %s to exist", tmpB)
+	}
+
+	if err := journal.CommitSigningKey(dataDir, tmpA); err != nil {
+		t.Fatalf("CommitSigningKey(A) failed: %v", err)
+	}
+	loaded, err := journal.LoadSigningKey(dataDir)
+	if err != nil {
+		t.Fatalf("LoadSigningKey failed: %v", err)
+	}
+	if !privA.Equal(loaded) {
+		t.Errorf("committed key does not match privA: A's temp file must not have been clobbered by B's write")
+	}
+	journal.RemoveSigningKeyTemp(tmpB)
+}
+
 // TestRemoveSigningKeyTemp covers the cleanup EnsureGenesis performs when
 // its conditional PUT does not win: RemoveSigningKeyTemp deletes the temp
 // file and is a harmless no-op when there is nothing to remove.
@@ -299,21 +350,21 @@ func TestRemoveSigningKeyTemp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKeypair failed: %v", err)
 	}
-	if err := journal.WriteSigningKeyTemp(dataDir, priv); err != nil {
+	tmpPath, err := journal.WriteSigningKeyTemp(dataDir, priv)
+	if err != nil {
 		t.Fatalf("WriteSigningKeyTemp failed: %v", err)
 	}
-	tmpPath := journal.SigningKeyPath(dataDir) + ".tmp"
 	if !fileExists(tmpPath) {
 		t.Fatalf("expected temp file %s to exist", tmpPath)
 	}
 
-	journal.RemoveSigningKeyTemp(dataDir)
+	journal.RemoveSigningKeyTemp(tmpPath)
 	if fileExists(tmpPath) {
 		t.Errorf("temp file %s still present after RemoveSigningKeyTemp", tmpPath)
 	}
 
 	// A second call with nothing to remove must not panic or error visibly.
-	journal.RemoveSigningKeyTemp(dataDir)
+	journal.RemoveSigningKeyTemp(tmpPath)
 }
 
 // TestGenesisRefusalsAreSingleLine covers the shape of every refusal this
@@ -325,6 +376,9 @@ func TestGenesisRefusalsAreSingleLine(t *testing.T) {
 		journal.RefuseNoSigningKey(dataDir),
 		journal.RefuseSigningKeyMismatch(dataDir, "ed25519:aa", "ed25519:bb"),
 		journal.RefuseInvalidSigningKeyFile(dataDir, errors.New("bad line")),
+		journal.RefuseSigningKeyUnreadable(errors.New("open " + dataDir + "/signing.key: permission denied")),
+		journal.RefuseSigningKeyPresentOnMint(dataDir),
+		journal.RefuseSigningKeyCommitFailed(dataDir, dataDir+"/signing.key.tmp.deadbeef", errors.New("cross-device link")),
 	}
 	for _, err := range errs {
 		if err == nil {
@@ -341,6 +395,62 @@ func TestGenesisRefusalsAreSingleLine(t *testing.T) {
 		if !errors.Is(err, journal.ErrSigningKeyUnavailable) {
 			t.Errorf("expected ErrSigningKeyUnavailable, got %v", err)
 		}
+	}
+}
+
+// TestRefuseNoSigningKeyNamesLeftoverTemp covers round 1 finding 3:
+// RefuseNoSigningKey must tell an interrupted mint (its temp file fsynced
+// and still on disk, only the final rename missing) apart from a key that
+// was never written or was genuinely lost, and name the leftover file when
+// one is present rather than telling the operator the key is simply gone.
+func TestRefuseNoSigningKeyNamesLeftoverTemp(t *testing.T) {
+	dataDir := t.TempDir()
+
+	plain := journal.RefuseNoSigningKey(dataDir)
+	if strings.Contains(plain.Error(), ".tmp.") {
+		t.Errorf("refusal names a temp file that does not exist: %q", plain.Error())
+	}
+
+	priv, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	tmpPath, err := journal.WriteSigningKeyTemp(dataDir, priv)
+	if err != nil {
+		t.Fatalf("WriteSigningKeyTemp failed: %v", err)
+	}
+
+	withLeftover := journal.RefuseNoSigningKey(dataDir)
+	if !strings.Contains(withLeftover.Error(), tmpPath) {
+		t.Errorf("refusal does not name the leftover temp file %s: %q", tmpPath, withLeftover.Error())
+	}
+	if strings.ContainsAny(withLeftover.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", withLeftover.Error())
+	}
+	if strings.Contains(withLeftover.Error(), "restore signing.key from backup, or point") {
+		t.Errorf("refusal still uses the no-leftover wording once a temp file is found: %q", withLeftover.Error())
+	}
+}
+
+// TestRefuseInvalidSigningKeyFileNoDoublePath covers round 1 finding 8: the
+// path must appear once, not twice, in the refusal's single line — an
+// earlier version printed it both directly and inside the wrapped LoadSigningKey
+// error, which already names the path itself.
+func TestRefuseInvalidSigningKeyFileNoDoublePath(t *testing.T) {
+	dataDir := t.TempDir()
+	path := journal.SigningKeyPath(dataDir)
+	if err := os.WriteFile(path, []byte("not-ed25519:deadbeef\n"), 0600); err != nil {
+		t.Fatalf("failed to seed signing key file: %v", err)
+	}
+
+	_, loadErr := journal.LoadSigningKey(dataDir)
+	if loadErr == nil {
+		t.Fatal("expected LoadSigningKey to fail on a malformed file")
+	}
+
+	refusal := journal.RefuseInvalidSigningKeyFile(dataDir, loadErr)
+	if n := strings.Count(refusal.Error(), path); n != 1 {
+		t.Errorf("path %s appears %d times in %q, want exactly once", path, n, refusal.Error())
 	}
 }
 

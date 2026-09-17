@@ -9,9 +9,11 @@ package store_test
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +23,20 @@ import (
 	"github.com/writtendev/walden/internal/store"
 	"github.com/writtendev/walden/internal/store/storetest"
 )
+
+// signingKeyTempFiles returns every signing key temp file
+// (SigningKeyPath(dataDir)+".tmp.<32-hex>") currently under dataDir. Every
+// test that used to check a single fixed "signing.key.tmp" path checks this
+// instead, since round 1 finding 1's fix gives each WriteSigningKeyTemp call
+// its own randomly suffixed name.
+func signingKeyTempFiles(t *testing.T, dataDir string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(journal.SigningKeyPath(dataDir) + ".tmp.*")
+	if err != nil {
+		t.Fatalf("Glob failed: %v", err)
+	}
+	return matches
+}
 
 // fixedGenesisNow is the deterministic clock every EnsureGenesis test uses,
 // so a minted record's timestamp never depends on wall-clock time.
@@ -88,8 +104,8 @@ func TestEnsureGenesisMintsOnEmptyJournal(t *testing.T) {
 	if !loaded.Equal(priv) {
 		t.Errorf("saved signing key does not match the key EnsureGenesis returned")
 	}
-	if fileExists(journal.SigningKeyPath(dataDir) + ".tmp") {
-		t.Errorf("temp key file left behind after a successful mint")
+	if matches := signingKeyTempFiles(t, dataDir); len(matches) != 0 {
+		t.Errorf("temp key file(s) left behind after a successful mint: %v", matches)
 	}
 
 	if n := metaObjectCount(fake); n != 1 {
@@ -218,13 +234,18 @@ func TestEnsureGenesisPreconditionFencesLoser(t *testing.T) {
 	if fileExists(journal.SigningKeyPath(dataDir)) {
 		t.Errorf("signing.key left behind after a fenced mint attempt")
 	}
-	if fileExists(journal.SigningKeyPath(dataDir) + ".tmp") {
-		t.Errorf("signing.key.tmp left behind after a fenced mint attempt")
+	if matches := signingKeyTempFiles(t, dataDir); len(matches) != 0 {
+		t.Errorf("signing key temp file(s) left behind after a fenced mint attempt: %v", matches)
 	}
 }
 
 // (e) An ambiguous outcome on the genesis PUT fences the instance with the
-// section 11.5 item 8 text, and leaves no signing key litter behind.
+// section 11.5 item 8 text, and does not touch signing.key itself. Unlike
+// the 412 case (d), the temp key file is deliberately retained rather than
+// removed (round 1 finding 7): an outcome-unknown PUT may have landed, in
+// which case the temp file is the only surviving copy of a now-permanent
+// record's private key, so deleting it on a mere maybe would trade a
+// recoverable state for an unrecoverable one on no proof of loss.
 func TestEnsureGenesisOutcomeUnknownFences(t *testing.T) {
 	c, fake := newFakeClient(t)
 	dataDir := t.TempDir()
@@ -247,8 +268,8 @@ func TestEnsureGenesisOutcomeUnknownFences(t *testing.T) {
 	if fileExists(journal.SigningKeyPath(dataDir)) {
 		t.Errorf("signing.key left behind after an outcome-unknown mint attempt")
 	}
-	if fileExists(journal.SigningKeyPath(dataDir) + ".tmp") {
-		t.Errorf("signing.key.tmp left behind after an outcome-unknown mint attempt")
+	if matches := signingKeyTempFiles(t, dataDir); len(matches) != 1 {
+		t.Errorf("expected exactly one retained signing key temp file after an outcome-unknown mint attempt, got %d: %v", len(matches), matches)
 	}
 }
 
@@ -274,6 +295,161 @@ func TestEnsureGenesisGetForbiddenIsStorageFailure(t *testing.T) {
 	}
 	if strings.ContainsAny(err.Error(), "\n\r") {
 		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+}
+
+// (g) Round 1 finding 2: minting must not silently overwrite a signing.key
+// that already exists in dataDir. An operator repointing --data-dir at a
+// new or typo'd journal prefix must get a refusal, not a destroyed private
+// key and a cheerful "journal identity minted:" line — and mint must
+// refuse before it ever calls PutIfAbsent, since generating and PUTting a
+// second identity is itself part of the damage.
+func TestEnsureGenesisMintRefusesOverExistingSigningKey(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	other, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	if err := journal.SaveSigningKey(dataDir, other); err != nil {
+		t.Fatalf("SaveSigningKey failed: %v", err)
+	}
+	callsBefore := len(fake.Calls())
+
+	_, _, _, err = c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if !errors.Is(err, journal.ErrSigningKeyUnavailable) {
+		t.Errorf("expected errors.Is(err, journal.ErrSigningKeyUnavailable), got %v", err)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+
+	for _, call := range fake.Calls()[callsBefore:] {
+		if call.Op == storetest.OpPutIfAbsent || call.Op == storetest.OpPut {
+			t.Errorf("mint issued a write before refusing over an existing signing key: %+v", call)
+		}
+	}
+	if n := metaObjectCount(fake); n != 0 {
+		t.Errorf("expected no object under _meta, got %d", n)
+	}
+
+	loaded, err := journal.LoadSigningKey(dataDir)
+	if err != nil {
+		t.Fatalf("LoadSigningKey failed: %v", err)
+	}
+	if !loaded.Equal(other) {
+		t.Error("the pre-existing signing key was overwritten by a refused mint attempt")
+	}
+}
+
+// (h) Round 1 finding 4: a local filesystem failure during mint — here,
+// WriteSigningKeyTemp failing because dataDir itself does not exist — must
+// not be answered with the bucket/region/credentials fix clause
+// wrapGenesisFailure uses for genuine storage failures. Nothing in this
+// path ever reaches the bucket (no PutIfAbsent call), so a clause about S3
+// credentials would send the operator to check the wrong thing entirely.
+func TestEnsureGenesisMintLocalDiskFailureGetsDiskFix(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := filepath.Join(t.TempDir(), "does-not-exist")
+
+	_, _, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if strings.Contains(err.Error(), "bucket") || strings.Contains(err.Error(), "credentials") {
+		t.Errorf("a local disk failure must not carry the bucket/credentials fix clause: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "data directory") {
+		t.Errorf("expected the refusal to name the data directory: %q", err.Error())
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	for _, call := range fake.Calls() {
+		if call.Op == storetest.OpPutIfAbsent || call.Op == storetest.OpPut {
+			t.Errorf("a WriteSigningKeyTemp failure must not still attempt PutIfAbsent: %+v", call)
+		}
+	}
+}
+
+// (i) Round 1 finding 5: an oversized object at _meta seq 0 must be refused
+// in one line, not read in full. A genesis record is ~250 bytes by spec
+// section 3.1; this seeds an object well past maxGenesisBody and checks
+// EnsureGenesis refuses rather than allocating the whole thing.
+func TestEnsureGenesisOversizedBodyRefused(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	huge := make([]byte, 1<<20) // 1 MiB, far past maxGenesisBody's 64 KiB.
+	for i := range huge {
+		huge[i] = 'x'
+	}
+	fake.SetObject(fullKey(journal.TxKey(journal.MetaStreamID, 0)), huge)
+
+	_, _, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if !errors.Is(err, journal.ErrInvalidGenesis) {
+		t.Errorf("expected errors.Is(err, journal.ErrInvalidGenesis), got %v", err)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+}
+
+// (j) Round 1 finding 6: the adopt check must compare decoded key bytes,
+// not formatted hex strings, so a genesis record naming the local key's
+// public half in non-lowercase (but still parseable) hex adopts instead of
+// refusing a mismatch that is really only a case difference.
+func TestEnsureGenesisAdoptToleratesUppercaseHexKey(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	priv, pub, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	if err := journal.SaveSigningKey(dataDir, priv); err != nil {
+		t.Fatalf("SaveSigningKey failed: %v", err)
+	}
+
+	lower := journal.FormatPublicKey(pub) // "ed25519:<64-lower-hex>"
+	upper := "ed25519:" + strings.ToUpper(strings.TrimPrefix(lower, "ed25519:"))
+	rec := map[string]string{
+		"version":    "v1",
+		"stream":     "_meta",
+		"seq":        "0",
+		"type":       "genesis",
+		"public_key": upper,
+		"timestamp":  "2026-09-17T12:00:00Z",
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	fake.SetObject(fullKey(journal.TxKey(journal.MetaStreamID, 0)), data)
+
+	chain, adoptedPriv, minted, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("expected an uppercase-hex public_key to adopt, got refusal: %v", err)
+	}
+	if minted {
+		t.Error("minted = true, want false (adopt)")
+	}
+	if !adoptedPriv.Equal(priv) {
+		t.Error("adopted key does not match the local signing key")
+	}
+	// ApplyGenesis stores the record's public_key string verbatim
+	// (identity.go), so the chain's ActiveKey carries the record's own
+	// uppercase spelling — it is the *comparison* against the local key
+	// that must be immune to case, not the chain's memory of the record.
+	if chain.ActiveKey() != upper {
+		t.Errorf("chain.ActiveKey() = %q, want the record's own form %q", chain.ActiveKey(), upper)
 	}
 }
 
@@ -356,11 +532,143 @@ func TestEnsureGenesisConcurrentRaceSingleWinner(t *testing.T) {
 		if fileExists(journal.SigningKeyPath(dir)) {
 			keyCount++
 		}
-		if fileExists(journal.SigningKeyPath(dir) + ".tmp") {
-			t.Errorf("temp key file left behind in %s", dir)
+		if matches := signingKeyTempFiles(t, dir); len(matches) != 0 {
+			t.Errorf("temp key file(s) left behind in %s: %v", dir, matches)
 		}
 	}
 	if keyCount != 1 {
 		t.Errorf("expected exactly one signing.key across both directories, got %d", keyCount)
+	}
+}
+
+// The regression test for round 1 finding 1: two Clients over one Fake,
+// racing EnsureGenesis against the SAME data directory (the scenario the
+// original TestEnsureGenesisConcurrentRaceSingleWinner missed by giving each
+// racer its own t.TempDir()). Before the fix, a fixed "signing.key.tmp"
+// path opened O_TRUNC with no O_EXCL let the two racers overwrite each
+// other's unwritten key before either conditional PUT was decided, so the
+// eventual winner's CommitSigningKey could rename the LOSER's bytes into
+// place under the WINNER's genesis record — a permanently unsignable
+// journal (spec section 2.2) reached with no crash at all. The reviewer's
+// reproduction hit this on 56 of 60 iterations against one shared data
+// directory; this test runs the same shape repeatedly and asserts, every
+// time, that whichever key ends up on disk is the actual winner's key and
+// nothing else — a per-call random temp file name plus O_EXCL (see
+// WriteSigningKeyTemp's doc comment) makes the clobber structurally
+// impossible rather than merely unlikely, so this passes deterministically
+// rather than passing most of the time.
+func TestEnsureGenesisConcurrentRaceSharedDataDir(t *testing.T) {
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	t.Cleanup(restore)
+
+	newRacer := func(fake *storetest.Fake) *store.Client {
+		j := &store.Journal{
+			Endpoint:    fake.URL(),
+			Region:      "us-east-1",
+			Bucket:      fake.Bucket(),
+			Prefix:      testPrefix,
+			PathStyle:   true,
+			Credentials: store.Credentials{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
+		}
+		return store.NewClient(j)
+	}
+
+	const iterations = 60
+	for i := 0; i < iterations; i++ {
+		fake := storetest.New(t)
+		c1, c2 := newRacer(fake), newRacer(fake)
+		dataDir := t.TempDir() // the whole point: ONE dir for both racers.
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		minted := make([]bool, 2)
+		privs := make([]ed25519.PrivateKey, 2)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, priv, m, err := c1.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+			minted[0], errs[0], privs[0] = m, err, priv
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, priv, m, err := c2.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+			minted[1], errs[1], privs[1] = m, err, priv
+		}()
+		close(start)
+		wg.Wait()
+
+		// A shared data directory admits more legitimate outcomes than two
+		// separate directories do: exactly one PutIfAbsent can ever win
+		// (storage's conditional-write contract, unaffected by any of
+		// this), but the *other* racer can land on either side of that
+		// win depending on pure goroutine scheduling — arriving at its own
+		// Get() before the winner's PUT lands (and then either losing its
+		// own PutIfAbsent with RefuseStreamFenced, or finding the winner's
+		// signing.key already committed locally by the time it reaches
+		// mintGenesis's pre-check, RefuseSigningKeyPresentOnMint), or
+		// arriving after (adopting the winner's already-on-disk identity
+		// outright, since the two racers share the very directory that
+		// identity was just written to). All of these are correct; what
+		// must never happen, on any interleaving, is a signing.key that
+		// does not match the genesis record — that is the corruption round
+		// 1 finding 1 describes.
+		var successPrivs []ed25519.PrivateKey
+		for racer, err := range errs {
+			if err == nil {
+				successPrivs = append(successPrivs, privs[racer])
+				continue
+			}
+			if !errors.Is(err, journal.ErrFenced) && !errors.Is(err, journal.ErrSigningKeyUnavailable) {
+				t.Fatalf("iteration %d: racer %d: unexpected refusal: %v", i, racer, err)
+			}
+			if strings.ContainsAny(err.Error(), "\n\r") {
+				t.Fatalf("iteration %d: racer %d: refusal is not a single line: %q", i, racer, err.Error())
+			}
+		}
+		if len(successPrivs) == 0 {
+			t.Fatalf("iteration %d: both racers refused; expected at least one to succeed", i)
+		}
+		for idx, p := range successPrivs {
+			if !p.Equal(successPrivs[0]) {
+				t.Fatalf("iteration %d: successful racers returned different private keys (index %d) — this is exactly the corruption round 1 finding 1 describes", i, idx)
+			}
+		}
+
+		if n := metaObjectCount(fake); n != 1 {
+			t.Fatalf("iteration %d: expected exactly one object under _meta, got %d", i, n)
+		}
+
+		// The crux of the regression: the key actually on disk must be the
+		// one true winner's key, never a loser's bytes renamed into place
+		// under the winner's genesis record.
+		onDisk, err := journal.LoadSigningKey(dataDir)
+		if err != nil {
+			t.Fatalf("iteration %d: LoadSigningKey failed: %v", i, err)
+		}
+		if !onDisk.Equal(successPrivs[0]) {
+			t.Fatalf("iteration %d: signing.key does not hold the winner's private key — this is the corruption round 1 finding 1 describes", i)
+		}
+
+		objKey := fullKey(journal.TxKey(journal.MetaStreamID, 0))
+		data, ok := fake.Object(objKey)
+		if !ok {
+			t.Fatalf("iteration %d: expected a genesis object", i)
+		}
+		rec, err := journal.ParseGenesis(data)
+		if err != nil {
+			t.Fatalf("iteration %d: ParseGenesis failed: %v", i, err)
+		}
+		wantPub := journal.FormatPublicKey(onDisk.Public().(ed25519.PublicKey))
+		if rec.PublicKey != wantPub {
+			t.Fatalf("iteration %d: genesis record's public_key does not match the key on disk — signing.key cannot sign for this journal", i)
+		}
+
+		if matches := signingKeyTempFiles(t, dataDir); len(matches) != 0 {
+			t.Fatalf("iteration %d: temp key file(s) left behind: %v", i, matches)
+		}
 	}
 }

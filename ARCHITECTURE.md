@@ -274,15 +274,16 @@ repositories from another belongs above it.
 
 By construction there are few, and each is legible:
 
-| Failure                    | Effect                                                  | Recovery                                      |
-| -------------------------- | ------------------------------------------------------- | --------------------------------------------- |
-| machine/disk dies          | none durable; cache lost                                | boot walden against the same journal          |
-| object storage unreachable | pushes fail loudly; reads keep serving                  | pushes succeed when storage returns           |
-| fenced-out writer          | conditional put fails; writes stop on that instance     | traffic already belongs to the current writer |
-| append outcome unknown     | writes stop on that stream on that instance             | restart; materialization reads what landed    |
-| crash mid-push             | refs never moved; journal may hold an unreferenced pack | harmless; compaction tidies                   |
-| journal-less mode          | durability = the disk, as warned                        | enable `WALDEN_JOURNAL`                       |
-| bucket lacks compare-and-swap | walden refuses to boot, one line                     | choose a provider per spec §11.2              |
+| Failure                                      | Effect                                                                           | Recovery                                      |
+| -------------------------------------------- | -------------------------------------------------------------------------------- | --------------------------------------------- |
+| machine/disk dies                            | none durable; cache lost                                                         | boot walden against the same journal          |
+| object storage unreachable (already running) | pushes fail loudly; reads keep serving                                           | pushes succeed when storage returns           |
+| object storage unreachable (at boot)         | the §11.6 probe runs before `net.Listen`; walden refuses to boot, nothing served | restart once storage is reachable             |
+| fenced-out writer                            | conditional put fails; writes stop on that instance                              | traffic already belongs to the current writer |
+| append outcome unknown                       | writes stop on that stream on that instance                                      | restart; materialization reads what landed    |
+| crash mid-push                               | refs never moved; journal may hold an unreferenced pack                          | harmless; compaction tidies                   |
+| journal-less mode                            | durability = the disk, as warned                                                 | enable `WALDEN_JOURNAL`                       |
+| bucket lacks compare-and-swap                | walden refuses to boot, one line                                                 | choose a provider per spec §11.2              |
 
 Losing an acknowledged push does not appear in this table. That is the
 entire product.

@@ -106,15 +106,39 @@ func (c *Client) providerName() string {
 	return c.journal.Endpoint
 }
 
+// probeFailureFix is the fix clause on every refusal wrapProbeFailure
+// produces. It is deliberately boot-appropriate rather than borrowed from
+// the wrapped cause: ProbeCAS runs before cmd/walden/main.go calls
+// net.Listen, so a failure here means walden has exited and bound
+// nothing, not that it is up and degrading - fixFor's "pushes succeed
+// when storage returns" (client.go) describes the latter, and would tell
+// an operator reading this refusal that requests are already being
+// served when none are.
+const probeFailureFix = "restart walden once storage is reachable, or check the journal knob"
+
 // wrapProbeFailure wraps any ProbeCAS failure that is not itself the
 // compare-and-swap capability problem - a 403, an unreachable endpoint,
 // retries exhausted, or an ambiguous outcome - as a single "invalid
-// journal" refusal. The fix is left empty: the wrapped cause (a
-// *refusal.Refusal from PutIfAbsent, or a plain error generating the probe
-// key) already carries what an operator needs, and a second "(...)" would
-// stack two fixes into one line.
+// journal" refusal, with probeFailureFix as its fix clause. The detail
+// comes from probeFailureWhy rather than cause.Error(): a *refusal.Refusal
+// from PutIfAbsent formats its own Fix (fixFor, tuned for a running server
+// mid-push) into that string, and appending probeFailureFix alongside it
+// would stack two fix clauses - one wrong for boot - into a single line.
 func wrapProbeFailure(cause error) error {
-	return refusal.RefuseWithCause("invalid journal", "compare-and-swap probe: "+cause.Error(), "", cause)
+	return refusal.RefuseWithCause("invalid journal", "compare-and-swap probe: "+probeFailureWhy(cause), probeFailureFix, cause)
+}
+
+// probeFailureWhy returns cause's detail without any fix clause of its
+// own: the bare "<what>: <why>" of a *refusal.Refusal from PutIfAbsent, or
+// cause.Error() for a plain error (probeKey's crypto/rand failure never
+// carries one). Skipping the *Refusal's own Fix field here is what keeps
+// wrapProbeFailure's probeFailureFix the only fix clause in the result.
+func probeFailureWhy(cause error) string {
+	var r *refusal.Refusal
+	if errors.As(cause, &r) {
+		return r.What + ": " + r.Why
+	}
+	return cause.Error()
 }
 
 // cleanupProbeKey deletes key and returns a one-line warning - never a

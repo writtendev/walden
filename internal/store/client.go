@@ -52,7 +52,7 @@ var (
 	// is "the caller can simply try again" - that is exactly wrong here,
 	// because a resend risks a 412 caused by this writer's own earlier,
 	// unacknowledged attempt. See classify and PutIfAbsent.
-	ErrOutcomeUnknown = errors.New("object storage write outcome unknown")
+	ErrOutcomeUnknown = journal.ErrOutcomeUnknown
 )
 
 const (

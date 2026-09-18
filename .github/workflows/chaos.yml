@@ -1,0 +1,179 @@
+# WALD-35: nightly chaos run for the write path. The default budget
+# (chaosDefaultRounds / chaosDefaultConcurrentRounds in chaos_test.go) is
+# tuned to stay inside the per-PR `go test -race ./...` step in ci.yml, so
+# nothing here is gated out of ordinary PR CI - this workflow only scales
+# the budget up, on a schedule rather than on every push, per the ticket's
+# plan.
+name: chaos
+
+on:
+  schedule:
+    # Nightly, well off the hour. WALDEN_CHAOS_SEED below is the run id, so
+    # successive nights explore different fault scripts rather than
+    # repeating the same one forever.
+    - cron: '17 9 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  chaos:
+    name: chaos (write path)
+    runs-on: ubuntu-latest
+    # A named upper bound on the whole job, well above the go test -timeout
+    # below (which covers checkout and setup-go too): belt-and-suspenders
+    # so a hang anywhere in the step, not just inside the test binary,
+    # still ends in a named CI failure instead of running until GitHub's
+    # own default (360 minutes) cuts it off.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.3'
+          cache: false
+
+      - name: Chaos test for the write path (large budget)
+        shell: bash
+        env:
+          # github.run_id changes every run, so the fault schedule differs
+          # night to night while staying reproducible for whichever run
+          # produced it: a failure's own log names the exact seed and round
+          # count to replay locally.
+          WALDEN_CHAOS_SEED: ${{ github.run_id }}
+          # 5000 is chosen, not the largest round count that technically
+          # runs: WALD-35 PR #65's round-1 review measured the previous
+          # value here (20000) failing to even finish
+          # TestChaosWritePathFaultsAndRestart inside Go's 10-minute default
+          # test timeout (629s and still running when killed). Two things
+          # fed that: the per-round invariant checks used to rescan the
+          # fake's entire call log and key set from scratch every round, and
+          # nextSeqFromFake (since removed) did the same to predict each
+          # round's own key - all three now cost O(1) or a bounded number of
+          # checkpoints per run instead (see chaos_test.go's
+          # chaosInvariantState and (*chaosInvariantState).predictedSeq doc
+          # comments). Fixing that helps, but does not make the runtime
+          # linear on its own: a large chaos run's real HTTP traffic under
+          # `-race` is itself superlinear in round count (profiling shows
+          # network syscalls and the race detector's own bookkeeping
+          # dominating, not this file's Go code), so picking a bounded round
+          # count for this nightly step is still necessary, not merely a
+          # fallback.
+          #
+          # This value drives TestChaosWritePathFaultsAndRestart (the
+          # sequential, seeded, fault-catalogue half - the one whose
+          # coverage genuinely grows with more rounds) directly.
+          # TestChaosWritePathConcurrentInstances (the barrier-synchronized
+          # race half) reads it too but caps its own effective round count
+          # at chaosConcurrentRoundsCap (chaos_test.go) regardless of what
+          # this says, and always uses its own *http.Client
+          # (newChaosConcurrentClient) with a wider per-host idle-connection
+          # pool than production's own default: WALD-35 PR #65's round-2
+          # review found that at 5000 iterations, the concurrent half's K=5
+          # simultaneous PutIfAbsent calls per round - all sharing one
+          # *store.Client, hence one connection pool, capped at net/http's
+          # default MaxIdleConnsPerHost=2 - forced most of each round's
+          # connections closed instead of reused, leaving ~14,930 sockets in
+          # TIME_WAIT (~91% of this runner's ephemeral port range) and
+          # failing the job with "can't assign requested address" on
+          # entirely correct code, misreported as a fencing-refusal
+          # mismatch. Widening the concurrent half's connection pool well
+          # above K removes that growth rather than just slowing it, by
+          # itself: see newChaosConcurrentClient's doc comment in
+          # chaos_test.go for the full reasoning and the invariant this
+          # keeps (production's own NewClient/its default pool size in
+          # client.go are untouched; only this test's own transport is
+          # configured this way). Capping the concurrent half's own rounds
+          # independently is a separate decision, for wall-clock budget
+          # inside this job's own -timeout, not for port usage (its
+          # assertions hold under every interleaving by construction - see
+          # its own doc comment - so a failure here is never a flake, but
+          # repeats past a few hundred still buy real, if steeply
+          # diminishing, interleaving coverage rather than mere
+          # confirmation - unlike the sequential half's seeded fault
+          # catalogue, whose coverage keeps growing with every round): see
+          # chaosConcurrentRoundsCap's doc comment in chaos_test.go for why
+          # it stays at 500 rather than scaling with WALDEN_CHAOS_ROUNDS.
+          #
+          # Measured locally (an M-series Mac, not this job's own runner -
+          # expect this class of hardware to be somewhat faster than
+          # ubuntu-latest, but see the port measurement below, which is
+          # independent of CPU speed) after the port-exhaustion fix: 5000
+          # rounds of TestChaosWritePathFaultsAndRestart plus
+          # TestChaosWritePathConcurrentInstances capped at 500 rounds run
+          # in ~97-100s combined (~94-96s + ~2.4s, three runs) - comfortably
+          # inside the -timeout below with roughly 9x headroom even before
+          # accounting for a slower runner, while still exercising the
+          # write path roughly 33x further than the default per-PR budget
+          # (chaosDefaultRounds = 150) does on every push. Peak TIME_WAIT
+          # sockets during that run measured 380 (polled every 0.5s), on a
+          # machine whose ephemeral range (49152-65535, 16384 ports) is
+          # narrower than ubuntu-latest's (~28.2k) - about 2.3% of this
+          # machine's range, so proportionally lower still on the actual
+          # runner. That residual 380 is not connection-pool churn (the
+          # concurrent half's fix above addresses that; if it recurred,
+          # it would scale with rounds x K, not with rounds alone): it
+          # tracks the sequential half's own fault catalogue, which
+          # deliberately severs the connection on roughly 1 in 6 rounds by
+          # design, not 1 in 12 - a round-3 review correction to this
+          # comment. classUnknownOutcome is drawn 1 in 4 rounds
+          # (pickFaultClass), and within it unknownOutcomeFault draws six
+          # shapes uniformly (r.Intn(6)), of which four - not two - sever
+          # the connection: storetest.Fault.Drop, with or without Land
+          # (cases 0-1), and storetest.Fault.TruncateBody (the default
+          # case, 4-5), which also hijackDrops the connection after
+          # writing its truncated bytes (storetest.go's handlePut). Only
+          # the remaining two of six (cases 2-3) are a bare 500/502/504
+          # with no connection close. So 4/6 x 1/4 = 1/6 rounds sever the
+          # connection, each one a genuine TCP close this test exists to
+          # inject - not a bug, and not something the port fix above is
+          # trying to eliminate. The rate correction does not change the
+          # peak or the headroom claim above: both were measured directly
+          # from a real run, which already exercised TruncateBody's own
+          # hijackDrop alongside Drop's, not derived from the (previously
+          # wrong) 1-in-12 figure; re-measured after this correction
+          # (same machine, same method): 96.44s combined and a peak of
+          # 383 TIME_WAIT sockets, in line with the original 380. 10000
+          # rounds of just the sequential half
+          # alone measured 355s in the same environment before this fix,
+          # unaffected by the port work (that half's own client and round
+          # budget are unchanged) - continued superlinear growth, and
+          # confirmation that scaling the sequential half further from here
+          # trades away the headroom this value keeps.
+          WALDEN_CHAOS_ROUNDS: 5000
+        run: |
+          set -o pipefail
+          # An explicit -timeout, rather than Go's own 10-minute default,
+          # so a hang here is this job's own named failure (and the
+          # timeout-minutes above's problem to catch only if this itself
+          # somehow wedges) instead of an ambiguous one.
+          go test -race -count=1 -timeout=15m -run '^TestChaosWritePath' -v ./internal/store/ 2>&1 | tee chaos.out
+          if grep -q -- '--- SKIP: TestChaosWritePath' chaos.out; then
+            echo "Error: a chaos test skipped with WALDEN_CHAOS_ROUNDS/WALDEN_CHAOS_SEED set"; exit 1
+          fi
+
+          # `-run` matching nothing (a rename, a move to another package, a
+          # build tag added to chaos_test.go) prints "no tests to run" and
+          # exits 0 with no --- SKIP: line, so the check above alone would
+          # report success having exercised no chaos test at all. Require
+          # both expected tests to show up as a PASS by name, the same
+          # anti-theatre guard the MinIO conformance step in ci.yml already
+          # uses.
+          EXPECTED_TESTS=(
+            TestChaosWritePathFaultsAndRestart
+            TestChaosWritePathConcurrentInstances
+          )
+          MISSING=()
+          for T in "${EXPECTED_TESTS[@]}"; do
+            # Anchor on the trailing " (" so a rename with this name as a
+            # prefix doesn't match.
+            if ! grep -qE -- "^--- PASS: ${T} \(" chaos.out; then
+              MISSING+=("${T}")
+            fi
+          done
+          if [ "${#MISSING[@]}" -ne 0 ]; then
+            echo "Error: expected chaos test(s) did not run and pass (renamed, moved, or gated out by a build tag?):"
+            printf '  %s\n' "${MISSING[@]}"
+            exit 1
+          fi

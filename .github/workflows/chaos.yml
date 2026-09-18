@@ -1,0 +1,70 @@
+# WALD-35: nightly chaos run for the write path. The default budget
+# (chaosDefaultRounds / chaosDefaultConcurrentRounds in chaos_test.go) is
+# tuned to stay inside the per-PR `go test -race ./...` step in ci.yml, so
+# nothing here is gated out of ordinary PR CI - this workflow only scales
+# the budget up, on a schedule rather than on every push, per the ticket's
+# plan.
+name: chaos
+
+on:
+  schedule:
+    # Nightly, well off the hour. WALDEN_CHAOS_SEED below is the run id, so
+    # successive nights explore different fault scripts rather than
+    # repeating the same one forever.
+    - cron: '17 9 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  chaos:
+    name: chaos (write path)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.3'
+          cache: false
+
+      - name: Chaos test for the write path (large budget)
+        shell: bash
+        env:
+          # github.run_id changes every run, so the fault schedule differs
+          # night to night while staying reproducible for whichever run
+          # produced it: a failure's own log names the exact seed and round
+          # count to replay locally.
+          WALDEN_CHAOS_SEED: ${{ github.run_id }}
+          WALDEN_CHAOS_ROUNDS: 20000
+        run: |
+          set -o pipefail
+          go test -race -count=1 -run '^TestChaosWritePath' -v ./internal/store/ 2>&1 | tee chaos.out
+          if grep -q -- '--- SKIP: TestChaosWritePath' chaos.out; then
+            echo "Error: a chaos test skipped with WALDEN_CHAOS_ROUNDS/WALDEN_CHAOS_SEED set"; exit 1
+          fi
+
+          # `-run` matching nothing (a rename, a move to another package, a
+          # build tag added to chaos_test.go) prints "no tests to run" and
+          # exits 0 with no --- SKIP: line, so the check above alone would
+          # report success having exercised no chaos test at all. Require
+          # both expected tests to show up as a PASS by name, the same
+          # anti-theatre guard the MinIO conformance step in ci.yml already
+          # uses.
+          EXPECTED_TESTS=(
+            TestChaosWritePathFaultsAndRestart
+            TestChaosWritePathConcurrentInstances
+          )
+          MISSING=()
+          for T in "${EXPECTED_TESTS[@]}"; do
+            # Anchor on the trailing " (" so a rename with this name as a
+            # prefix doesn't match.
+            if ! grep -qE -- "^--- PASS: ${T} \(" chaos.out; then
+              MISSING+=("${T}")
+            fi
+          done
+          if [ "${#MISSING[@]}" -ne 0 ]; then
+            echo "Error: expected chaos test(s) did not run and pass (renamed, moved, or gated out by a build tag?):"
+            printf '  %s\n' "${MISSING[@]}"
+            exit 1
+          fi

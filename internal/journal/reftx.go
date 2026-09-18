@@ -181,14 +181,19 @@ func ValidateOID(oid string) error {
 // while preserving exact byte representation.
 //
 // Deliberately not checked here: whether ref is valid UTF-8. Git does not
-// require it, and this function is shared by paths that do not either —
-// SigningChain's callers and MarshalMarker (marker.go) — where a raw,
-// non-UTF-8 byte sequence is preserved exactly through CanonicalRefUpdatePayload
-// / CanonicalMarkerPayload's plain byte streams and verifies correctly
-// (TestRefNameRawBytePreservationNonUTF8). It is v1's JSON record format
-// specifically that cannot carry those bytes losslessly, so that check
-// belongs at the point a record is serialized to JSON: see MarshalRefTx's
-// own doc comment for why, rather than here.
+// require it, and this function is shared by paths with different
+// guarantees about raw bytes. The signing layer — SignRefTx/VerifyRefTx via
+// CanonicalRefUpdatePayload, a plain byte stream rather than JSON —
+// preserves an arbitrary, non-UTF-8 byte sequence exactly; that is what
+// TestRefNameRawBytePreservationNonUTF8 pins. v1's JSON record format
+// cannot make the same promise (encoding/json replaces invalid UTF-8 with
+// U+FFFD), which is why MarshalRefTx refuses such a ref rather than
+// writing an unverifiable record: see its own doc comment for why.
+//
+// MarshalMarker (marker.go) marshals ref names to JSON the same way and
+// has the identical hole — unfixed, and deliberately out of this ticket's
+// five files. WALD-119 tracks the v1-format decision this implies and the
+// MarshalMarker fix that follows from it.
 func ValidateRefName(ref string) error {
 	if ref == "" {
 		return fmt.Errorf("%w: cannot be empty", ErrInvalidRef)

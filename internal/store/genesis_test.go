@@ -346,6 +346,82 @@ func TestEnsureGenesisMintRefusesOverExistingSigningKey(t *testing.T) {
 	}
 }
 
+// (g2) Round 2 finding: a local signing.key must never cause a refusal that
+// claims no genesis record exists when one actually does — the exact shape
+// of the shared-data-directory race where a sibling's winning PutIfAbsent
+// and CommitSigningKey could land between this instance's Get and a later
+// stat, leaving RefuseSigningKeyPresentOnMint's "no genesis record found"
+// false by the time it printed (internal/store/genesis.go, line 183 in the
+// version that finding was filed against). EnsureGenesis now stats the
+// local key before the Get rather than after (see EnsureGenesis's doc
+// comment), so a genesis record that is actually present always routes to
+// adopt regardless of what the earlier stat found; these two cases pin that
+// down deterministically, without depending on goroutine timing the way
+// TestEnsureGenesisConcurrentRaceSharedDataDir must.
+func TestEnsureGenesisPresentSigningKeyNeverBlocksAdopt(t *testing.T) {
+	t.Run("matching local key adopts", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		dataDir := t.TempDir()
+
+		priv, pub, err := journal.GenerateKeypair()
+		if err != nil {
+			t.Fatalf("GenerateKeypair failed: %v", err)
+		}
+		if err := journal.SaveSigningKey(dataDir, priv); err != nil {
+			t.Fatalf("SaveSigningKey failed: %v", err)
+		}
+		rec := journal.NewGenesisRecord(pub, fixedGenesisNow().UTC().Format(time.RFC3339))
+		data, err := journal.MarshalGenesis(rec)
+		if err != nil {
+			t.Fatalf("MarshalGenesis failed: %v", err)
+		}
+		fake.SetObject(fullKey(journal.TxKey(journal.MetaStreamID, 0)), data)
+
+		_, _, minted, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+		if err != nil {
+			t.Fatalf("EnsureGenesis failed: %v", err)
+		}
+		if minted {
+			t.Error("minted = true, want false (adopt)")
+		}
+	})
+
+	t.Run("mismatched local key names the record, not a missing one", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		dataDir := t.TempDir()
+
+		_, pub, err := journal.GenerateKeypair()
+		if err != nil {
+			t.Fatalf("GenerateKeypair failed: %v", err)
+		}
+		other, _, err := journal.GenerateKeypair()
+		if err != nil {
+			t.Fatalf("GenerateKeypair failed: %v", err)
+		}
+		if err := journal.SaveSigningKey(dataDir, other); err != nil {
+			t.Fatalf("SaveSigningKey failed: %v", err)
+		}
+		rec := journal.NewGenesisRecord(pub, fixedGenesisNow().UTC().Format(time.RFC3339))
+		data, err := journal.MarshalGenesis(rec)
+		if err != nil {
+			t.Fatalf("MarshalGenesis failed: %v", err)
+		}
+		fake.SetObject(fullKey(journal.TxKey(journal.MetaStreamID, 0)), data)
+
+		_, _, _, err = c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+		if err == nil {
+			t.Fatal("expected a refusal, got nil")
+		}
+		if strings.Contains(err.Error(), "no genesis record found") {
+			t.Errorf("refusal claims no genesis record exists, but one does: %q", err.Error())
+		}
+		want := journal.RefuseSigningKeyMismatch(dataDir, rec.PublicKey, journal.FormatPublicKey(other.Public().(ed25519.PublicKey))).Error()
+		if err.Error() != want {
+			t.Errorf("got %q, want %q", err.Error(), want)
+		}
+	})
+}
+
 // (h) Round 1 finding 4: a local filesystem failure during mint — here,
 // WriteSigningKeyTemp failing because dataDir itself does not exist — must
 // not be answered with the bucket/region/credentials fix clause
@@ -606,16 +682,31 @@ func TestEnsureGenesisConcurrentRaceSharedDataDir(t *testing.T) {
 		// (storage's conditional-write contract, unaffected by any of
 		// this), but the *other* racer can land on either side of that
 		// win depending on pure goroutine scheduling — arriving at its own
-		// Get() before the winner's PUT lands (and then either losing its
-		// own PutIfAbsent with RefuseStreamFenced, or finding the winner's
-		// signing.key already committed locally by the time it reaches
-		// mintGenesis's pre-check, RefuseSigningKeyPresentOnMint), or
-		// arriving after (adopting the winner's already-on-disk identity
-		// outright, since the two racers share the very directory that
-		// identity was just written to). All of these are correct; what
-		// must never happen, on any interleaving, is a signing.key that
-		// does not match the genesis record — that is the corruption round
-		// 1 finding 1 describes.
+		// Get() before the winner's PUT lands (and then losing its own
+		// PutIfAbsent with RefuseStreamFenced), or arriving after (adopting
+		// the winner's already-on-disk identity outright, since the two
+		// racers share the very directory that identity was just written
+		// to, or refusing honestly via RefuseNoSigningKey/
+		// RefuseSigningKeyMismatch if it observes the record before the
+		// winner's local rename has caught up). All of these are correct;
+		// what must never happen, on any interleaving, is a signing.key
+		// that does not match the genesis record — that is the corruption
+		// round 1 finding 1 describes.
+		//
+		// Before a round 2 fix (EnsureGenesis now stats the local signing
+		// key before its genesis GET rather than after — see
+		// EnsureGenesis's doc comment), a third shape was possible here:
+		// this racer's own Get() returning not-found just ahead of the
+		// winner's commit, followed by this racer's stat finding the
+		// winner's signing.key already on disk, reaching
+		// RefuseSigningKeyPresentOnMint's "no genesis record found" claim
+		// opposite what the winner had, by then, already proven. Stat-then-
+		// Get closes that ordering (see TestEnsureGenesisPresentSigningKeyNeverBlocksAdopt
+		// for a deterministic pin of the invariant it relies on), so that
+		// refusal should no longer surface from this loop at all; errors.Is
+		// against ErrSigningKeyUnavailable is kept broad below rather than
+		// narrowed to the two remaining constructors, since this test's own
+		// job is the key/record match, not enumerating which refusal fired.
 		var successPrivs []ed25519.PrivateKey
 		for racer, err := range errs {
 			if err == nil {

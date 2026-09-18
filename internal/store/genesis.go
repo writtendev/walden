@@ -41,42 +41,58 @@ const maxGenesisBody = 64 << 10 // 64 KiB
 //
 // Order of operations is the substance of this function:
 //
-//  1. Get(TxKey(MetaStreamID, 0)), body bounded by maxGenesisBody.
-//  2. Present -> adopt: ParseGenesis, NewSigningChain().ApplyGenesis, then
+//  1. Stat dataDir's signing.key, before the genesis GET rather than after
+//     it. This used to run inside the mint path, reached only once Get had
+//     already returned not-found — which left a window, in the
+//     shared-data-directory race two instances can run by sharing one
+//     --data-dir, where a sibling's winning PutIfAbsent and rename could
+//     land in between this instance's Get and its (later) stat: the stat
+//     would then find the sibling's signing.key and refuse
+//     RefuseSigningKeyPresentOnMint with "no genesis record found" even
+//     though the sibling's record was by then committed (round 2 finding,
+//     internal/store/genesis.go line 183). Stat-ing first closes that
+//     window rather than merely narrowing it: a signing.key can only be on
+//     disk once some PutIfAbsent has already won, and storage's read-after-
+//     write consistency means the Get immediately below is guaranteed to
+//     see that same write, so "key present" and "record absent" can no
+//     longer both be true here — a late-arriving sibling now always reads
+//     as a found record (step 2, adopt) rather than this stale refusal.
+//  2. Get(TxKey(MetaStreamID, 0)), body bounded by maxGenesisBody.
+//  3. Present -> adopt: ParseGenesis, NewSigningChain().ApplyGenesis, then
 //     require a local signing key whose public half matches the record's
 //     (compared as decoded bytes, not formatted hex, so case differences in
 //     a spec-non-conformant but parseable record never look like a
 //     mismatch). Absent or mismatched -> a one-line refusal, because an
 //     instance that cannot sign cannot journal, and a push it could not
 //     journal must not be acknowledged (spec section 2.2).
-//  3. ErrObjectNotFound -> mint, refusing first if dataDir already holds a
-//     signing.key (round 1 finding 2: that file belongs to some other
-//     journal, and minting would rename straight over it). Otherwise:
-//     GenerateKeypair, build the record, MarshalGenesis, write the temp key
-//     file under a name unique to this call (round 1 finding 1), PutIfAbsent
-//     the record, and only then rename the temp file into place. The rename
-//     is the commit point: a crash between a winning PUT and the rename
-//     leaves a genesis record in the bucket whose signing key never reached
-//     disk under its final name — though it is very likely still sitting,
-//     fsynced, at its temp name (round 1 finding 3). That window is narrowed
-//     to one atomic rename, not eliminated — there is no recovery mode
-//     here, deliberately.
-//  4. ErrPrecondition on that PUT -> the loser of the race. Spec section
+//  4. ErrObjectNotFound -> mint, refusing first if step 1 found dataDir
+//     already holding a signing.key (round 1 finding 2: that file belongs
+//     to some other journal, and minting would rename straight over it).
+//     Otherwise: GenerateKeypair, build the record, MarshalGenesis, write
+//     the temp key file under a name unique to this call (round 1 finding
+//     1), PutIfAbsent the record, and only then rename the temp file into
+//     place. The rename is the commit point: a crash between a winning PUT
+//     and the rename leaves a genesis record in the bucket whose signing
+//     key never reached disk under its final name — though it is very
+//     likely still sitting, fsynced, at its temp name (round 1 finding 3).
+//     That window is narrowed to one atomic rename, not eliminated — there
+//     is no recovery mode here, deliberately.
+//  5. ErrPrecondition on that PUT -> the loser of the race. Spec section
 //     11.4 items 2-4: a 412 is definitive proof another writer got there
 //     first, so this instance does not re-read the head, does not retry,
 //     and does not adopt within the same boot. It removes its temp key file
 //     and returns journal.RefuseStreamFenced(MetaStreamID, 0), which refuses
 //     boot in one line. Restart is the recovery: a restart takes the adopt
-//     path at step 2, where it correctly refuses if the operator pointed a
+//     path at step 3, where it correctly refuses if the operator pointed a
 //     second instance at another instance's journal.
-//  5. ErrOutcomeUnknown on that PUT -> journal.RefuseAppendOutcomeUnknown
+//  6. ErrOutcomeUnknown on that PUT -> journal.RefuseAppendOutcomeUnknown
 //     (MetaStreamID, 0), no resend and no GET to find out (spec section
-//     11.4 item 6). Unlike step 4, the temp key file is deliberately kept,
+//     11.4 item 6). Unlike step 5, the temp key file is deliberately kept,
 //     not removed (round 1 finding 7): the PUT may have landed, and if it
 //     did, the temp file is the only surviving copy of a now-permanent
 //     record's private key.
-//  6. Any other GET/PUT failure, or a local filesystem failure from steps 2
-//     or 3 that never touched storage at all -> wrapped once as a single
+//  7. Any other GET/PUT failure, or a local filesystem failure from steps 1
+//     or 4 that never touched storage at all -> wrapped once as a single
 //     "invalid journal"-style refusal. Storage failures use the same shape
 //     wrapProbeFailure uses in probe.go, so a 403 or an unreachable
 //     endpoint does not masquerade as a corrupt journal; local failures use
@@ -85,18 +101,33 @@ const maxGenesisBody = 64 << 10 // 64 KiB
 func (c *Client) EnsureGenesis(ctx context.Context, dataDir string, now func() time.Time) (*journal.SigningChain, ed25519.PrivateKey, bool, error) {
 	key := journal.TxKey(journal.MetaStreamID, 0)
 
+	// Step 1: see this function's doc comment for why this runs before the
+	// Get rather than inside the mint path. statErr is only acted on below,
+	// in the mint branch — the adopt branch (Get succeeds) never needed
+	// this stat and must not fail boot over it; LoadSigningKey will surface
+	// the same filesystem problem there through its own refusal if it
+	// matters.
+	_, statErr := os.Stat(journal.SigningKeyPath(dataDir))
+	keyPresent := statErr == nil
+
 	body, err := c.Get(ctx, key)
 	switch {
 	case err == nil:
 		return c.adoptGenesis(dataDir, body)
 	case errors.Is(err, ErrObjectNotFound):
+		if keyPresent {
+			return nil, nil, false, journal.RefuseSigningKeyPresentOnMint(dataDir)
+		}
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return nil, nil, false, wrapGenesisDiskFailure(statErr)
+		}
 		return c.mintGenesis(ctx, dataDir, key, now)
 	default:
 		return nil, nil, false, wrapGenesisFailure(err)
 	}
 }
 
-// adoptGenesis handles EnsureGenesis's step 2: an existing genesis record
+// adoptGenesis handles EnsureGenesis's step 3: an existing genesis record
 // was found at _meta seq 0.
 func (c *Client) adoptGenesis(dataDir string, body io.ReadCloser) (*journal.SigningChain, ed25519.PrivateKey, bool, error) {
 	defer body.Close()
@@ -168,23 +199,12 @@ func (c *Client) adoptGenesis(dataDir string, body io.ReadCloser) (*journal.Sign
 	return chain, priv, false, nil
 }
 
-// mintGenesis handles EnsureGenesis's steps 3-6: no genesis record exists
-// yet, so this instance attempts to become the one that writes it.
+// mintGenesis handles EnsureGenesis's steps 4-7: no genesis record exists
+// yet, so this instance attempts to become the one that writes it. The
+// pre-existing-signing.key guard (round 1 finding 2) is EnsureGenesis's
+// step 1, ahead of the Get that routes here, not this function's own —
+// see EnsureGenesis's doc comment for why that stat had to move.
 func (c *Client) mintGenesis(ctx context.Context, dataDir, key string, now func() time.Time) (*journal.SigningChain, ed25519.PrivateKey, bool, error) {
-	// A pre-existing signing.key means dataDir already belongs to some
-	// journal's identity — CommitSigningKey renames unconditionally, so
-	// minting here would destroy that journal's only private key the
-	// moment this instance's own conditional PUT won (round 1 finding 2;
-	// see RefuseSigningKeyPresentOnMint's doc comment for the operator
-	// scenario, typically --data-dir repointed at a new or typo'd journal
-	// prefix).
-	switch _, err := os.Stat(journal.SigningKeyPath(dataDir)); {
-	case err == nil:
-		return nil, nil, false, journal.RefuseSigningKeyPresentOnMint(dataDir)
-	case !os.IsNotExist(err):
-		return nil, nil, false, wrapGenesisDiskFailure(err)
-	}
-
 	priv, pub, err := journal.GenerateKeypair()
 	if err != nil {
 		return nil, nil, false, wrapGenesisKeygenFailure(err)
@@ -216,8 +236,15 @@ func (c *Client) mintGenesis(ctx context.Context, dataDir, key string, now func(
 		// fails — it may hold the only surviving copy of the private key
 		// — and the refusal says so and names it, rather than sending the
 		// operator to check bucket credentials for a local rename failure.
-		if err := journal.CommitSigningKey(dataDir, tmpPath); err != nil {
-			return nil, nil, false, journal.RefuseSigningKeyCommitFailed(dataDir, tmpPath, err)
+		// CommitSigningKey's renamed result tells RefuseSigningKeyCommitFailed
+		// which of its two internal steps failed (round 2 finding,
+		// internal/journal/genesis.go line 452): the rename itself, which
+		// leaves the key at tmpPath, or the directory fsync that follows a
+		// successful rename, which leaves the key already at its final
+		// path — a refusal that named tmpPath regardless would send the
+		// operator to a file that no longer exists in the second case.
+		if renamed, err := journal.CommitSigningKey(dataDir, tmpPath); err != nil {
+			return nil, nil, false, journal.RefuseSigningKeyCommitFailed(dataDir, tmpPath, renamed, err)
 		}
 		chain := journal.NewSigningChain()
 		if err := chain.ApplyGenesis(rec); err != nil {

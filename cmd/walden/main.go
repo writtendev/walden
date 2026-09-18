@@ -25,11 +25,13 @@ import (
 // Version can be set via ldflags at build time.
 var Version = "dev"
 
-// probeTimeout bounds the boot-time compare-and-swap probe (ProbeCAS).
-// Not a knob: walden's five knobs don't include tuning this, so there is
-// no flag or env var. The client's own transport timeouts and retry cap
-// bound each individual request anyway; this is a backstop on the whole
-// probe (two writes and a delete, retries included).
+// probeTimeout bounds two boot-time preflights against object storage: the
+// compare-and-swap probe (ProbeCAS) and, when it runs, EnsureGenesis's
+// genesis GET plus conditional PUT. Not a knob: walden's five knobs don't
+// include tuning this, so there is no flag or env var. The client's own
+// transport timeouts and retry cap bound each individual request anyway;
+// this is a backstop on the whole of either preflight (a handful of
+// requests each, retries included).
 const probeTimeout = 2 * time.Minute
 
 func main() {

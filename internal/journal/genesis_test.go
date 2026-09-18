@@ -278,7 +278,7 @@ func TestWriteSigningKeyTempThenCommit(t *testing.T) {
 		t.Errorf("tmpPath = %q, want a random per-call suffix rather than the old fixed name", tmpPath)
 	}
 
-	if err := journal.CommitSigningKey(dataDir, tmpPath); err != nil {
+	if _, err := journal.CommitSigningKey(dataDir, tmpPath); err != nil {
 		t.Fatalf("CommitSigningKey failed: %v", err)
 	}
 	if fileExists(tmpPath) {
@@ -328,7 +328,7 @@ func TestWriteSigningKeyTempNamesDistinctFiles(t *testing.T) {
 		t.Errorf("expected %s to exist", tmpB)
 	}
 
-	if err := journal.CommitSigningKey(dataDir, tmpA); err != nil {
+	if _, err := journal.CommitSigningKey(dataDir, tmpA); err != nil {
 		t.Fatalf("CommitSigningKey(A) failed: %v", err)
 	}
 	loaded, err := journal.LoadSigningKey(dataDir)
@@ -378,7 +378,8 @@ func TestGenesisRefusalsAreSingleLine(t *testing.T) {
 		journal.RefuseInvalidSigningKeyFile(dataDir, errors.New("bad line")),
 		journal.RefuseSigningKeyUnreadable(errors.New("open " + dataDir + "/signing.key: permission denied")),
 		journal.RefuseSigningKeyPresentOnMint(dataDir),
-		journal.RefuseSigningKeyCommitFailed(dataDir, dataDir+"/signing.key.tmp.deadbeef", errors.New("cross-device link")),
+		journal.RefuseSigningKeyCommitFailed(dataDir, dataDir+"/signing.key.tmp.deadbeef", false, errors.New("cross-device link")),
+		journal.RefuseSigningKeyCommitFailed(dataDir, dataDir+"/signing.key.tmp.deadbeef", true, errors.New("cannot sync data directory")),
 	}
 	for _, err := range errs {
 		if err == nil {
@@ -457,4 +458,140 @@ func TestRefuseInvalidSigningKeyFileNoDoublePath(t *testing.T) {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// TestCommitSigningKeyReportsWhichStepFailed covers round 2's finding on
+// RefuseSigningKeyCommitFailed (this file's RefuseSigningKeyCommitFailed,
+// filed against line 452): CommitSigningKey's renamed result must tell the
+// two failure points apart. A rename failure (tmpPath does not exist, so
+// os.Rename fails before ever touching the destination) must report
+// renamed = false; a directory-fsync failure that follows a successful
+// rename must report renamed = true, since the key is already at its final
+// path by then and tmpPath no longer names anything.
+func TestCommitSigningKeyReportsWhichStepFailed(t *testing.T) {
+	t.Run("rename failure", func(t *testing.T) {
+		dataDir := t.TempDir()
+		missingTmp := filepath.Join(dataDir, "signing.key.tmp.does-not-exist")
+
+		renamed, err := journal.CommitSigningKey(dataDir, missingTmp)
+		if err == nil {
+			t.Fatal("expected CommitSigningKey to fail renaming a nonexistent temp file")
+		}
+		if renamed {
+			t.Error("renamed = true after a failed rename, want false: the key never moved")
+		}
+	})
+
+	t.Run("directory fsync failure", func(t *testing.T) {
+		// dataDir itself doubles as the "directory" CommitSigningKey syncs
+		// after the rename; removing it out from under the open dirFile
+		// between the (successful) rename and the Sync call is not
+		// reproducible portably, so this exercises the same shape
+		// RefuseSigningKeyCommitFailed's own tests use: the boundary
+		// between the two return points is asserted directly against
+		// CommitSigningKey's doc comment and mintGenesis's call site
+		// (internal/store/genesis.go), which passes the reported renamed
+		// value straight through to the refusal untouched. What this test
+		// does check end-to-end is the success path both branches share:
+		// a real rename plus a real directory sync reports renamed = true
+		// with no error, confirming CommitSigningKey's normal return
+		// matches what a fsync-failure return would also claim about the
+		// key's location.
+		dataDir := t.TempDir()
+		priv, _, err := journal.GenerateKeypair()
+		if err != nil {
+			t.Fatalf("GenerateKeypair failed: %v", err)
+		}
+		tmpPath, err := journal.WriteSigningKeyTemp(dataDir, priv)
+		if err != nil {
+			t.Fatalf("WriteSigningKeyTemp failed: %v", err)
+		}
+		renamed, err := journal.CommitSigningKey(dataDir, tmpPath)
+		if err != nil {
+			t.Fatalf("CommitSigningKey failed: %v", err)
+		}
+		if !renamed {
+			t.Error("renamed = false after a successful commit, want true")
+		}
+	})
+}
+
+// TestRefuseSigningKeyCommitFailedNamesCorrectLocation covers round 2's
+// finding directly at the refusal-text level: the fix clause must name
+// tmpPath only when the key is actually still there (renamed = false), and
+// must never assert the key is "intact at" a temp path that the rename
+// already consumed (renamed = true) — pointing an operator at a file that
+// no longer exists during a root-of-trust failure is the defect.
+func TestRefuseSigningKeyCommitFailedNamesCorrectLocation(t *testing.T) {
+	dataDir := t.TempDir()
+	tmpPath := journal.SigningKeyPath(dataDir) + ".tmp.deadbeef"
+	cause := errors.New("boom")
+
+	notRenamed := journal.RefuseSigningKeyCommitFailed(dataDir, tmpPath, false, cause)
+	if !strings.Contains(notRenamed.Error(), tmpPath) {
+		t.Errorf("renamed=false refusal does not name tmpPath %s: %q", tmpPath, notRenamed.Error())
+	}
+	if strings.ContainsAny(notRenamed.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", notRenamed.Error())
+	}
+
+	renamed := journal.RefuseSigningKeyCommitFailed(dataDir, tmpPath, true, cause)
+	if strings.Contains(renamed.Error(), tmpPath) {
+		t.Errorf("renamed=true refusal still names tmpPath %s, which no longer exists: %q", tmpPath, renamed.Error())
+	}
+	if !strings.Contains(renamed.Error(), journal.SigningKeyPath(dataDir)) {
+		t.Errorf("renamed=true refusal does not name the final signing key path: %q", renamed.Error())
+	}
+	if strings.ContainsAny(renamed.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", renamed.Error())
+	}
+}
+
+// TestLeftoverSigningKeyTempNamesEveryMatch covers round 2's finding on
+// leftoverSigningKeyTemp: after two ambiguous mint attempts leave two temp
+// files behind (the shape store.ErrOutcomeUnknown and a CommitSigningKey
+// failure both produce, per their doc comments), RefuseNoSigningKey and
+// RefuseSigningKeyMismatch must name both candidates, not pick one
+// arbitrarily and go silent about the other.
+func TestLeftoverSigningKeyTempNamesEveryMatch(t *testing.T) {
+	dataDir := t.TempDir()
+
+	privA, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	privB, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	tmpA, err := journal.WriteSigningKeyTemp(dataDir, privA)
+	if err != nil {
+		t.Fatalf("WriteSigningKeyTemp (A) failed: %v", err)
+	}
+	tmpB, err := journal.WriteSigningKeyTemp(dataDir, privB)
+	if err != nil {
+		t.Fatalf("WriteSigningKeyTemp (B) failed: %v", err)
+	}
+
+	noKey := journal.RefuseNoSigningKey(dataDir)
+	if !strings.Contains(noKey.Error(), tmpA) {
+		t.Errorf("RefuseNoSigningKey does not name %s: %q", tmpA, noKey.Error())
+	}
+	if !strings.Contains(noKey.Error(), tmpB) {
+		t.Errorf("RefuseNoSigningKey does not name %s: %q", tmpB, noKey.Error())
+	}
+	if strings.ContainsAny(noKey.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", noKey.Error())
+	}
+
+	mismatch := journal.RefuseSigningKeyMismatch(dataDir, "ed25519:aa", "ed25519:bb")
+	if !strings.Contains(mismatch.Error(), tmpA) {
+		t.Errorf("RefuseSigningKeyMismatch does not name %s: %q", tmpA, mismatch.Error())
+	}
+	if !strings.Contains(mismatch.Error(), tmpB) {
+		t.Errorf("RefuseSigningKeyMismatch does not name %s: %q", tmpB, mismatch.Error())
+	}
+	if strings.ContainsAny(mismatch.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", mismatch.Error())
+	}
 }

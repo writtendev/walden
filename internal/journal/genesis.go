@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/writtendev/walden/internal/refusal"
@@ -257,23 +258,33 @@ func WriteSigningKeyTemp(dataDir string, priv ed25519.PrivateKey) (string, error
 // EnsureGenesis's doc comment names this window; it is narrowed to one
 // atomic rename, not eliminated, and there is no recovery mode that papers
 // over it.
-func CommitSigningKey(dataDir, tmpPath string) error {
+//
+// The renamed result tells a caller which of the two steps below failed,
+// when err is non-nil: false means the rename itself failed, so the key is
+// still at tmpPath and nowhere else; true means the rename succeeded and
+// only the directory fsync that follows it failed, so the key is already at
+// its final path, SigningKeyPath(dataDir) — tmpPath no longer names
+// anything. A caller that reports "the key is at tmpPath" without checking
+// this sends the operator to a file that may no longer exist (round 2
+// finding, this file's line 452 in the version that finding was filed
+// against).
+func CommitSigningKey(dataDir, tmpPath string) (renamed bool, err error) {
 	path := SigningKeyPath(dataDir)
 	dir := filepath.Dir(path)
 
 	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("cannot replace %s: %w", path, err)
+		return false, fmt.Errorf("cannot replace %s: %w", path, err)
 	}
 
 	dirFile, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("cannot open data directory %s to sync it: %w", dir, err)
+		return true, fmt.Errorf("cannot open data directory %s to sync it: %w", dir, err)
 	}
 	defer dirFile.Close()
 	if err := dirFile.Sync(); err != nil {
-		return fmt.Errorf("cannot sync data directory %s: %w", dir, err)
+		return true, fmt.Errorf("cannot sync data directory %s: %w", dir, err)
 	}
-	return nil
+	return true, nil
 }
 
 // RemoveSigningKeyTemp removes tmpPath — the path WriteSigningKeyTemp
@@ -289,23 +300,28 @@ func RemoveSigningKeyTemp(tmpPath string) {
 	os.Remove(tmpPath)
 }
 
-// leftoverSigningKeyTemp looks for a signing key temp file
+// leftoverSigningKeyTemp looks for signing key temp files
 // (SigningKeyPath(dataDir)+".tmp.<32-hex>") left behind under dataDir and
-// returns the first match. There is normally at most one: every
-// WriteSigningKeyTemp call names its own file, and a mint attempt that
-// finishes locally either removes it (RemoveSigningKeyTemp) or renames it
-// away (CommitSigningKey) before returning. Finding one here means a mint
-// attempt started and then never finished on this instance — most often the
-// crash window EnsureGenesis's doc comment names, between a winning
-// conditional PUT and the rename. RefuseNoSigningKey uses this to tell that
-// state apart from a key that was never written at all, or was genuinely
-// lost.
-func leftoverSigningKeyTemp(dataDir string) (string, bool) {
+// returns every match it finds, sorted for a deterministic refusal message.
+//
+// There can be more than one. A mint attempt that finishes cleanly on this
+// instance always removes its temp file (RemoveSigningKeyTemp) or renames it
+// away (CommitSigningKey), but two paths deliberately retain it instead:
+// store.ErrOutcomeUnknown on the conditional PUT (the write may have
+// landed), and a CommitSigningKey failure after a winning PUT (the rename or
+// its directory fsync failed). Either can happen on more than one boot in a
+// row — two ambiguous PUTs across two restarts leaves two temp files, both
+// genuine candidates — so a caller must not assume, or claim, that the
+// first match found is the only or the right one. RefuseNoSigningKey and
+// RefuseSigningKeyMismatch both use this so an operator is pointed at every
+// candidate on disk rather than one picked arbitrarily.
+func leftoverSigningKeyTemp(dataDir string) ([]string, bool) {
 	matches, err := filepath.Glob(SigningKeyPath(dataDir) + signingKeyTmpSuffix + ".*")
 	if err != nil || len(matches) == 0 {
-		return "", false
+		return nil, false
 	}
-	return matches[0], true
+	sort.Strings(matches)
+	return matches, true
 }
 
 // SaveSigningKey persists priv as dataDir's signing key file in one call:
@@ -319,7 +335,8 @@ func SaveSigningKey(dataDir string, priv ed25519.PrivateKey) error {
 	if err != nil {
 		return err
 	}
-	return CommitSigningKey(dataDir, tmpPath)
+	_, err = CommitSigningKey(dataDir, tmpPath)
+	return err
 }
 
 // RefuseCorruptGenesis returns a one-line refusal when the genesis object at
@@ -344,22 +361,25 @@ func RefuseCorruptGenesis(reason error) error {
 // key-loss case, encountered here on an instance that never had the key in
 // the first place rather than one that lost it).
 //
-// It looks for a leftover signing key temp file first (leftoverSigningKeyTemp)
-// and names it when present, rather than telling the operator the key is
-// gone: WriteSigningKeyTemp fsyncs that file before the genesis record's
-// conditional PUT is even attempted, so the crash window between a winning
-// PUT and CommitSigningKey's rename (EnsureGenesis's doc comment) usually
-// leaves the private key intact under a temp name, one rename away from
-// recoverable. This still does not auto-recover — no read of a stray temp
-// file is trusted without an operator's say-so — it only tells the operator
-// honestly what is on disk.
+// It looks for leftover signing key temp files first (leftoverSigningKeyTemp)
+// and names all of them when present, rather than telling the operator the
+// key is gone: WriteSigningKeyTemp fsyncs its temp file before the genesis
+// record's conditional PUT is even attempted, so the crash window between a
+// winning PUT and CommitSigningKey's rename (EnsureGenesis's doc comment)
+// usually leaves the private key intact under a temp name, one rename away
+// from recoverable — and there can be more than one such file (see
+// leftoverSigningKeyTemp's doc comment), so every match is named rather than
+// one chosen arbitrarily. This still does not auto-recover — no read of a
+// stray temp file is trusted without an operator's say-so — it only tells
+// the operator honestly what is on disk.
 func RefuseNoSigningKey(dataDir string) error {
 	path := SigningKeyPath(dataDir)
 	why := fmt.Sprintf("genesis record adopted but %s holds no signing key", path)
 	fix := "restore signing.key from backup, or point this instance at a fresh journal prefix"
-	if tmp, ok := leftoverSigningKeyTemp(dataDir); ok {
-		why = fmt.Sprintf("genesis record adopted but %s holds no signing key (found %s from an interrupted mint)", path, tmp)
-		fix = fmt.Sprintf("if %s holds the matching private key, rename it to %s by hand; otherwise restore signing.key from backup", tmp, path)
+	if tmps, ok := leftoverSigningKeyTemp(dataDir); ok {
+		found := strings.Join(tmps, ", ")
+		why = fmt.Sprintf("genesis record adopted but %s holds no signing key (found %s from an interrupted mint)", path, found)
+		fix = fmt.Sprintf("check %s for the matching private key and rename the correct one to %s by hand; otherwise restore signing.key from backup", found, path)
 	}
 	return refusal.RefuseWithCause("invalid journal", why, fix, ErrSigningKeyUnavailable)
 }
@@ -367,13 +387,24 @@ func RefuseNoSigningKey(dataDir string) error {
 // RefuseSigningKeyMismatch returns a one-line refusal when this instance's
 // local signing key does not match the adopted genesis record's public key:
 // signing with it would never verify against this journal's root of trust.
+//
+// It also checks leftoverSigningKeyTemp, the way RefuseNoSigningKey does,
+// and names any match: a mismatch does not rule out an interrupted mint
+// sitting beside the wrong key (an earlier temp file recovered by hand into
+// the wrong slot, or a second one left over from a prior ambiguous PUT), and
+// the fix below sent the operator straight to "restore from backup" without
+// ever mentioning it — a dead end when the real key was on disk the whole
+// time (round 2 finding, this file's line 308 in the version that finding
+// was filed against).
 func RefuseSigningKeyMismatch(dataDir, want, got string) error {
-	return refusal.RefuseWithCause(
-		"invalid journal",
-		fmt.Sprintf("%s holds key %s, genesis at %s names %s", SigningKeyPath(dataDir), got, TxKey(MetaStreamID, 0), want),
-		"restore the correct signing.key, or point this instance at a fresh journal prefix",
-		ErrSigningKeyUnavailable,
-	)
+	why := fmt.Sprintf("%s holds key %s, genesis at %s names %s", SigningKeyPath(dataDir), got, TxKey(MetaStreamID, 0), want)
+	fix := "restore the correct signing.key, or point this instance at a fresh journal prefix"
+	if tmps, ok := leftoverSigningKeyTemp(dataDir); ok {
+		found := strings.Join(tmps, ", ")
+		why = fmt.Sprintf("%s holds key %s, genesis at %s names %s (also found %s from an earlier interrupted mint)", SigningKeyPath(dataDir), got, TxKey(MetaStreamID, 0), want, found)
+		fix = fmt.Sprintf("check %s for the matching private key before restoring the correct signing.key, or point this instance at a fresh journal prefix", found)
+	}
+	return refusal.RefuseWithCause("invalid journal", why, fix, ErrSigningKeyUnavailable)
 }
 
 // RefuseInvalidSigningKeyFile returns a one-line refusal when the signing
@@ -426,30 +457,53 @@ func RefuseSigningKeyUnreadable(cause error) error {
 // rather than crash-induced). The genesis record already gets this
 // adopt-don't-overwrite treatment on the object-storage side; mint is the
 // one local path that previously gave the private half none.
+//
+// EnsureGenesis stats dataDir's signing key before its genesis GET rather
+// than after (see EnsureGenesis's doc comment), which closes the shared-
+// data-directory race that used to let a sibling's just-committed genesis
+// record reach this refusal opposite what had, by then, already been
+// proven — but a check-then-act call is never airtight against every timing,
+// so the fix clause here still does not assume the "no genesis record
+// found" half of its own why-clause is beyond doubt: it names the safe next
+// step (restart, which adopts cleanly if a concurrent instance won this
+// journal) ahead of the destructive one, rather than sending the operator
+// straight to deleting the one private key on disk on an unproven premise
+// (round 2 finding, this file's line 183 in the version that finding was
+// filed against).
 func RefuseSigningKeyPresentOnMint(dataDir string) error {
 	return refusal.RefuseWithCause(
 		"invalid journal",
 		fmt.Sprintf("no genesis record found at %s, but %s already holds a signing key", TxKey(MetaStreamID, 0), SigningKeyPath(dataDir)),
-		"verify --data-dir and the journal prefix name the same journal; remove signing.key only if you intend to mint a fresh identity",
+		"restart first in case another instance is concurrently initializing this journal; otherwise verify --data-dir and the journal prefix name the same journal before removing signing.key",
 		ErrSigningKeyUnavailable,
 	)
 }
 
 // RefuseSigningKeyCommitFailed returns a one-line refusal for the one
 // mint-time failure that lands after the conditional PUT of the genesis
-// record has already won: CommitSigningKey's rename of tmpPath to
-// SigningKeyPath(dataDir) failed. The genesis record is now permanent (spec
-// section 2.2) and the only surviving copy of its private key is tmpPath —
-// CommitSigningKey's caller deliberately does not remove it on this failure
-// for exactly that reason. The fix names the rename by hand rather than
-// "restore from backup" (there is nothing to restore) or a bucket/
-// credentials clause (storage already accepted the write; the failure is
-// local).
-func RefuseSigningKeyCommitFailed(dataDir, tmpPath string, cause error) error {
+// record has already won: CommitSigningKey failed. The genesis record is
+// now permanent (spec section 2.2), and renamed reports which of
+// CommitSigningKey's two steps failed (see its doc comment): false means
+// the rename itself failed, so the only surviving copy of the private key
+// is still at tmpPath; true means the rename succeeded and only the
+// trailing directory fsync failed, so the key is already at its final path
+// and tmpPath no longer names anything — asserting the key is "intact at
+// tmpPath" in that case would send the operator to a file that does not
+// exist during a root-of-trust failure (round 2 finding, this file's line
+// 452 in the version that finding was filed against). The fix names
+// whichever is actually true rather than "restore from backup" (there is
+// nothing to restore) or a bucket/credentials clause (storage already
+// accepted the write; the failure is local).
+func RefuseSigningKeyCommitFailed(dataDir, tmpPath string, renamed bool, cause error) error {
+	path := SigningKeyPath(dataDir)
+	fix := fmt.Sprintf("the private key is intact at %s; rename it to %s by hand, then restart", tmpPath, path)
+	if renamed {
+		fix = fmt.Sprintf("the private key is already at %s; verify it is present, then restart", path)
+	}
 	return refusal.RefuseWithCause(
 		"invalid journal",
 		fmt.Sprintf("genesis committed to storage at %s but the signing key commit failed: %v", TxKey(MetaStreamID, 0), cause),
-		fmt.Sprintf("the private key is intact at %s; rename it to %s by hand, then restart", tmpPath, SigningKeyPath(dataDir)),
+		fix,
 		fmt.Errorf("%w: %w", ErrSigningKeyUnavailable, cause),
 	)
 }

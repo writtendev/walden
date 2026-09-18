@@ -784,3 +784,150 @@ func TestFailedRejectsStaleSeqAndDoesNotMisreportOrFence(t *testing.T) {
 		t.Fatalf("Failed error:\ngot:  %v\nwant: %q", failErr, want)
 	}
 }
+
+// Regression test for round 2 review finding 1: Failed must clear the
+// outstanding checkout and fence the stream as one indivisible step. The
+// pre-fix code cleared outstanding and released the lease's mutex before
+// calling into the Fencer, leaving a window in which a concurrent Next saw
+// outstanding already false but the stream not yet fenced, and handed out
+// the very seq Failed was in the middle of retiring - a resend spec
+// section 11.4 item 6 forbids, or a PUT issued after this instance already
+// held 412 proof, which item 3 forbids. The reviewer reproduced this
+// 730/3000 times under -race; this races the same two calls the same
+// number of times, opening a fresh stream each iteration so one flaky
+// iteration cannot mask another.
+func TestConcurrentNextNeverReissuesSeqDuringFailed(t *testing.T) {
+	c, _ := newLeaseClient(t)
+	leases := journal.NewLeases(c)
+	ctx := context.Background()
+
+	const iterations = 3000
+	for i := 0; i < iterations; i++ {
+		stream := journal.StreamID(fmt.Sprintf("repo-race1-%d", i))
+		lease, err := leases.Open(ctx, stream)
+		if err != nil {
+			t.Fatalf("iteration %d: Open: %v", i, err)
+		}
+		seq, err := lease.Next()
+		if err != nil {
+			t.Fatalf("iteration %d: Next: %v", i, err)
+		}
+
+		var (
+			wg      sync.WaitGroup
+			raceSeq journal.Seq
+			raceErr error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = lease.Failed(seq, journal.ErrOutcomeUnknown)
+		}()
+		go func() {
+			defer wg.Done()
+			raceSeq, raceErr = lease.Next()
+		}()
+		wg.Wait()
+
+		if raceErr == nil {
+			t.Fatalf("iteration %d: concurrent Next() succeeded with seq %d while Failed(%d, ErrOutcomeUnknown) was racing it - the outstanding seq was reissued", i, raceSeq, seq)
+		}
+	}
+}
+
+// Regression test for round 2 review finding 2: a caller that takes a seq
+// from Next and never calls Landed or Failed at all - the true abandonment
+// case, distinct from the merely-slow contention finding 3 confirmed
+// should keep refusing without fencing - must not leave the stream
+// unwritable for the life of the process with a fix clause promising an
+// event ("wait for Landed or Failed") that can never arrive. Once
+// abandonedCheckoutGrace has passed with no release, the next Next() call
+// must fence the stream through the same unknown-outcome path Failed uses,
+// so the operator is told the one remedy that actually works (restart)
+// instead of one that cannot be performed.
+func TestAbandonedCheckoutFencesAfterGracePeriod(t *testing.T) {
+	restore := journal.SetAbandonedCheckoutGraceForTest(20 * time.Millisecond)
+	defer restore()
+
+	c, _ := newLeaseClient(t)
+	leases := journal.NewLeases(c)
+	ctx := context.Background()
+
+	lease, err := leases.Open(ctx, "repo-mu-abandoned")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	seq, err := lease.Next()
+	if err != nil {
+		t.Fatalf("first Next: %v", err)
+	}
+
+	// Immediately after: still within the grace period, so this is
+	// ordinary contention, not abandonment - refuses, but must not fence.
+	if _, err := lease.Next(); err == nil {
+		t.Fatalf("expected an immediate second Next() to refuse")
+	} else if errors.Is(err, journal.ErrFenced) {
+		t.Fatalf("a fresh outstanding checkout must not fence the stream, got %v", err)
+	}
+
+	// The original caller never calls Landed or Failed for seq - simulating
+	// a marshal error, cancelled context, or any other abandonment.
+	time.Sleep(40 * time.Millisecond)
+
+	_, err = lease.Next()
+	if err == nil {
+		t.Fatalf("expected Next() to refuse once the checkout has been outstanding past the grace period")
+	}
+	if !errors.Is(err, journal.ErrFenced) {
+		t.Fatalf("expected an abandoned checkout past its grace period to fence the stream, got %v (fenced=%v)", err, lease.Fencer().IsFenced("repo-mu-abandoned"))
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if !lease.Fencer().IsFenced("repo-mu-abandoned") {
+		t.Fatalf("stream must be fenced after the abandoned checkout's grace period elapses")
+	}
+	fencedSeq, ok := lease.Fencer().FencedSeq("repo-mu-abandoned")
+	if !ok || fencedSeq != seq {
+		t.Errorf("fenced seq = %d (ok=%v), want the abandoned seq %d", fencedSeq, ok, seq)
+	}
+
+	// From here it behaves like any other fenced stream: zero-network-call
+	// refusal, every time.
+	if _, err := lease.Next(); !errors.Is(err, journal.ErrFenced) {
+		t.Errorf("expected every subsequent Next() to refuse fenced, got %v", err)
+	}
+}
+
+// Regression test for round 2 review finding 4: Open must validate every
+// key a LIST yields, not only the last (highest) one. A malformed key that
+// sorts below the real head - a stray ".bak" copy, a leftover artifact -
+// must refuse Open exactly as a malformed head does, per this file's own
+// doc comment ("a one-line refusal, not a skipped key"), rather than be
+// silently skipped because a later, well-formed key overwrote it as the
+// tracked candidate.
+func TestOpenRefusesMalformedKeyThatSortsBelowHead(t *testing.T) {
+	c, fake := newLeaseClient(t)
+
+	// "...0003.json.bak" sorts lexicographically before "...0004.json" (the
+	// real head) at the same prefix, so a naive "keep only the last key"
+	// scan never looks at it.
+	fake.SetObject(journal.TxKey("repo-nu", 3)+".bak", []byte(`{}`))
+	fake.SetObject(journal.TxKey("repo-nu", 4), []byte(`{}`))
+
+	leases := journal.NewLeases(c)
+	_, err := leases.Open(context.Background(), "repo-nu")
+	if err == nil {
+		t.Fatalf("expected Open to refuse on a malformed key under tx/, got nil")
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if !strings.HasPrefix(err.Error(), "refusal: push failed") {
+		t.Errorf("refusal does not announce itself as a refusal: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), ".bak") {
+		t.Errorf("refusal does not name the offending key: %q", err.Error())
+	}
+}

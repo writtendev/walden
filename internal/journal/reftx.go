@@ -265,6 +265,13 @@ func ValidateRefName(ref string) error {
 }
 
 // ValidateRefUpdate validates a single ref update triple.
+//
+// Deliberately does not wrap its own errors in ErrInvalidRefTx: its only
+// caller, RefTransactionRecord.Validate, already wraps whatever it returns
+// with ErrInvalidRefTx via its "update[%d] invalid: %w" error, the same way
+// it wraps ValidateRefName's and ValidateOID's errors (neither of which
+// carries ErrInvalidRefTx either). Doing it here too doubled the sentinel's
+// text in operator-facing refusals built from this error's message.
 func ValidateRefUpdate(u RefUpdate) error {
 	if err := ValidateRefName(u.Ref); err != nil {
 		return err
@@ -276,15 +283,15 @@ func ValidateRefUpdate(u RefUpdate) error {
 		return fmt.Errorf("invalid new_oid: %w", err)
 	}
 	if len(u.OldOID) != len(u.NewOID) {
-		return fmt.Errorf("%w: old_oid and new_oid have mismatched lengths (%d vs %d)", ErrInvalidRefTx, len(u.OldOID), len(u.NewOID))
+		return fmt.Errorf("old_oid and new_oid have mismatched lengths (%d vs %d)", len(u.OldOID), len(u.NewOID))
 	}
 	isOldZero := isZeroOID(u.OldOID)
 	isNewZero := isZeroOID(u.NewOID)
 	if isOldZero && isNewZero {
-		return fmt.Errorf("%w: cannot transition from zero oid to zero oid", ErrInvalidRefTx)
+		return fmt.Errorf("cannot transition from zero oid to zero oid")
 	}
 	if strings.EqualFold(u.OldOID, u.NewOID) {
-		return fmt.Errorf("%w: no-op ref update (old_oid == new_oid: %q)", ErrInvalidRefTx, u.OldOID)
+		return fmt.Errorf("no-op ref update (old_oid == new_oid: %q)", u.OldOID)
 	}
 	return nil
 }

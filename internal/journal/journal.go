@@ -217,8 +217,9 @@ func ValidateHash(hash string) error {
 // sequence numbers on a stream are not strictly contiguous during replay
 // (spec section 8.1 rule 4): the reader found actual where it expected
 // expected, and stops rather than skip over or guess at what filled the
-// gap. Shared with WALD-31's _meta contiguity check, which needs the
-// identical wording for the identical rule on a different stream.
+// gap. WALD-31's _meta contiguity check enforces the identical rule on
+// _meta but through its own differently-worded refuseMetaSequenceGap
+// (internal/store/meta.go), not this function.
 func RefuseSequenceGap(stream StreamID, expected, actual Seq) error {
 	return refusal.RefuseWithCause(
 		"refusal: replay failed",

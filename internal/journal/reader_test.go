@@ -693,3 +693,56 @@ func TestPlanStreamRefusesMalformedRecordBody(t *testing.T) {
 		t.Errorf("err = %q, want %q", err.Error(), want.Error())
 	}
 }
+
+// TestPlanStreamRefusesMalformedRecordBodyWithoutDoublingSentinel is round-3
+// review's minor finding on the test above: a missing "signature" field
+// never reaches the doubling this package is actually exposed to, because
+// ParseRefTx's own presence check ("missing required field %q") returns
+// before RefTransactionRecord.Validate ever runs, and the sibling test's
+// assertion recomputes "want" from the same ParseRefTx call it is checking,
+// so it can never disagree with itself.
+//
+// This test instead reaches ValidateRefUpdate's no-op-update branch (old_oid
+// == new_oid), which only Validate() rejects - ParseRefTx's decode succeeds
+// first. That is the exact path finding 1 fixed: ValidateRefUpdate no longer
+// wraps ErrInvalidRefTx itself, so Validate()'s own "update[%d] invalid: %w"
+// wrap is the only place the sentinel enters. Rather than compare against a
+// "want" built from the same production code path (self-referential, and
+// blind to a regression in both places at once), this counts occurrences of
+// ErrInvalidRefTx's literal text in the final message and requires exactly
+// one. Reintroducing the old double-wrap in ValidateRefUpdate
+// (fmt.Errorf("%w: %w", ErrInvalidRefTx, err) in its three branches) makes
+// this test fail with count == 2, which is what makes it load-bearing.
+func TestPlanStreamRefusesMalformedRecordBodyWithoutDoublingSentinel(t *testing.T) {
+	src := newFixtureSource(t)
+	key := journal.TxKey(fixtureRepoStream, 4)
+	data, err := os.ReadFile(fixtureKeyPath(key))
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+	noOpOID := "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	mutated := mutateField(t, data, "updates", []map[string]string{
+		{"ref": "refs/heads/main", "old_oid": noOpOID, "new_oid": noOpOID},
+	})
+	src.set(key, mutated)
+
+	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	plan, err := journal.NewReader(src).PlanStream(context.Background(), chain, fixtureRepoStream)
+	if plan != nil {
+		t.Errorf("plan = %+v, want nil (not a plan built from an unparseable record)", plan)
+	}
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !errors.Is(err, journal.ErrInvalidRefTx) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "no-op ref update") {
+		t.Fatalf("refusal did not reach the no-op ref update branch: %q", err.Error())
+	}
+
+	sentinelText := journal.ErrInvalidRefTx.Error()
+	if n := strings.Count(err.Error(), sentinelText); n != 1 {
+		t.Errorf("sentinel %q appears %d times in refusal, want exactly 1: %q", sentinelText, n, err.Error())
+	}
+}

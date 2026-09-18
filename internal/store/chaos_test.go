@@ -128,8 +128,9 @@ const (
 	// round-2 review found the nightly workflow driving both halves off one
 	// WALDEN_CHAOS_ROUNDS=5000 exhausting the runner's ephemeral port range
 	// (see .github/workflows/chaos.yml and newChaosConcurrentClient's doc
-	// comment for the mechanism and the fix on the connection-reuse side).
-	// The other half of that fix is here: unlike
+	// comment for the mechanism and the fix, which lives entirely on the
+	// connection-reuse side - this cap is not part of it; see the round-4
+	// paragraph below for why it exists instead). Unlike
 	// TestChaosWritePathFaultsAndRestart, whose seeded fault catalogue keeps
 	// exploring new ground every additional round, this test has no
 	// catalogue and no seed - every round is the same fixed barrier over
@@ -305,11 +306,12 @@ func newChaosClient(t *testing.T) (*store.Client, *storetest.Fake) {
 // leaves an ephemeral port in TIME_WAIT for the OS's usual linger period.
 // WALD-35 PR #65's round-2 review measured this exhausting the runner's
 // ephemeral port range at the nightly workflow's WALDEN_CHAOS_ROUNDS=5000
-// (see .github/workflows/chaos.yml, and chaosConcurrentRoundsCap's doc
-// comment for the other half of the fix). Raising the ceiling well above K
-// lets every instance's connection be reused round after round instead of
+// (see .github/workflows/chaos.yml). Raising the ceiling well above K lets
+// every instance's connection be reused round after round instead of
 // closed and redialed, which removes the growth rather than merely
-// slowing it.
+// slowing it - by itself: chaosConcurrentRoundsCap (see its own doc
+// comment) is a separate, wall-clock-budget decision, not part of this
+// fix.
 const chaosConcurrentClientMaxIdleConnsPerHost = 64
 
 // newChaosConcurrentClient is newChaosClient's counterpart for

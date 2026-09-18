@@ -78,19 +78,23 @@ jobs:
           # TIME_WAIT (~91% of this runner's ephemeral port range) and
           # failing the job with "can't assign requested address" on
           # entirely correct code, misreported as a fencing-refusal
-          # mismatch. Capping the concurrent half's own rounds independently
-          # (its assertions hold under every interleaving by construction -
-          # see its own doc comment - so a failure here is never a flake,
-          # but repeats past a few hundred still buy real, if steeply
+          # mismatch. Widening the concurrent half's connection pool well
+          # above K removes that growth rather than just slowing it, by
+          # itself: see newChaosConcurrentClient's doc comment in
+          # chaos_test.go for the full reasoning and the invariant this
+          # keeps (production's own NewClient/its default pool size in
+          # client.go are untouched; only this test's own transport is
+          # configured this way). Capping the concurrent half's own rounds
+          # independently is a separate decision, for wall-clock budget
+          # inside this job's own -timeout, not for port usage (its
+          # assertions hold under every interleaving by construction - see
+          # its own doc comment - so a failure here is never a flake, but
+          # repeats past a few hundred still buy real, if steeply
           # diminishing, interleaving coverage rather than mere
           # confirmation - unlike the sequential half's seeded fault
-          # catalogue, whose coverage keeps growing with every round) and
-          # widening its connection pool well above K together remove that
-          # growth rather than just slowing it: see chaosConcurrentRoundsCap
-          # and newChaosConcurrentClient's doc comments in chaos_test.go for
-          # the full reasoning and the invariant this keeps (production's
-          # own NewClient/its default pool size in client.go are untouched;
-          # only this test's own transport is configured this way).
+          # catalogue, whose coverage keeps growing with every round): see
+          # chaosConcurrentRoundsCap's doc comment in chaos_test.go for why
+          # it stays at 500 rather than scaling with WALDEN_CHAOS_ROUNDS.
           #
           # Measured locally (an M-series Mac, not this job's own runner -
           # expect this class of hardware to be somewhat faster than
@@ -123,7 +127,7 @@ jobs:
           # the remaining two of six (cases 2-3) are a bare 500/502/504
           # with no connection close. So 4/6 x 1/4 = 1/6 rounds sever the
           # connection, each one a genuine TCP close this test exists to
-          # inject - not a bug, and not something either fix above is
+          # inject - not a bug, and not something the port fix above is
           # trying to eliminate. The rate correction does not change the
           # peak or the headroom claim above: both were measured directly
           # from a real run, which already exercised TruncateBody's own

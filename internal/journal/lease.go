@@ -15,27 +15,9 @@ import (
 	"math"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
-
-// abandonedCheckoutGrace bounds how long Next tolerates an outstanding
-// checkout with no matching Landed or Failed before concluding it was
-// abandoned rather than merely slow, and fencing rather than continuing to
-// refuse with refuseSeqOutstanding forever (see the Lease doc comment).
-// ARCHITECTURE.md documents the ordinary cost of one ref-transaction
-// append as a "~50-150 ms" round trip; by the time Next hands out a seq,
-// the slow, unbounded part of a push (receiving the client's packfile) is
-// already behind it, so what remains is a small, bounded conditional PUT.
-// This grace period is set with wide headroom above that ordinary cost so
-// a merely-slow, still-legitimate append - one more attempt in store's
-// own bounded retry loop, a bad network minute - is never mistaken for an
-// abandoned one; only a caller that truly never reports back ever reaches
-// it. It is a var, not a const, only so SetAbandonedCheckoutGraceForTest
-// can shrink it for a test; production code never changes it, and this is
-// not a sixth knob - there is no flag or env var that reaches it.
-var abandonedCheckoutGrace = 5 * time.Minute
 
 // TxLister is the whole storage surface a Lease needs to discover a
 // stream's head sequence: one paginated listing under a prefix, exactly the
@@ -113,7 +95,7 @@ func (l *Leases) Open(ctx context.Context, stream StreamID) (*Lease, error) {
 	defer l.mu.Unlock()
 
 	// Re-check now that mu is held: a concurrent Open of a different
-	// stream cannot have fenced this one, but a concurrent Failed on an
+	// stream cannot have fenced this one, but a concurrent Append on an
 	// already-open lease for this exact stream could have, between the
 	// unlocked check above and this one.
 	if l.fencer.IsFenced(stream) {
@@ -172,7 +154,7 @@ func (l *Leases) Open(ctx context.Context, stream StreamID) (*Lease, error) {
 		// the maximum representable sequence, in which case head+1 would
 		// silently wrap to 0 - already the head's own key - rather than
 		// signal that the stream has no room left. See the same guard in
-		// Lease.Next.
+		// Lease.Append.
 		if head == math.MaxUint64 {
 			exhausted = true
 		} else {
@@ -203,75 +185,40 @@ func parseTxSeq(prefix, key string) (Seq, error) {
 
 // Lease is one stream's sequence lease: this process's memoized view of
 // the stream's head, discovered once by (*Leases).Open and advanced only
-// by Landed. Next, Landed, and Failed enforce that at most one sequence is
-// ever outstanding for this stream at a time, but - unlike an earlier
-// version of this file - no lock is ever held across the boundary between
-// them. Next takes mu only for the instant it needs to check the current
-// state and, if nothing is outstanding, record the seq it is about to
-// hand out; it releases mu before returning either way. A second Next
-// while one is already outstanding does not wait for it: it refuses in
-// one line, immediately, rather than block - a caller waiting on the old
-// held lock would eventually have been served, with a sequence of its
-// own; this design trades that away for the guarantee that forgetting to
-// release a checkout can never wedge a process (see refuseSeqOutstanding
-// for why that trade was made).
+// by a successful Append. The only way to consume a sequence is Append,
+// which owns the entire checkout from start to finish inside one call - it
+// acquires the sequence, invokes the caller's function with it, and
+// resolves the checkout itself in a defer before returning. There is no
+// step where a sequence is handed to a caller and the caller is trusted to
+// report back later: nothing outside this file can hold a checkout open,
+// so there is no such thing as a caller that forgets to release one.
+// Abandonment - the failure mode three earlier rounds of review kept
+// finding new symptoms of (a wedged process, a fatal double-unlock, a
+// stream refused forever with no remedy, a healthy stream fenced on a
+// wall-clock guess) - is not detected, tolerated, or timed out here; it is
+// unrepresentable, the same standard this file already holds itself to for
+// section 11.4 item 4.
 //
-// A caller who takes a seq from Next and, for any reason (a marshal or
-// signing error, a validation refusal, a cancelled context, a panic
-// recovered upstream), never calls Landed or Failed has abandoned that
-// checkout - and this process now has no way to learn whether the append
-// it never made a call about was ever attempted. That is not a distinct
-// problem from an outcome storage itself cannot prove either way (spec
-// section 11.4 item 6): it is the same problem, so it gets the same
-// answer. Next tolerates an outstanding checkout, refusing in one line
-// without touching it, for up to abandonedCheckoutGrace - long enough that
-// no merely-slow, still-legitimate append is ever caught by it (see that
-// var's doc comment) - and only past that grace period does the next Next
-// call conclude the checkout was abandoned, clear it, and fence the stream
-// through Fencer.HandleOutcomeUnknown exactly as Failed does for a proven
-// unknown outcome. From there the stream is a stream like any other this
-// package fences: RefusePermanentlyFenced, zero network calls, restart to
-// recover - a real, always-available remedy, not the unresolvable "wait
-// for a Landed or Failed that will never arrive" a soft, non-fenced
-// "refused forever" state would leave behind. Every caller on the write
-// path must still call exactly one of Landed or Failed for every seq Next
-// hands it - that discipline has not gone away - but failing to hold up
-// that discipline now costs, at worst, a one-line refusal to concurrent
-// callers until the grace period passes and the stream fences itself,
-// never an unrecoverable process and never a stream stuck with no way out.
-//
-// Landed and Failed verify seq against the outstanding one before doing
-// anything else: a mismatched seq - stale, off-by-one, or a second release
-// for a checkout that already cleared (including one this file itself
-// cleared by fencing it as abandoned) - refuses instead of silently
-// advancing next past an unwritten sequence (a permanent gap forbidden by
-// section 1 and section 12) or unlocking a state nothing holds.
-//
-// Within the grace period, this still closes the race the held lock
-// closed: two goroutines in this process racing an append to the same
-// stream can never be handed the same sequence, because only one seq is
-// ever outstanding at a time and Next hands out the current one exactly
-// once. A second goroutine's genuine 412 in that scenario would be
-// indistinguishable from a stale external writer's, and section 11.4 item
-// 4 forbids telling them apart by re-reading, so letting two goroutines
-// collide on one seq would fence a perfectly healthy stream over its own
-// concurrency - the same reason the original design serialized here at
-// all.
+// At most one Append is ever in flight on a Lease at a time. A second
+// Append while one is running does not wait for it - Go already has a
+// mechanism (the running call's own eventual return) that will resolve the
+// first one without a clock, so there is nothing to time out - it refuses
+// in one line, immediately, and the caller retries once the in-flight
+// Append has returned. That in-flight window is bounded by how long the
+// caller's own fn takes, never by this package.
 type Lease struct {
 	stream StreamID
 	fencer *Fencer
 
-	// mu guards next, exhausted, outstanding, outstandingSeq, and
-	// outstandingSince. It is held only for the duration of a single Next,
-	// Landed, or Failed call - never across the boundary between them - so
-	// nothing a caller does between those calls, including never calling
-	// one at all, can leave mu held.
-	mu               sync.Mutex
-	next             Seq
-	exhausted        bool
-	outstanding      bool      // true from a successful Next until the matching Landed, Failed, or grace-period fencing
-	outstandingSeq   Seq       // valid only while outstanding is true
-	outstandingSince time.Time // when the outstanding checkout was recorded; valid only while outstanding is true
+	// mu guards next, exhausted, and busy. It is held only for the two short
+	// windows inside Append that read or write this state - acquiring the
+	// seq to hand fn and releasing it again once fn has returned - never
+	// while fn itself is running, so a slow fn blocks nothing but a second
+	// concurrent Append on the same Lease.
+	mu        sync.Mutex
+	next      Seq
+	exhausted bool
+	busy      bool // true only while an Append's fn is running on this Lease
 }
 
 // Stream returns the stream this lease was opened for.
@@ -282,127 +229,103 @@ func (l *Lease) Stream() StreamID { return l.stream }
 // stream's Leases registry has ever opened.
 func (l *Lease) Fencer() *Fencer { return l.fencer }
 
-// Next returns the sequence to write next. It refuses with
-// RefusePermanentlyFenced, making zero network calls, once the stream is
-// fenced - checked both before and after acquiring mu, since a concurrent
-// Failed (or this same method, on a previous call) can fence the stream in
-// the instant between the two. It refuses in one line, rather than block,
-// if a previously returned seq has not yet reached a matching Landed or
-// Failed and the grace period for that checkout has not yet passed - see
-// the Lease doc comment for why that is a refusal and not a wait. Once the
-// grace period has passed with no release, Next concludes the checkout was
-// abandoned and fences the stream through the same unknown-outcome path
-// Failed uses, atomically with clearing it - see the Lease doc comment.
-// It refuses in one line, rather than silently wrapping onto sequence 0 -
-// already written - once the stream has exhausted the full 64-bit
-// sequence space.
-func (l *Lease) Next() (Seq, error) {
+// Append acquires the next sequence for this stream, calls fn with it, and
+// resolves the checkout before returning - the only way a sequence ever
+// leaves this type. It refuses with RefusePermanentlyFenced, making zero
+// network calls, if the stream is already fenced (checked both before and
+// after acquiring mu, since a concurrent Append can fence the stream in the
+// instant between the two). It refuses in one line, rather than wait, if
+// another Append is already running on this Lease. It refuses in one line,
+// rather than silently wrap onto sequence 0 - already written - once the
+// stream has exhausted the full 64-bit sequence space.
+//
+// fn's outcome is classified exactly as an earlier version of this file's
+// Failed method classified it:
+//
+//   - fn returns nil: the append landed. The lease advances to seq+1 (or,
+//     at the maximum 64-bit sequence, marks itself exhausted instead of
+//     wrapping to 0).
+//   - fn returns an error matching ErrPreconditionFailed: a proven 412.
+//     The stream fences permanently through Fencer.HandleConflict (spec
+//     section 11.4 items 2-3), and that refusal is returned.
+//   - fn returns an error matching ErrOutcomeUnknown: the append's outcome
+//     could not be proven either way. The stream fences permanently
+//     through Fencer.HandleOutcomeUnknown (spec section 11.4 item 6), and
+//     that refusal is returned.
+//   - fn returns any other error: returned unchanged. The stream stays
+//     unfenced and the sequence is not consumed, so the next Append offers
+//     the same seq again. Conflating this retryable case with fencing is
+//     the split-brain bug WALD-22 typed ErrPrecondition and
+//     ErrOutcomeUnknown to prevent.
+//   - fn panics: the process cannot prove whether the write it was in the
+//     middle of landed - exactly the epistemic position ErrOutcomeUnknown
+//     exists for - so Append recovers the panic, fences the stream through
+//     Fencer.HandleOutcomeUnknown, and re-panics so the panic still
+//     propagates to fn's own caller rather than being swallowed here.
+//
+// mu is not held while fn runs: Append takes it only to read the seq to
+// hand fn and mark this Lease busy, releases it, calls fn unlocked, then
+// reacquires it to finalize the outcome. A slow fn therefore blocks no
+// other stream and no other operation on this process - only a second,
+// concurrent Append on this same Lease, which refuses rather than waits.
+func (l *Lease) Append(fn func(seq Seq) error) error {
 	if l.fencer.IsFenced(l.stream) {
-		return 0, RefusePermanentlyFenced(l.stream)
+		return RefusePermanentlyFenced(l.stream)
 	}
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if l.fencer.IsFenced(l.stream) {
-		return 0, RefusePermanentlyFenced(l.stream)
+		l.mu.Unlock()
+		return RefusePermanentlyFenced(l.stream)
 	}
-	if l.outstanding {
-		if time.Since(l.outstandingSince) < abandonedCheckoutGrace {
-			return 0, refuseSeqOutstanding(l.stream, l.outstandingSeq)
-		}
-		// The checkout has outlived any legitimate append by a wide
-		// margin (see abandonedCheckoutGrace) with no Landed or Failed
-		// ever arriving for it. Clear it and fence in the same
-		// acquisition of mu that discovered the abandonment - the mirror
-		// of the fix in Failed below - so no concurrent Next can ever
-		// observe outstanding cleared while the stream is not yet fenced.
-		abandonedSeq := l.outstandingSeq
-		l.outstanding = false
-		return 0, l.fencer.HandleOutcomeUnknown(l.stream, abandonedSeq)
+	if l.busy {
+		l.mu.Unlock()
+		return refuseSeqBusy(l.stream)
 	}
 	if l.exhausted {
-		return 0, refuseSeqExhausted(l.stream)
+		l.mu.Unlock()
+		return refuseSeqExhausted(l.stream)
 	}
+	seq := l.next
+	l.busy = true
+	l.mu.Unlock()
 
-	l.outstanding = true
-	l.outstandingSeq = l.next
-	l.outstandingSince = time.Now()
-	return l.next, nil
-}
+	var (
+		callErr  error
+		panicked any
+	)
+	func() {
+		defer func() { panicked = recover() }()
+		callErr = fn(seq)
+	}()
 
-// Landed records that storage acknowledged the append at seq, advancing
-// the lease to seq+1 and clearing the outstanding checkout Next recorded.
-// seq must be the one outstanding seq Next most recently returned; any
-// other value - stale, off-by-one, or a checkout that already cleared -
-// is refused rather than accepted, so a caller-side bookkeeping mistake
-// can never open a permanent gap in tx/ by advancing next past a
-// sequence nothing wrote. seq at the maximum 64-bit value has no
-// successor, so the lease is marked exhausted instead of wrapping to 0.
-func (l *Lease) Landed(seq Seq) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.busy = false
 
-	if !l.outstanding || seq != l.outstandingSeq {
-		return refuseSeqMismatch(l.stream, "Landed", seq, l.outstanding, l.outstandingSeq)
-	}
-	l.outstanding = false
-
-	if seq == math.MaxUint64 {
-		l.exhausted = true
-		return nil
-	}
-	l.next = seq + 1
-	return nil
-}
-
-// Failed classifies a conditional append's failure at seq and clears the
-// outstanding checkout Next recorded. seq must be the one outstanding seq
-// Next most recently returned; any other value is refused before it is
-// classified at all, so a stale or mismatched seq can never be
-// interpolated into the operator-facing section 11.5 fencing refusal in
-// place of the sequence the append was actually attempted at. Once
-// matched, a proven precondition failure or an outcome that could not be
-// proven either way both permanently fence the stream (spec/journal/v1
-// section 11.4 items 2-3 and item 6) through Fencer - HandleConflict and
-// HandleOutcomeUnknown respectively - and Failed returns the resulting
-// one-line refusal. Any other cause (store.ErrStorageUnavailable, a
-// refused request, a cancelled context) is returned unchanged: the stream
-// stays unfenced and next stays where it was, so the same seq is offered
-// again by the next Next call. Conflating that retryable case with
-// fencing is the split-brain bug WALD-22 typed ErrPrecondition and
-// ErrOutcomeUnknown to prevent.
-//
-// mu is held across the whole call, including the Fencer call in the
-// fencing branches, not just across the seq check: clearing outstanding
-// and fencing the stream must be indivisible with respect to a concurrent
-// Next, or a Next between the two could see outstanding already clear but
-// the stream not yet fenced, and be handed the very seq Failed is in the
-// middle of retiring. Next takes the same mu before it checks fenced-ness
-// or records a new outstanding seq (see Next), so holding mu here for the
-// duration closes that window rather than relocating it.
-func (l *Lease) Failed(seq Seq, err error) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if !l.outstanding || seq != l.outstandingSeq {
-		return refuseSeqMismatch(l.stream, "Failed", seq, l.outstanding, l.outstandingSeq)
+	if panicked != nil {
+		l.fencer.HandleOutcomeUnknown(l.stream, seq)
+		panic(panicked)
 	}
 
 	switch {
-	case errors.Is(err, ErrPreconditionFailed):
-		l.outstanding = false
+	case callErr == nil:
+		if seq == math.MaxUint64 {
+			l.exhausted = true
+		} else {
+			l.next = seq + 1
+		}
+		return nil
+	case errors.Is(callErr, ErrPreconditionFailed):
 		return l.fencer.HandleConflict(l.stream, seq)
-	case errors.Is(err, ErrOutcomeUnknown):
-		l.outstanding = false
+	case errors.Is(callErr, ErrOutcomeUnknown):
 		return l.fencer.HandleOutcomeUnknown(l.stream, seq)
 	default:
-		l.outstanding = false
-		return err
+		return callErr
 	}
 }
 
-// refuseSeqExhausted is Next's one-line refusal for a stream that has
+// refuseSeqExhausted is Append's one-line refusal for a stream that has
 // written every sequence from 0 through the maximum 64-bit value: there is
 // no next sequence left to lease, and the alternative - wrapping to 0 -
 // would collide with that sequence's own, already-written record.
@@ -418,58 +341,20 @@ func refuseSeqExhausted(stream StreamID) error {
 	)
 }
 
-// refuseSeqOutstanding is Next's one-line refusal when a previously
-// returned seq has not yet reached a matching Landed or Failed and is
-// still within abandonedCheckoutGrace: rather than block waiting for it,
-// which is what wedged a stream for the life of the process whenever a
-// caller's own error path skipped the release (round 1 review, findings
-// 1-2), Next refuses immediately and leaves it to the caller to retry
-// once the in-flight append resolves. This refusal, and only this one, is
-// unchanged by the grace period: two goroutines racing a legitimate
-// append to the same stream still see exactly this wording, not fencing
-// (round 2 review, finding 3) - it is refuseSeqOutstanding's caller, Next,
-// that stops returning it and fences instead once the checkout has been
-// outstanding long enough that it can no longer plausibly be that race.
-func refuseSeqOutstanding(stream StreamID, seq Seq) error {
+// refuseSeqBusy is Append's one-line refusal when another Append is
+// already running on this Lease. It names no internal method and promises
+// no event to wait for: the in-flight Append is guaranteed, by its own
+// structure, to finish and release the checkout on its own - there is no
+// abandoned or unbounded case to describe here, only ordinary contention,
+// so the fix is simply to retry.
+func refuseSeqBusy(stream StreamID) error {
 	what := "refusal: push failed"
 	if stream == MetaStreamID {
 		what = "refusal: meta operation failed"
 	}
 	return refusal.Refuse(
 		what,
-		fmt.Sprintf("stream %s already has seq %d outstanding from a previous Next", stream, seq),
-		"wait for the in-flight append to call Landed or Failed, then retry",
-	)
-}
-
-// refuseSeqMismatch is Landed's and Failed's one-line refusal when seq is
-// not the one outstanding seq Next most recently returned - including
-// when nothing is outstanding at all. Most triggers are an ordinary
-// caller-side mistake rather than a storage condition: a deferred cleanup
-// registered before checking Next's own error, a retry loop calling
-// Failed twice for one Next, a stale or recomputed seq passed to Landed.
-// One trigger is not a mistake: a checkout Next itself already cleared and
-// fenced as abandoned (see abandonedCheckoutGrace) reaches here too, if
-// its caller does eventually call Landed or Failed - by then the stream
-// is already fenced, so RefusePermanentlyFenced governs any further write
-// attempt regardless of what this refusal says. None of these triggers
-// may silently open a permanent gap in tx/ (Landed) or misattribute a
-// fencing sequence to the operator (Failed), and - the failure round 1
-// review reproduced as an unrecoverable "fatal error: sync: unlock of
-// unlocked mutex" - none of them may crash the process either. Refusing
-// here is what makes both impossible.
-func refuseSeqMismatch(stream StreamID, op string, seq Seq, outstanding bool, outstandingSeq Seq) error {
-	what := "refusal: push failed"
-	if stream == MetaStreamID {
-		what = "refusal: meta operation failed"
-	}
-	why := fmt.Sprintf("%s(%d) called for stream %s with no outstanding Next", op, seq, stream)
-	if outstanding {
-		why = fmt.Sprintf("%s(%d) called for stream %s while seq %d is the outstanding one", op, seq, stream, outstandingSeq)
-	}
-	return refusal.Refuse(
-		what,
-		why,
-		"call Landed or Failed exactly once, with the seq the matching Next returned",
+		fmt.Sprintf("stream %s already has an append in progress", stream),
+		"retry the push",
 	)
 }

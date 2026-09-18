@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/store"
@@ -52,12 +51,15 @@ func TestOpenEmptyStreamLeasesZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
+	var seq journal.Seq
+	if err := lease.Append(func(s journal.Seq) error {
+		seq = s
+		return nil
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
 	}
 	if seq != 0 {
-		t.Errorf("Next() = %d, want 0", seq)
+		t.Errorf("Append handed out seq %d, want 0", seq)
 	}
 }
 
@@ -70,12 +72,15 @@ func TestOpenExistingStreamLeasesHeadPlusOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
+	var seq journal.Seq
+	if err := lease.Append(func(s journal.Seq) error {
+		seq = s
+		return nil
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
 	}
 	if seq != 5 {
-		t.Errorf("Next() = %d, want 5 (head 4 + 1)", seq)
+		t.Errorf("Append handed out seq %d, want 5 (head 4 + 1)", seq)
 	}
 }
 
@@ -93,21 +98,24 @@ func TestOpenHeadDiscoverySpansPages(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
+	var seq journal.Seq
+	if err := lease.Append(func(s journal.Seq) error {
+		seq = s
+		return nil
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
 	}
 	if seq != 5 {
-		t.Errorf("Next() = %d, want 5 (head 4 + 1, discovered across %d-key pages)", seq, fake.PageSize)
+		t.Errorf("Append handed out seq %d, want 5 (head 4 + 1, discovered across %d-key pages)", seq, fake.PageSize)
 	}
 }
 
-// 3. A 412 from PutIfAbsent on the leased key, reported through Failed,
-// fences the stream: the error is exactly section 11.5 item 1's string,
-// errors.Is(err, journal.ErrFenced) holds, and the next Next() and Open()
-// refuse with section 11.5 item 2's string having made zero further
+// 3. A 412 from PutIfAbsent on the leased key, reported by fn's return
+// value, fences the stream: the error is exactly section 11.5 item 1's
+// string, errors.Is(err, journal.ErrFenced) holds, and the next Append and
+// Open refuse with section 11.5 item 2's string having made zero further
 // requests - asserted against Fake.Calls().
-func TestFailedPreconditionFencesStream(t *testing.T) {
+func TestAppendPreconditionFencesStream(t *testing.T) {
 	c, fake := newLeaseClient(t)
 	leases := journal.NewLeases(c)
 	ctx := context.Background()
@@ -116,35 +124,39 @@ func TestFailedPreconditionFencesStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
 
-	// A rival writer's record already sits at the key this Next() promised,
-	// so the conditional PUT below fails with a real, storage-proven 412 -
-	// never a status this test fabricates without the fake actually
-	// enforcing the condition.
-	fake.SetObject(journal.TxKey("repo-alpha", seq), []byte(`{}`))
-	putErr := putIfAbsentAt(ctx, c, journal.TxKey("repo-alpha", seq))
-	if !errors.Is(putErr, store.ErrPrecondition) {
-		t.Fatalf("PutIfAbsent: errors.Is(_, ErrPrecondition) = false, err = %v", putErr)
-	}
+	var gotSeq journal.Seq
+	appendErr := lease.Append(func(seq journal.Seq) error {
+		gotSeq = seq
+		key := journal.TxKey("repo-alpha", seq)
+		// A rival writer's record already sits at the key this Append
+		// promised, so the conditional PUT below fails with a real,
+		// storage-proven 412 - never a status this test fabricates without
+		// the fake actually enforcing the condition.
+		fake.SetObject(key, []byte(`{}`))
+		return putIfAbsentAt(ctx, c, key)
+	})
 
-	failErr := lease.Failed(seq, putErr)
-	want := fmt.Sprintf("refusal: push failed: stream repo-alpha fenced by concurrent writer at seq %d (instance is fenced for this stream; restart or check active writer)", seq)
-	if failErr == nil || failErr.Error() != want {
-		t.Fatalf("Failed error:\ngot:  %v\nwant: %q", failErr, want)
+	want := fmt.Sprintf("refusal: push failed: stream repo-alpha fenced by concurrent writer at seq %d (instance is fenced for this stream; restart or check active writer)", gotSeq)
+	if appendErr == nil || appendErr.Error() != want {
+		t.Fatalf("Append error:\ngot:  %v\nwant: %q", appendErr, want)
 	}
-	if !errors.Is(failErr, journal.ErrFenced) {
-		t.Errorf("expected Failed's error to match journal.ErrFenced")
+	if !errors.Is(appendErr, journal.ErrFenced) {
+		t.Errorf("expected Append's error to match journal.ErrFenced")
 	}
 
 	callsBefore := len(fake.Calls())
 
 	wantPerm := "refusal: push failed: stream repo-alpha is permanently fenced on this instance (restart walden process to re-materialize from journal)"
-	if _, err := lease.Next(); err == nil || err.Error() != wantPerm {
-		t.Errorf("Next() after fencing = %v, want %q", err, wantPerm)
+	ranAfterFenced := false
+	if err := lease.Append(func(journal.Seq) error {
+		ranAfterFenced = true
+		return nil
+	}); err == nil || err.Error() != wantPerm {
+		t.Errorf("Append() after fencing = %v, want %q", err, wantPerm)
+	}
+	if ranAfterFenced {
+		t.Errorf("fn ran on a fenced stream")
 	}
 	if _, err := leases.Open(ctx, "repo-alpha"); err == nil || err.Error() != wantPerm {
 		t.Errorf("Open() after fencing = %v, want %q", err, wantPerm)
@@ -158,7 +170,7 @@ func TestFailedPreconditionFencesStream(t *testing.T) {
 // 4. A dropped response injected through storetest (store's
 // ErrOutcomeUnknown path) fences the same stream the same way, with
 // section 11.5 item 7's string.
-func TestFailedOutcomeUnknownFencesStream(t *testing.T) {
+func TestAppendOutcomeUnknownFencesStream(t *testing.T) {
 	c, fake := newLeaseClient(t)
 	leases := journal.NewLeases(c)
 	ctx := context.Background()
@@ -167,34 +179,29 @@ func TestFailedOutcomeUnknownFencesStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
 
-	key := journal.TxKey("repo-beta", seq)
-	// Land:true means the fake actually stores the write - it applied -
-	// before Drop severs the connection with no response, the exact
-	// ambiguity store.ErrOutcomeUnknown exists for.
-	fake.Inject(storetest.Rule{
-		Op:    storetest.OpPutIfAbsent,
-		Key:   key,
-		Call:  1,
-		Fault: storetest.Fault{Drop: true, Land: true},
+	var gotSeq journal.Seq
+	appendErr := lease.Append(func(seq journal.Seq) error {
+		gotSeq = seq
+		key := journal.TxKey("repo-beta", seq)
+		// Land:true means the fake actually stores the write - it applied
+		// - before Drop severs the connection with no response, the exact
+		// ambiguity store.ErrOutcomeUnknown exists for.
+		fake.Inject(storetest.Rule{
+			Op:    storetest.OpPutIfAbsent,
+			Key:   key,
+			Call:  1,
+			Fault: storetest.Fault{Drop: true, Land: true},
+		})
+		return putIfAbsentAt(ctx, c, key)
 	})
 
-	putErr := putIfAbsentAt(ctx, c, key)
-	if !errors.Is(putErr, store.ErrOutcomeUnknown) {
-		t.Fatalf("PutIfAbsent: errors.Is(_, ErrOutcomeUnknown) = false, err = %v", putErr)
+	want := fmt.Sprintf("refusal: push failed: stream repo-beta append at seq %d has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)", gotSeq)
+	if appendErr == nil || appendErr.Error() != want {
+		t.Fatalf("Append error:\ngot:  %v\nwant: %q", appendErr, want)
 	}
-
-	failErr := lease.Failed(seq, putErr)
-	want := fmt.Sprintf("refusal: push failed: stream repo-beta append at seq %d has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)", seq)
-	if failErr == nil || failErr.Error() != want {
-		t.Fatalf("Failed error:\ngot:  %v\nwant: %q", failErr, want)
-	}
-	if !errors.Is(failErr, journal.ErrFenced) {
-		t.Errorf("expected Failed's error to match journal.ErrFenced")
+	if !errors.Is(appendErr, journal.ErrFenced) {
+		t.Errorf("expected Append's error to match journal.ErrFenced")
 	}
 	if !lease.Fencer().IsFenced("repo-beta") {
 		t.Errorf("expected repo-beta to be fenced")
@@ -223,54 +230,51 @@ func TestStreamIsolationAcrossFencing(t *testing.T) {
 	}
 
 	// Fence repo-alpha via a genuine 412.
-	seqA, err := alpha.Next()
-	if err != nil {
-		t.Fatalf("alpha.Next: %v", err)
-	}
-	fake.SetObject(journal.TxKey("repo-alpha", seqA), []byte(`{}`))
-	putErr := putIfAbsentAt(ctx, c, journal.TxKey("repo-alpha", seqA))
-	if !errors.Is(putErr, store.ErrPrecondition) {
-		t.Fatalf("PutIfAbsent(repo-alpha): errors.Is(_, ErrPrecondition) = false, err = %v", putErr)
-	}
-	if failErr := alpha.Failed(seqA, putErr); !errors.Is(failErr, journal.ErrFenced) {
-		t.Fatalf("alpha.Failed: expected ErrFenced, got %v", failErr)
+	appendErr := alpha.Append(func(seq journal.Seq) error {
+		key := journal.TxKey("repo-alpha", seq)
+		fake.SetObject(key, []byte(`{}`))
+		return putIfAbsentAt(ctx, c, key)
+	})
+	if !errors.Is(appendErr, journal.ErrFenced) {
+		t.Fatalf("alpha.Append: expected ErrFenced, got %v", appendErr)
 	}
 
 	// repo-beta keeps writing and counting on its own, unaffected.
-	seqB, err := beta.Next()
-	if err != nil {
-		t.Fatalf("beta.Next: %v", err)
+	var seqB journal.Seq
+	if err := beta.Append(func(seq journal.Seq) error {
+		seqB = seq
+		return putIfAbsentAt(ctx, c, journal.TxKey("repo-beta", seq))
+	}); err != nil {
+		t.Fatalf("beta.Append: %v", err)
 	}
 	if seqB != 0 {
-		t.Errorf("beta.Next() = %d, want 0", seqB)
+		t.Errorf("beta's first Append got seq %d, want 0", seqB)
 	}
-	if err := putIfAbsentAt(ctx, c, journal.TxKey("repo-beta", seqB)); err != nil {
-		t.Fatalf("PutIfAbsent(repo-beta): %v", err)
+	var seqB2 journal.Seq
+	if err := beta.Append(func(seq journal.Seq) error {
+		seqB2 = seq
+		return nil
+	}); err != nil {
+		t.Fatalf("beta.Append (second): %v", err)
 	}
-	if err := beta.Landed(seqB); err != nil {
-		t.Fatalf("beta.Landed: %v", err)
-	}
-	if seqB2, err := beta.Next(); err != nil || seqB2 != 1 {
-		t.Errorf("beta.Next() after Landed = (%d, %v), want (1, nil)", seqB2, err)
+	if seqB2 != 1 {
+		t.Errorf("beta's second Append got seq %d, want 1", seqB2)
 	}
 
 	// _meta keeps writing and counting on its own too.
-	seqM, err := meta.Next()
-	if err != nil {
-		t.Fatalf("meta.Next: %v", err)
+	var seqM journal.Seq
+	if err := meta.Append(func(seq journal.Seq) error {
+		seqM = seq
+		return putIfAbsentAt(ctx, c, journal.TxKey(journal.MetaStreamID, seq))
+	}); err != nil {
+		t.Fatalf("meta.Append: %v", err)
 	}
 	if seqM != 0 {
-		t.Errorf("meta.Next() = %d, want 0", seqM)
-	}
-	if err := putIfAbsentAt(ctx, c, journal.TxKey(journal.MetaStreamID, seqM)); err != nil {
-		t.Fatalf("PutIfAbsent(_meta): %v", err)
-	}
-	if err := meta.Landed(seqM); err != nil {
-		t.Fatalf("meta.Landed: %v", err)
+		t.Errorf("meta's Append got seq %d, want 0", seqM)
 	}
 
 	// alpha stays fenced throughout.
-	if _, err := alpha.Next(); !errors.Is(err, journal.ErrFenced) {
+	if err := alpha.Append(func(journal.Seq) error { return nil }); !errors.Is(err, journal.ErrFenced) {
 		t.Errorf("expected repo-alpha to remain fenced, got %v", err)
 	}
 	if beta.Fencer().IsFenced("repo-beta") {
@@ -283,8 +287,8 @@ func TestStreamIsolationAcrossFencing(t *testing.T) {
 
 // The _meta stream's own two refusals use the "meta operation failed"
 // wording (section 11.5 items 3, 4), exercised the same way test 3 above
-// exercises the repo-stream wording - through a genuine 412 reported to
-// Failed.
+// exercises the repo-stream wording - through a genuine 412 reported from
+// fn.
 func TestMetaStreamConflictRefusalWording(t *testing.T) {
 	c, fake := newLeaseClient(t)
 	leases := journal.NewLeases(c)
@@ -294,26 +298,22 @@ func TestMetaStreamConflictRefusalWording(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open(_meta): %v", err)
 	}
-	seq, err := meta.Next()
-	if err != nil {
-		t.Fatalf("meta.Next: %v", err)
-	}
 
-	fake.SetObject(journal.TxKey(journal.MetaStreamID, seq), []byte(`{}`))
-	putErr := putIfAbsentAt(ctx, c, journal.TxKey(journal.MetaStreamID, seq))
-	if !errors.Is(putErr, store.ErrPrecondition) {
-		t.Fatalf("PutIfAbsent(_meta): errors.Is(_, ErrPrecondition) = false, err = %v", putErr)
-	}
-
-	failErr := meta.Failed(seq, putErr)
-	want := fmt.Sprintf("refusal: meta operation failed: stream _meta fenced by concurrent writer at seq %d (instance is fenced for this stream; restart or check active writer)", seq)
-	if failErr == nil || failErr.Error() != want {
-		t.Fatalf("Failed error:\ngot:  %v\nwant: %q", failErr, want)
+	var gotSeq journal.Seq
+	appendErr := meta.Append(func(seq journal.Seq) error {
+		gotSeq = seq
+		key := journal.TxKey(journal.MetaStreamID, seq)
+		fake.SetObject(key, []byte(`{}`))
+		return putIfAbsentAt(ctx, c, key)
+	})
+	want := fmt.Sprintf("refusal: meta operation failed: stream _meta fenced by concurrent writer at seq %d (instance is fenced for this stream; restart or check active writer)", gotSeq)
+	if appendErr == nil || appendErr.Error() != want {
+		t.Fatalf("Append error:\ngot:  %v\nwant: %q", appendErr, want)
 	}
 
 	wantPerm := "refusal: meta operation failed: stream _meta is permanently fenced on this instance (restart walden process to re-materialize from journal)"
-	if _, err := meta.Next(); err == nil || err.Error() != wantPerm {
-		t.Errorf("meta.Next() after fencing = %v, want %q", err, wantPerm)
+	if err := meta.Append(func(journal.Seq) error { return nil }); err == nil || err.Error() != wantPerm {
+		t.Errorf("meta.Append() after fencing = %v, want %q", err, wantPerm)
 	}
 }
 
@@ -329,34 +329,28 @@ func TestMetaStreamOutcomeUnknownRefusalWording(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open(_meta): %v", err)
 	}
-	seq, err := meta.Next()
-	if err != nil {
-		t.Fatalf("meta.Next: %v", err)
-	}
 
-	key := journal.TxKey(journal.MetaStreamID, seq)
-	fake.Inject(storetest.Rule{
-		Op:    storetest.OpPutIfAbsent,
-		Key:   key,
-		Call:  1,
-		Fault: storetest.Fault{Drop: true, Land: true},
+	var gotSeq journal.Seq
+	appendErr := meta.Append(func(seq journal.Seq) error {
+		gotSeq = seq
+		key := journal.TxKey(journal.MetaStreamID, seq)
+		fake.Inject(storetest.Rule{
+			Op:    storetest.OpPutIfAbsent,
+			Key:   key,
+			Call:  1,
+			Fault: storetest.Fault{Drop: true, Land: true},
+		})
+		return putIfAbsentAt(ctx, c, key)
 	})
-
-	putErr := putIfAbsentAt(ctx, c, key)
-	if !errors.Is(putErr, store.ErrOutcomeUnknown) {
-		t.Fatalf("PutIfAbsent(_meta): errors.Is(_, ErrOutcomeUnknown) = false, err = %v", putErr)
-	}
-
-	failErr := meta.Failed(seq, putErr)
-	want := fmt.Sprintf("refusal: meta operation failed: stream _meta append at seq %d has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)", seq)
-	if failErr == nil || failErr.Error() != want {
-		t.Fatalf("Failed error:\ngot:  %v\nwant: %q", failErr, want)
+	want := fmt.Sprintf("refusal: meta operation failed: stream _meta append at seq %d has unknown outcome (instance is fenced for this stream; restart walden process to re-materialize from journal)", gotSeq)
+	if appendErr == nil || appendErr.Error() != want {
+		t.Fatalf("Append error:\ngot:  %v\nwant: %q", appendErr, want)
 	}
 }
 
 // 6. A retryable failure (ErrStorageUnavailable) neither fences nor
 // consumes the sequence: the same seq is offered again.
-func TestFailedRetryableDoesNotFenceOrConsumeSeq(t *testing.T) {
+func TestAppendRetryableDoesNotFenceOrConsumeSeq(t *testing.T) {
 	c, fake := newLeaseClient(t)
 	leases := journal.NewLeases(c)
 	ctx := context.Background()
@@ -365,42 +359,40 @@ func TestFailedRetryableDoesNotFenceOrConsumeSeq(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
 
-	key := journal.TxKey("repo-gamma", seq)
-	// Count 4 matches the client's own maxAttempts (client.go), so every
-	// attempt the client makes fails the same way and it gives up with
-	// ErrStorageUnavailable rather than retrying forever or succeeding.
-	fake.Inject(storetest.Rule{
-		Op:    storetest.OpPutIfAbsent,
-		Key:   key,
-		Call:  1,
-		Count: 4,
-		Fault: storetest.Fault{Status: 503, Code: "ServiceUnavailable"},
+	var seq journal.Seq
+	appendErr := lease.Append(func(s journal.Seq) error {
+		seq = s
+		key := journal.TxKey("repo-gamma", s)
+		// Count 4 matches the client's own maxAttempts (client.go), so
+		// every attempt the client makes fails the same way and it gives
+		// up with ErrStorageUnavailable rather than retrying forever or
+		// succeeding.
+		fake.Inject(storetest.Rule{
+			Op:    storetest.OpPutIfAbsent,
+			Key:   key,
+			Call:  1,
+			Count: 4,
+			Fault: storetest.Fault{Status: 503, Code: "ServiceUnavailable"},
+		})
+		return putIfAbsentAt(ctx, c, key)
 	})
-
-	putErr := putIfAbsentAt(ctx, c, key)
-	if !errors.Is(putErr, store.ErrStorageUnavailable) {
-		t.Fatalf("PutIfAbsent: errors.Is(_, ErrStorageUnavailable) = false, err = %v", putErr)
-	}
-
-	failErr := lease.Failed(seq, putErr)
-	if failErr != putErr {
-		t.Errorf("Failed() = %v, want the original error returned unchanged", failErr)
+	if !errors.Is(appendErr, store.ErrStorageUnavailable) {
+		t.Fatalf("Append: errors.Is(_, ErrStorageUnavailable) = false, err = %v", appendErr)
 	}
 	if lease.Fencer().IsFenced("repo-gamma") {
 		t.Errorf("expected repo-gamma to remain unfenced after a retryable failure")
 	}
 
-	seq2, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next after retryable failure: %v", err)
+	var seq2 journal.Seq
+	if err := lease.Append(func(s journal.Seq) error {
+		seq2 = s
+		return nil
+	}); err != nil {
+		t.Fatalf("Append after retryable failure: %v", err)
 	}
 	if seq2 != seq {
-		t.Errorf("Next() after retryable failure = %d, want the same seq %d offered again", seq2, seq)
+		t.Errorf("Append after retryable failure offered seq %d, want the same seq %d offered again", seq2, seq)
 	}
 }
 
@@ -436,16 +428,14 @@ func TestOpenTwiceReturnsSameLeaseAndListsOnce(t *testing.T) {
 	}
 }
 
-// 8. Under -race, many goroutines against one lease never see the same
-// sequence issued twice: at most one seq is ever outstanding on a Lease at
-// a time, and Next refuses in one line - rather than block - whenever a
-// previous seq is still outstanding (round 1 review, findings 1-2: a
-// blocking design wedges the stream forever the moment any caller returns
-// without reaching Landed/Failed, so contention is resolved by refusal,
-// not by waiting). Each goroutine here retries Next until it wins the
-// outstanding slot, which is the concurrent analogue of the blocking the
-// old design did, without a lock held across the call boundary.
-func TestLeaseNextUnderConcurrencyNeverDuplicatesSequence(t *testing.T) {
+// 8. Under -race, many goroutines appending against one lease never see the
+// same sequence issued twice: at most one Append is ever running on a
+// Lease at a time, and a second, concurrent Append refuses in one line -
+// rather than block - while another is in flight (see refuseSeqBusy). Each
+// goroutine here retries Append until it wins the turn, and its fn performs
+// the real conditional PUT and reports the outcome, so this exercises the
+// whole path end to end, not just sequence bookkeeping.
+func TestAppendUnderConcurrencyNeverDuplicatesSequence(t *testing.T) {
 	c, _ := newLeaseClient(t)
 	leases := journal.NewLeases(c)
 	ctx := context.Background()
@@ -467,41 +457,29 @@ func TestLeaseNextUnderConcurrencyNeverDuplicatesSequence(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			var seq journal.Seq
 			for {
-				var nextErr error
-				seq, nextErr = lease.Next()
-				if nextErr == nil {
-					break
-				}
-				if errors.Is(nextErr, journal.ErrFenced) {
-					errCh <- fmt.Errorf("Next: unexpectedly fenced: %w", nextErr)
+				appendErr := lease.Append(func(seq journal.Seq) error {
+					mu.Lock()
+					dup := seen[seq]
+					seen[seq] = true
+					mu.Unlock()
+					if dup {
+						errCh <- fmt.Errorf("sequence %d issued twice", seq)
+					}
+					return putIfAbsentAt(ctx, c, journal.TxKey("repo-epsilon", seq))
+				})
+				if appendErr == nil {
 					return
 				}
-				// Another goroutine's seq is still outstanding - retry
-				// rather than treat the refusal as failure.
-			}
-
-			mu.Lock()
-			dup := seen[seq]
-			seen[seq] = true
-			mu.Unlock()
-			if dup {
-				errCh <- fmt.Errorf("sequence %d issued twice", seq)
-			}
-
-			key := journal.TxKey("repo-epsilon", seq)
-			if putErr := putIfAbsentAt(ctx, c, key); putErr != nil {
-				if failErr := lease.Failed(seq, putErr); errors.Is(failErr, journal.ErrFenced) {
+				if errors.Is(appendErr, journal.ErrFenced) {
 					// A real fencing failure here means two goroutines
 					// raced the same seq against the fake - the exact bug
 					// this test exists to catch.
-					errCh <- fmt.Errorf("seq %d: unexpected fencing from %v: %w", seq, putErr, failErr)
+					errCh <- fmt.Errorf("unexpected fencing: %w", appendErr)
+					return
 				}
-				return
-			}
-			if err := lease.Landed(seq); err != nil {
-				errCh <- fmt.Errorf("Landed(%d): %v", seq, err)
+				// Another goroutine's Append is still in flight - retry
+				// rather than treat the refusal as failure.
 			}
 		}()
 	}
@@ -527,28 +505,33 @@ func TestLeaseAtMaxSequenceRefusesInsteadOfWrapping(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	_, err = lease.Next()
+	ranFn := false
+	err = lease.Append(func(journal.Seq) error {
+		ranFn = true
+		return nil
+	})
 	if err == nil {
-		t.Fatalf("expected Next() to refuse once the stream is at the maximum sequence")
+		t.Fatalf("expected Append to refuse once the stream is at the maximum sequence")
+	}
+	if ranFn {
+		t.Errorf("fn ran on an exhausted stream")
 	}
 	if strings.ContainsAny(err.Error(), "\n\r") {
 		t.Errorf("refusal is not a single line: %q", err.Error())
 	}
 	want := "refusal: push failed: stream repo-zeta has exhausted its 64-bit sequence space"
 	if err.Error() != want {
-		t.Errorf("Next() error = %q, want %q", err.Error(), want)
+		t.Errorf("Append() error = %q, want %q", err.Error(), want)
 	}
 }
 
 // The same exhaustion guard applies when a lease reaches the maximum
-// sequence through Landed rather than through Open discovering it already
-// there - Landed(math.MaxUint64) must not silently wrap next to 0, which
-// would collide with that same stream's own already-written seq 0. The
-// stream's head is seeded one below the maximum so Next legitimately
-// returns math.MaxUint64 itself: Landed now verifies seq against the
-// outstanding one (round 1 review, finding 3), so this test drives the
-// boundary with the real outstanding seq rather than an arbitrary one.
-func TestLeaseLandedAtMaxSequenceRefusesInsteadOfWrapping(t *testing.T) {
+// sequence through a landed Append rather than through Open discovering it
+// already there - landing seq math.MaxUint64 must not silently wrap next
+// to 0, which would collide with that same stream's own already-written
+// seq 0. The stream's head is seeded one below the maximum so Append
+// legitimately hands out math.MaxUint64 itself.
+func TestAppendAtMaxSequenceRefusesInsteadOfWrapping(t *testing.T) {
 	c, fake := newLeaseClient(t)
 	fake.SetObject(journal.TxKey("repo-eta", journal.Seq(math.MaxUint64-1)), []byte(`{}`))
 
@@ -559,36 +542,37 @@ func TestLeaseLandedAtMaxSequenceRefusesInsteadOfWrapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
+	var seq journal.Seq
+	if err := lease.Append(func(s journal.Seq) error {
+		seq = s
+		return nil
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
 	}
 	if seq != math.MaxUint64 {
-		t.Fatalf("Next() = %d, want %d (head MaxUint64-1 + 1)", seq, uint64(math.MaxUint64))
-	}
-	if err := lease.Landed(seq); err != nil {
-		t.Fatalf("Landed(%d): %v", seq, err)
+		t.Fatalf("Append handed out seq %d, want %d (head MaxUint64-1 + 1)", seq, uint64(math.MaxUint64))
 	}
 
-	_, err = lease.Next()
+	err = lease.Append(func(journal.Seq) error { return nil })
 	if err == nil {
-		t.Fatalf("expected Next() to refuse after Landed(MaxUint64)")
+		t.Fatalf("expected Append to refuse after landing seq MaxUint64")
 	}
 	want := "refusal: push failed: stream repo-eta has exhausted its 64-bit sequence space"
 	if err.Error() != want {
-		t.Errorf("Next() error = %q, want %q", err.Error(), want)
+		t.Errorf("Append() error = %q, want %q", err.Error(), want)
 	}
 }
 
-// Regression test for round 1 review finding 1: a caller that takes a seq
-// from Next and, for any reason, never calls Landed or Failed - a marshal
-// or signing error, a validation refusal, a cancelled context, a panic
-// recovered upstream, all return before ever attempting the conditional
-// PUT - must not wedge the stream forever. The reviewer reproduced a
-// second Next() still blocked after 2s with no way to cancel it; this
-// asserts a second Next() instead returns promptly with a one-line
-// refusal.
-func TestNextAfterAbandonedCheckoutRefusesRatherThanBlocks(t *testing.T) {
+// Regression test for round 1 review findings 1-2 and round 3's major
+// finding: a second Append while one is already running on the same Lease
+// must refuse in one line, promptly, rather than block or wedge - and,
+// unlike the deleted checkout protocol this replaces, there is no separate
+// "abandoned" case to time out, because Append itself always resolves the
+// checkout before returning (including via panic - see the test below).
+// This drives fn with a channel so the assertion does not depend on
+// scheduling luck: the second Append is only issued once the first is
+// certainly still running inside fn.
+func TestAppendRefusesRatherThanBlocksWhileAnotherIsInFlight(t *testing.T) {
 	c, _ := newLeaseClient(t)
 	leases := journal.NewLeases(c)
 	ctx := context.Background()
@@ -598,305 +582,151 @@ func TestNextAfterAbandonedCheckoutRefusesRatherThanBlocks(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	// First caller takes a seq and abandons it: simulating a marshal or
-	// signing error, a validation refusal, or a cancelled context, none
-	// of which reach Landed or Failed.
-	if _, err := lease.Next(); err != nil {
-		t.Fatalf("first Next: %v", err)
-	}
-
-	// A second Next() must return promptly with a refusal, never block.
-	done := make(chan struct{})
-	var secondErr error
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
 	go func() {
-		_, secondErr = lease.Next()
-		close(done)
+		firstDone <- lease.Append(func(journal.Seq) error {
+			close(started)
+			<-release
+			return nil
+		})
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("second Next() still blocked after 2s - stream wedged for the life of the process")
+	<-started
+
+	secondRan := false
+	secondErr := lease.Append(func(journal.Seq) error {
+		secondRan = true
+		return nil
+	})
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Append: %v", err)
 	}
 
+	if secondRan {
+		t.Fatalf("fn ran for a second Append issued while the first was still in flight")
+	}
 	if secondErr == nil {
-		t.Fatalf("expected second Next() to refuse while the first seq is outstanding, got nil")
+		t.Fatalf("expected the second Append to refuse while the first was in flight, got nil")
 	}
 	if strings.ContainsAny(secondErr.Error(), "\n\r") {
 		t.Errorf("refusal is not a single line: %q", secondErr.Error())
 	}
 	if errors.Is(secondErr, journal.ErrFenced) {
-		t.Errorf("an abandoned checkout must not fence the stream, got %v", secondErr)
+		t.Errorf("ordinary contention between two Appends must not fence the stream, got %v", secondErr)
+	}
+
+	// The lease is healthy afterward: a third Append succeeds and advances
+	// past the seq the first Append landed.
+	if err := lease.Append(func(journal.Seq) error { return nil }); err != nil {
+		t.Fatalf("Append after contention cleared: %v", err)
 	}
 }
 
-// Regression test for round 1 review finding 2: Landed or Failed called
-// with no matching successful Next - or a second time for a checkout that
-// already cleared - must never unlock a lock nothing holds. The reviewer
-// reproduced this against the held-mutex design as an unrecoverable
-// "fatal error: sync: unlock of unlocked mutex", which kills the whole
-// walden process. It must instead refuse in one line.
-func TestFailedAndLandedWithoutMatchingNextRefuseRatherThanPanic(t *testing.T) {
+// Regression test for round 3's major finding and the deleted grace
+// period: a panic inside fn leaves the process genuinely unable to prove
+// whether the write it was making landed, so Append fences the stream
+// through the same unknown-outcome path a proven ambiguous failure uses,
+// and then re-panics so the panic still reaches fn's own caller instead of
+// being swallowed. Unlike the deleted abandoned-checkout timer, this
+// requires no clock and no guess: the panic itself is the evidence.
+func TestAppendPanicFencesStreamAndRepanics(t *testing.T) {
 	c, _ := newLeaseClient(t)
 	leases := journal.NewLeases(c)
 	ctx := context.Background()
 
-	lease, err := leases.Open(ctx, "repo-iota")
+	lease, err := leases.Open(ctx, "repo-panic")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 
-	// No Next() has ever been called: Failed and Landed both have nothing
-	// to release.
-	if err := lease.Failed(0, errors.New("boom")); err == nil {
-		t.Fatalf("expected Failed with no outstanding Next to refuse, got nil")
-	} else if strings.ContainsAny(err.Error(), "\n\r") {
-		t.Errorf("refusal is not a single line: %q", err.Error())
+	var (
+		recovered any
+		gotSeq    journal.Seq
+	)
+	func() {
+		defer func() { recovered = recover() }()
+		_ = lease.Append(func(seq journal.Seq) error {
+			gotSeq = seq
+			panic("simulated panic mid-append")
+		})
+	}()
+
+	if recovered == nil {
+		t.Fatalf("expected the panic to propagate out of Append, got no panic")
 	}
-	if err := lease.Landed(0); err == nil {
-		t.Fatalf("expected Landed with no outstanding Next to refuse, got nil")
-	} else if strings.ContainsAny(err.Error(), "\n\r") {
-		t.Errorf("refusal is not a single line: %q", err.Error())
+	if recovered != "simulated panic mid-append" {
+		t.Errorf("recovered panic = %v, want the original panic value", recovered)
+	}
+	if !lease.Fencer().IsFenced("repo-panic") {
+		t.Fatalf("expected the stream to be fenced after a panic mid-append")
+	}
+	fencedSeq, ok := lease.Fencer().FencedSeq("repo-panic")
+	if !ok || fencedSeq != gotSeq {
+		t.Errorf("fenced seq = %d (ok=%v), want the seq the panicking Append was given, %d", fencedSeq, ok, gotSeq)
 	}
 
-	// A legitimate Next/Failed pair releases the checkout normally - the
-	// retryable branch leaves the stream unfenced and the seq unconsumed
-	// (test 6 above covers that in detail; this only needs the release).
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-	if failErr := lease.Failed(seq, store.ErrStorageUnavailable); failErr != store.ErrStorageUnavailable {
-		t.Fatalf("Failed: got %v, want ErrStorageUnavailable unchanged", failErr)
-	}
-
-	// A second Failed for the same seq, after the checkout already
-	// cleared, must refuse rather than double-release - this is exactly
-	// the retry-loop-calls-Failed-twice trigger the reviewer named.
-	if err := lease.Failed(seq, errors.New("boom")); err == nil {
-		t.Fatalf("expected a second Failed for the same seq to refuse, got nil")
-	}
-
-	// The lease is still healthy: Next reissues the same seq (nothing was
-	// consumed by either the retryable Failed or the refused second one).
-	seq2, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next after Failed: %v", err)
-	}
-	if seq2 != seq {
-		t.Errorf("Next() after Failed = %d, want the same seq %d reissued", seq2, seq)
+	wantPerm := "refusal: push failed: stream repo-panic is permanently fenced on this instance (restart walden process to re-materialize from journal)"
+	if err := lease.Append(func(journal.Seq) error { return nil }); err == nil || err.Error() != wantPerm {
+		t.Errorf("Append() after a panic-fenced stream = %v, want %q", err, wantPerm)
 	}
 }
 
-// Regression test for round 1 review finding 3: Landed must verify seq is
-// the one Next handed out. An off-by-one or otherwise stale Landed call
-// must refuse rather than silently advance next past a sequence nothing
-// wrote, which would open a permanent gap in tx/ forbidden by
-// spec/journal/v1 section 1 and section 12.
-func TestLandedRejectsSeqThatDoesNotMatchOutstanding(t *testing.T) {
+// Regression test for round 2 review finding 1 and round 3's major finding,
+// ported to the scoped Append API: a concurrent Append must never be able
+// to run its fn - and so never be handed an overlapping or duplicate
+// sequence - while another Append's fn is still executing on the same
+// Lease. Round 2 reproduced the pre-fix code losing this race 730/3000
+// times; here the two Appends are synchronized with channels rather than
+// left to scheduling luck, so the assertion holds by construction rather
+// than by getting lucky enough times in a row, and the loop repeats across
+// fresh streams to also exercise it under -race across many goroutine
+// interleavings.
+func TestConcurrentAppendNeverOverlapsWhileFirstInFlight(t *testing.T) {
 	c, _ := newLeaseClient(t)
 	leases := journal.NewLeases(c)
 	ctx := context.Background()
 
-	lease, err := leases.Open(ctx, "repo-kappa")
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-
-	// An off-by-one Landed (seq+1, never issued by Next) must refuse
-	// rather than accept it and silently advance next past the real,
-	// unwritten seq.
-	if err := lease.Landed(seq + 1); err == nil {
-		t.Fatalf("expected Landed(seq+1) to refuse, got nil")
-	}
-
-	// The real seq is still outstanding: the mismatched call above did not
-	// clear it, so a concurrent Next() still refuses busy rather than
-	// handing out a second, overlapping seq.
-	if _, err := lease.Next(); err == nil {
-		t.Fatalf("expected Next() to still refuse while the real seq %d is outstanding", seq)
-	}
-
-	// Landed with the real seq succeeds and advances next by exactly one -
-	// no gap was opened by the earlier mismatched call.
-	if err := lease.Landed(seq); err != nil {
-		t.Fatalf("Landed(%d): %v", seq, err)
-	}
-	seq2, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next after Landed: %v", err)
-	}
-	if seq2 != seq+1 {
-		t.Errorf("Next() after Landed = %d, want %d (no gap)", seq2, seq+1)
-	}
-}
-
-// Regression test for round 1 review finding 3's other half: Failed must
-// verify seq before classifying it, so a stale seq can never be
-// interpolated into the operator-facing section 11.5 fencing refusal in
-// place of the sequence the append was actually attempted at, and must
-// never fence the stream on a mismatched report.
-func TestFailedRejectsStaleSeqAndDoesNotMisreportOrFence(t *testing.T) {
-	c, fake := newLeaseClient(t)
-	leases := journal.NewLeases(c)
-	ctx := context.Background()
-
-	lease, err := leases.Open(ctx, "repo-lambda")
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-
-	fake.SetObject(journal.TxKey("repo-lambda", seq), []byte(`{}`))
-	putErr := putIfAbsentAt(ctx, c, journal.TxKey("repo-lambda", seq))
-	if !errors.Is(putErr, store.ErrPrecondition) {
-		t.Fatalf("PutIfAbsent: errors.Is(_, ErrPrecondition) = false, err = %v", putErr)
-	}
-
-	stale := seq + 7
-	staleErr := lease.Failed(stale, putErr)
-	if staleErr == nil {
-		t.Fatalf("expected Failed with a stale seq to refuse, got nil")
-	}
-	if strings.Contains(staleErr.Error(), fmt.Sprintf("seq %d", stale)) {
-		t.Errorf("stale seq %d leaked into the refusal: %q", stale, staleErr.Error())
-	}
-	if lease.Fencer().IsFenced("repo-lambda") {
-		t.Errorf("a stale Failed call must not fence the stream")
-	}
-
-	// The real seq, reported correctly, still fences as expected - the
-	// verification above rejected only the mismatched call, not every
-	// call.
-	failErr := lease.Failed(seq, putErr)
-	if !errors.Is(failErr, journal.ErrFenced) {
-		t.Fatalf("Failed(seq): expected ErrFenced, got %v", failErr)
-	}
-	want := fmt.Sprintf("refusal: push failed: stream repo-lambda fenced by concurrent writer at seq %d (instance is fenced for this stream; restart or check active writer)", seq)
-	if failErr.Error() != want {
-		t.Fatalf("Failed error:\ngot:  %v\nwant: %q", failErr, want)
-	}
-}
-
-// Regression test for round 2 review finding 1: Failed must clear the
-// outstanding checkout and fence the stream as one indivisible step. The
-// pre-fix code cleared outstanding and released the lease's mutex before
-// calling into the Fencer, leaving a window in which a concurrent Next saw
-// outstanding already false but the stream not yet fenced, and handed out
-// the very seq Failed was in the middle of retiring - a resend spec
-// section 11.4 item 6 forbids, or a PUT issued after this instance already
-// held 412 proof, which item 3 forbids. The reviewer reproduced this
-// 730/3000 times under -race; this races the same two calls the same
-// number of times, opening a fresh stream each iteration so one flaky
-// iteration cannot mask another.
-func TestConcurrentNextNeverReissuesSeqDuringFailed(t *testing.T) {
-	c, _ := newLeaseClient(t)
-	leases := journal.NewLeases(c)
-	ctx := context.Background()
-
-	const iterations = 3000
+	const iterations = 500
 	for i := 0; i < iterations; i++ {
 		stream := journal.StreamID(fmt.Sprintf("repo-race1-%d", i))
 		lease, err := leases.Open(ctx, stream)
 		if err != nil {
 			t.Fatalf("iteration %d: Open: %v", i, err)
 		}
-		seq, err := lease.Next()
-		if err != nil {
-			t.Fatalf("iteration %d: Next: %v", i, err)
+
+		started := make(chan struct{})
+		release := make(chan struct{})
+		firstDone := make(chan error, 1)
+		go func() {
+			firstDone <- lease.Append(func(journal.Seq) error {
+				close(started)
+				<-release
+				return journal.ErrOutcomeUnknown
+			})
+		}()
+
+		<-started
+
+		racerRan := false
+		raceErr := lease.Append(func(journal.Seq) error {
+			racerRan = true
+			return nil
+		})
+		close(release)
+		<-firstDone
+
+		if racerRan {
+			t.Fatalf("iteration %d: concurrent Append's fn ran while the first Append was still in flight", i)
 		}
-
-		var (
-			wg      sync.WaitGroup
-			raceSeq journal.Seq
-			raceErr error
-		)
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			_ = lease.Failed(seq, journal.ErrOutcomeUnknown)
-		}()
-		go func() {
-			defer wg.Done()
-			raceSeq, raceErr = lease.Next()
-		}()
-		wg.Wait()
-
 		if raceErr == nil {
-			t.Fatalf("iteration %d: concurrent Next() succeeded with seq %d while Failed(%d, ErrOutcomeUnknown) was racing it - the outstanding seq was reissued", i, raceSeq, seq)
+			t.Fatalf("iteration %d: concurrent Append unexpectedly succeeded while the first Append was still in flight", i)
 		}
-	}
-}
-
-// Regression test for round 2 review finding 2: a caller that takes a seq
-// from Next and never calls Landed or Failed at all - the true abandonment
-// case, distinct from the merely-slow contention finding 3 confirmed
-// should keep refusing without fencing - must not leave the stream
-// unwritable for the life of the process with a fix clause promising an
-// event ("wait for Landed or Failed") that can never arrive. Once
-// abandonedCheckoutGrace has passed with no release, the next Next() call
-// must fence the stream through the same unknown-outcome path Failed uses,
-// so the operator is told the one remedy that actually works (restart)
-// instead of one that cannot be performed.
-func TestAbandonedCheckoutFencesAfterGracePeriod(t *testing.T) {
-	restore := journal.SetAbandonedCheckoutGraceForTest(20 * time.Millisecond)
-	defer restore()
-
-	c, _ := newLeaseClient(t)
-	leases := journal.NewLeases(c)
-	ctx := context.Background()
-
-	lease, err := leases.Open(ctx, "repo-mu-abandoned")
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-
-	seq, err := lease.Next()
-	if err != nil {
-		t.Fatalf("first Next: %v", err)
-	}
-
-	// Immediately after: still within the grace period, so this is
-	// ordinary contention, not abandonment - refuses, but must not fence.
-	if _, err := lease.Next(); err == nil {
-		t.Fatalf("expected an immediate second Next() to refuse")
-	} else if errors.Is(err, journal.ErrFenced) {
-		t.Fatalf("a fresh outstanding checkout must not fence the stream, got %v", err)
-	}
-
-	// The original caller never calls Landed or Failed for seq - simulating
-	// a marshal error, cancelled context, or any other abandonment.
-	time.Sleep(40 * time.Millisecond)
-
-	_, err = lease.Next()
-	if err == nil {
-		t.Fatalf("expected Next() to refuse once the checkout has been outstanding past the grace period")
-	}
-	if !errors.Is(err, journal.ErrFenced) {
-		t.Fatalf("expected an abandoned checkout past its grace period to fence the stream, got %v (fenced=%v)", err, lease.Fencer().IsFenced("repo-mu-abandoned"))
-	}
-	if strings.ContainsAny(err.Error(), "\n\r") {
-		t.Errorf("refusal is not a single line: %q", err.Error())
-	}
-	if !lease.Fencer().IsFenced("repo-mu-abandoned") {
-		t.Fatalf("stream must be fenced after the abandoned checkout's grace period elapses")
-	}
-	fencedSeq, ok := lease.Fencer().FencedSeq("repo-mu-abandoned")
-	if !ok || fencedSeq != seq {
-		t.Errorf("fenced seq = %d (ok=%v), want the abandoned seq %d", fencedSeq, ok, seq)
-	}
-
-	// From here it behaves like any other fenced stream: zero-network-call
-	// refusal, every time.
-	if _, err := lease.Next(); !errors.Is(err, journal.ErrFenced) {
-		t.Errorf("expected every subsequent Next() to refuse fenced, got %v", err)
+		if errors.Is(raceErr, journal.ErrFenced) {
+			t.Fatalf("iteration %d: ordinary contention with an in-flight Append must not itself read as fenced: %v", i, raceErr)
+		}
 	}
 }
 

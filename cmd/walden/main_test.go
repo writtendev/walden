@@ -18,6 +18,7 @@ import (
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/journal"
+	"github.com/writtendev/walden/internal/store"
 	"github.com/writtendev/walden/internal/store/storetest"
 )
 
@@ -1448,5 +1449,89 @@ func TestServeJournalLessBootWritesNoSigningKey(t *testing.T) {
 	}
 	if _, err := os.Stat(journal.SigningKeyPath(dataDir)); !os.IsNotExist(err) {
 		t.Errorf("expected no signing.key in journal-less mode, stat err = %v", err)
+	}
+}
+
+// TestServeFirstBootWithJournalJournalsAdminToken covers WALD-33: when a
+// journal is configured, the first-boot admin token is journaled to
+// _meta -- a token_create record at seq 1, right after genesis's own seq
+// 0 -- before it is written to tokens.json, and a second boot (the local
+// store is no longer empty) mints and journals nothing further.
+func TestServeFirstBootWithJournalJournalsAdminToken(t *testing.T) {
+	dataDir := t.TempDir()
+	setJournalCreds(t)
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+
+	var stdout, stderr bytes.Buffer
+	if err := runServe(cancelledContext(), []string{
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("runServe failed: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "admin token: walden_") {
+		t.Fatalf("expected stdout to contain 'admin token: walden_', got:\n%s", out)
+	}
+	var token string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "admin token: ") {
+			token = strings.TrimPrefix(line, "admin token: ")
+			break
+		}
+	}
+	if token == "" {
+		t.Fatal("failed to extract admin token from output")
+	}
+
+	j, err := store.ResolveJournal(journalURL, os.LookupEnv)
+	if err != nil {
+		t.Fatalf("ResolveJournal: %v", err)
+	}
+	c := store.NewClient(j)
+	chain, table, err := c.ReplayMetaTable(context.Background())
+	if err != nil {
+		t.Fatalf("ReplayMetaTable: %v", err)
+	}
+	if chain.LastMetaSeq() != 1 {
+		t.Errorf("LastMetaSeq() = %d, want 1 (genesis at 0, the admin token_create at 1)", chain.LastMetaSeq())
+	}
+	row, ok := table.Row(auth.AdminTokenID)
+	if !ok {
+		t.Fatal("the journal's rebuilt token table does not hold the admin token")
+	}
+	if row.TokenHash != auth.HashToken(token) {
+		t.Errorf("journaled token hash %q != HashToken(printed token) = %q", row.TokenHash, auth.HashToken(token))
+	}
+	if row.Revoked {
+		t.Error("the admin token came back revoked")
+	}
+	if got, want := strings.Join(row.Scopes, ","), "rwc:*"; got != want {
+		t.Errorf("journaled scopes = %q, want %q", got, want)
+	}
+
+	// Second boot: the local store already holds a token, so
+	// EnsureAdminToken mints nothing further and _meta gains no further
+	// record.
+	var stdout2, stderr2 bytes.Buffer
+	if err := runServe(cancelledContext(), []string{
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	}, &stdout2, &stderr2); err != nil {
+		t.Fatalf("second runServe failed: %v", err)
+	}
+	if strings.Contains(stdout2.String(), "admin token:") {
+		t.Errorf("second boot must not mint or print an admin token, got:\n%s", stdout2.String())
+	}
+	chain2, _, err := c.ReplayMetaTable(context.Background())
+	if err != nil {
+		t.Fatalf("ReplayMetaTable after second boot: %v", err)
+	}
+	if chain2.LastMetaSeq() != 1 {
+		t.Errorf("LastMetaSeq() after second boot = %d, want 1 (unchanged: no further token record written)", chain2.LastMetaSeq())
 	}
 }

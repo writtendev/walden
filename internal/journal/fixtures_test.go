@@ -1184,20 +1184,19 @@ func TestFixtureConditionalAppend(t *testing.T) {
 	}
 }
 
-// fixtureToken is one row of a token table rebuilt from the meta stream: the hash a bearer
-// token is looked up by, what it may touch, and whether it still may.
-type fixtureToken struct {
-	hash    string
-	scopes  []string
-	revoked bool
-}
-
 // TestFixtureTokenTableReplay covers the promise ARCHITECTURE.md's Auth section makes for
 // built-in tokens: they are "journaled to the meta stream, so restore restores your tokens
 // too". A restore holds the journal and nothing else — the local token store died with the
-// disk — so this rebuilds the table from the meta records alone and asserts that what comes
-// back is a table a server could serve from: a hash to look a request up by, and the scopes
-// to answer it with.
+// disk — so this rebuilds the table from the meta records alone, through the production
+// journal.TokenTable type (WALD-33), and asserts that what comes back is a table a server
+// could serve from: a hash to look a request up by, and the scopes to answer it with.
+//
+// This is the acceptance test for journal.TokenTable itself: it used to carry its own inline
+// map and its own inline rule-10/11/12 t.Errorf strings, duplicating exactly the logic
+// TokenTable now owns. If a rewrite driving the production type changed what this test
+// concludes about the golden journal, the type would be wrong, not the test — see
+// TestTokenTableReusedTokenIDRefused and its siblings (tokentable_test.go) for the same
+// rules pinned in isolation, byte for byte.
 //
 // It walks the whole stream rather than the records it expects, so a token record appended
 // later is replayed here too, and a type nobody taught this loop about is reported rather
@@ -1215,7 +1214,7 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 	sort.Strings(names)
 
 	chain := journal.NewSigningChain()
-	table := make(map[string]*fixtureToken, len(names))
+	table := journal.NewTokenTable()
 
 	for i, name := range names {
 		seq := journal.Seq(i)
@@ -1259,10 +1258,9 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 			if rec.Seq != seq {
 				t.Errorf("%s: record seq = %d does not match its key", path, rec.Seq)
 			}
-			if _, exists := table[rec.TokenID]; exists {
-				t.Errorf("%s: token create at seq %d reuses token id %s", path, rec.Seq, rec.TokenID)
+			if err := table.ApplyTokenCreate(rec); err != nil {
+				t.Fatalf("ApplyTokenCreate failed on %s: %v", path, err)
 			}
-			table[rec.TokenID] = &fixtureToken{hash: rec.TokenHash, scopes: rec.Scopes}
 			if err := chain.AdvanceMetaSeq(rec.Seq); err != nil {
 				t.Fatalf("AdvanceMetaSeq failed on %s: %v", path, err)
 			}
@@ -1277,14 +1275,8 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 			if rec.Seq != seq {
 				t.Errorf("%s: record seq = %d does not match its key", path, rec.Seq)
 			}
-			existing, exists := table[rec.TokenID]
-			switch {
-			case !exists:
-				t.Errorf("%s: token revoke at seq %d names unknown token %s", path, rec.Seq, rec.TokenID)
-			case existing.hash != rec.TokenHash:
-				t.Errorf("%s: token revoke at seq %d disagrees with the hash recorded for token %s", path, rec.Seq, rec.TokenID)
-			default:
-				existing.revoked = true
+			if err := table.ApplyTokenRevoke(rec); err != nil {
+				t.Fatalf("ApplyTokenRevoke failed on %s: %v", path, err)
 			}
 			if err := chain.AdvanceMetaSeq(rec.Seq); err != nil {
 				t.Fatalf("AdvanceMetaSeq failed on %s: %v", path, err)
@@ -1297,33 +1289,34 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 	if chain.LastMetaSeq() != fixtureMetaHeadSeq {
 		t.Errorf("the meta replay ended at seq %d, want %d", chain.LastMetaSeq(), fixtureMetaHeadSeq)
 	}
-	if len(table) != 2 {
-		t.Fatalf("the rebuilt token table holds %d tokens, want 2", len(table))
+	rows := table.Rows()
+	if len(rows) != 2 {
+		t.Fatalf("the rebuilt token table holds %d tokens, want 2", len(rows))
 	}
 
 	// The rebuilt rows are held against the tokens spec/auth/v1 publishes under the same two
 	// identifiers, read from that file rather than restated here, so that the printed claim
 	// that the two fixture sets agree on hash and scopes is a claim a test can fail.
-	admin, ok := table[fixtureAdminTokenID]
+	admin, ok := table.Row(fixtureAdminTokenID)
 	if !ok {
 		t.Fatalf("the rebuilt token table lost %s", fixtureAdminTokenID)
 	}
-	if !admin.revoked {
+	if !admin.Revoked {
 		t.Errorf("%s is revoked on the meta stream but came back live", fixtureAdminTokenID)
 	}
 	assertFixtureTokenMatchesAuthSpec(t, fixtureAdminTokenID, admin)
 
 	// The two-scope case: a single scope field cannot carry this token at all, which is why
 	// the record has an array. Both scopes survive the round trip, in the order written.
-	writer, ok := table[fixtureWriterTokenID]
+	writer, ok := table.Row(fixtureWriterTokenID)
 	if !ok {
 		t.Fatalf("the rebuilt token table lost %s", fixtureWriterTokenID)
 	}
-	if writer.revoked {
+	if writer.Revoked {
 		t.Errorf("%s is never revoked on the meta stream but came back revoked", fixtureWriterTokenID)
 	}
 	assertFixtureTokenMatchesAuthSpec(t, fixtureWriterTokenID, writer)
-	if got, want := strings.Join(writer.scopes, ","), "rw:blog-*,r:docs"; got != want {
+	if got, want := strings.Join(writer.Scopes, ","), "rw:blog-*,r:docs"; got != want {
 		t.Errorf("%s scopes = %q, want %q", fixtureWriterTokenID, got, want)
 	}
 }
@@ -1336,13 +1329,13 @@ func TestFixtureTokenTableReplay(t *testing.T) {
 // what stops the two trees drifting out of it. Revocation state is not part of the claim and
 // is not checked here: the journal is authoritative for that, and the auth fixtures publish
 // their own table.
-func assertFixtureTokenMatchesAuthSpec(t *testing.T, tokenID string, row *fixtureToken) {
+func assertFixtureTokenMatchesAuthSpec(t *testing.T, tokenID string, row *journal.TokenRow) {
 	t.Helper()
 	published := loadFixtureBuiltinToken(t, tokenID)
-	if got, want := row.hash, fixtureTokenHash(published.RawToken); got != want {
+	if got, want := row.TokenHash, fixtureTokenHash(published.RawToken); got != want {
 		t.Errorf("%s hash in the golden journal = %q, want the SHA-256 of the raw token spec/auth/v1/fixtures/builtin_tokens.json publishes for it, %q", tokenID, got, want)
 	}
-	if got, want := strings.Join(row.scopes, ","), strings.Join(published.Scopes, ","); got != want {
+	if got, want := strings.Join(row.Scopes, ","), strings.Join(published.Scopes, ","); got != want {
 		t.Errorf("%s scopes in the golden journal = %q, want the scopes spec/auth/v1/fixtures/builtin_tokens.json publishes for it, %q", tokenID, got, want)
 	}
 }

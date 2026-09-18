@@ -12,6 +12,8 @@ import (
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/journal"
+	"github.com/writtendev/walden/internal/store"
+	"github.com/writtendev/walden/internal/store/storetest"
 )
 
 func TestTokenCreateSuccess(t *testing.T) {
@@ -552,5 +554,273 @@ func TestTokenUnexpectedArguments(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unexpected argument: extra-arg") {
 		t.Errorf("expected unexpected argument refusal, got %v", err)
+	}
+}
+
+// bootJournal boots a fresh signing identity for dataDir against a fake
+// journal (mirroring rotate_test.go's own pattern) and returns the
+// --journal URL every test below passes straight through to `walden
+// token create`/`walden token revoke`.
+func bootJournal(t *testing.T, dataDir string) string {
+	t.Helper()
+	setJournalCreds(t)
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+
+	var stdout, stderr bytes.Buffer
+	if err := runServe(cancelledContext(), []string{
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("runServe (mint) failed: %v", err)
+	}
+	return journalURL
+}
+
+// replayJournalTable replays the journal at journalURL and returns its
+// rebuilt token table, for assertions independent of the CLI's own
+// output.
+func replayJournalTable(t *testing.T, journalURL string) (*journal.SigningChain, *journal.TokenTable) {
+	t.Helper()
+	j, err := store.ResolveJournal(journalURL, os.LookupEnv)
+	if err != nil {
+		t.Fatalf("ResolveJournal: %v", err)
+	}
+	c := store.NewClient(j)
+	chain, table, err := c.ReplayMetaTable(context.Background())
+	if err != nil {
+		t.Fatalf("ReplayMetaTable: %v", err)
+	}
+	return chain, table
+}
+
+// TestTokenCreateWithJournalWritesMetaRecordAndDisk covers WALD-33's "how
+// to know it worked" item 8: `walden token create` against a fake journal
+// writes both the _meta record and tokens.json, and prints the raw token
+// only on full success.
+func TestTokenCreateWithJournalWritesMetaRecordAndDisk(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--allow", "rw:blog-*", "--id", "tok_journaled"}
+	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+	rawToken := strings.TrimSpace(stdout.String())
+	if !strings.HasPrefix(rawToken, "walden_") {
+		t.Fatalf("expected token with prefix walden_, got %q", rawToken)
+	}
+
+	_, table := replayJournalTable(t, journalURL)
+	row, ok := table.Row("tok_journaled")
+	if !ok {
+		t.Fatal("the journal's rebuilt token table does not hold tok_journaled")
+	}
+	if row.TokenHash != auth.HashToken(rawToken) {
+		t.Errorf("journaled hash %q != HashToken(printed token) = %q", row.TokenHash, auth.HashToken(rawToken))
+	}
+	if got, want := strings.Join(row.Scopes, ","), "rw:blog-*"; got != want {
+		t.Errorf("journaled scopes = %q, want %q", got, want)
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), "tok_journaled")
+	if err != nil {
+		t.Fatalf("GetTokenByID: %v", err)
+	}
+	if rec.TokenHash != auth.HashToken(rawToken) {
+		t.Errorf("tokens.json hash %q != HashToken(printed token) = %q", rec.TokenHash, auth.HashToken(rawToken))
+	}
+}
+
+// TestTokenCreateWithJournalReusedIDRefusesBeforeAnyPut covers the
+// uniqueness pre-check: a create whose id the journal already holds
+// refuses in one line before any PUT, and tokens.json gains no row for
+// it.
+func TestTokenCreateWithJournalReusedIDRefusesBeforeAnyPut(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	first := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_dup"}
+	if err := run(context.Background(), first, &stdout, &stderr); err != nil {
+		t.Fatalf("first run token create failed: %v", err)
+	}
+
+	chainBefore, _ := replayJournalTable(t, journalURL)
+	seqBefore := chainBefore.LastMetaSeq()
+
+	stdout.Reset()
+	stderr.Reset()
+	second := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_dup"}
+	err := run(context.Background(), second, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected the second create with a reused id to refuse")
+	}
+	if !errors.Is(err, auth.ErrTokenExists) {
+		t.Errorf("errors.Is(_, auth.ErrTokenExists) = false, err = %v", err)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+	if stdout.String() != "" {
+		t.Errorf("expected no token printed on a refused create, got %q", stdout.String())
+	}
+
+	chainAfter, _ := replayJournalTable(t, journalURL)
+	if chainAfter.LastMetaSeq() != seqBefore {
+		t.Errorf("LastMetaSeq() = %d after the refused create, want unchanged %d (no PUT should have happened)", chainAfter.LastMetaSeq(), seqBefore)
+	}
+
+	// tokens.json must not have gained a second row either.
+	store := auth.NewFileTokenStore(dataDir)
+	tokens, err := store.ListTokens(context.Background())
+	if err != nil {
+		t.Fatalf("ListTokens: %v", err)
+	}
+	count := 0
+	for _, tok := range tokens {
+		if tok.TokenID == "tok_dup" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("tokens.json holds %d rows named tok_dup, want 1", count)
+	}
+}
+
+// TestTokenRevokeWithJournalJournalsThenMutates covers the revoke half of
+// "how to know it worked" item 8: `walden token revoke` journals then
+// mutates tokens.json.
+func TestTokenRevokeWithJournalJournalsThenMutates(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_to_revoke"}
+	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	revoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_to_revoke"}
+	if err := run(context.Background(), revoke, &stdout, &stderr); err != nil {
+		t.Fatalf("run token revoke failed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "revoked token tok_to_revoke") {
+		t.Errorf("expected confirmation line, got %q", stdout.String())
+	}
+
+	_, table := replayJournalTable(t, journalURL)
+	row, ok := table.Row("tok_to_revoke")
+	if !ok {
+		t.Fatal("the journal's rebuilt token table lost tok_to_revoke")
+	}
+	if !row.Revoked {
+		t.Error("the journal's rebuilt table shows tok_to_revoke as live, want revoked")
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), "tok_to_revoke")
+	if err != nil {
+		t.Fatalf("GetTokenByID: %v", err)
+	}
+	if !rec.Revoked {
+		t.Error("tokens.json still shows tok_to_revoke as live")
+	}
+}
+
+// TestTokenRevokeWithJournalUnknownOrAlreadyRevokedRefusesWithoutAppending
+// covers the same "without appending" guarantee create's uniqueness
+// check gives, on the revoke side: an unknown id and an already-revoked
+// id both refuse before any further _meta record lands.
+func TestTokenRevokeWithJournalUnknownOrAlreadyRevokedRefusesWithoutAppending(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_live"}
+	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+
+	t.Run("unknown id", func(t *testing.T) {
+		chainBefore, _ := replayJournalTable(t, journalURL)
+
+		var out, errOut bytes.Buffer
+		args := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_ghost"}
+		err := run(context.Background(), args, &out, &errOut)
+		if err == nil {
+			t.Fatal("expected revoking an unknown id to refuse")
+		}
+		if !errors.Is(err, auth.ErrTokenNotFound) {
+			t.Errorf("errors.Is(_, auth.ErrTokenNotFound) = false, err = %v", err)
+		}
+		if strings.Count(err.Error(), "\n") != 0 {
+			t.Errorf("refusal is not one line: %q", err.Error())
+		}
+
+		chainAfter, _ := replayJournalTable(t, journalURL)
+		if chainAfter.LastMetaSeq() != chainBefore.LastMetaSeq() {
+			t.Errorf("LastMetaSeq() changed from %d to %d; an unknown id must not append", chainBefore.LastMetaSeq(), chainAfter.LastMetaSeq())
+		}
+	})
+
+	t.Run("already revoked", func(t *testing.T) {
+		var out, errOut bytes.Buffer
+		firstRevoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_live"}
+		if err := run(context.Background(), firstRevoke, &out, &errOut); err != nil {
+			t.Fatalf("first revoke failed: %v", err)
+		}
+
+		chainBefore, _ := replayJournalTable(t, journalURL)
+
+		out.Reset()
+		errOut.Reset()
+		secondRevoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_live"}
+		err := run(context.Background(), secondRevoke, &out, &errOut)
+		if err == nil {
+			t.Fatal("expected revoking an already-revoked id to refuse")
+		}
+		if !errors.Is(err, auth.ErrTokenAlreadyRevoked) {
+			t.Errorf("errors.Is(_, auth.ErrTokenAlreadyRevoked) = false, err = %v", err)
+		}
+		if strings.Count(err.Error(), "\n") != 0 {
+			t.Errorf("refusal is not one line: %q", err.Error())
+		}
+
+		chainAfter, _ := replayJournalTable(t, journalURL)
+		if chainAfter.LastMetaSeq() != chainBefore.LastMetaSeq() {
+			t.Errorf("LastMetaSeq() changed from %d to %d; an already-revoked id must not append", chainBefore.LastMetaSeq(), chainAfter.LastMetaSeq())
+		}
+	})
+}
+
+// TestTokenCreateNoJournalBehavesAsBefore pins that omitting --journal (and
+// leaving WALDEN_JOURNAL unset) behaves exactly as it did before this
+// ticket: no network access, disk-only.
+func TestTokenCreateNoJournalBehavesAsBefore(t *testing.T) {
+	dataDir := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_no_journal"}
+	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+	rawToken := strings.TrimSpace(stdout.String())
+	if !strings.HasPrefix(rawToken, "walden_") {
+		t.Fatalf("expected token with prefix walden_, got %q", rawToken)
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), "tok_no_journal")
+	if err != nil {
+		t.Fatalf("GetTokenByID: %v", err)
+	}
+	if rec.TokenHash != auth.HashToken(rawToken) {
+		t.Errorf("tokens.json hash %q != HashToken(printed token) = %q", rec.TokenHash, auth.HashToken(rawToken))
 	}
 }

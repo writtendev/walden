@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/config"
 	"github.com/writtendev/walden/internal/githttp"
+	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/refusal"
 	"github.com/writtendev/walden/internal/store"
 )
@@ -147,12 +149,16 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	// check a URL on a machine that holds no secrets; it still names where
 	// the credentials would come from, so it cannot report an unresolved
 	// journal that would in fact boot.
-	var journal *store.Journal
+	// Named jrnl, not journal: this function also needs the internal/journal
+	// package below (leases, MetaStreamID) to build the admin token's
+	// journalFn (WALD-33), and a local variable named journal would shadow
+	// that package import for the rest of this function.
+	var jrnl *store.Journal
 	if cfg.JournalURL != "" {
 		if printConfig {
-			journal, err = store.ParseJournalURL(cfg.JournalURL, os.LookupEnv)
+			jrnl, err = store.ParseJournalURL(cfg.JournalURL, os.LookupEnv)
 		} else {
-			journal, err = store.ResolveJournal(cfg.JournalURL, os.LookupEnv)
+			jrnl, err = store.ResolveJournal(cfg.JournalURL, os.LookupEnv)
 		}
 		if err != nil {
 			return err
@@ -161,8 +167,8 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 
 	if printConfig {
 		fmt.Fprintln(stdout, cfg.String())
-		if journal != nil {
-			fmt.Fprintln(stdout, journal.String())
+		if jrnl != nil {
+			fmt.Fprintln(stdout, jrnl.String())
 		}
 		return nil
 	}
@@ -183,9 +189,16 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	// an already-cancelled ctx to make boot return once it has bound and
 	// printed - tying the probe to that ctx would make it spuriously fail
 	// before it ever reaches the bucket.
-	if journal != nil {
+	// journalClient is created once, here, when a journal is configured at
+	// all, and reused below for EnsureGenesis and (WALD-33) for journaling
+	// the first-boot admin token — rather than a fresh store.NewClient(jrnl)
+	// at each call site, which is all the pre-WALD-33 code did because it
+	// had only one caller after this point.
+	var journalClient *store.Client
+	if jrnl != nil {
+		journalClient = store.NewClient(jrnl)
 		probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-		cleanup, err := store.NewClient(journal).ProbeCAS(probeCtx)
+		cleanup, err := journalClient.ProbeCAS(probeCtx)
 		cancel()
 		if cleanup != nil {
 			fmt.Fprintf(stderr, "walden: WARNING: %v\n", cleanup)
@@ -222,13 +235,24 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	// with an already-cancelled ctx to make boot return once it has bound
 	// and printed — tying this to that ctx would make it spuriously fail
 	// before it ever reaches the bucket.
-	if journal != nil {
+	// signingChain and signingPriv are set only when jrnl != nil, exactly
+	// the condition journalFn below is built under: EnsureGenesis is the
+	// one place this process learns both the verified signing chain and
+	// the private key active at its head, and (WALD-33) the admin token's
+	// journalFn reuses both rather than replaying _meta a second time at
+	// boot just to relearn what this call already knows.
+	var (
+		signingChain *journal.SigningChain
+		signingPriv  ed25519.PrivateKey
+	)
+	if jrnl != nil {
 		genesisCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-		chain, _, minted, err := store.NewClient(journal).EnsureGenesis(genesisCtx, cfg.DataDir, time.Now)
+		chain, priv, minted, err := journalClient.EnsureGenesis(genesisCtx, cfg.DataDir, time.Now)
 		cancel()
 		if err != nil {
 			return err
 		}
+		signingChain, signingPriv = chain, priv
 		outcome := "adopted"
 		if minted {
 			outcome = "minted"
@@ -259,8 +283,43 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		)
 	}
 
+	// journalFn (WALD-33) is non-nil only when a journal is configured: it
+	// journals the first-boot admin token to _meta before EnsureAdminToken
+	// commits it to tokenStore, the same journal-then-disk order
+	// cmd/walden/token.go's helper gives `walden token create`. It reuses
+	// signingChain and signingPriv from EnsureGenesis above rather than
+	// replaying _meta a second time, and opens its own *journal.Lease on
+	// journalClient's registry — a fresh Leases per boot, since this
+	// process has appended nothing to _meta yet.
+	//
+	// Like ProbeCAS and EnsureGenesis above, this ignores the ctx
+	// EnsureAdminToken hands it and uses its own bounded
+	// context.Background(), for the identical reason those two give: this
+	// runs during boot, before anything has a reason to gracefully stop,
+	// and the end-to-end tests boot with an already-cancelled ctx to make
+	// boot return once it has bound and printed — tying this call to that
+	// ctx would make it spuriously fail before it ever reaches the bucket.
+	var journalFn func(context.Context, *auth.TokenRecord) error
+	if journalClient != nil {
+		leases := journal.NewLeases(journalClient)
+		journalFn = func(_ context.Context, rec *auth.TokenRecord) error {
+			journalCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			defer cancel()
+			lease, err := leases.Open(journalCtx, journal.MetaStreamID)
+			if err != nil {
+				return err
+			}
+			scopes := make([]string, len(rec.Scopes))
+			for i, s := range rec.Scopes {
+				scopes[i] = s.String()
+			}
+			_, err = journalClient.AppendTokenCreate(journalCtx, lease, signingPriv, signingChain, rec.TokenID, rec.TokenHash, scopes, time.Now)
+			return err
+		}
+	}
+
 	if cfg.AuthTrustKey == "" {
-		adminToken, err := auth.EnsureAdminToken(ctx, tokenStore)
+		adminToken, err := auth.EnsureAdminToken(ctx, tokenStore, journalFn)
 		if err != nil {
 			ln.Close()
 			return err

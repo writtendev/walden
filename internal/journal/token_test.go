@@ -363,3 +363,163 @@ func TestTokenHashRefusalWithholdsTheValue(t *testing.T) {
 		t.Errorf("ValidateTokenID should name the identifier it refused, got %v", idErr)
 	}
 }
+
+// TestNewTokenCreateRecord covers NewTokenCreateRecord's fixed fields and its scopes clone
+// (WALD-33): the record is built with version/stream/type fixed, seq and timestamp from the
+// caller, unsigned, and scopes independent of the slice the caller passed in.
+func TestNewTokenCreateRecord(t *testing.T) {
+	scopes := []string{"rw:blog-*", "r:docs"}
+	rec := journal.NewTokenCreateRecord(4, "tok_writer_02", "sha256:5453e0186b8b6f1d4852424e8ae33ecf685ce338a44862fc8db2acddc7b40d2a", scopes, "2026-08-31T00:09:00Z")
+
+	if rec.Version != journal.VersionPrefix {
+		t.Errorf("Version = %q, want %q", rec.Version, journal.VersionPrefix)
+	}
+	if rec.Stream != journal.MetaStreamID {
+		t.Errorf("Stream = %q, want %q", rec.Stream, journal.MetaStreamID)
+	}
+	if rec.Type != journal.RecordTypeTokenCreate {
+		t.Errorf("Type = %q, want %q", rec.Type, journal.RecordTypeTokenCreate)
+	}
+	if rec.Seq != 4 {
+		t.Errorf("Seq = %d, want 4", rec.Seq)
+	}
+	if rec.Signature != "" {
+		t.Errorf("Signature = %q, want unsigned", rec.Signature)
+	}
+	if got, want := strings.Join(rec.Scopes, ","), strings.Join(scopes, ","); got != want {
+		t.Errorf("Scopes = %q, want %q", got, want)
+	}
+
+	// The clone is real: mutating the caller's slice after the call must not reach the
+	// record.
+	scopes[0] = "rwc:*"
+	if rec.Scopes[0] == "rwc:*" {
+		t.Error("NewTokenCreateRecord aliased the caller's scopes slice instead of cloning it")
+	}
+
+	if err := journal.SignTokenCreate(fixtureKey(0x01), rec); err != nil {
+		t.Fatalf("SignTokenCreate on a freshly constructed record failed: %v", err)
+	}
+}
+
+// TestNewTokenRevokeRecord is TestNewTokenCreateRecord's counterpart for token_revoke.
+func TestNewTokenRevokeRecord(t *testing.T) {
+	rec := journal.NewTokenRevokeRecord(3, "tok_admin_01", "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb", "2026-08-31T00:08:00Z")
+
+	if rec.Version != journal.VersionPrefix {
+		t.Errorf("Version = %q, want %q", rec.Version, journal.VersionPrefix)
+	}
+	if rec.Stream != journal.MetaStreamID {
+		t.Errorf("Stream = %q, want %q", rec.Stream, journal.MetaStreamID)
+	}
+	if rec.Type != journal.RecordTypeTokenRevoke {
+		t.Errorf("Type = %q, want %q", rec.Type, journal.RecordTypeTokenRevoke)
+	}
+	if rec.Seq != 3 {
+		t.Errorf("Seq = %d, want 3", rec.Seq)
+	}
+	if rec.Signature != "" {
+		t.Errorf("Signature = %q, want unsigned", rec.Signature)
+	}
+
+	if err := journal.SignTokenRevoke(fixtureKey(0x01), rec); err != nil {
+		t.Fatalf("SignTokenRevoke on a freshly constructed record failed: %v", err)
+	}
+}
+
+// TestMarshalTokenCreateRoundTrip covers MarshalTokenCreate's happy path: a signed,
+// two-scope record marshals to indented JSON with a trailing newline and parses/verifies
+// back to the same record (WALD-33).
+func TestMarshalTokenCreateRoundTrip(t *testing.T) {
+	priv, pub := deterministicKeypair(0x03)
+	rec := journal.NewTokenCreateRecord(4, "tok_writer_02", "sha256:5453e0186b8b6f1d4852424e8ae33ecf685ce338a44862fc8db2acddc7b40d2a", []string{"rw:blog-*", "r:docs"}, "2026-08-31T00:09:00Z")
+	if err := journal.SignTokenCreate(priv, rec); err != nil {
+		t.Fatalf("SignTokenCreate failed: %v", err)
+	}
+
+	data, err := journal.MarshalTokenCreate(rec)
+	if err != nil {
+		t.Fatalf("MarshalTokenCreate failed: %v", err)
+	}
+	if data[len(data)-1] != '\n' {
+		t.Error("MarshalTokenCreate did not append a trailing newline")
+	}
+
+	parsed, err := journal.ParseTokenCreate(data)
+	if err != nil {
+		t.Fatalf("ParseTokenCreate on the marshaled record failed: %v", err)
+	}
+	if err := journal.VerifyTokenCreate(parsed, journal.FormatPublicKey(pub)); err != nil {
+		t.Errorf("VerifyTokenCreate on the round-tripped record failed: %v", err)
+	}
+	if got, want := strings.Join(parsed.Scopes, ","), "rw:blog-*,r:docs"; got != want {
+		t.Errorf("scopes round-tripped to %q, want %q", got, want)
+	}
+
+	if _, err := journal.MarshalTokenCreate(nil); err == nil {
+		t.Error("MarshalTokenCreate accepted a nil record")
+	}
+}
+
+// TestMarshalTokenCreateRefusesInvalidUTF8Scope covers WALD-33's UTF-8 guard: a scope
+// carrying invalid UTF-8 would otherwise be silently replaced with U+FFFD by
+// json.MarshalIndent, producing a record whose bytes no longer match the ones its
+// signature was computed over. MarshalTokenCreate refuses it by index instead of writing
+// it, the same treatment MarshalRefTx gives a non-UTF-8 ref name.
+func TestMarshalTokenCreateRefusesInvalidUTF8Scope(t *testing.T) {
+	priv, _ := deterministicKeypair(0x03)
+	rec := journal.NewTokenCreateRecord(1, "tok_admin_01", "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb", []string{"rwc:*"}, "2026-08-31T00:01:00Z")
+	// Slip the invalid byte in after signing (a signature computed over the honest scope
+	// still lets Validate pass, which is exactly the case MarshalTokenCreate's own doc
+	// comment says ValidateTokenScope does not catch): ValidateTokenScope bans only
+	// 0x00-0x1F and 0x7F, and 0xFF alone is not.
+	if err := journal.SignTokenCreate(priv, rec); err != nil {
+		t.Fatalf("SignTokenCreate failed: %v", err)
+	}
+	rec.Scopes = []string{"rwc:*", "r:doc\xffs"}
+	if err := rec.Validate(); err != nil {
+		t.Fatalf("test no longer demonstrates the gap ValidateTokenScope leaves open: Validate itself now refuses this scope: %v", err)
+	}
+
+	_, err := journal.MarshalTokenCreate(rec)
+	if err == nil {
+		t.Fatal("MarshalTokenCreate accepted a scope that is not valid UTF-8")
+	}
+	if !errors.Is(err, journal.ErrInvalidTokenScope) {
+		t.Errorf("error = %v, want ErrInvalidTokenScope", err)
+	}
+	if !strings.Contains(err.Error(), "scopes[1]") {
+		t.Errorf("error does not name the offending index: %v", err)
+	}
+}
+
+// TestMarshalTokenRevokeRoundTrip is TestMarshalTokenCreateRoundTrip's counterpart for
+// token_revoke: no scopes, so nothing for the UTF-8 guard to check, but nil is still
+// refused.
+func TestMarshalTokenRevokeRoundTrip(t *testing.T) {
+	priv, pub := deterministicKeypair(0x03)
+	rec := journal.NewTokenRevokeRecord(3, "tok_admin_01", "sha256:b807af8cbdd0849e534474c93408ecdc1593e7e3de172261bd717e6484425ceb", "2026-08-31T00:08:00Z")
+	if err := journal.SignTokenRevoke(priv, rec); err != nil {
+		t.Fatalf("SignTokenRevoke failed: %v", err)
+	}
+
+	data, err := journal.MarshalTokenRevoke(rec)
+	if err != nil {
+		t.Fatalf("MarshalTokenRevoke failed: %v", err)
+	}
+	if data[len(data)-1] != '\n' {
+		t.Error("MarshalTokenRevoke did not append a trailing newline")
+	}
+
+	parsed, err := journal.ParseTokenRevoke(data)
+	if err != nil {
+		t.Fatalf("ParseTokenRevoke on the marshaled record failed: %v", err)
+	}
+	if err := journal.VerifyTokenRevoke(parsed, journal.FormatPublicKey(pub)); err != nil {
+		t.Errorf("VerifyTokenRevoke on the round-tripped record failed: %v", err)
+	}
+
+	if _, err := journal.MarshalTokenRevoke(nil); err == nil {
+		t.Error("MarshalTokenRevoke accepted a nil record")
+	}
+}

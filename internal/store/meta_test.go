@@ -494,3 +494,159 @@ func TestReplayMetaTokenSignatureMismatchNotDoubleWrapped(t *testing.T) {
 		t.Errorf("refusal = %q, want %q (double-wrapped by refuseMetaVerificationFailed)", err.Error(), wantLine)
 	}
 }
+
+// putTokenCreate signs and writes a token_create record directly at _meta
+// seq, bypassing (*Client).AppendTokenCreate — meta_test.go exercises the
+// replay-side rebuild in isolation, so tokens_test.go is the one that
+// exercises the writer itself.
+func putTokenCreate(t *testing.T, c *store.Client, priv ed25519.PrivateKey, seq journal.Seq, tokenID, tokenHash string, scopes []string, timestamp string) {
+	t.Helper()
+	rec := journal.NewTokenCreateRecord(seq, tokenID, tokenHash, scopes, timestamp)
+	if err := journal.SignTokenCreate(priv, rec); err != nil {
+		t.Fatalf("SignTokenCreate failed: %v", err)
+	}
+	data, err := journal.MarshalTokenCreate(rec)
+	if err != nil {
+		t.Fatalf("MarshalTokenCreate failed: %v", err)
+	}
+	if err := c.PutIfAbsent(context.Background(), journal.TxKey(journal.MetaStreamID, seq), bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatalf("PutIfAbsent token_create at seq %d failed: %v", seq, err)
+	}
+}
+
+// putTokenRevoke is putTokenCreate's counterpart for token_revoke.
+func putTokenRevoke(t *testing.T, c *store.Client, priv ed25519.PrivateKey, seq journal.Seq, tokenID, tokenHash, timestamp string) {
+	t.Helper()
+	rec := journal.NewTokenRevokeRecord(seq, tokenID, tokenHash, timestamp)
+	if err := journal.SignTokenRevoke(priv, rec); err != nil {
+		t.Fatalf("SignTokenRevoke failed: %v", err)
+	}
+	data, err := journal.MarshalTokenRevoke(rec)
+	if err != nil {
+		t.Fatalf("MarshalTokenRevoke failed: %v", err)
+	}
+	if err := c.PutIfAbsent(context.Background(), journal.TxKey(journal.MetaStreamID, seq), bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatalf("PutIfAbsent token_revoke at seq %d failed: %v", seq, err)
+	}
+}
+
+// TestReplayMetaReusedTokenIDRefuses covers WALD-33: the table the walk
+// builds on every replay enforces spec section 8.1 rule 10, so a journal
+// carrying two token_create records for the same token_id refuses at
+// ReplayMeta itself -- not only when a caller separately asks for the
+// table via ReplayMetaTable.
+func TestReplayMetaReusedTokenIDRefuses(t *testing.T) {
+	c, _ := newFakeClient(t)
+	dataDir := t.TempDir()
+	_, priv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+	hash1 := journal.TokenHashPrefix + strings.Repeat("a", 64)
+	hash2 := journal.TokenHashPrefix + strings.Repeat("b", 64)
+	putTokenCreate(t, c, priv, 1, "tok_dup", hash1, []string{"rwc:*"}, "2026-09-18T00:00:00Z")
+	putTokenCreate(t, c, priv, 2, "tok_dup", hash2, []string{"r:docs"}, "2026-09-18T00:01:00Z")
+
+	_, err = c.ReplayMeta(context.Background())
+	if err == nil {
+		t.Fatal("ReplayMeta accepted a journal with a reused token id")
+	}
+	wantLine := "refusal: replay failed: token create at seq 2 reuses token id tok_dup"
+	if err.Error() != wantLine {
+		t.Errorf("refusal = %q, want %q", err.Error(), wantLine)
+	}
+}
+
+// TestReplayMetaUnknownTokenRevokedRefuses covers rule 11 the same way.
+func TestReplayMetaUnknownTokenRevokedRefuses(t *testing.T) {
+	c, _ := newFakeClient(t)
+	dataDir := t.TempDir()
+	_, priv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+	hash := journal.TokenHashPrefix + strings.Repeat("a", 64)
+	putTokenRevoke(t, c, priv, 1, "tok_ghost", hash, "2026-09-18T00:00:00Z")
+
+	_, err = c.ReplayMeta(context.Background())
+	if err == nil {
+		t.Fatal("ReplayMeta accepted a revoke naming an unknown token")
+	}
+	wantLine := "refusal: replay failed: token revoke at seq 1 names unknown token tok_ghost"
+	if err.Error() != wantLine {
+		t.Errorf("refusal = %q, want %q", err.Error(), wantLine)
+	}
+}
+
+// TestReplayMetaTokenHashDisagreementRefuses covers rule 12 the same way.
+func TestReplayMetaTokenHashDisagreementRefuses(t *testing.T) {
+	c, _ := newFakeClient(t)
+	dataDir := t.TempDir()
+	_, priv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+	hash := journal.TokenHashPrefix + strings.Repeat("a", 64)
+	wrongHash := journal.TokenHashPrefix + strings.Repeat("b", 64)
+	putTokenCreate(t, c, priv, 1, "tok_x", hash, []string{"rwc:*"}, "2026-09-18T00:00:00Z")
+	putTokenRevoke(t, c, priv, 2, "tok_x", wrongHash, "2026-09-18T00:01:00Z")
+
+	_, err = c.ReplayMeta(context.Background())
+	if err == nil {
+		t.Fatal("ReplayMeta accepted a revoke whose hash disagrees with the recorded row")
+	}
+	wantLine := "refusal: replay failed: token revoke at seq 2 disagrees with the hash recorded for token tok_x"
+	if err.Error() != wantLine {
+		t.Errorf("refusal = %q, want %q", err.Error(), wantLine)
+	}
+}
+
+// TestReplayMetaInvalidTokenRecordRefuses covers rule 13: a token_create
+// that fails to parse (here, a token_hash that is not
+// "sha256:<64-lowercase-hex>") is refused through
+// journal.RefuseInvalidTokenRecord, not refuseMetaVerificationFailed --
+// the wording correction WALD-33 makes to the two token branches only.
+func TestReplayMetaInvalidTokenRecordRefuses(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+	if _, _, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow); err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+
+	malformed := []byte(`{"version":"v1","stream":"_meta","seq":"1","type":"token_create","token_id":"tok_bad","token_hash":"not-a-hash","scopes":["rwc:*"],"timestamp":"2026-09-18T00:00:00Z","signature":"ed25519:` + strings.Repeat("00", 64) + `"}`)
+	fake.SetObject(fullKey(journal.TxKey(journal.MetaStreamID, 1)), malformed)
+
+	_, err := c.ReplayMeta(context.Background())
+	if err == nil {
+		t.Fatal("ReplayMeta accepted a token_create with a malformed token_hash")
+	}
+	if !strings.HasPrefix(err.Error(), "refusal: replay failed: invalid token record at seq 1 (") {
+		t.Errorf("refusal = %q, want it to start with the rule 13 line", err.Error())
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+}
+
+// TestReplayMetaTableBuiltOnEveryWalk covers the behaviour change WALD-33
+// calls for explicitly: the token table is built on every _meta walk, not
+// only when a caller asks for it through ReplayMetaTable, so a journal a
+// pre-WALD-33 ReplayMeta would have replayed now refuses at boot.
+func TestReplayMetaTableBuiltOnEveryWalk(t *testing.T) {
+	c, _ := newFakeClient(t)
+	dataDir := t.TempDir()
+	_, priv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+	hash := journal.TokenHashPrefix + strings.Repeat("a", 64)
+	putTokenCreate(t, c, priv, 1, "tok_dup", hash, []string{"rwc:*"}, "2026-09-18T00:00:00Z")
+	putTokenCreate(t, c, priv, 2, "tok_dup", hash, []string{"rwc:*"}, "2026-09-18T00:01:00Z")
+
+	if _, err := c.ReplayMeta(context.Background()); err == nil {
+		t.Fatal("ReplayMeta (chain-only) accepted a reused token id; the table must be enforced on every walk, not only via ReplayMetaTable")
+	}
+	if _, _, err := c.ReplayMetaTable(context.Background()); err == nil {
+		t.Fatal("ReplayMetaTable accepted a reused token id")
+	}
+}

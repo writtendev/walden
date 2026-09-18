@@ -59,11 +59,21 @@ func GenerateToken() (rawToken, tokenHash string, err error) {
 }
 
 // EnsureAdminToken ensures a first-boot admin token exists when store has no tokens.
-// If store is empty, it generates and persists an admin token with ID AdminTokenID and
-// scope "rwc:*", returning the raw bearer token. If tokens already exist, or if another
-// concurrent process wins the race to create the token (ErrTokenExists), it returns ("", nil).
-// If store is nil, it refuses under ErrStoreUnavailable.
-func EnsureAdminToken(ctx context.Context, store TokenStore) (string, error) {
+// If store is empty, it generates an admin token with ID AdminTokenID and scope "rwc:*",
+// journals it (see journalFn below), persists it, and returns the raw bearer token. If
+// tokens already exist, or if another concurrent process wins the race to create the token
+// (ErrTokenExists), it returns ("", nil). If store is nil, it refuses under
+// ErrStoreUnavailable.
+//
+// journalFn, when non-nil, is called with the built record before store.CreateToken, and
+// any error it returns is returned unchanged, with store never touched — journal first,
+// disk second (WALD-33), the same order as `walden token create`: a disk-first order that
+// then failed to journal would leave a live token the journal never heard of, breaking
+// walden's first promise. A nil journalFn is journal-less mode and behaves exactly as
+// before this parameter existed. internal/auth gains no import of internal/store from this:
+// journalFn is the caller's own closure, built from whatever store.Client and
+// journal.Leases it already has in hand (cmd/walden/main.go).
+func EnsureAdminToken(ctx context.Context, store TokenStore, journalFn func(context.Context, *TokenRecord) error) (string, error) {
 	if store == nil {
 		return "", refusal.RefuseWithCause(
 			"token store unavailable",
@@ -96,6 +106,12 @@ func EnsureAdminToken(ctx context.Context, store TokenStore) (string, error) {
 		TokenHash: tokenHash,
 		Scopes:    scopes,
 		CreatedAt: time.Now().UTC(),
+	}
+
+	if journalFn != nil {
+		if err := journalFn(ctx, record); err != nil {
+			return "", err
+		}
 	}
 
 	if err := store.CreateToken(ctx, record); err != nil {

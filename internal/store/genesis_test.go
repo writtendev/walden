@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -415,11 +416,67 @@ func TestEnsureGenesisPresentSigningKeyNeverBlocksAdopt(t *testing.T) {
 		if strings.Contains(err.Error(), "no genesis record found") {
 			t.Errorf("refusal claims no genesis record exists, but one does: %q", err.Error())
 		}
-		want := journal.RefuseSigningKeyMismatch(dataDir, rec.PublicKey, journal.FormatPublicKey(other.Public().(ed25519.PublicKey))).Error()
+		want := journal.RefuseSigningKeyMismatch(dataDir, 0, rec.PublicKey, journal.FormatPublicKey(other.Public().(ed25519.PublicKey))).Error()
 		if err.Error() != want {
 			t.Errorf("got %q, want %q", err.Error(), want)
 		}
 	})
+}
+
+// TestEnsureGenesisMismatchAfterRotationNamesRotationNotGenesis is round 1's
+// medium finding on internal/journal/genesis.go: RefuseSigningKeyMismatch
+// used to hardcode "genesis at <_meta seq 0> names <want>" even though, after
+// a rotation, chain.ActiveKey() (the key EnsureGenesis's adopt path actually
+// compares against) is no longer genesis's own public_key. Reproduces the
+// exact scenario from the review: mint, rotate once, restore the retired
+// (genesis) key to signing.key, and boot — the refusal must not claim
+// genesis names the active key, since genesis never named it in the first
+// place; it must instead name the seq _meta was replayed through.
+func TestEnsureGenesisMismatchAfterRotationNamesRotationNotGenesis(t *testing.T) {
+	c, _ := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	seedChain, genesisPriv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis (mint) failed: %v", err)
+	}
+	genesisKey := seedChain.ActiveKey()
+
+	leases := journal.NewLeases(c)
+	_, activeKey, err := c.RotateKey(context.Background(), dataDir, leases, fixedRotateNow)
+	if err != nil {
+		t.Fatalf("RotateKey failed: %v", err)
+	}
+	if activeKey == genesisKey {
+		t.Fatal("RotateKey did not change the active key")
+	}
+
+	// signing.key on disk now holds the post-rotation key; restore the
+	// retired genesis key in its place, the way an operator recovering an
+	// old backup would.
+	if err := journal.SaveSigningKey(dataDir, genesisPriv); err != nil {
+		t.Fatalf("SaveSigningKey failed: %v", err)
+	}
+
+	_, _, _, err = c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if strings.Contains(err.Error(), fmt.Sprintf("genesis at %s names", journal.TxKey(journal.MetaStreamID, 0))) {
+		t.Errorf("refusal still blames genesis for a key only a rotation named: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "_meta replayed through seq 1") {
+		t.Errorf("refusal does not name the sequence _meta was replayed through: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), activeKey) {
+		t.Errorf("refusal does not name the rotation's active key %q: %q", activeKey, err.Error())
+	}
+	if !strings.Contains(err.Error(), genesisKey) {
+		t.Errorf("refusal does not name the local (genesis) key %q on disk: %q", genesisKey, err.Error())
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
 }
 
 // (h) Round 1 finding 4: a local filesystem failure during mint — here,

@@ -410,8 +410,24 @@ func RefuseNoSigningKey(dataDir string) error {
 }
 
 // RefuseSigningKeyMismatch returns a one-line refusal when this instance's
-// local signing key does not match the adopted genesis record's public key:
+// local signing key does not match _meta's currently active key (as
+// (*store.Client).ReplayMeta's chain reports it, rotations folded in):
 // signing with it would never verify against this journal's root of trust.
+// lastMetaSeq is chain.LastMetaSeq() at the point the mismatch was found —
+// 0 when no rotation has ever happened, in which case the active key is
+// still genesis's own public_key, so the why clause names the genesis
+// record exactly as it always has; a non-zero value means at least one
+// key_rotation record has run since, so the active key is no longer
+// genesis's, and the why clause says so instead of naming a record that
+// does not hold it.
+//
+// Round 1 finding: adoptGenesis (internal/store/genesis.go) started passing
+// chain.ActiveKey() here once ReplayMeta learned to fold rotations into the
+// chain, but this refusal still hardcoded "genesis at <seq 0> names <want>"
+// regardless — so after any rotation it named a record that does not
+// contain the key it was blaming, sending the operator to the wrong place
+// with no hint that a later _meta sequence, or an interrupted rotation's
+// signing.key.tmp.*, is what they actually need to look at.
 //
 // It also checks leftoverSigningKeyTemp, the way RefuseNoSigningKey does,
 // and names any match: a mismatch does not rule out an interrupted mint or
@@ -421,12 +437,16 @@ func RefuseNoSigningKey(dataDir string) error {
 // ever mentioning it — a dead end when the real key was on disk the whole
 // time (round 2 finding, this file's line 308 in the version that finding
 // was filed against).
-func RefuseSigningKeyMismatch(dataDir, want, got string) error {
-	why := fmt.Sprintf("%s holds key %s, genesis at %s names %s", SigningKeyPath(dataDir), got, TxKey(MetaStreamID, 0), want)
+func RefuseSigningKeyMismatch(dataDir string, lastMetaSeq Seq, want, got string) error {
+	source := fmt.Sprintf("genesis at %s names %s", TxKey(MetaStreamID, 0), want)
+	if lastMetaSeq != 0 {
+		source = fmt.Sprintf("_meta replayed through seq %d names active key %s (not genesis's own key — a rotation has run)", lastMetaSeq, want)
+	}
+	why := fmt.Sprintf("%s holds key %s, %s", SigningKeyPath(dataDir), got, source)
 	fix := "restore the correct signing.key, or point this instance at a fresh journal prefix"
 	if tmps, ok := leftoverSigningKeyTemp(dataDir); ok {
 		found := strings.Join(tmps, ", ")
-		why = fmt.Sprintf("%s holds key %s, genesis at %s names %s (also found %s from an earlier interrupted mint or rotation)", SigningKeyPath(dataDir), got, TxKey(MetaStreamID, 0), want, found)
+		why = fmt.Sprintf("%s holds key %s, %s (also found %s from an earlier interrupted mint or rotation)", SigningKeyPath(dataDir), got, source, found)
 		fix = fmt.Sprintf("check %s for the matching private key before restoring the correct signing.key, or point this instance at a fresh journal prefix", found)
 	}
 	return refusal.RefuseWithCause("invalid journal", why, fix, ErrSigningKeyUnavailable)

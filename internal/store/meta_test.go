@@ -266,3 +266,60 @@ func TestReplayMetaOversizedRecordRefused(t *testing.T) {
 		t.Errorf("refusal is not a single line: %q", err.Error())
 	}
 }
+
+// (j) Round 1 medium finding: a gap in _meta -- a valid key_rotation record
+// at seq 2 with nothing at seq 1 -- must refuse rather than have the walk's
+// first 404 (at seq 1) read as the stream's head. Before the fix,
+// ReplayMeta returned successfully here with LastMetaSeq()=0 and the
+// genesis key still active, silently dropping the rotation at seq 2 --
+// exactly what let EnsureGenesis adopt a stale active key and epoch, and
+// let RotateKey's own Lease (which LISTs and sees seq 2) diverge from what
+// ReplayMeta verified.
+func TestReplayMetaGapRefuses(t *testing.T) {
+	c, _ := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	_, genesisPriv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+	_, pub2, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	// A valid rotation record at seq 2; nothing at seq 1 at all.
+	putRotation(t, c, 2, genesisPriv, pub2, "2026-09-17T13:00:00Z")
+
+	_, err = c.ReplayMeta(context.Background())
+	if err == nil {
+		t.Fatal("expected a refusal, got nil (the gap at seq 1 must not read as the stream's end)")
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "seq 1") {
+		t.Errorf("refusal does not name the missing sequence: %q", err.Error())
+	}
+}
+
+// (k) The corroborating List call this fix adds must not turn a genuine
+// end of stream into a false gap: genesis alone, with nothing past it,
+// still succeeds -- TestReplayMetaGenesisOnly already covers this end to
+// end, but this pins the List call itself is not the source of a
+// regression by checking the fake saw no writes past genesis and no
+// injected fault is needed for a clean success.
+func TestReplayMetaNoGapSucceeds(t *testing.T) {
+	c, _ := newFakeClient(t)
+	dataDir := t.TempDir()
+	if _, _, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow); err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+
+	chain, err := c.ReplayMeta(context.Background())
+	if err != nil {
+		t.Fatalf("ReplayMeta on a genuinely complete stream refused: %v", err)
+	}
+	if chain.LastMetaSeq() != 0 {
+		t.Errorf("LastMetaSeq() = %d, want 0", chain.LastMetaSeq())
+	}
+}

@@ -78,8 +78,11 @@ func TestRunRotateKeyNoJournalRefuses(t *testing.T) {
 
 // TestRunRotateKeyEmptyJournalFlagRefuses mirrors config.Load's own
 // treatment of an explicit but empty --journal: fs.Visit proves the
-// operator typed the flag, so this must not silently fall through to
-// "no journal configured" and it must not panic on an empty URL either.
+// operator typed the flag, so this must name the empty flag explicitly
+// rather than silently falling through to the generic "no journal
+// configured" refusal meant for an unset knob (round 1 minor finding —
+// this is the exact behavior the pre-fix version of this test's own
+// comment claimed without asserting).
 func TestRunRotateKeyEmptyJournalFlagRefuses(t *testing.T) {
 	dataDir := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -89,6 +92,59 @@ func TestRunRotateKeyEmptyJournalFlagRefuses(t *testing.T) {
 	}
 	if strings.ContainsAny(err.Error(), "\n\r") {
 		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "empty value") {
+		t.Errorf("refusal does not name the explicitly empty --journal flag: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "no journal configured") {
+		t.Errorf("refusal fell through to the generic no-journal-configured message: %q", err.Error())
+	}
+}
+
+// TestRunRotateKeyWhitespaceJournalFlagRefuses covers the same knob's other
+// dropped refusal (round 1 minor finding): a --journal value that is
+// present but only whitespace must be told apart from both an unset flag
+// (journal-less mode) and an explicitly empty one, the way
+// config.go's refuseWhitespaceJournal already tells `walden serve` apart.
+func TestRunRotateKeyWhitespaceJournalFlagRefuses(t *testing.T) {
+	dataDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	err := runRotateKey([]string{"--data-dir", dataDir, "--journal", "   "}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "whitespace") {
+		t.Errorf("refusal does not name the whitespace-only --journal value: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "no journal configured") {
+		t.Errorf("refusal fell through to the generic no-journal-configured message: %q", err.Error())
+	}
+}
+
+// TestRunRotateKeyWhitespaceJournalEnvRefuses covers the same refusal
+// reached through WALDEN_JOURNAL instead of --journal, the route
+// `walden rotate-key --journal "$UNSET_VAR"` actually takes when the
+// variable is set but blank -- the exact operator mistake the round 1
+// finding named.
+func TestRunRotateKeyWhitespaceJournalEnvRefuses(t *testing.T) {
+	t.Setenv("WALDEN_JOURNAL", "   ")
+	dataDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	err := runRotateKey([]string{"--data-dir", dataDir}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "whitespace") {
+		t.Errorf("refusal does not name the whitespace-only WALDEN_JOURNAL value: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "no journal configured") {
+		t.Errorf("refusal fell through to the generic no-journal-configured message: %q", err.Error())
 	}
 }
 

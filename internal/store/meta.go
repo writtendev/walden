@@ -20,15 +20,20 @@ import (
 )
 
 // ReplayMeta reads the genesis record at _meta seq 0, applies it as the
-// signing chain's root of trust, then walks seq 1, 2, ... contiguously —
-// by GET, not by LIST: this is a read/verify path, not an append, so it
-// has no reason to reach for the head-discovery machinery
-// (*journal.Leases).Open owns for the write side (lease.go, WALD-29), and
-// doing so here would duplicate exactly the head discovery that file's own
-// file comment warns against duplicating — until the first sequence that
-// does not exist, which is the chain's current head. Each record in
-// between is dispatched by its own "type" field, per spec section 8 step
-// 2:
+// signing chain's root of trust, then walks seq 1, 2, ... contiguously by
+// GET — this is a read/verify path, not an append, so it has no reason to
+// reach for (*journal.Leases).Open's per-stream bookkeeping (lease.go,
+// WALD-29), which this file does not duplicate — until the first sequence
+// whose GET comes back not-found. That alone does not prove the walk has
+// reached the chain's current head: a GET-only walk cannot tell "the
+// object at this sequence is missing" (a gap) from "the stream ends the
+// sequence before" (nothing wrong at all) — both read back as the same
+// 404, and treating the first one as the second lets a rotation past a
+// gap vanish silently (round 1 medium finding). confirmMetaEndOfStream
+// corroborates with one List call before this function trusts a not-found
+// as the head, so a hole is refused rather than mistaken for the end of
+// the stream. Each record between genesis and the confirmed head is
+// dispatched by its own "type" field, per spec section 8 step 2:
 //
 //   - "key_rotation": parsed with ParseKeyRotation and applied through
 //     (*journal.SigningChain).ApplyRotation, which both advances the chain
@@ -79,7 +84,7 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 		body, err := c.Get(ctx, journal.TxKey(journal.MetaStreamID, seq))
 		if err != nil {
 			if errors.Is(err, ErrObjectNotFound) {
-				return chain, nil
+				return c.confirmMetaEndOfStream(ctx, chain, seq)
 			}
 			return nil, wrapMetaFailure(seq, err)
 		}
@@ -106,36 +111,105 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 				return nil, journal.RefuseCorruptRotation(seq, err)
 			}
 			if err := chain.ApplyRotation(rec); err != nil {
-				return nil, err
+				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 		case journal.RecordTypeTokenCreate:
 			rec, err := journal.ParseTokenCreate(data)
 			if err != nil {
-				return nil, err
+				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 			if err := chain.VerifyTokenCreate(rec); err != nil {
-				return nil, err
+				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 			if err := chain.AdvanceMetaSeq(seq); err != nil {
-				return nil, err
+				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 		case journal.RecordTypeTokenRevoke:
 			rec, err := journal.ParseTokenRevoke(data)
 			if err != nil {
-				return nil, err
+				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 			if err := chain.VerifyTokenRevoke(rec); err != nil {
-				return nil, err
+				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 			if err := chain.AdvanceMetaSeq(seq); err != nil {
-				return nil, err
+				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 		default:
 			if err := chain.AdvanceMetaSeq(seq); err != nil {
-				return nil, err
+				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 		}
 	}
+}
+
+// errMetaContinuesPastGap is confirmMetaEndOfStream's internal signal that
+// its corroborating List call found a key at or past the sequence whose GET
+// came back not-found: proof the walk stopped at a gap, not the head. It
+// never escapes this file — List returns a callback's error unchanged
+// (list.go's own doc comment), so this reaches confirmMetaEndOfStream
+// directly and is turned into refuseMetaSequenceGap there.
+var errMetaContinuesPastGap = errors.New("meta stream continues past a missing sequence")
+
+// confirmMetaEndOfStream corroborates a GET 404 at seq — the sequence
+// ReplayMeta's contiguous walk just failed to read — against the actual
+// listing before trusting it as _meta's head. One List call, starting
+// after seq-1's own key (already confirmed present: genesis at seq 0, or a
+// record this walk already read and applied), answers the question a
+// GET-only walk cannot: List's ascending-order-over-tx/ guarantee (spec
+// section 10, list.go's own doc comment) means any key it yields here names
+// a sequence >= seq, so a single hit proves _meta continues past a hole
+// rather than ending at it. The callback returns as soon as it sees one key
+// — List stops and returns that error immediately (list.go) — so this is a
+// one-object probe, not a second full listing of _meta.
+func (c *Client) confirmMetaEndOfStream(ctx context.Context, chain *journal.SigningChain, seq journal.Seq) (*journal.SigningChain, error) {
+	startAfter := journal.TxKey(journal.MetaStreamID, seq-1)
+	err := c.List(ctx, journal.TxPrefix(journal.MetaStreamID), startAfter, func(key string) error {
+		return errMetaContinuesPastGap
+	})
+	switch {
+	case err == nil:
+		return chain, nil
+	case errors.Is(err, errMetaContinuesPastGap):
+		return nil, refuseMetaSequenceGap(seq)
+	default:
+		return nil, wrapMetaFailure(seq, err)
+	}
+}
+
+// refuseMetaSequenceGap returns a one-line refusal when _meta's record at
+// seq is missing but the listing proves the stream continues past it: a
+// gap, not the stream's genuine end, per spec section 8's contiguous
+// replay. Trusting the missing sequence as the head here is exactly what
+// let a rotation past the gap adopt a stale active key and epoch (round 1
+// medium finding) — this refuses instead, before any of that is chosen.
+func refuseMetaSequenceGap(seq journal.Seq) error {
+	return refusal.Refuse(
+		"invalid journal",
+		fmt.Sprintf("_meta seq %d is missing, but later meta records exist", seq),
+		"restore the _meta stream from a known-good journal, or point this instance at a fresh journal prefix",
+	)
+}
+
+// refuseMetaVerificationFailed wraps a _meta record's parse or chain-
+// verification failure — ParseTokenCreate/ParseTokenRevoke, ApplyRotation,
+// VerifyTokenCreate/VerifyTokenRevoke, AdvanceMetaSeq — as a one-line "invalid
+// journal" refusal with a remedy, the same treatment RefuseCorruptRotation
+// (journal/rotation.go) already gives a key_rotation record that fails to
+// parse. Before this, these five calls returned cause unwrapped: one line,
+// since every error journal/identity.go and journal/token.go build already
+// is, but with no "invalid journal" prefix and no fix clause on a path an
+// operator only ever reaches at boot (round 1 minor finding). cause is kept
+// as the wrapped Unwrap() cause, so errors.Is against ErrUnchainableRotation,
+// ErrInvalidTokenRecord, and the rest still holds for any caller checking a
+// specific reason.
+func refuseMetaVerificationFailed(seq journal.Seq, cause error) error {
+	return refusal.RefuseWithCause(
+		"invalid journal",
+		fmt.Sprintf("_meta seq %d: %s", seq, cause.Error()),
+		"restore the _meta stream from a known-good journal, or point this instance at a fresh journal prefix",
+		cause,
+	)
 }
 
 // wrapMetaFailure wraps a GET failure encountered while replaying _meta

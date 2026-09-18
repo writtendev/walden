@@ -172,7 +172,7 @@ func (c *Client) adoptGenesis(dataDir string, chain *journal.SigningChain) (*jou
 	}
 	localPub := priv.Public().(ed25519.PublicKey)
 	if !localPub.Equal(wantPub) {
-		return nil, nil, false, journal.RefuseSigningKeyMismatch(dataDir, chain.ActiveKey(), journal.FormatPublicKey(localPub))
+		return nil, nil, false, journal.RefuseSigningKeyMismatch(dataDir, chain.LastMetaSeq(), chain.ActiveKey(), journal.FormatPublicKey(localPub))
 	}
 
 	return chain, priv, false, nil

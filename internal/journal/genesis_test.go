@@ -8,6 +8,7 @@ package journal_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -374,7 +375,8 @@ func TestGenesisRefusalsAreSingleLine(t *testing.T) {
 	errs := []error{
 		journal.RefuseCorruptGenesis(errors.New("unexpected end of JSON input")),
 		journal.RefuseNoSigningKey(dataDir),
-		journal.RefuseSigningKeyMismatch(dataDir, "ed25519:aa", "ed25519:bb"),
+		journal.RefuseSigningKeyMismatch(dataDir, 0, "ed25519:aa", "ed25519:bb"),
+		journal.RefuseSigningKeyMismatch(dataDir, 3, "ed25519:aa", "ed25519:bb"),
 		journal.RefuseInvalidSigningKeyFile(dataDir, errors.New("bad line")),
 		journal.RefuseSigningKeyUnreadable(errors.New("open " + dataDir + "/signing.key: permission denied")),
 		journal.RefuseSigningKeyPresentOnMint(dataDir),
@@ -395,6 +397,36 @@ func TestGenesisRefusalsAreSingleLine(t *testing.T) {
 	for _, err := range errs[1:] {
 		if !errors.Is(err, journal.ErrSigningKeyUnavailable) {
 			t.Errorf("expected ErrSigningKeyUnavailable, got %v", err)
+		}
+	}
+}
+
+// TestRefuseSigningKeyMismatchNamesTheRightRecord covers round 1's medium
+// finding: RefuseSigningKeyMismatch used to hardcode "genesis at <seq 0>
+// names <want>" regardless of whether a rotation had actually moved the
+// active key elsewhere. lastMetaSeq 0 means no rotation has run, so want is
+// still genesis's own public_key and the original genesis wording holds; a
+// non-zero lastMetaSeq means at least one key_rotation record has, so the
+// refusal must say so instead of naming a record (genesis) that does not
+// hold the key it is blaming.
+func TestRefuseSigningKeyMismatchNamesTheRightRecord(t *testing.T) {
+	dataDir := t.TempDir()
+
+	genesisCase := journal.RefuseSigningKeyMismatch(dataDir, 0, "ed25519:aa", "ed25519:bb")
+	if !strings.Contains(genesisCase.Error(), fmt.Sprintf("genesis at %s names", journal.TxKey(journal.MetaStreamID, 0))) {
+		t.Errorf("lastMetaSeq 0 should still blame genesis: %q", genesisCase.Error())
+	}
+
+	rotatedCase := journal.RefuseSigningKeyMismatch(dataDir, 4, "ed25519:aa", "ed25519:bb")
+	if strings.Contains(rotatedCase.Error(), fmt.Sprintf("genesis at %s names", journal.TxKey(journal.MetaStreamID, 0))) {
+		t.Errorf("a non-zero lastMetaSeq must not blame genesis for a key it never named: %q", rotatedCase.Error())
+	}
+	if !strings.Contains(rotatedCase.Error(), "_meta replayed through seq 4") {
+		t.Errorf("a non-zero lastMetaSeq should name the sequence _meta was replayed through: %q", rotatedCase.Error())
+	}
+	for _, err := range []error{genesisCase, rotatedCase} {
+		if strings.ContainsAny(err.Error(), "\n\r") {
+			t.Errorf("refusal is not a single line: %q", err.Error())
 		}
 	}
 }
@@ -584,7 +616,7 @@ func TestLeftoverSigningKeyTempNamesEveryMatch(t *testing.T) {
 		t.Errorf("refusal is not a single line: %q", noKey.Error())
 	}
 
-	mismatch := journal.RefuseSigningKeyMismatch(dataDir, "ed25519:aa", "ed25519:bb")
+	mismatch := journal.RefuseSigningKeyMismatch(dataDir, 0, "ed25519:aa", "ed25519:bb")
 	if !strings.Contains(mismatch.Error(), tmpA) {
 		t.Errorf("RefuseSigningKeyMismatch does not name %s: %q", tmpA, mismatch.Error())
 	}

@@ -51,8 +51,15 @@ import (
 //     genesis key's temp file before its own conditional PUT — signing.key
 //     itself is not touched yet.
 //  5. leases.Open(ctx, journal.MetaStreamID), then Lease.Append: inside the
-//     callback, build the record at the sequence the Lease hands it, sign
-//     it with the *outgoing* private key, marshal it, and PutIfAbsent it.
+//     callback, first confirm the sequence the Lease hands it is the one
+//     ReplayMeta's chain (step 1) actually verified up to — seq must equal
+//     chain.LastMetaSeq()+1, or refuse (round 1 major finding: a concurrent
+//     _meta append between step 1 and this Open, or a pre-existing gap, can
+//     otherwise make the Lease offer a sequence past the one old_public_key
+//     was verified against, landing a rotation record no replay could ever
+//     accept while still committing signing.key to the new key). Only once
+//     that holds: build the record at seq, sign it with the *outgoing*
+//     private key, marshal it, and PutIfAbsent it.
 //  6. On success, CommitSigningKey renames the new key into place — the
 //     commit point, matching mintGenesis's own. A failure here refuses
 //     with RefuseSigningKeyCommitFailed, naming whichever path (temp or
@@ -64,9 +71,10 @@ import (
 //     outcome the temp file is deliberately kept — it may be the only
 //     surviving copy of a now-live key, the same reasoning
 //     mintGenesis's own ErrOutcomeUnknown branch gives. Any other error
-//     from the callback (a Sign or Marshal failure) leaves _meta unfenced,
-//     per Lease.Append's own contract, and the temp file is removed since
-//     nothing was ever sent to storage.
+//     from the callback (a Sign or Marshal failure, or step 5's sequence
+//     check failing) leaves _meta unfenced, per Lease.Append's own
+//     contract, and the temp file is removed since nothing was ever sent
+//     to storage.
 func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.Leases, now func() time.Time) (retired, active string, err error) {
 	chain, err := c.ReplayMeta(ctx)
 	if err != nil {
@@ -120,6 +128,31 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 	newPubFormatted := journal.FormatPublicKey(newPub)
 	var putErr error
 	appendErr := lease.Append(func(seq journal.Seq) error {
+		// The consistency check the write side never asserted (round 1
+		// major finding): old_public_key above was verified against
+		// chain as of chain.LastMetaSeq(), but seq comes from the
+		// Lease's own LIST-derived head, discovered independently at
+		// leases.Open above. A concurrent _meta append landing between
+		// ReplayMeta and that Open, or a pre-existing gap, can make the
+		// two diverge — the lease then offers a sequence past the one
+		// old_public_key was actually chained against, and signing a
+		// record there would land one no future replay could ever
+		// accept. ApplyRotation already enforces exactly this invariant
+		// on the read side (identity.go: "r.Seq != c.lastMetaSeq+1");
+		// this is its write-side counterpart, checked here (inside the
+		// closure, where seq is finally known) rather than by re-reading
+		// the head and retrying, which spec section 11.4 item 4 forbids.
+		// A plain error is deliberate, not a fabricated precondition or
+		// outcome-unknown: Lease.Append's own contract (lease.go) is
+		// that any other error leaves the stream unfenced and the
+		// sequence unconsumed, and that is the right outcome here — the
+		// lease's cached view is stale, not the stream itself, and a
+		// caller that replays _meta again gets a fresh, consistent
+		// chain to rotate from.
+		if want := chain.LastMetaSeq() + 1; seq != want {
+			putErr = refuseMetaSequenceDrift(chain.LastMetaSeq(), seq)
+			return putErr
+		}
 		rec := journal.NewKeyRotationRecord(seq, localPub, newPub, now().UTC().Format(time.RFC3339))
 		if err := journal.SignRotation(priv, rec); err != nil {
 			putErr = err
@@ -169,6 +202,23 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 		journal.RemoveSigningKeyTemp(tmpPath)
 		return "", "", appendErr
 	}
+}
+
+// refuseMetaSequenceDrift returns a one-line refusal when the sequence
+// (*journal.Lease).Append hands RotateKey's callback does not immediately
+// follow the sequence ReplayMeta's chain verified up to: a concurrent
+// writer landed a _meta record after this rotation's replay, or the two
+// diverge for some other reason (a pre-existing gap ReplayMeta itself did
+// not already refuse — see meta.go's contiguity check). Retrying here would
+// mean re-reading the head, which spec section 11.4 item 4 forbids; the
+// correct recovery is simply running rotate-key again, which replays
+// _meta fresh and rotates from whatever is actually current.
+func refuseMetaSequenceDrift(chainLastSeq, leaseSeq journal.Seq) error {
+	return refusal.Refuse(
+		"rotate-key refused",
+		fmt.Sprintf("this rotation's replay verified _meta through seq %d, but the append sequence offered is %d", chainLastSeq, leaseSeq),
+		"retry rotate-key: _meta changed since this replay, so a fresh run will rotate from the current state",
+	)
 }
 
 // refuseNoGenesisToRotate returns a one-line refusal when RotateKey finds

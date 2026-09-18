@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/writtendev/walden/internal/config"
@@ -25,9 +24,27 @@ import (
 // configuration knob: no new flag or environment variable joins the five
 // walden already has.
 //
-// A missing journal is a one-line refusal: there is nothing to rotate in
-// journal-less mode, since the signing identity is born with the journal
-// (spec/journal/v1 section 2.1) and journal-less walden never has one.
+// The --journal / WALDEN_JOURNAL knob's precedence and refusals are
+// resolved by handing config.Load the exact flag this command's own
+// --journal parse captured, rather than reimplementing that resolution
+// here (round 1 minor finding): the earlier version of this function
+// collapsed an explicitly empty --journal and a whitespace-only value into
+// the same generic "no journal configured" refusal meant for an unset
+// knob, so `walden rotate-key --journal "$UNSET_VAR"` told the operator to
+// set a flag they had just set, and gave a different answer than `walden
+// serve` would for the identical input. config.Load already carries both
+// of those refusals (config.go: the explicit-empty check ahead of
+// refuseWhitespaceJournal) for the one command that already resolves this
+// knob correctly; only --journal is threaded through, not --data-dir,
+// which resolveDataDir below continues to resolve on its own (token.go) --
+// this does not also change data-dir's refusal wording, and reuses no
+// flag rotate-key does not already define, so the five-knob surface is
+// unchanged.
+//
+// A missing journal is still a one-line refusal: there is nothing to
+// rotate in journal-less mode, since the signing identity is born with the
+// journal (spec/journal/v1 section 2.1) and journal-less walden never has
+// one.
 func runRotateKey(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("rotate-key", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -60,11 +77,21 @@ func runRotateKey(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	journalURL := os.Getenv(config.EnvJournal)
+	// Only --journal is passed through to config.Load, and only when this
+	// command's own parse found it explicitly set -- fs.Visit here is what
+	// proves an empty value was typed rather than left unset, the same
+	// proof config.Load's own fs.Visit relies on for the explicit-empty
+	// refusal. An unset --journal leaves configArgs empty, so config.Load
+	// falls through to its own WALDEN_JOURNAL / "" resolution unchanged.
+	var configArgs []string
 	if setFlags["journal"] {
-		journalURL = flagJournal
+		configArgs = append(configArgs, "--journal", flagJournal)
 	}
-	journalURL = strings.TrimSpace(journalURL)
+	cfg, _, err := config.Load(configArgs)
+	if err != nil {
+		return err
+	}
+	journalURL := cfg.JournalURL
 	if journalURL == "" {
 		return refusal.Refuse(
 			"rotate-key refused",

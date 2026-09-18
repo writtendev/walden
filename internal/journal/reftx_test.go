@@ -1,10 +1,14 @@
 package journal_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/writtendev/walden/internal/journal"
 )
@@ -1183,5 +1187,254 @@ func TestZeroValueSigningChainVerifyRefTx(t *testing.T) {
 	}
 	if err := chain.VerifyRefTx(&tx2); err != nil {
 		t.Fatalf("zero-value SigningChain.VerifyRefTx(tx2) failed: %v", err)
+	}
+}
+
+// TestNewRefTransactionRecordFixedFields pins that NewRefTransactionRecord
+// sets version and type (spec section 5.1) in one place, exactly as
+// NewGenesisRecord does for the genesis record, and threads every other
+// field straight through unmodified.
+func TestNewRefTransactionRecordFixedFields(t *testing.T) {
+	segments := []string{"db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"}
+	updates := []journal.RefUpdate{
+		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+	}
+
+	rec := journal.NewRefTransactionRecord("repo-alpha", 3, 1, "2026-08-31T00:02:00Z", segments, updates)
+
+	if rec.Version != journal.VersionPrefix {
+		t.Errorf("Version = %q, want %q", rec.Version, journal.VersionPrefix)
+	}
+	if rec.Type != journal.RecordTypeRefUpdate {
+		t.Errorf("Type = %q, want %q", rec.Type, journal.RecordTypeRefUpdate)
+	}
+	if rec.Stream != "repo-alpha" {
+		t.Errorf("Stream = %q, want %q", rec.Stream, "repo-alpha")
+	}
+	if rec.Seq != 3 {
+		t.Errorf("Seq = %d, want 3", rec.Seq)
+	}
+	if rec.KeyEpoch != 1 {
+		t.Errorf("KeyEpoch = %d, want 1", rec.KeyEpoch)
+	}
+	if rec.Timestamp != "2026-08-31T00:02:00Z" {
+		t.Errorf("Timestamp = %q, want %q", rec.Timestamp, "2026-08-31T00:02:00Z")
+	}
+	if !reflect.DeepEqual(rec.Segments, segments) {
+		t.Errorf("Segments = %v, want %v", rec.Segments, segments)
+	}
+	if !reflect.DeepEqual(rec.Updates, updates) {
+		t.Errorf("Updates = %v, want %v", rec.Updates, updates)
+	}
+	if rec.Signature != "" {
+		t.Errorf("Signature = %q, want empty (unsigned)", rec.Signature)
+	}
+}
+
+// TestMarshalRefTxFixtureByteEquality is change 4's "real proof" for
+// internal/journal/reftx.go: every ref-transaction record in the golden
+// journal (spec/journal/v1/fixtures), on both repo-alpha and the opaque
+// stream, is rebuilt through NewRefTransactionRecord from the fixture's own
+// decoded field values and signature, and MarshalRefTx's output is asserted
+// byte-for-byte equal to the committed fixture file. A pass here means
+// production code — not just the fixture generator's own writeJSON — can
+// reproduce the published golden records exactly.
+func TestMarshalRefTxFixtureByteEquality(t *testing.T) {
+	for _, stream := range []journal.StreamID{fixtureRepoStream, fixtureOpaqueStream} {
+		for _, rec := range fixtureStreamRecords(t, stream) {
+			rebuilt := journal.NewRefTransactionRecord(rec.Stream, rec.Seq, rec.KeyEpoch, rec.Timestamp, rec.Segments, rec.Updates)
+			rebuilt.Signature = rec.Signature
+
+			got, err := journal.MarshalRefTx(rebuilt)
+			if err != nil {
+				t.Fatalf("MarshalRefTx(%s seq %d): %v", stream, rec.Seq, err)
+			}
+
+			want, err := os.ReadFile(fixtureKeyPath(journal.TxKey(stream, rec.Seq)))
+			if err != nil {
+				t.Fatalf("reading golden fixture for %s seq %d: %v", stream, rec.Seq, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("MarshalRefTx(%s seq %d) does not reproduce the golden fixture byte-for-byte\ngot:\n%s\nwant:\n%s", stream, rec.Seq, got, want)
+			}
+		}
+	}
+}
+
+// TestMarshalRefTxEmptySegmentsMarshalAsEmptyArray pins that a record with
+// no segments marshals "segments": [] rather than omitting the field or
+// emitting null — Validate already normalizes a nil Segments to []string{}
+// (reftx.go), and MarshalRefTx must not add omitempty and undo that. This
+// is also exercised end to end by repo-alpha seq 2 in the byte-equality
+// test above; this test isolates the claim against a record built fresh,
+// with nil Segments, rather than one read back off disk.
+func TestMarshalRefTxEmptySegmentsMarshalAsEmptyArray(t *testing.T) {
+	priv, _ := deterministicKeypair(0x01)
+	rec := journal.NewRefTransactionRecord("repo-alpha", 0, 0, "2026-08-31T00:00:00Z", nil, []journal.RefUpdate{
+		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+	})
+	if err := journal.SignRefTx(priv, rec); err != nil {
+		t.Fatalf("SignRefTx: %v", err)
+	}
+
+	data, err := journal.MarshalRefTx(rec)
+	if err != nil {
+		t.Fatalf("MarshalRefTx: %v", err)
+	}
+	if !strings.Contains(string(data), `"segments": []`) {
+		t.Errorf("MarshalRefTx with nil segments = %s, want it to contain \"segments\": []", data)
+	}
+}
+
+// TestMarshalRefTxLowercasesWithoutMutatingCaller pins the two halves of
+// change 1's lowercasing requirement together: uppercase-hex segments and
+// OIDs marshal lowercase (spec section 5.1), and MarshalRefTx does this in
+// a copy, never touching the caller's own Segments/Updates slices in
+// place. NewRefTransactionRecord assigns the caller's slices straight
+// through with no copy of its own, so this is the one place the mutation
+// could leak from if MarshalRefTx got the copy wrong.
+func TestMarshalRefTxLowercasesWithoutMutatingCaller(t *testing.T) {
+	priv, _ := deterministicKeypair(0x01)
+
+	segments := []string{"DB89AEED94AF475AE97CE5FE75618D404F017D23E0AA61CE1C7ABD11707DBBAB"}
+	updates := []journal.RefUpdate{
+		{Ref: "refs/heads/main", OldOID: strings.ToUpper(journal.ZeroOID40), NewOID: "4B825DC642CB6EB9A060E54BF8D69288FBEE4904"},
+	}
+	wantSegments := append([]string(nil), segments...)
+	wantUpdates := append([]journal.RefUpdate(nil), updates...)
+
+	rec := journal.NewRefTransactionRecord("repo-alpha", 0, 0, "2026-08-31T00:00:00Z", segments, updates)
+	if err := journal.SignRefTx(priv, rec); err != nil {
+		t.Fatalf("SignRefTx: %v", err)
+	}
+
+	data, err := journal.MarshalRefTx(rec)
+	if err != nil {
+		t.Fatalf("MarshalRefTx: %v", err)
+	}
+	if strings.Contains(string(data), "DB89AEED") || strings.Contains(string(data), "4B825DC6") {
+		t.Errorf("MarshalRefTx did not lowercase hex: %s", data)
+	}
+	if !strings.Contains(string(data), "db89aeed") || !strings.Contains(string(data), "4b825dc6") {
+		t.Errorf("MarshalRefTx did not emit the expected lowercase hex: %s", data)
+	}
+
+	if !reflect.DeepEqual(segments, wantSegments) {
+		t.Errorf("MarshalRefTx mutated the caller's segments slice: got %v, want %v", segments, wantSegments)
+	}
+	if !reflect.DeepEqual(updates, wantUpdates) {
+		t.Errorf("MarshalRefTx mutated the caller's updates slice: got %v, want %v", updates, wantUpdates)
+	}
+}
+
+// TestMarshalRefTxRefusals covers MarshalRefTx's refusals: a nil record, an
+// invalid one (Validate fails), an unsigned one (empty signature), and one
+// carrying a signature ParseSignature rejects. Every refusal is asserted to
+// be exactly one line, per AGENTS.md's mechanical review rule that every
+// operator-facing refusal is one line.
+func TestMarshalRefTxRefusals(t *testing.T) {
+	validRec := func() *journal.RefTransactionRecord {
+		return journal.NewRefTransactionRecord("repo-alpha", 0, 0, "2026-08-31T00:00:00Z",
+			[]string{"db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"},
+			[]journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"}},
+		)
+	}
+
+	assertOneLine := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		if strings.Count(err.Error(), "\n") != 0 {
+			t.Errorf("refusal is not one line: %q", err.Error())
+		}
+	}
+
+	t.Run("nil record", func(t *testing.T) {
+		_, err := journal.MarshalRefTx(nil)
+		if !errors.Is(err, journal.ErrInvalidRefTx) {
+			t.Fatalf("expected ErrInvalidRefTx, got %v", err)
+		}
+		assertOneLine(t, err)
+	})
+
+	t.Run("invalid record", func(t *testing.T) {
+		rec := validRec()
+		rec.Type = "not-ref-update"
+		_, err := journal.MarshalRefTx(rec)
+		if !errors.Is(err, journal.ErrInvalidRefTx) {
+			t.Fatalf("expected ErrInvalidRefTx, got %v", err)
+		}
+		assertOneLine(t, err)
+	})
+
+	t.Run("empty signature", func(t *testing.T) {
+		rec := validRec()
+		_, err := journal.MarshalRefTx(rec)
+		if !errors.Is(err, journal.ErrInvalidSignature) {
+			t.Fatalf("expected ErrInvalidSignature, got %v", err)
+		}
+		assertOneLine(t, err)
+	})
+
+	t.Run("malformed signature", func(t *testing.T) {
+		rec := validRec()
+		rec.Signature = "not-a-signature"
+		_, err := journal.MarshalRefTx(rec)
+		if !errors.Is(err, journal.ErrInvalidSignature) {
+			t.Fatalf("expected ErrInvalidSignature, got %v", err)
+		}
+		assertOneLine(t, err)
+	})
+}
+
+// TestMarshalRefTxRefusesNonUTF8RefName is WALD-27 round 3's finding, made
+// permanent: a ref name git and journal.ValidateRefName both accept but
+// that is not valid UTF-8 (Latin-1 "café", the reviewer's own example) must
+// never reach json.MarshalIndent, which silently replaces such bytes with
+// U+FFFD rather than erroring — producing a record whose signature, computed
+// over the raw bytes via CanonicalRefUpdatePayload, can never verify again
+// (spec section 5.2; spec section 8.1 rule 3 aborts replay of the whole
+// stream on exactly that).
+//
+// ValidateRefName and SignRefTx still accept this ref name — they operate
+// on raw bytes, never JSON, and TestRefNameRawBytePreservationNonUTF8 above
+// pins that this is deliberate, not an oversight this test contradicts.
+// v1's on-disk record format is JSON (section 5.1), so that is where the
+// two representations diverge, and MarshalRefTx is where this refuses.
+func TestMarshalRefTxRefusesNonUTF8RefName(t *testing.T) {
+	priv, _ := deterministicKeypair(0x01)
+
+	// "café" encoded as Latin-1 rather than UTF-8: 'c', 'a', 'f', 0xE9. Legal
+	// per git-check-ref-format (no control character, no reserved byte), so
+	// ValidateRefName accepts it — but a lone 0xE9 is not a valid UTF-8 byte
+	// sequence.
+	nonUTF8Ref := "refs/heads/caf\xe9"
+	if utf8.ValidString(nonUTF8Ref) {
+		t.Fatalf("test fixture %q is valid UTF-8; this test needs a byte sequence that genuinely is not", nonUTF8Ref)
+	}
+	if err := journal.ValidateRefName(nonUTF8Ref); err != nil {
+		t.Fatalf("ValidateRefName(%q) = %v, want nil: this ref name is legal per git-check-ref-format", nonUTF8Ref, err)
+	}
+
+	rec := journal.NewRefTransactionRecord("repo-alpha", 0, 0, "2026-08-31T00:00:00Z", nil, []journal.RefUpdate{
+		{Ref: nonUTF8Ref, OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+	})
+	if err := journal.SignRefTx(priv, rec); err != nil {
+		t.Fatalf("SignRefTx(%q) = %v, want nil: CanonicalRefUpdatePayload is a raw byte stream, not JSON, so it preserves this ref name exactly", nonUTF8Ref, err)
+	}
+
+	_, err := journal.MarshalRefTx(rec)
+	if err == nil {
+		t.Fatal("MarshalRefTx succeeded on a non-UTF-8 ref name; it must refuse rather than silently write a record that can never verify again")
+	}
+	if !errors.Is(err, journal.ErrInvalidRefTx) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+	}
+	if !errors.Is(err, journal.ErrInvalidRef) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRef) = false, err = %v", err)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
 	}
 }

@@ -2,11 +2,13 @@ package journal
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
@@ -63,6 +65,100 @@ type RefTransactionRecord struct {
 	Signature string      `json:"signature,omitempty"`
 }
 
+// NewRefTransactionRecord builds a RefTransactionRecord with the fixed
+// fields spec/journal/v1 section 5.1 requires ("version": "v1", "type":
+// "ref_update") set in one place, exactly as NewGenesisRecord does for
+// section 3.1 (genesis.go) and as WALD-31's NewKeyRotationRecord will for
+// section 4.1. timestamp is the caller's, not time.Now(), for the same
+// determinism reason NewGenesisRecord gives: a caller (or a test) controls
+// the clock, this constructor does not.
+func NewRefTransactionRecord(stream StreamID, seq Seq, keyEpoch Epoch, timestamp string, segments []string, updates []RefUpdate) *RefTransactionRecord {
+	return &RefTransactionRecord{
+		Version:   VersionPrefix,
+		Stream:    stream,
+		Seq:       seq,
+		Type:      RecordTypeRefUpdate,
+		KeyEpoch:  keyEpoch,
+		Segments:  segments,
+		Updates:   updates,
+		Timestamp: timestamp,
+	}
+}
+
+// MarshalRefTx serializes a RefTransactionRecord to indented JSON with a
+// trailing newline, mirroring MarshalMarker (marker.go): refuse nil,
+// Validate() first, then json.MarshalIndent with a two-space indent and an
+// appended trailing newline byte. That is byte-for-byte what the fixture
+// generator's writeJSON produces, and RefTransactionRecord's field order
+// already matches section 5.1, so the published golden records become
+// reproducible by production code rather than only by a test helper.
+//
+// Three checks beyond Validate:
+//
+//   - r must already carry a non-empty signature ParseSignature accepts —
+//     section 5.1 lists signature as required, and an unsigned record can
+//     never be verified on replay, so it is refused here rather than
+//     written.
+//   - Every update's Ref must be valid UTF-8. Section 5.2 requires ref
+//     names to round-trip as exact, opaque byte sequences, and
+//     CanonicalRefUpdatePayload (section 5.3) honors that: it is a raw
+//     byte stream, not JSON, so SignRefTx and VerifyRefTx preserve any
+//     byte sequence git itself accepts, including one that is not valid
+//     UTF-8. v1's on-disk record format cannot make the same promise: it
+//     is JSON (section 5.1), and encoding/json silently replaces an
+//     invalid UTF-8 byte sequence with U+FFFD instead of erroring, which
+//     would write a record whose bytes no longer match the ones the
+//     signature above was computed over — permanently unverifiable, and
+//     spec section 8.1 rule 3 aborts replay of the whole stream on
+//     exactly that. There is no v1 escape convention for raw bytes in
+//     JSON (section 5.4 forbids inventing one unilaterally as an unknown
+//     field), so this is refused rather than written.
+//   - Segments and every update's OIDs are lowercased in a copy before
+//     marshaling (section 5.1 requires lowercase hex), the same way
+//     MarshalMarker lowercases Snapshot. The copy is real, not a struct
+//     copy sharing r's backing arrays: a struct copy alone would still
+//     let this mutate the caller's own Segments and Updates slices in
+//     place.
+func MarshalRefTx(r *RefTransactionRecord) ([]byte, error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: record cannot be nil", ErrInvalidRefTx)
+	}
+	if err := r.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidRefTx, err)
+	}
+	if r.Signature == "" {
+		return nil, fmt.Errorf("%w: missing signature", ErrInvalidSignature)
+	}
+	if _, err := ParseSignature(r.Signature); err != nil {
+		return nil, err
+	}
+	for i, u := range r.Updates {
+		if !utf8.ValidString(u.Ref) {
+			return nil, fmt.Errorf("%w: %w: update[%d] ref is not valid UTF-8; v1's JSON record format cannot carry it losslessly (json.MarshalIndent would replace its bytes with U+FFFD, producing a record that could never verify again): %q", ErrInvalidRefTx, ErrInvalidRef, i, u.Ref)
+		}
+	}
+
+	rCopy := *r
+	rCopy.Segments = make([]string, len(r.Segments))
+	for i, seg := range r.Segments {
+		rCopy.Segments[i] = strings.ToLower(seg)
+	}
+	rCopy.Updates = make([]RefUpdate, len(r.Updates))
+	for i, u := range r.Updates {
+		rCopy.Updates[i] = RefUpdate{
+			Ref:    u.Ref,
+			OldOID: strings.ToLower(u.OldOID),
+			NewOID: strings.ToLower(u.NewOID),
+		}
+	}
+
+	data, err := json.MarshalIndent(&rCopy, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ref transaction: %w", err)
+	}
+	return append(data, '\n'), nil
+}
+
 // ValidateOID validates that an object ID is a 40-hex (SHA-1) or 64-hex (SHA-256) string.
 func ValidateOID(oid string) error {
 	if len(oid) == 40 {
@@ -83,6 +179,21 @@ func ValidateOID(oid string) error {
 // ValidateRefName validates a Git ref name according to git-check-ref-format rules.
 // Note: Git ref names are raw byte sequences. This validator enforces format invariants
 // while preserving exact byte representation.
+//
+// Deliberately not checked here: whether ref is valid UTF-8. Git does not
+// require it, and this function is shared by paths with different
+// guarantees about raw bytes. The signing layer — SignRefTx/VerifyRefTx via
+// CanonicalRefUpdatePayload, a plain byte stream rather than JSON —
+// preserves an arbitrary, non-UTF-8 byte sequence exactly; that is what
+// TestRefNameRawBytePreservationNonUTF8 pins. v1's JSON record format
+// cannot make the same promise (encoding/json replaces invalid UTF-8 with
+// U+FFFD), which is why MarshalRefTx refuses such a ref rather than
+// writing an unverifiable record: see its own doc comment for why.
+//
+// MarshalMarker (marker.go) marshals ref names to JSON the same way and
+// has the identical hole — unfixed, and deliberately out of this ticket's
+// five files. WALD-119 tracks the v1-format decision this implies and the
+// MarshalMarker fix that follows from it.
 func ValidateRefName(ref string) error {
 	if ref == "" {
 		return fmt.Errorf("%w: cannot be empty", ErrInvalidRef)

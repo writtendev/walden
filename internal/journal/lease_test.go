@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -671,6 +672,59 @@ func TestAppendPanicFencesStreamAndRepanics(t *testing.T) {
 	wantPerm := "refusal: push failed: stream repo-panic is permanently fenced on this instance (restart walden process to re-materialize from journal)"
 	if err := lease.Append(func(journal.Seq) error { return nil }); err == nil || err.Error() != wantPerm {
 		t.Errorf("Append() after a panic-fenced stream = %v, want %q", err, wantPerm)
+	}
+}
+
+// Regression test for round 4's medium finding: fn calling runtime.Goexit
+// (what t.Fatal/FailNow do) unwinds past any straight-line resolution after
+// the call to fn without panicking and without returning, so a resolution
+// that only runs in the normal-return path never runs at all - busy stays
+// true forever and every later Append on the stream refuses "already has
+// an append in progress (retry the push)" with no way for that retry to
+// ever succeed. runtime.Goexit terminates the calling goroutine, so fn is
+// run in its own goroutine here and the test synchronizes on that
+// goroutine's completion (via a deferred close, which - like everything
+// else deferred on that goroutine's stack, including Append's own
+// resolution - still runs during the Goexit unwind) rather than on
+// Append's return, since Append never returns in this path.
+func TestAppendGoexitFencesStreamRatherThanWedgingBusyForever(t *testing.T) {
+	c, _ := newLeaseClient(t)
+	leases := journal.NewLeases(c)
+	ctx := context.Background()
+
+	lease, err := leases.Open(ctx, "repo-goexit")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	var gotSeq journal.Seq
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = lease.Append(func(seq journal.Seq) error {
+			gotSeq = seq
+			runtime.Goexit()
+			return nil // unreachable
+		})
+	}()
+	<-done
+
+	if !lease.Fencer().IsFenced("repo-goexit") {
+		t.Fatalf("expected the stream to be fenced after fn terminated via runtime.Goexit without returning or panicking")
+	}
+	fencedSeq, ok := lease.Fencer().FencedSeq("repo-goexit")
+	if !ok || fencedSeq != gotSeq {
+		t.Errorf("fenced seq = %d (ok=%v), want the seq the Goexit-ed Append was given, %d", fencedSeq, ok, gotSeq)
+	}
+
+	// The regression this guards against: without the fix, busy stays true
+	// forever and this Append refuses "already has an append in progress"
+	// rather than being fenced. Assert the fenced refusal specifically, not
+	// just "an error", so a reversion back to the busy-forever bug fails
+	// this test on the wrong error message rather than passing by accident.
+	wantPerm := "refusal: push failed: stream repo-goexit is permanently fenced on this instance (restart walden process to re-materialize from journal)"
+	if err := lease.Append(func(journal.Seq) error { return nil }); err == nil || err.Error() != wantPerm {
+		t.Errorf("Append() after a Goexit-fenced stream = %v, want %q", err, wantPerm)
 	}
 }
 

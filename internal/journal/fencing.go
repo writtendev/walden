@@ -26,7 +26,7 @@ var (
 	// into store.ErrOutcomeUnknown (internal/store/client.go), exactly as
 	// ErrPreconditionFailed is aliased into store.ErrPrecondition above - one
 	// sentinel, not two. store's classify (client.go) is what sorts a PutIfAbsent's
-	// ambiguous failure into this value; (*Lease).Failed (lease.go, WALD-29) is what
+	// ambiguous failure into this value; (*Lease).Append (lease.go, WALD-29) is what
 	// maps it to Fencer.HandleOutcomeUnknown, closing the loop the Fencer doc comment
 	// below used to describe as "the caller's job."
 	ErrOutcomeUnknown = errors.New("object storage write outcome unknown")
@@ -141,7 +141,7 @@ func RefuseProviderLacksCAS(provider string) error {
 // the stream permanently transitions to fenced on this instance. The same happens when a
 // conditional write's outcome cannot be proven either way (see HandleOutcomeUnknown) - the
 // journal package cannot import store (that would cycle), so the mapping from
-// ErrOutcomeUnknown to HandleOutcomeUnknown lives in (*Lease).Failed (lease.go, WALD-29),
+// ErrOutcomeUnknown to HandleOutcomeUnknown lives in (*Lease).Append (lease.go, WALD-29),
 // the one place outside this file that classifies a failed conditional write.
 // Fencing is strictly isolated per stream: fencing stream A leaves stream B and _meta unaffected.
 type Fencer struct {

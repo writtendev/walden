@@ -262,13 +262,20 @@ func (l *Lease) Fencer() *Fencer { return l.fencer }
 //     exists for - so Append recovers the panic, fences the stream through
 //     Fencer.HandleOutcomeUnknown, and re-panics so the panic still
 //     propagates to fn's own caller rather than being swallowed here.
+//   - fn calls runtime.Goexit, terminating its goroutine without returning
+//     and without panicking: the same epistemic position as a panic, so
+//     the deferred resolution fences through Fencer.HandleOutcomeUnknown
+//     rather than leave busy set for the life of the process. There is no
+//     value to return to - the goroutine is gone - but the stream is left
+//     fenced rather than wedged, so a later Append from a healthy
+//     goroutine gets a real refusal instead of "in progress" forever.
 //
 // mu is not held while fn runs: Append takes it only to read the seq to
 // hand fn and mark this Lease busy, releases it, calls fn unlocked, then
 // reacquires it to finalize the outcome. A slow fn therefore blocks no
 // other stream and no other operation on this process - only a second,
 // concurrent Append on this same Lease, which refuses rather than waits.
-func (l *Lease) Append(fn func(seq Seq) error) error {
+func (l *Lease) Append(fn func(seq Seq) error) (err error) {
 	if l.fencer.IsFenced(l.stream) {
 		return RefusePermanentlyFenced(l.stream)
 	}
@@ -291,38 +298,63 @@ func (l *Lease) Append(fn func(seq Seq) error) error {
 	l.mu.Unlock()
 
 	var (
-		callErr  error
-		panicked any
+		callErr   error
+		panicked  any
+		completed bool
 	)
+	// The resolution below runs in a defer, not straight-line code after
+	// the call to fn, because a panic is not the only way fn can fail to
+	// return: fn calling runtime.Goexit (in practice, t.Fatal/FailNow
+	// inside fn, in this package's own tests) also unwinds past any
+	// straight-line resolution, and a defer is the only thing a Goexit
+	// unwind still runs. completed is set as the last statement of the
+	// normal path, once fn has returned and callErr holds its result; the
+	// deferred resolution checks it before trusting callErr, so a Goexit
+	// unwind - which leaves panicked nil, the same as a normal return -
+	// cannot fall through and advance the sequence as though the append
+	// had landed. Not completed and not panicking is its own outcome: the
+	// process cannot prove whether fn's write landed, the same epistemic
+	// position a panic leaves it in, so it is routed through
+	// Fencer.HandleOutcomeUnknown exactly as the panic case below is,
+	// rather than left to leave busy set for the life of the process.
+	defer func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.busy = false
+
+		if panicked != nil {
+			l.fencer.HandleOutcomeUnknown(l.stream, seq)
+			panic(panicked)
+		}
+
+		if !completed {
+			err = l.fencer.HandleOutcomeUnknown(l.stream, seq)
+			return
+		}
+
+		switch {
+		case callErr == nil:
+			if seq == math.MaxUint64 {
+				l.exhausted = true
+			} else {
+				l.next = seq + 1
+			}
+		case errors.Is(callErr, ErrPreconditionFailed):
+			err = l.fencer.HandleConflict(l.stream, seq)
+		case errors.Is(callErr, ErrOutcomeUnknown):
+			err = l.fencer.HandleOutcomeUnknown(l.stream, seq)
+		default:
+			err = callErr
+		}
+	}()
+
 	func() {
 		defer func() { panicked = recover() }()
 		callErr = fn(seq)
+		completed = true
 	}()
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.busy = false
-
-	if panicked != nil {
-		l.fencer.HandleOutcomeUnknown(l.stream, seq)
-		panic(panicked)
-	}
-
-	switch {
-	case callErr == nil:
-		if seq == math.MaxUint64 {
-			l.exhausted = true
-		} else {
-			l.next = seq + 1
-		}
-		return nil
-	case errors.Is(callErr, ErrPreconditionFailed):
-		return l.fencer.HandleConflict(l.stream, seq)
-	case errors.Is(callErr, ErrOutcomeUnknown):
-		return l.fencer.HandleOutcomeUnknown(l.stream, seq)
-	default:
-		return callErr
-	}
+	return nil
 }
 
 // refuseSeqExhausted is Append's one-line refusal for a stream that has

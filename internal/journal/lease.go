@@ -381,12 +381,14 @@ func refuseSeqExhausted(stream StreamID) error {
 // so the fix is simply to retry.
 func refuseSeqBusy(stream StreamID) error {
 	what := "refusal: push failed"
+	fix := "retry the push"
 	if stream == MetaStreamID {
 		what = "refusal: meta operation failed"
+		fix = "retry the meta operation"
 	}
 	return refusal.Refuse(
 		what,
 		fmt.Sprintf("stream %s already has an append in progress", stream),
-		"retry the push",
+		fix,
 	)
 }

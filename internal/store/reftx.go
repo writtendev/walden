@@ -55,7 +55,7 @@ import (
 // the request-signing clock, and newFakeClient builds a client on real
 // time.
 //
-// Three checks run before lease.Append is ever called, each a one-line
+// Four checks run before lease.Append is ever called, each a one-line
 // refusal with zero network calls, in the order a caller's mistake is
 // cheapest to catch:
 //
@@ -63,14 +63,19 @@ import (
 //     defensive: ed25519.Sign panics on a wrong-size key, and a panic
 //     inside lease.Append's callback fences the stream through WALD-29's
 //     unknown-outcome path — a malformed key must not take a healthy
-//     stream out of service. After this check, the callback below has no
-//     panic path left.
-//  2. lease.Stream() naming the meta stream. Ref transactions never go on
+//     stream out of service.
+//  2. A nil now. This is load-bearing for the identical reason check 1
+//     is: now is called inside the callback to stamp the record's
+//     timestamp, and calling a nil func value panics exactly where check
+//     1's wrong-size key does — a nil clock must not take a healthy
+//     stream out of service either. After this check, the callback below
+//     has no panic path left.
+//  3. lease.Stream() naming the meta stream. Ref transactions never go on
 //     _meta (spec section 9.1); RefTransactionRecord.Validate would catch
 //     it too, but refusing here keeps it out of the append entirely.
-//  3. No ref updates at all (spec section 5.1 requires at least one).
+//  4. No ref updates at all (spec section 5.1 requires at least one).
 //
-// Beyond those three, AppendRefTx classifies nothing: a Validate, sign, or
+// Beyond those four, AppendRefTx classifies nothing: a Validate, sign, or
 // marshal failure inside the callback, and whatever PutIfAbsent itself
 // returns, are both passed back to lease.Append unchanged. lease.Append is
 // the only place that sorts a proven 412 from an unprovable outcome from
@@ -88,6 +93,9 @@ func (c *Client) AppendRefTx(
 ) (journal.Seq, error) {
 	if len(priv) != ed25519.PrivateKeySize {
 		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("ed25519 private key must be %d bytes, got %d", ed25519.PrivateKeySize, len(priv)))
+	}
+	if now == nil {
+		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("now must not be nil"))
 	}
 	if lease.Stream() == journal.MetaStreamID {
 		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("%w: ref transactions cannot be written to meta stream %q", journal.ErrInvalidRefTx, journal.MetaStreamID))

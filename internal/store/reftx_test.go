@@ -302,10 +302,11 @@ func TestAppendRefTxStreamIsolation(t *testing.T) {
 // 6. Each pre-check AppendRefTx makes before ever calling lease.Append
 // refuses with zero entries added to fake.Calls() beyond whatever Open
 // itself already made, leaves the stream unfenced, and is exactly one
-// line - including the wrong-size private key, the test that proves a bad
-// key refuses instead of fencing (ed25519.Sign would otherwise panic
-// inside lease.Append's callback and fence a healthy stream through
-// WALD-29's unknown-outcome path).
+// line - including the wrong-size private key and the nil now, the two
+// tests that prove a load-bearing pre-check refuses instead of fencing
+// (ed25519.Sign on a wrong-size key, or calling a nil now inside the
+// closure, would otherwise panic inside lease.Append's callback and fence
+// a healthy stream through WALD-29's unknown-outcome path).
 func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T) {
 	priv, _, err := journal.GenerateKeypair()
 	if err != nil {
@@ -327,6 +328,29 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 		assertReftxOneLine(t, err)
 		if errors.Is(err, journal.ErrFenced) {
 			t.Errorf("a malformed key must refuse, not fence: %v", err)
+		}
+		if lease.Fencer().IsFenced("repo-alpha") {
+			t.Errorf("expected repo-alpha to remain unfenced")
+		}
+		if got := len(fake.Calls()); got != callsBefore {
+			t.Errorf("fake saw %d further requests, want 0", got-callsBefore)
+		}
+	})
+
+	t.Run("nil now", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		ctx := context.Background()
+		leases := journal.NewLeases(c)
+		lease, err := leases.Open(ctx, "repo-alpha")
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		callsBefore := len(fake.Calls())
+
+		_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), nil)
+		assertReftxOneLine(t, err)
+		if errors.Is(err, journal.ErrFenced) {
+			t.Errorf("a nil now must refuse, not fence: %v", err)
 		}
 		if lease.Fencer().IsFenced("repo-alpha") {
 			t.Errorf("expected repo-alpha to remain unfenced")
@@ -381,4 +405,61 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 			t.Errorf("fake saw %d further requests, want 0", got-callsBefore)
 		}
 	})
+}
+
+// 7. A Validate failure caught only inside lease.Append's closure - not by
+// any of AppendRefTx's four pre-checks - stays a plain error: a duplicate
+// ref in updates passes the valid-key, non-nil-now, non-meta-stream, and
+// non-empty-updates pre-checks, and is refused only once SignRefTx calls
+// RefTransactionRecord.Validate. WALD-29's Append passes that error through
+// unchanged (it matches neither ErrPreconditionFailed nor
+// ErrOutcomeUnknown), so the stream is left unfenced and the sequence is
+// left unconsumed - the plan's explicit "worth a test" case.
+func TestAppendRefTxValidationFailureInsideClosureLeavesSequenceReusable(t *testing.T) {
+	c, fake := newFakeClient(t)
+	ctx := context.Background()
+
+	priv, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair: %v", err)
+	}
+
+	leases := journal.NewLeases(c)
+	lease, err := leases.Open(ctx, "repo-alpha")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// Two updates for the same ref: passes every pre-check (all four run
+	// against priv, now, the stream, and the updates slice as a whole, none
+	// of them look inside individual updates) and is caught only by
+	// Validate's duplicate-ref check inside the closure.
+	dup := []journal.RefUpdate{
+		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "5b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+	}
+
+	_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, dup, fixedReftxNow)
+	if !errors.Is(err, journal.ErrInvalidRefTx) {
+		t.Fatalf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+	}
+	if errors.Is(err, journal.ErrFenced) {
+		t.Errorf("a caller's malformed input must refuse, not fence: %v", err)
+	}
+	if lease.Fencer().IsFenced("repo-alpha") {
+		t.Errorf("expected repo-alpha to remain unfenced")
+	}
+	if _, ok := fake.Object(fullKey(journal.TxKey("repo-alpha", 0))); ok {
+		t.Errorf("expected no object written for a rejected transaction")
+	}
+
+	// The sequence is unconsumed: the next AppendRefTx on the same lease
+	// still writes seq 0.
+	seq, err := c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	if err != nil {
+		t.Fatalf("AppendRefTx after the validation failure: %v", err)
+	}
+	if seq != 0 {
+		t.Errorf("seq = %d, want 0 (the sequence must be reusable after a validation failure)", seq)
+	}
 }

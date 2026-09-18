@@ -27,6 +27,24 @@ var (
 
 	// ErrInvalidOID indicates an invalid Git object ID.
 	ErrInvalidOID = errors.New("invalid object id")
+
+	// ErrRefTxKeySeqMismatch indicates a ref-transaction record's own "seq"
+	// field disagrees with the sequence encoded in the object key it was
+	// read from: spec section 1.1 rule 3, "a record's sequence MUST still
+	// equal the sequence in its key." This is a distinct sentinel from
+	// ErrSequenceGap: rule 4 (ErrSequenceGap) checks that the *keys* a
+	// listing returns are strictly contiguous, never that a key and the
+	// record body found at it agree with each other.
+	ErrRefTxKeySeqMismatch = errors.New("ref transaction sequence does not match its key")
+
+	// ErrRefTxStreamMismatch indicates a ref-transaction record's own
+	// "stream" field disagrees with the stream being planned: a record
+	// genuinely signed for one stream, found filed under another's tx/
+	// prefix. chain.VerifyRefTx cannot catch this on its own - it builds
+	// its canonical payload from the record's own Stream field, so a
+	// record signed for stream B verifies perfectly when read out of
+	// stream A's tx/.
+	ErrRefTxStreamMismatch = errors.New("ref transaction stream does not match its location")
 )
 
 var (
@@ -68,7 +86,7 @@ type RefTransactionRecord struct {
 // NewRefTransactionRecord builds a RefTransactionRecord with the fixed
 // fields spec/journal/v1 section 5.1 requires ("version": "v1", "type":
 // "ref_update") set in one place, exactly as NewGenesisRecord does for
-// section 3.1 (genesis.go) and as WALD-31's NewKeyRotationRecord will for
+// section 3.1 (genesis.go) and as WALD-31's NewKeyRotationRecord does for
 // section 4.1. timestamp is the caller's, not time.Now(), for the same
 // determinism reason NewGenesisRecord gives: a caller (or a test) controls
 // the clock, this constructor does not.
@@ -247,6 +265,13 @@ func ValidateRefName(ref string) error {
 }
 
 // ValidateRefUpdate validates a single ref update triple.
+//
+// Deliberately does not wrap its own errors in ErrInvalidRefTx: its only
+// caller, RefTransactionRecord.Validate, already wraps whatever it returns
+// with ErrInvalidRefTx via its "update[%d] invalid: %w" error, the same way
+// it wraps ValidateRefName's and ValidateOID's errors (neither of which
+// carries ErrInvalidRefTx either). Doing it here too doubled the sentinel's
+// text in operator-facing refusals built from this error's message.
 func ValidateRefUpdate(u RefUpdate) error {
 	if err := ValidateRefName(u.Ref); err != nil {
 		return err
@@ -258,15 +283,15 @@ func ValidateRefUpdate(u RefUpdate) error {
 		return fmt.Errorf("invalid new_oid: %w", err)
 	}
 	if len(u.OldOID) != len(u.NewOID) {
-		return fmt.Errorf("%w: old_oid and new_oid have mismatched lengths (%d vs %d)", ErrInvalidRefTx, len(u.OldOID), len(u.NewOID))
+		return fmt.Errorf("old_oid and new_oid have mismatched lengths (%d vs %d)", len(u.OldOID), len(u.NewOID))
 	}
 	isOldZero := isZeroOID(u.OldOID)
 	isNewZero := isZeroOID(u.NewOID)
 	if isOldZero && isNewZero {
-		return fmt.Errorf("%w: cannot transition from zero oid to zero oid", ErrInvalidRefTx)
+		return fmt.Errorf("cannot transition from zero oid to zero oid")
 	}
 	if strings.EqualFold(u.OldOID, u.NewOID) {
-		return fmt.Errorf("%w: no-op ref update (old_oid == new_oid: %q)", ErrInvalidRefTx, u.OldOID)
+		return fmt.Errorf("no-op ref update (old_oid == new_oid: %q)", u.OldOID)
 	}
 	return nil
 }
@@ -343,6 +368,94 @@ func (r *RefTransactionRecord) Validate() error {
 		}
 	}
 	return nil
+}
+
+// refTxShadow decodes tx/<seq>.json into pointer fields so that ParseRefTx
+// can tell a field that is genuinely absent from one that decoded to its
+// zero value — the same discipline markerShadow (marker.go) and
+// tokenCreateShadow (token.go) already apply to their own record types.
+//
+// KeyEpoch is deliberately not a pointer here, unlike every other field:
+// section 5.1 states plainly that "a record with no key_epoch at all is
+// read as epoch 0, identically to an explicit 'key_epoch': '0'" — an
+// absent key_epoch is not an error to catch, it is the documented
+// default. Segments and Updates are plain slices for the same reason:
+// Validate() already turns a nil Segments into an empty one and already
+// refuses an Updates array with no entries (nil included), so a shadow
+// presence check would only duplicate what Validate does, not catch
+// anything it misses.
+type refTxShadow struct {
+	Version   *string     `json:"version"`
+	Stream    *StreamID   `json:"stream"`
+	Seq       *Seq        `json:"seq"`
+	Type      *string     `json:"type"`
+	KeyEpoch  Epoch       `json:"key_epoch"`
+	Segments  []string    `json:"segments"`
+	Updates   []RefUpdate `json:"updates"`
+	Timestamp *string     `json:"timestamp"`
+	Signature *string     `json:"signature"`
+}
+
+// ParseRefTx parses and validates a tx/<seq>.json ref-transaction record's
+// JSON bytes, in the style of ParseMarker and ParseTokenCreate: decode into
+// a shadow of pointer fields so a genuinely missing required field is
+// refused by name rather than silently read as its zero value, then run
+// Validate() before returning. Unknown JSON keys are ignored, per spec
+// section 5.4's forward-compatibility rule.
+//
+// ParseRefTx does not itself verify the signature or assert Type ==
+// "ref_update" beyond what Validate() already checks — callers replaying a
+// stream do that against a *SigningChain (see (*SigningChain).VerifyRefTx),
+// using the record's own declared Type rather than inferring it from where
+// its key was found.
+func ParseRefTx(data []byte) (*RefTransactionRecord, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%w: empty ref transaction data", ErrInvalidRefTx)
+	}
+	var shadow refTxShadow
+	if err := json.Unmarshal(data, &shadow); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidRefTx, err)
+	}
+	missing := ""
+	switch {
+	case shadow.Version == nil:
+		missing = "version"
+	case shadow.Stream == nil:
+		missing = "stream"
+	case shadow.Seq == nil:
+		missing = "seq"
+	case shadow.Type == nil:
+		missing = "type"
+	case shadow.Timestamp == nil:
+		missing = "timestamp"
+	case shadow.Signature == nil:
+		missing = "signature"
+	}
+	if missing != "" {
+		return nil, fmt.Errorf("%w: missing required field %q", ErrInvalidRefTx, missing)
+	}
+	r := &RefTransactionRecord{
+		Version:   *shadow.Version,
+		Stream:    *shadow.Stream,
+		Seq:       *shadow.Seq,
+		Type:      *shadow.Type,
+		KeyEpoch:  shadow.KeyEpoch,
+		Segments:  shadow.Segments,
+		Updates:   shadow.Updates,
+		Timestamp: *shadow.Timestamp,
+		Signature: *shadow.Signature,
+	}
+	// Validate() already wraps ErrInvalidRefTx around whatever field rule
+	// failed (see its own definition above): returning err as-is, rather
+	// than wrapping it a second time, is the same error either way for
+	// errors.Is, but avoids doubling the "invalid ref transaction record"
+	// prefix in the message text - a reader that surfaces this error
+	// verbatim (as (*Reader).PlanStream's tx/ walk does, via
+	// RefuseWithCause) would otherwise show it twice.
+	if err := r.Validate(); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // CanonicalRefUpdatePayload returns the deterministic canonical byte payload to sign/verify for a RefTransactionRecord.
@@ -484,5 +597,88 @@ func RefuseKeyEpochRegression(stream StreamID, seq Seq, epoch, lastEpoch Epoch) 
 		fmt.Sprintf("ref update on stream %s at seq %d names key epoch %s below epoch %s already seen on this stream", stream, seq, epoch, lastEpoch),
 		"",
 		ErrKeyEpochRegression,
+	)
+}
+
+// RefuseRefTxSignatureMismatch returns a single-line operator-facing refusal
+// when a ref-transaction record's signature does not verify against the key
+// its own key_epoch names (spec section 8.1 rule 3). A reader replaying a
+// stream maps the raw ErrSignatureMismatch VerifyRefTx returns onto this
+// constructor rather than surfacing VerifyRefTx's own message, which quotes
+// the stream id and is not the wording section 8.1 publishes.
+func RefuseRefTxSignatureMismatch(stream StreamID, seq Seq) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("signature mismatch for ref update on stream %s at seq %d", stream, seq),
+		"",
+		ErrSignatureMismatch,
+	)
+}
+
+// RefuseRefTxKeySeqMismatch returns a single-line operator-facing refusal
+// when a ref-transaction record's own seq disagrees with the sequence in
+// the object key it was read from (spec section 1.1 rule 3: "a record's
+// sequence MUST still equal the sequence in its key"). Section 8.1 does
+// not publish wording of its own for this failure - rule 4's
+// RefuseSequenceGap checks that the *keys* a listing returns are strictly
+// contiguous, never that a key and the record body found at it agree with
+// each other - so this uses the refusal.RefuseWithCause <what>: <why>
+// (<fix>) shape directly, the same shape the malformed-transaction-key
+// refusal in (*Reader).PlanStream's own List callback already uses for a
+// sibling problem (a key that does not parse at all, versus one that
+// parses but disagrees with the body found at it).
+func RefuseRefTxKeySeqMismatch(stream StreamID, keySeq, recordSeq Seq) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("ref transaction at %s: record seq %d does not match key seq %d", TxKey(stream, keySeq), recordSeq, keySeq),
+		fmt.Sprintf("remove or restore the object at %s; a record's seq must equal the sequence in its own key", TxKey(stream, keySeq)),
+		ErrRefTxKeySeqMismatch,
+	)
+}
+
+// RefuseRefTxStreamMismatch returns a single-line operator-facing refusal
+// when a ref-transaction record's own stream disagrees with the stream
+// being planned - the same class of problem (*Reader).PlanStream's marker
+// path already checks (marker.Stream != stream, reader.go, citing spec
+// section 7.5 step 2), worded the same way for consistency: "<kind> stream
+// %q does not match stream %q". Section 8.1 does not publish wording of
+// its own for this failure either, so this uses the
+// refusal.RefuseWithCause <what>: <why> (<fix>) shape directly rather than
+// inventing a spec-rule-style line.
+func RefuseRefTxStreamMismatch(stream StreamID, seq Seq, recordStream StreamID) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("ref transaction at %s: record stream %q does not match stream %q", TxKey(stream, seq), recordStream, stream),
+		fmt.Sprintf("remove the object at %s; it belongs under stream %q's own tx/ prefix, not %q's", TxKey(stream, seq), recordStream, stream),
+		ErrRefTxStreamMismatch,
+	)
+}
+
+// RefuseRefTxMalformed returns a single-line operator-facing refusal when a
+// tx/<seq>.json record body itself fails to parse - malformed JSON, a
+// missing required field, or a well-formed document that still fails
+// Validate() (a wrong "type", say) - found while walking a stream's tx/
+// listing, before the record can even be checked against chain. Section
+// 8.1 publishes wording for every other failure this file's constructors
+// cover, but not this one: rule 13's "Malformed Token Record" line is the
+// _meta stream's analogue (token_create/token_revoke, section 4.3/4.4),
+// and section 8.1 has no equivalent for a malformed ref_update body, so
+// this uses the refusal.RefuseWithCause <what>: <why> (<fix>) shape
+// directly - the same shape RefuseRefTxKeySeqMismatch and
+// RefuseRefTxStreamMismatch above already use for their own unpublished
+// failures. It locates the failure the way the malformed-transaction-key
+// refusal in (*Reader).PlanStream's own List callback already does for a
+// sibling problem (a key that does not parse at all, versus a key that
+// parses but names a body that does not): naming the stream, the sequence
+// parsed from the key, and the key itself, with reason - ParseRefTx's own
+// error - folded in as the cause for errors.Is/errors.As rather than
+// surfaced as the located message's own text.
+func RefuseRefTxMalformed(stream StreamID, seq Seq, reason error) error {
+	key := TxKey(stream, seq)
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("ref transaction at %s does not parse: %s", key, reason),
+		fmt.Sprintf("inspect and, if necessary, restore or remove the object at %s", key),
+		reason,
 	)
 }

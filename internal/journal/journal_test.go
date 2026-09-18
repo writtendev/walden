@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/writtendev/walden/internal/journal"
+	"github.com/writtendev/walden/internal/store"
 )
 
 func TestMetaStreamID(t *testing.T) {
@@ -264,5 +265,45 @@ func TestValidateHash(t *testing.T) {
 		if !errors.Is(err, journal.ErrInvalidHash) {
 			t.Errorf("expected ErrInvalidHash for %q, got %v", h, err)
 		}
+	}
+}
+
+// TestRefuseSequenceGap pins section 8.1 rule 4's exact wording. WALD-31's
+// _meta contiguity check enforces the identical rule but through its own
+// differently-worded refuseMetaSequenceGap (internal/store/meta.go), not
+// this constructor.
+func TestRefuseSequenceGap(t *testing.T) {
+	err := journal.RefuseSequenceGap("repo-alpha", 2, 3)
+	if !errors.Is(err, journal.ErrSequenceGap) {
+		t.Errorf("errors.Is(_, journal.ErrSequenceGap) = false, err = %v", err)
+	}
+	want := "refusal: replay failed: sequence gap detected on stream repo-alpha (expected 2, got 3)"
+	if err.Error() != want {
+		t.Errorf("RefuseSequenceGap = %q, want %q", err.Error(), want)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+}
+
+// TestErrObjectNotFoundIsSharedWithStore pins the one-sentinel-not-two
+// pattern this ticket applies to ErrObjectNotFound, the same pattern
+// journal.ErrPreconditionFailed/store.ErrPrecondition already use: that
+// store.ErrObjectNotFound (internal/store/client.go) really is an alias
+// for journal.ErrObjectNotFound, not a second, independently constructed
+// sentinel that merely compares equal today. errors.Is(_, nonNilErr) is
+// always false for a nil first argument, so asserting non-nilness alone
+// (as an earlier version of this test did) can never fail and guards
+// nothing; this asserts the identity the name promises instead. The
+// regression this exists to catch - store.ErrObjectNotFound quietly
+// becoming its own errors.New("object not found") - is covered again,
+// implicitly, by internal/store/reader_test.go's
+// TestPlanStreamGenesisPathResumesAcrossPagination, which drops
+// marker.json and expects PlanStream's ErrObjectNotFound branch (reader.go)
+// to fire across the package boundary; this test pins the same fact
+// directly, where both packages are already imported.
+func TestErrObjectNotFoundIsSharedWithStore(t *testing.T) {
+	if !errors.Is(store.ErrObjectNotFound, journal.ErrObjectNotFound) {
+		t.Fatalf("store.ErrObjectNotFound is not journal.ErrObjectNotFound: they no longer share one sentinel")
 	}
 }

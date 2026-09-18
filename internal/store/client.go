@@ -37,8 +37,13 @@ var (
 	ErrStorageUnavailable = errors.New("object storage unavailable")
 	// ErrStorageRefused marks a permanent failure: retrying will not help.
 	ErrStorageRefused = errors.New("object storage refused request")
-	// ErrObjectNotFound marks a GET against a key that does not exist.
-	ErrObjectNotFound = errors.New("object not found")
+	// ErrObjectNotFound marks a GET against a key that does not exist: the
+	// same identity as journal.ErrObjectNotFound, one sentinel rather than
+	// two, exactly as ErrPrecondition below aliases
+	// journal.ErrPreconditionFailed. journal.(*Reader) tests for this
+	// sentinel to tell an absent marker.json (the ordinary genesis path)
+	// from a real failure.
+	ErrObjectNotFound = journal.ErrObjectNotFound
 	// ErrPrecondition marks a conditional write's target key already
 	// existing (412): the same identity as journal.ErrPreconditionFailed,
 	// so one sentinel exists, not two (the same pattern as

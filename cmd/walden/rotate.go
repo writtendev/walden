@@ -142,7 +142,20 @@ func runRotateKey(args []string, stdout, stderr io.Writer) error {
 	c := store.NewClient(j)
 	leases := journal.NewLeases(c)
 
-	retired, active, err := c.RotateKey(context.Background(), dataDir, leases, time.Now)
+	// Bounded the same way serve's own boot-time preflights are (main.go's
+	// probeTimeout, shared rather than reintroduced here as a second
+	// constant): RotateKey's ReplayMeta walk retries a "grew" 404 a bounded
+	// number of times per sequence (meta.go's maxMetaGrowRetries), but that
+	// bound is per-sequence, not per-call — a provider that keeps growing
+	// the stream out from under a long _meta history could still stall for
+	// a long time without a deadline on the call as a whole. A bare
+	// context.Background() here previously meant rotate-key could hang
+	// silently against an out-of-contract provider, printing no refusal at
+	// all (round 3 medium finding). Not a sixth knob: fixed and internal,
+	// like probeTimeout itself.
+	rotateCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	retired, active, err := c.RotateKey(rotateCtx, dataDir, leases, time.Now)
 	if err != nil {
 		return err
 	}

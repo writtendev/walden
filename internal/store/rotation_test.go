@@ -8,6 +8,7 @@ package store_test
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -609,5 +610,77 @@ func TestRotateKeyRefusesOnConcurrentRotationDuringLeaseOpen(t *testing.T) {
 	wantActive := journal.FormatPublicKey(rivalPub)
 	if chain.ActiveKey() != wantActive {
 		t.Errorf("ActiveKey() = %q, want %q (the rival rotation's key)", chain.ActiveKey(), wantActive)
+	}
+}
+
+// (i) Round 3 medium finding: an active key that is byte-identical to the
+// local signing key but spelled with uppercase hex -- the same
+// spec-non-conformant-but-parseable genesis shape
+// TestEnsureGenesisAdoptToleratesUppercaseHexKey (genesis_test.go) already
+// covers for the adopt path -- must not reach SignRotation (identity.go)
+// at all. Before the fix, the decoded-byte comparison at step 3 passed,
+// but SignRotation's own exact-string comparison against its
+// always-lowercase FormatPublicKey output then failed a few lines later,
+// inside the lease closure, as a bare, unshaped error with no fix clause:
+// the instance "booted fine but could never rotate again," now with a
+// worse message than before round 2's fix. This pins the outcome the
+// round 3 review asked for instead: a proper one-line RefuseNotActiveSigningKey
+// refusal, before any key is generated or any disk/storage write happens.
+func TestRotateKeyRefusesOnUppercaseHexActiveKey(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	priv, pub, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	if err := journal.SaveSigningKey(dataDir, priv); err != nil {
+		t.Fatalf("SaveSigningKey failed: %v", err)
+	}
+
+	lower := journal.FormatPublicKey(pub) // "ed25519:<64-lower-hex>"
+	upper := "ed25519:" + strings.ToUpper(strings.TrimPrefix(lower, "ed25519:"))
+	rec := map[string]string{
+		"version":    "v1",
+		"stream":     "_meta",
+		"seq":        "0",
+		"type":       "genesis",
+		"public_key": upper,
+		"timestamp":  "2026-09-17T12:00:00Z",
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	fake.SetObject(fullKey(journal.TxKey(journal.MetaStreamID, 0)), data)
+
+	callsBefore := len(fake.Calls())
+	leases := journal.NewLeases(c)
+	_, _, err = c.RotateKey(context.Background(), dataDir, leases, fixedRotateNow)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil (this genesis's active key is byte-identical to the local key but not lowercase, which SignRotation would refuse deep inside the closure)")
+	}
+	if !errors.Is(err, journal.ErrSigningKeyUnavailable) {
+		t.Errorf("expected errors.Is(_, ErrSigningKeyUnavailable) (RefuseNotActiveSigningKey's cause), got %v", err)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "private key does not match old public key") {
+		t.Errorf("refusal leaked SignRotation's own bare error text instead of refusing early: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "rotate-key refused") {
+		t.Errorf("refusal = %q, want the RefuseNotActiveSigningKey shape (\"rotate-key refused: ...\")", err.Error())
+	}
+
+	// No write of any kind: the check runs before GenerateKeypair, the temp
+	// key file, and leases.Open.
+	for _, call := range fake.Calls()[callsBefore:] {
+		if call.Op == storetest.OpPutIfAbsent || call.Op == storetest.OpPut {
+			t.Errorf("RotateKey issued a write despite the uppercase-hex active key refusing early: %+v", call)
+		}
+	}
+	if matches := signingKeyTempFiles(t, dataDir); len(matches) != 0 {
+		t.Errorf("temp key file(s) left behind: %v", matches)
 	}
 }

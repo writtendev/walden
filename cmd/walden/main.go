@@ -25,13 +25,17 @@ import (
 // Version can be set via ldflags at build time.
 var Version = "dev"
 
-// probeTimeout bounds two boot-time preflights against object storage: the
+// probeTimeout bounds boot-time preflights against object storage — the
 // compare-and-swap probe (ProbeCAS) and, when it runs, EnsureGenesis's
-// genesis GET plus conditional PUT. Not a knob: walden's five knobs don't
-// include tuning this, so there is no flag or env var. The client's own
-// transport timeouts and retry cap bound each individual request anyway;
-// this is a backstop on the whole of either preflight (a handful of
-// requests each, retries included).
+// genesis GET plus conditional PUT — and, in rotate.go, the same shape of
+// preflight rotate-key performs from a long-lived operator command instead
+// of at boot: ReplayMeta's walk of _meta plus the rotation's own append.
+// Not a knob: walden's five knobs don't include tuning this, so there is
+// no flag or env var. The client's own transport timeouts and retry cap
+// bound each individual request anyway; this is a backstop on the whole of
+// a walk against an out-of-contract provider — see meta.go's
+// maxMetaGrowRetries doc comment for the specific hazard rotate-key's use
+// of this bound closes — rather than a single request.
 const probeTimeout = 2 * time.Minute
 
 func main() {

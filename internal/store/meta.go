@@ -37,9 +37,11 @@ import (
 // stream merely grew during the walk, not proof of a hole (round 2 medium
 // finding). Only a key at a sequence strictly greater than seq proves a
 // hole; a key equal to seq means the record now exists and the walk
-// simply retries the GET at the same seq. Each record between genesis and
-// the confirmed head is dispatched by its own "type" field, per spec
-// section 8 step 2:
+// simply retries the GET at the same seq — bounded by maxMetaGrowRetries,
+// so an out-of-contract provider whose List and Get permanently disagree
+// about the same key gets a one-line refusal instead of an unbounded loop
+// (round 3 medium finding). Each record between genesis and the confirmed
+// head is dispatched by its own "type" field, per spec section 8 step 2:
 //
 //   - "key_rotation": parsed with ParseKeyRotation and applied through
 //     (*journal.SigningChain).ApplyRotation, which both advances the chain
@@ -86,7 +88,7 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 		return nil, journal.RefuseCorruptGenesis(err)
 	}
 
-	for seq := journal.Seq(1); ; {
+	for seq, growRetries := journal.Seq(1), 0; ; {
 		body, err := c.Get(ctx, journal.TxKey(journal.MetaStreamID, seq))
 		if err != nil {
 			if errors.Is(err, ErrObjectNotFound) {
@@ -100,12 +102,32 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 					// the GET above and the List, not a hole. Re-read it at
 					// the same seq rather than treating the 404 as the
 					// stream's head.
+					//
+					// That convergence relies on spec section 11.2 item 4's
+					// mandated strong read-after-write consistency: List
+					// has already proved the object exists, so the very
+					// next Get must see it, and one retry is normally
+					// enough. It does not hold against an out-of-contract
+					// provider whose List reports a key its Get keeps
+					// 404ing — measured spinning at ~15k requests/second
+					// with no exit. maxListPages (list.go) gives itself
+					// the same kind of backstop for the same reason: a
+					// provider that never finishes gets a one-line
+					// refusal, not a request storm (round 3 medium
+					// finding). growRetries counts consecutive "grew"
+					// results at this same seq; it resets to 0 below every
+					// time a record is actually read and applied.
+					growRetries++
+					if growRetries > maxMetaGrowRetries {
+						return nil, refuseMetaGrowExhausted(seq, growRetries)
+					}
 					continue
 				}
 				return chain, nil
 			}
 			return nil, wrapMetaFailure(seq, err)
 		}
+		growRetries = 0
 		data, err := io.ReadAll(io.LimitReader(body, maxGenesisBody+1))
 		body.Close()
 		if err != nil {
@@ -178,6 +200,22 @@ var errMetaContinuesPastGap = errors.New("meta stream continues past a missing s
 // file, for the same reason errMetaContinuesPastGap does not.
 var errMetaGrewDuringWalk = errors.New("meta stream grew past a sequence during replay")
 
+// maxMetaGrowRetries bounds how many times ReplayMeta's walk will retry a
+// GET at the same seq after probeMetaAfterNotFound's corroborating List
+// reports grew=true there. Spec section 11.2 item 4's mandated strong
+// read-after-write consistency means one retry is normally enough — List
+// has already proved the object exists, so the very next Get must see it —
+// but nothing here enforces that promise on an out-of-contract provider
+// whose List reports a key its Get keeps 404ing: without this bound the
+// loop spins forever (measured at roughly 15,000 requests/second against
+// storetest). list.go's maxListPages gives itself the identical kind of
+// backstop, for the identical reason ("this cap is the backstop for a
+// provider that never repeats but also never finishes") — a few retries is
+// generous slack for a real race with a concurrent writer, while still
+// turning a misbehaving provider into a one-line refusal instead of a
+// request storm.
+const maxMetaGrowRetries = 3
+
 // probeMetaAfterNotFound corroborates a GET 404 at seq — the sequence
 // ReplayMeta's contiguous walk just failed to read — against the actual
 // listing before trusting it as _meta's head. One List call, starting
@@ -239,19 +277,48 @@ func refuseMetaSequenceGap(seq journal.Seq) error {
 	)
 }
 
+// refuseMetaGrowExhausted returns a one-line refusal when
+// probeMetaAfterNotFound has reported "grew" at the same seq more than
+// maxMetaGrowRetries times in a row: the corroborating List keeps insisting
+// the record exists while Get keeps 404ing on it, which spec section 11.2
+// item 4's read-after-write consistency requirement says should not be
+// possible after even one retry. Whatever the provider is doing, it is not
+// honoring the journal's storage contract, and the walk stops here rather
+// than spinning.
+func refuseMetaGrowExhausted(seq journal.Seq, attempts int) error {
+	return refusal.Refuse(
+		"invalid journal",
+		fmt.Sprintf("_meta seq %d: object storage LIST reports this key but GET still returns not-found after %d attempts", seq, attempts),
+		"the object storage provider is not honoring strong read-after-write consistency (spec/journal/v1 section 11.2 item 4); check the provider",
+	)
+}
+
 // refuseMetaVerificationFailed wraps a _meta record's parse or chain-
 // verification failure — ParseTokenCreate/ParseTokenRevoke, ApplyRotation,
-// VerifyTokenCreate/VerifyTokenRevoke, AdvanceMetaSeq — as a one-line "invalid
-// journal" refusal with a remedy, the same treatment RefuseCorruptRotation
-// (journal/rotation.go) already gives a key_rotation record that fails to
-// parse. Before this, these five calls returned cause unwrapped: one line,
-// since every error journal/identity.go and journal/token.go build already
-// is, but with no "invalid journal" prefix and no fix clause on a path an
-// operator only ever reaches at boot (round 1 minor finding). cause is kept
-// as the wrapped Unwrap() cause, so errors.Is against ErrUnchainableRotation,
-// ErrInvalidTokenRecord, and the rest still holds for any caller checking a
-// specific reason.
+// AdvanceMetaSeq — as a one-line "invalid journal" refusal with a remedy,
+// the same treatment RefuseCorruptRotation (journal/rotation.go) already
+// gives a key_rotation record that fails to parse. Before this, these
+// calls returned cause unwrapped: one line, since every error
+// journal/identity.go and journal/token.go build already is, but with no
+// "invalid journal" prefix and no fix clause on a path an operator only
+// ever reaches at boot (round 1 minor finding).
+//
+// VerifyTokenCreate/VerifyTokenRevoke are the exception: on a signature
+// failure they already return a purpose-built refusal —
+// RefuseTokenSignatureMismatch (journal/token.go) — whose entire job is to
+// emit spec section 8.1 rule 19's exact prescribed line. Wrapping an
+// already-shaped *refusal.Refusal here stacked a second "invalid journal: …
+// refusal: replay failed: …" prefix onto it, naming the sequence twice and
+// breaking the string journal/fixtures_test.go pins for that rule (round 3
+// minor finding). errors.As detects that case and returns cause unchanged;
+// every other cause (a plain error from ApplyRotation, AdvanceMetaSeq, or a
+// parse failure) still takes the wrap below, keeping round 1's fix for the
+// calls that genuinely need it.
 func refuseMetaVerificationFailed(seq journal.Seq, cause error) error {
+	var already *refusal.Refusal
+	if errors.As(cause, &already) {
+		return cause
+	}
 	return refusal.RefuseWithCause(
 		"invalid journal",
 		fmt.Sprintf("_meta seq %d: %s", seq, cause.Error()),

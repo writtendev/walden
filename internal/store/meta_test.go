@@ -10,7 +10,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -382,5 +384,113 @@ func TestReplayMetaConcurrentAppendDuringGapProbeSucceeds(t *testing.T) {
 	}
 	if res.chain.LastMetaSeq() != 1 {
 		t.Errorf("LastMetaSeq() = %d, want 1", res.chain.LastMetaSeq())
+	}
+}
+
+// (m) Round 3 medium finding: the "grew" retry must not spin forever
+// against a provider whose LIST reports a key its GET still 404s. The
+// record at _meta seq 1 genuinely exists in the fake's object store for
+// the whole test -- the corroborating List (unfaulted) always reports it
+// -- but every GET at that key is faulted to a 404, for far more calls
+// than maxMetaGrowRetries allows. This is exactly the out-of-contract
+// shape the review measured spinning at roughly 15,000 requests/second
+// with no bound: without the fix, ReplayMeta never returns. The context
+// carries its own short deadline so a regression here fails fast, as a
+// clearly-failed test, rather than hanging the whole race-mode run.
+func TestReplayMetaGrowExhaustedRefuses(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	_, genesisPriv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+	_, pub2, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	putRotation(t, c, 1, genesisPriv, pub2, "2026-09-18T00:00:00Z")
+
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpGet, Key: fullKey(journal.TxKey(journal.MetaStreamID, 1)), Call: 1, Count: 1000,
+		Fault: storetest.Fault{Status: http.StatusNotFound, Code: "NoSuchKey"},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = c.ReplayMeta(ctx)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReplayMeta did not stop on its own retry bound -- it ran out this test's safety deadline instead: %v", err)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "seq 1") {
+		t.Errorf("refusal does not name the sequence: %q", err.Error())
+	}
+}
+
+// (n) Round 3 minor finding: VerifyTokenCreate's own spec section 8.1 rule
+// 19 refusal (RefuseTokenSignatureMismatch, journal/token.go) must pass
+// through refuseMetaVerificationFailed unchanged rather than getting a
+// second "invalid journal: ..." prefix stacked on top of it -- which would
+// name the sequence twice and stop matching the line
+// journal/fixtures_test.go's TestFixtureForgedTokenCreateRefused pins for
+// the identical condition. This drives the same forged-signature shape
+// through ReplayMeta itself, so it exercises the wrapping this file adds
+// on top of (*SigningChain).VerifyTokenCreate, not VerifyTokenCreate alone.
+func TestReplayMetaTokenSignatureMismatchNotDoubleWrapped(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+	if _, _, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow); err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+	wrongPriv, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+
+	forged := &journal.TokenCreateRecord{
+		Version:   journal.VersionPrefix,
+		Stream:    journal.MetaStreamID,
+		Seq:       1,
+		Type:      journal.RecordTypeTokenCreate,
+		TokenID:   "tok_forged_00",
+		TokenHash: journal.TokenHashPrefix + strings.Repeat("a", 64),
+		Scopes:    []string{"rwc:*"},
+		Timestamp: "2026-09-18T00:00:00Z",
+	}
+	// Signed by a key that never chained to genesis -- bucket write access
+	// without the active signing key, the same forged shape
+	// TestFixtureForgedTokenCreateRefused (journal/fixtures_test.go) uses.
+	if err := journal.SignTokenCreate(wrongPriv, forged); err != nil {
+		t.Fatalf("SignTokenCreate failed: %v", err)
+	}
+	data, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	fake.SetObject(fullKey(journal.TxKey(journal.MetaStreamID, 1)), data)
+
+	_, err = c.ReplayMeta(context.Background())
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("errors.Is(_, ErrSignatureMismatch) = false, err = %v", err)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	// Spec section 8.1 rule 19, quoted verbatim -- the same string
+	// journal/fixtures_test.go pins for VerifyTokenCreate's own refusal.
+	// Double-wrapping it here would produce "invalid journal: _meta seq 1:
+	// refusal: replay failed: ..." instead.
+	wantLine := "refusal: replay failed: signature mismatch for token record at seq 1"
+	if err.Error() != wantLine {
+		t.Errorf("refusal = %q, want %q (double-wrapped by refuseMetaVerificationFailed)", err.Error(), wantLine)
 	}
 }

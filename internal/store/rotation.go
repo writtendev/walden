@@ -49,7 +49,13 @@ import (
 //     decoded key bytes, not formatted strings, matching adoptGenesis
 //     (genesis.go): a chain whose active key is spec-non-conformant but
 //     parseable hex must not read as a mismatch against a local key that
-//     is byte-for-byte correct (round 2 finding).
+//     is byte-for-byte correct (round 2 finding). A second, exact-string
+//     comparison follows immediately: SignRotation (identity.go) itself
+//     compares old_public_key to FormatPublicKey's always-lowercase output
+//     by exact string, so a byte-identical but non-lowercase active key
+//     still cannot be signed — refused here, with the proper one-line
+//     refusal and fix clause, rather than failing unshaped deep inside the
+//     lease closure below (round 3 finding).
 //  4. GenerateKeypair, then WriteSigningKeyTemp for the *new* key. Written
 //     before the record's fate is known, exactly as mintGenesis writes the
 //     genesis key's temp file before its own conditional PUT — signing.key
@@ -124,6 +130,32 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 		return "", "", journal.RefuseCorruptGenesis(err)
 	}
 	if !localPub.Equal(activeKeyPub) {
+		return "", "", journal.RefuseNotActiveSigningKey(dataDir, localPubFormatted, chain.ActiveKey())
+	}
+	// The byte comparison above is deliberately more permissive than the
+	// exact-string comparison SignRotation (identity.go, not owned by this
+	// ticket) performs a few lines further down inside the lease closure:
+	// SignRotation checks r.OldPublicKey against FormatPublicKey(priv's own
+	// public half), which hex.EncodeToString always renders in lowercase.
+	// When chain.ActiveKey() is byte-identical but spelled with uppercase
+	// hex (the same non-conformant-but-parseable case the byte comparison
+	// above exists to tolerate), old_public_key is set from
+	// chain.ActiveKey()'s own string a few lines down — required so a
+	// future replay's string comparison in VerifyRotation still matches
+	// (round 2 finding, see NewKeyRotationRecord's doc comment) — and that
+	// string can never equal SignRotation's lowercase-only formattedPub.
+	// There is no way to satisfy both string comparisons at once without
+	// editing identity.go, which this ticket does not own: reformatting
+	// old_public_key to lowercase here would make SignRotation succeed but
+	// permanently break VerifyRotation's replay-side match against
+	// genesis's own (still-uppercase) stored string, trading one
+	// unreplayable rotation for another. So this instance genuinely cannot
+	// produce a rotation record any future replay could ever accept, and
+	// must refuse here — before generating a new key or touching disk —
+	// rather than let SignRotation's own string comparison fail deep
+	// inside the lease closure with a bare, unshaped error and no fix
+	// clause (round 3 medium finding).
+	if chain.ActiveKey() != localPubFormatted {
 		return "", "", journal.RefuseNotActiveSigningKey(dataDir, localPubFormatted, chain.ActiveKey())
 	}
 

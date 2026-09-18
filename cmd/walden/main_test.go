@@ -1289,3 +1289,164 @@ func TestServeProbeCleanupFailureIsWarning(t *testing.T) {
 		t.Errorf("expected boot to continue past the cleanup warning and bind, got stdout:\n%s", stdout.String())
 	}
 }
+
+// journalTestJournalURL builds a --journal value pointing at fake, styled on
+// TestServeJournalWarning and TestServeProbeRefusesProviderLacksCAS.
+func journalTestJournalURL(fake *storetest.Fake) string {
+	return fake.URL() + "/" + fake.Bucket() + "/prefix"
+}
+
+// setJournalCreds sets the AWS-conventional environment variables
+// ResolveJournal reads credentials and region from, the same three every
+// other journal-backed runServe test in this file sets.
+func setJournalCreds(t *testing.T) {
+	t.Helper()
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "topsecret")
+	t.Setenv("AWS_REGION", "us-east-1")
+}
+
+// extractIdentityLine finds the "journal identity <outcome>: <key>" line
+// runServe prints (WALD-28) and returns the key. It fails the test if no
+// such line is present.
+func extractIdentityLine(t *testing.T, out, outcome string) string {
+	t.Helper()
+	prefix := "journal identity " + outcome + ": "
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
+		}
+	}
+	t.Fatalf("expected a line with prefix %q, got:\n%s", prefix, out)
+	return ""
+}
+
+// TestServeJournalPrintsMintedIdentity covers WALD-28: a first boot against
+// an empty journal mints a signing identity, prints it before the server
+// starting line (the same ordering TestServeFirstBootMintsAdminToken checks
+// for the admin token), and leaves a signing.key behind.
+func TestServeJournalPrintsMintedIdentity(t *testing.T) {
+	dataDir := t.TempDir()
+	setJournalCreds(t)
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+
+	var stdout, stderr bytes.Buffer
+	err := runServe(cancelledContext(), []string{
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("runServe failed: %v", err)
+	}
+
+	out := stdout.String()
+	key := extractIdentityLine(t, out, "minted")
+	if !strings.HasPrefix(key, "ed25519:") {
+		t.Errorf("minted identity key = %q, want an ed25519: key", key)
+	}
+	if strings.Contains(out, "journal identity adopted:") {
+		t.Errorf("first boot must not also print an adopted identity line, got:\n%s", out)
+	}
+
+	identityIdx := strings.Index(out, "journal identity minted:")
+	startIdx := strings.Index(out, "walden server starting on")
+	if identityIdx == -1 || startIdx == -1 || identityIdx >= startIdx {
+		t.Errorf("expected the identity line before the server starting line, got:\n%s", out)
+	}
+
+	if _, err := os.Stat(journal.SigningKeyPath(dataDir)); err != nil {
+		t.Errorf("expected %s to exist after a mint: %v", journal.SigningKeyPath(dataDir), err)
+	}
+}
+
+// TestServeJournalSecondBootAdoptsIdentity covers WALD-28: a second boot
+// against the same data directory and journal adopts the identity the
+// first boot minted (same key, "adopted" rather than "minted") and writes
+// no new object to the bucket.
+func TestServeJournalSecondBootAdoptsIdentity(t *testing.T) {
+	dataDir := t.TempDir()
+	setJournalCreds(t)
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+	args := []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0", "--journal", journalURL}
+
+	var stdout1, stderr1 bytes.Buffer
+	if err := runServe(cancelledContext(), args, &stdout1, &stderr1); err != nil {
+		t.Fatalf("first runServe failed: %v", err)
+	}
+	minted := extractIdentityLine(t, stdout1.String(), "minted")
+	keysAfterFirst := len(fake.Keys())
+
+	var stdout2, stderr2 bytes.Buffer
+	if err := runServe(cancelledContext(), args, &stdout2, &stderr2); err != nil {
+		t.Fatalf("second runServe failed: %v", err)
+	}
+	adopted := extractIdentityLine(t, stdout2.String(), "adopted")
+	if strings.Contains(stdout2.String(), "journal identity minted:") {
+		t.Errorf("second boot must not print a minted identity line, got:\n%s", stdout2.String())
+	}
+
+	if adopted != minted {
+		t.Errorf("adopted key %q != minted key %q", adopted, minted)
+	}
+	if keysAfterSecond := len(fake.Keys()); keysAfterSecond != keysAfterFirst {
+		t.Errorf("second boot changed the object count in the bucket: %d -> %d", keysAfterFirst, keysAfterSecond)
+	}
+}
+
+// TestServeJournalWipedDataDirRefusesAdopt covers WALD-28: a data directory
+// wiped between boots (PHILOSOPHY.md's "the disk is a cache") against a
+// journal that already holds a genesis record must adopt, not mint — and an
+// instance with no local signing key cannot adopt, so it refuses in one
+// line and binds no port.
+func TestServeJournalWipedDataDirRefusesAdopt(t *testing.T) {
+	dataDir := t.TempDir()
+	setJournalCreds(t)
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+	args := []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0", "--journal", journalURL}
+
+	var stdout1, stderr1 bytes.Buffer
+	if err := runServe(cancelledContext(), args, &stdout1, &stderr1); err != nil {
+		t.Fatalf("first runServe failed: %v", err)
+	}
+
+	if err := os.RemoveAll(dataDir); err != nil {
+		t.Fatalf("failed to wipe data dir: %v", err)
+	}
+
+	var stdout2, stderr2 bytes.Buffer
+	err := runServe(cancelledContext(), args, &stdout2, &stderr2)
+	if err == nil {
+		t.Fatal("expected a refusal after wiping the data directory, got nil")
+	}
+	if !errors.Is(err, journal.ErrSigningKeyUnavailable) {
+		t.Errorf("expected errors.Is(err, journal.ErrSigningKeyUnavailable), got %v", err)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+	if strings.Contains(stdout2.String(), "walden server starting on") {
+		t.Errorf("expected boot to stop before binding, got stdout:\n%s", stdout2.String())
+	}
+}
+
+// TestServeJournalLessBootWritesNoSigningKey covers WALD-28: journal-less
+// mode never calls EnsureGenesis — the identity is born with the journal,
+// and there is no journal to be born with — so it must leave no
+// signing.key behind.
+func TestServeJournalLessBootWritesNoSigningKey(t *testing.T) {
+	dataDir := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	if err := runServe(cancelledContext(), []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0"}, &stdout, &stderr); err != nil {
+		t.Fatalf("runServe failed: %v", err)
+	}
+	if strings.Contains(stdout.String(), "journal identity") {
+		t.Errorf("journal-less boot must not print an identity line, got:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(journal.SigningKeyPath(dataDir)); !os.IsNotExist(err) {
+		t.Errorf("expected no signing.key in journal-less mode, stat err = %v", err)
+	}
+}

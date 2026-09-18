@@ -25,11 +25,13 @@ import (
 // Version can be set via ldflags at build time.
 var Version = "dev"
 
-// probeTimeout bounds the boot-time compare-and-swap probe (ProbeCAS).
-// Not a knob: walden's five knobs don't include tuning this, so there is
-// no flag or env var. The client's own transport timeouts and retry cap
-// bound each individual request anyway; this is a backstop on the whole
-// probe (two writes and a delete, retries included).
+// probeTimeout bounds two boot-time preflights against object storage: the
+// compare-and-swap probe (ProbeCAS) and, when it runs, EnsureGenesis's
+// genesis GET plus conditional PUT. Not a knob: walden's five knobs don't
+// include tuning this, so there is no flag or env var. The client's own
+// transport timeouts and retry cap bound each individual request anyway;
+// this is a backstop on the whole of either preflight (a handful of
+// requests each, retries included).
 const probeTimeout = 2 * time.Minute
 
 func main() {
@@ -192,6 +194,35 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			"verify the data directory path and permissions",
 			auth.ErrStoreUnavailable,
 		)
+	}
+
+	// The journal's first act is to declare who is writing it (WALD-28,
+	// spec/journal/v1 sections 2.1, 3.2): a journal with no genesis record
+	// gets one minted here, on first boot; a journal that already has one is
+	// adopted rather than overwritten. This runs after ProbeCAS (so a
+	// bucket that fails the CAS probe never reaches this point) and after
+	// os.MkdirAll above (the minted signing key needs the data directory
+	// that just came into being), but still before net.Listen: a refused
+	// boot binds no port. Journal-less mode never calls it — the identity
+	// is born with the journal, and there is no journal to be born with.
+	// Like ProbeCAS above, this deliberately uses context.Background()
+	// rather than ctx: it is a bounded, sub-second-to-low-second preflight
+	// with nothing yet to gracefully stop, and the end-to-end tests boot
+	// with an already-cancelled ctx to make boot return once it has bound
+	// and printed — tying this to that ctx would make it spuriously fail
+	// before it ever reaches the bucket.
+	if journal != nil {
+		genesisCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		chain, _, minted, err := store.NewClient(journal).EnsureGenesis(genesisCtx, cfg.DataDir, time.Now)
+		cancel()
+		if err != nil {
+			return err
+		}
+		outcome := "adopted"
+		if minted {
+			outcome = "minted"
+		}
+		fmt.Fprintf(stdout, "journal identity %s: %s\n", outcome, chain.ActiveKey())
 	}
 
 	// The authorizer's mode is decided exactly once, here: an empty

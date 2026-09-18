@@ -416,7 +416,7 @@ func TestEnsureGenesisPresentSigningKeyNeverBlocksAdopt(t *testing.T) {
 		if strings.Contains(err.Error(), "no genesis record found") {
 			t.Errorf("refusal claims no genesis record exists, but one does: %q", err.Error())
 		}
-		want := journal.RefuseSigningKeyMismatch(dataDir, 0, rec.PublicKey, journal.FormatPublicKey(other.Public().(ed25519.PublicKey))).Error()
+		want := journal.RefuseSigningKeyMismatch(dataDir, 0, false, rec.PublicKey, journal.FormatPublicKey(other.Public().(ed25519.PublicKey))).Error()
 		if err.Error() != want {
 			t.Errorf("got %q, want %q", err.Error(), want)
 		}
@@ -473,6 +473,58 @@ func TestEnsureGenesisMismatchAfterRotationNamesRotationNotGenesis(t *testing.T)
 	}
 	if !strings.Contains(err.Error(), genesisKey) {
 		t.Errorf("refusal does not name the local (genesis) key %q on disk: %q", genesisKey, err.Error())
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+}
+
+// TestEnsureGenesisMismatchWithoutRotationStillBlamesGenesis is round 2's
+// minor finding on internal/journal/genesis.go: RefuseSigningKeyMismatch
+// used to treat lastMetaSeq != 0 as proof "a rotation has run", but
+// LastMetaSeq() also advances on a meta record type ReplayMeta does not
+// recognise (spec section 5.4's forward-compatibility rule) or on a token
+// mutation — neither moves the active key away from genesis's own. A _meta
+// carrying such a record with no rotation anywhere in the stream, and a
+// mismatched local key, must still get the genesis wording and must not
+// claim a rotation ran when none did.
+func TestEnsureGenesisMismatchWithoutRotationStillBlamesGenesis(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	seedChain, _, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis (mint) failed: %v", err)
+	}
+	genesisKey := seedChain.ActiveKey()
+
+	// A meta record ReplayMeta does not recognise, folded into
+	// LastMetaSeq() by spec section 5.4 without touching the active key —
+	// the same shape TestReplayMetaToleratesUnknownRecordType
+	// (meta_test.go) uses, here with no rotation anywhere in the stream.
+	unknown := []byte(`{"version":"v1","stream":"_meta","seq":"1","type":"future_record_type","anything":"goes"}`)
+	fake.SetObject(fullKey(journal.TxKey(journal.MetaStreamID, 1)), unknown)
+
+	other, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	if err := journal.SaveSigningKey(dataDir, other); err != nil {
+		t.Fatalf("SaveSigningKey failed: %v", err)
+	}
+
+	_, _, _, err = c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("genesis at %s names", journal.TxKey(journal.MetaStreamID, 0))) {
+		t.Errorf("refusal should still blame genesis (no rotation ran): %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "a rotation has run") {
+		t.Errorf("refusal claims a rotation ran, but none did: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), genesisKey) {
+		t.Errorf("refusal does not name the genesis/active key %q: %q", genesisKey, err.Error())
 	}
 	if strings.ContainsAny(err.Error(), "\n\r") {
 		t.Errorf("refusal is not a single line: %q", err.Error())

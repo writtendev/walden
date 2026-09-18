@@ -13,9 +13,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/store"
+	"github.com/writtendev/walden/internal/store/storetest"
 )
 
 // (a) An empty journal: ReplayMeta returns ErrObjectNotFound, unwrapped, so
@@ -61,7 +63,7 @@ func TestReplayMetaGenesisOnly(t *testing.T) {
 // RotateKey itself.
 func putRotation(t *testing.T, c *store.Client, seq journal.Seq, oldPriv ed25519.PrivateKey, newPub ed25519.PublicKey, timestamp string) {
 	t.Helper()
-	rec := journal.NewKeyRotationRecord(seq, oldPriv.Public().(ed25519.PublicKey), newPub, timestamp)
+	rec := journal.NewKeyRotationRecord(seq, journal.FormatPublicKey(oldPriv.Public().(ed25519.PublicKey)), newPub, timestamp)
 	if err := journal.SignRotation(oldPriv, rec); err != nil {
 		t.Fatalf("SignRotation failed: %v", err)
 	}
@@ -321,5 +323,64 @@ func TestReplayMetaNoGapSucceeds(t *testing.T) {
 	}
 	if chain.LastMetaSeq() != 0 {
 		t.Errorf("LastMetaSeq() = %d, want 0", chain.LastMetaSeq())
+	}
+}
+
+// (l) Round 2 medium finding: the corroborating List must not read a key
+// at exactly the sequence whose GET 404'd as proof of a hole -- a
+// legitimate concurrent _meta append landing at that sequence during the
+// walk is proof the stream merely grew, not proof of corruption.
+// Reproduced the reviewer's own way: a delay is injected on the
+// corroborating List call, and a rival, validly signed rotation is landed
+// at _meta seq 1 while that List is still sleeping out its delay, before
+// the request is evaluated. The GET at seq 1 that triggered the List
+// really did 404 -- the record did not exist yet when it ran -- so this
+// is a genuine "stream grew mid-walk" case, not a fabricated one, and
+// ReplayMeta must succeed rather than refuse a corruption it has not
+// proven.
+func TestReplayMetaConcurrentAppendDuringGapProbeSucceeds(t *testing.T) {
+	c, fake := newFakeClient(t)
+	dataDir := t.TempDir()
+
+	_, genesisPriv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+
+	fake.Inject(storetest.Rule{
+		Op: storetest.OpList, Key: fullKey(journal.TxPrefix(journal.MetaStreamID)), Call: 1,
+		Fault: storetest.Fault{Delay: 200 * time.Millisecond},
+	})
+
+	type result struct {
+		chain *journal.SigningChain
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		chain, err := c.ReplayMeta(context.Background())
+		done <- result{chain, err}
+	}()
+
+	// Land the rival rotation while the corroborating List above is still
+	// sleeping out its injected delay -- well inside the 200ms window, so
+	// the write is durably applied before List is evaluated.
+	time.Sleep(50 * time.Millisecond)
+	_, pub2, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	putRotation(t, c, 1, genesisPriv, pub2, "2026-09-18T00:00:00Z")
+
+	res := <-done
+	if res.err != nil {
+		t.Fatalf("ReplayMeta refused on a stream that was contiguous by the time the corroborating List ran: %v", res.err)
+	}
+	wantActive := journal.FormatPublicKey(pub2)
+	if res.chain.ActiveKey() != wantActive {
+		t.Errorf("ActiveKey() = %q, want %q", res.chain.ActiveKey(), wantActive)
+	}
+	if res.chain.LastMetaSeq() != 1 {
+		t.Errorf("LastMetaSeq() = %d, want 1", res.chain.LastMetaSeq())
 	}
 }

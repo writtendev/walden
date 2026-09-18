@@ -45,6 +45,13 @@ import (
 // rotate in journal-less mode, since the signing identity is born with the
 // journal (spec/journal/v1 section 2.1) and journal-less walden never has
 // one.
+//
+// Sharing config.Load also means sharing its Validate call, which checks
+// --listen, --auth-trust, and --data-dir alongside --journal -- three
+// knobs this command does not use the returned *Config for at all. See the
+// comment beside configArgs below (round 2 minor finding) for how those
+// three are kept from ever being able to fail Validate on this command's
+// behalf.
 func runRotateKey(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("rotate-key", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -87,6 +94,33 @@ func runRotateKey(args []string, stdout, stderr io.Writer) error {
 	if setFlags["journal"] {
 		configArgs = append(configArgs, "--journal", flagJournal)
 	}
+	// config.Load's Validate also checks --listen, --auth-trust, and
+	// --data-dir -- three knobs rotate-key neither binds nor reads from
+	// the *Config it gets back (dataDir above already comes from
+	// resolveDataDir, not cfg.DataDir). Left to their own environment
+	// fallbacks, those three can still fail Validate on nothing rotate-key
+	// itself did wrong: a stray WALDEN_LISTEN=8080 or a whitespace-only
+	// WALDEN_AUTH_TRUST, plausible on a host that also runs `walden
+	// serve`, would otherwise block a key rotation with a refusal about a
+	// port rotate-key never binds (round 2 minor finding). Validate has no
+	// per-knob mode, and config.Load returns a nil *Config on any failure
+	// -- there would be no cfg left to pull JournalURL from even if the
+	// failure were caught and filtered afterward -- so the fix has to keep
+	// those three from ever reaching Validate in a state that could fail
+	// it, not react to the failure once it happens. Passing an
+	// always-valid literal for each, explicitly, on every call (a flag
+	// always outranks its environment variable in config.Load) does that:
+	// this command never reads cfg.AuthTrustKey or cfg.ListenAddr at all,
+	// and cfg.DataDir here is thrown away in favor of resolveDataDir's own
+	// result above, so which literal wins is immaterial -- only whichever
+	// --journal value setFlags["journal"] contributed above still comes
+	// from the operator, and internal/config/config.go itself is untouched
+	// (it is not in this ticket's owned files).
+	configArgs = append(configArgs,
+		"--auth-trust", "unused",
+		"--listen", config.DefaultListenAddr,
+		"--data-dir", dataDir,
+	)
 	cfg, _, err := config.Load(configArgs)
 	if err != nil {
 		return err

@@ -45,7 +45,11 @@ import (
 //     if this instance holds none.
 //  3. Refuse with RefuseNotActiveSigningKey if the local key's public half
 //     is not the chain's active key — this instance cannot sign a
-//     chainable rotation, so it must not be allowed to try.
+//     chainable rotation, so it must not be allowed to try. Compared as
+//     decoded key bytes, not formatted strings, matching adoptGenesis
+//     (genesis.go): a chain whose active key is spec-non-conformant but
+//     parseable hex must not read as a mismatch against a local key that
+//     is byte-for-byte correct (round 2 finding).
 //  4. GenerateKeypair, then WriteSigningKeyTemp for the *new* key. Written
 //     before the record's fate is known, exactly as mintGenesis writes the
 //     genesis key's temp file before its own conditional PUT — signing.key
@@ -58,8 +62,11 @@ import (
 //     otherwise make the Lease offer a sequence past the one old_public_key
 //     was verified against, landing a rotation record no replay could ever
 //     accept while still committing signing.key to the new key). Only once
-//     that holds: build the record at seq, sign it with the *outgoing*
-//     private key, marshal it, and PutIfAbsent it.
+//     that holds: build the record at seq — old_public_key set from
+//     chain.ActiveKey()'s own string, not a copy reformatted from the
+//     local key's decoded bytes, since VerifyRotation compares
+//     old_public_key to ActiveKey() as strings (round 2 finding) — sign it
+//     with the *outgoing* private key, marshal it, and PutIfAbsent it.
 //  6. On success, CommitSigningKey renames the new key into place — the
 //     commit point, matching mintGenesis's own. A failure here refuses
 //     with RefuseSigningKeyCommitFailed, naming whichever path (temp or
@@ -97,7 +104,26 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 	}
 	localPub := priv.Public().(ed25519.PublicKey)
 	localPubFormatted := journal.FormatPublicKey(localPub)
-	if localPubFormatted != chain.ActiveKey() {
+	// Compared as decoded key bytes, not formatted strings — the same
+	// discipline adoptGenesis (genesis.go) already holds itself to, with a
+	// regression test pinning it (TestEnsureGenesisAdoptToleratesUppercaseHexKey).
+	// journal.ParsePublicKey accepts uppercase hex, so a chain whose active
+	// key is spec-non-conformant but parseable can read
+	// "ed25519:8A88...". Comparing that against localPubFormatted as
+	// strings would refuse a rotation this instance is genuinely entitled
+	// to perform — the journal boots fine but can never rotate again,
+	// refused with two keys differing only in case (round 2 finding).
+	// activeKeyPub is reused below, when the rotation record's
+	// old_public_key is set directly from chain.ActiveKey()'s own string
+	// rather than reformatted from localPub: VerifyRotation compares
+	// old_public_key to ActiveKey() as strings (identity.go), so a record
+	// built from a reformatted (lowercase) copy of a non-conformant active
+	// key would itself become permanently unchainable.
+	activeKeyPub, err := journal.ParsePublicKey(chain.ActiveKey())
+	if err != nil {
+		return "", "", journal.RefuseCorruptGenesis(err)
+	}
+	if !localPub.Equal(activeKeyPub) {
 		return "", "", journal.RefuseNotActiveSigningKey(dataDir, localPubFormatted, chain.ActiveKey())
 	}
 
@@ -126,6 +152,26 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 	}
 
 	newPubFormatted := journal.FormatPublicKey(newPub)
+	// Computed once, here, rather than inside the closure below: the
+	// timestamp does not depend on seq, so it has no reason to be part of
+	// the checkout at all, and now() is a caller-supplied clock this
+	// function does not control — a nil now or a panicking clock, called
+	// from inside lease.Append's fn, would panic there, and Append routes
+	// a panic through Fencer.HandleOutcomeUnknown and re-panics (lease.go),
+	// fencing _meta for a failure that never touched storage. Hoisting is
+	// the same fix WALD-27 gave the same class of bug in its own file: it
+	// removes the panic surface rather than adding a recover around it.
+	// Nothing else inside the closure below panics, checked rather than
+	// assumed: journal.NewKeyRotationRecord and FormatPublicKey are pure
+	// string/hex formatting over newPub, always a valid key fresh from
+	// GenerateKeypair; SignRotation's priv.Public().(ed25519.PublicKey)
+	// assertion always holds for an ed25519.PrivateKey, and ed25519.Sign
+	// cannot panic on priv because LoadSigningKey above already validated
+	// its seed length; MarshalKeyRotation nil-checks its argument before
+	// touching it; and PutIfAbsent's ctx, key, and body are all
+	// already-validated local values, not caller input this function
+	// leaves unchecked.
+	timestamp := now().UTC().Format(time.RFC3339)
 	var putErr error
 	appendErr := lease.Append(func(seq journal.Seq) error {
 		// The consistency check the write side never asserted (round 1
@@ -153,7 +199,7 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 			putErr = refuseMetaSequenceDrift(chain.LastMetaSeq(), seq)
 			return putErr
 		}
-		rec := journal.NewKeyRotationRecord(seq, localPub, newPub, now().UTC().Format(time.RFC3339))
+		rec := journal.NewKeyRotationRecord(seq, chain.ActiveKey(), newPub, timestamp)
 		if err := journal.SignRotation(priv, rec); err != nil {
 			putErr = err
 			return err

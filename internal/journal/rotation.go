@@ -30,18 +30,33 @@ import (
 // NewKeyRotationRecord builds the key_rotation record a rotation appends to
 // _meta: the fixed fields spec section 4.1 requires (version "v1", stream
 // "_meta", type "key_rotation"), seq supplied by the caller (a Lease's own
-// sequence issuance owns that — see lease.go — not this constructor),
-// oldKey/newKey formatted as "ed25519:<64-hex>", and timestamp (RFC 3339
-// UTC) supplied by the caller so a rotation stays deterministic in tests.
-// The record is unsigned until SignRotation is called on it, mirroring
-// NewGenesisRecord's shape.
-func NewKeyRotationRecord(seq Seq, oldKey, newKey ed25519.PublicKey, timestamp string) *KeyRotationRecord {
+// sequence issuance owns that — see lease.go — not this constructor), and
+// timestamp (RFC 3339 UTC) supplied by the caller so a rotation stays
+// deterministic in tests. The record is unsigned until SignRotation is
+// called on it, mirroring NewGenesisRecord's shape.
+//
+// oldKey is taken as the exact "ed25519:<64-hex>" string the caller already
+// has in hand — the chain's own ActiveKey(), not a copy reformatted from
+// decoded bytes — because VerifyRotation/ApplyRotation compare
+// old_public_key against ActiveKey() as strings (identity.go), not as
+// decoded key material. ParsePublicKey accepts uppercase hex, so a
+// spec-non-conformant but parseable chain entry can carry
+// "ed25519:8A88..."; a caller that checks its local signing key against the
+// chain by decoded bytes (round 2 finding, store/rotation.go) but then
+// rebuilt old_public_key from that decoded key would reformat it to
+// lowercase and produce a record no future replay's string comparison
+// could ever accept. Passing the chain's own string through unchanged is
+// what keeps the two checks — decoded-byte identity here, string identity
+// at replay — talking about the same fact. newKey has no such history: it
+// is this rotation's freshly generated key, so this constructor formats it
+// directly.
+func NewKeyRotationRecord(seq Seq, oldKey string, newKey ed25519.PublicKey, timestamp string) *KeyRotationRecord {
 	return &KeyRotationRecord{
 		Version:      VersionPrefix,
 		Stream:       MetaStreamID,
 		Seq:          seq,
 		Type:         RecordTypeKeyRotation,
-		OldPublicKey: FormatPublicKey(oldKey),
+		OldPublicKey: oldKey,
 		NewPublicKey: FormatPublicKey(newKey),
 		Timestamp:    timestamp,
 	}

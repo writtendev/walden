@@ -413,13 +413,14 @@ func RefuseNoSigningKey(dataDir string) error {
 // local signing key does not match _meta's currently active key (as
 // (*store.Client).ReplayMeta's chain reports it, rotations folded in):
 // signing with it would never verify against this journal's root of trust.
-// lastMetaSeq is chain.LastMetaSeq() at the point the mismatch was found —
-// 0 when no rotation has ever happened, in which case the active key is
-// still genesis's own public_key, so the why clause names the genesis
-// record exactly as it always has; a non-zero value means at least one
-// key_rotation record has run since, so the active key is no longer
-// genesis's, and the why clause says so instead of naming a record that
-// does not hold it.
+// lastMetaSeq is chain.LastMetaSeq() at the point the mismatch was found,
+// used only to name the sequence _meta was replayed through in the
+// rotated wording below. rotated is chain.CurrentEpoch() != 0 — whether a
+// key_rotation record has actually run, which is the fact this refusal's
+// wording turns on: when it has not, the active key is still genesis's own
+// public_key, so the why clause names the genesis record exactly as it
+// always has; when it has, the active key is no longer genesis's, and the
+// why clause says so instead of naming a record that does not hold it.
 //
 // Round 1 finding: adoptGenesis (internal/store/genesis.go) started passing
 // chain.ActiveKey() here once ReplayMeta learned to fold rotations into the
@@ -429,6 +430,17 @@ func RefuseNoSigningKey(dataDir string) error {
 // with no hint that a later _meta sequence, or an interrupted rotation's
 // signing.key.tmp.*, is what they actually need to look at.
 //
+// Round 2 finding: the reword above used lastMetaSeq != 0 as its proxy for
+// "a rotation has run", but LastMetaSeq() also advances on token_create,
+// token_revoke, and any record type ReplayMeta does not recognise (spec
+// section 5.4's forward-compatibility case) — none of which move the
+// active key. A _meta carrying such a record and no rotation made this
+// refusal assert two things that were both false: that the active key is
+// "not genesis's own key" (it is) and that "a rotation has run" (none
+// has), while still naming the right key. rotated — chain.CurrentEpoch(),
+// which counts rotations, not meta records — is the fact actually being
+// tested, so the wording now turns on that instead.
+//
 // It also checks leftoverSigningKeyTemp, the way RefuseNoSigningKey does,
 // and names any match: a mismatch does not rule out an interrupted mint or
 // rotation sitting beside the wrong key (an earlier temp file recovered by hand into
@@ -437,9 +449,9 @@ func RefuseNoSigningKey(dataDir string) error {
 // ever mentioning it — a dead end when the real key was on disk the whole
 // time (round 2 finding, this file's line 308 in the version that finding
 // was filed against).
-func RefuseSigningKeyMismatch(dataDir string, lastMetaSeq Seq, want, got string) error {
+func RefuseSigningKeyMismatch(dataDir string, lastMetaSeq Seq, rotated bool, want, got string) error {
 	source := fmt.Sprintf("genesis at %s names %s", TxKey(MetaStreamID, 0), want)
-	if lastMetaSeq != 0 {
+	if rotated {
 		source = fmt.Sprintf("_meta replayed through seq %d names active key %s (not genesis's own key — a rotation has run)", lastMetaSeq, want)
 	}
 	why := fmt.Sprintf("%s holds key %s, %s", SigningKeyPath(dataDir), got, source)

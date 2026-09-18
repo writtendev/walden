@@ -148,6 +148,45 @@ func TestRunRotateKeyWhitespaceJournalEnvRefuses(t *testing.T) {
 	}
 }
 
+// TestRunRotateKeyIgnoresUnrelatedConfigValidation is round 2's minor
+// finding: threading --journal through config.Load also inherits
+// Config.Validate, which checks --listen, --auth-trust, and --data-dir --
+// three knobs rotate-key neither binds nor reads back out of the *Config
+// it gets. Reproduces the finding's own repro (WALDEN_LISTEN=8080, a
+// stray port with no host that Validate rejects, and a whitespace-only
+// WALDEN_AUTH_TRUST) against a real rotation end to end: neither should
+// block a key rotation with a refusal about a knob this command never
+// uses.
+func TestRunRotateKeyIgnoresUnrelatedConfigValidation(t *testing.T) {
+	dataDir := t.TempDir()
+	setJournalCreds(t)
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+
+	var bootStdout, bootStderr bytes.Buffer
+	if err := runServe(cancelledContext(), []string{
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	}, &bootStdout, &bootStderr); err != nil {
+		t.Fatalf("runServe (mint) failed: %v", err)
+	}
+
+	t.Setenv("WALDEN_LISTEN", "8080")
+	t.Setenv("WALDEN_AUTH_TRUST", "   ")
+
+	var stdout, stderr bytes.Buffer
+	if err := runRotateKey([]string{
+		"--data-dir", dataDir,
+		"--journal", journalURL,
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("runRotateKey refused over an unrelated listen/auth-trust config value: %v", err)
+	}
+	if !strings.HasPrefix(stdout.String(), "key rotated: retired ") {
+		t.Errorf("output %q does not start with the expected prefix", stdout.String())
+	}
+}
+
 // TestRunUsageListsRotateKey covers "how to know it worked" item 6's third
 // clause: `walden help` lists rotate-key.
 func TestRunUsageListsRotateKey(t *testing.T) {

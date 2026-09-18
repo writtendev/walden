@@ -29,11 +29,17 @@ import (
 // object at this sequence is missing" (a gap) from "the stream ends the
 // sequence before" (nothing wrong at all) — both read back as the same
 // 404, and treating the first one as the second lets a rotation past a
-// gap vanish silently (round 1 medium finding). confirmMetaEndOfStream
+// gap vanish silently (round 1 medium finding). probeMetaAfterNotFound
 // corroborates with one List call before this function trusts a not-found
-// as the head, so a hole is refused rather than mistaken for the end of
-// the stream. Each record between genesis and the confirmed head is
-// dispatched by its own "type" field, per spec section 8 step 2:
+// as the head — but the corroborating List itself runs after the GET, so
+// a legitimate concurrent _meta append can land at exactly seq in the gap
+// between the two: the List then sees a key at seq, which is proof the
+// stream merely grew during the walk, not proof of a hole (round 2 medium
+// finding). Only a key at a sequence strictly greater than seq proves a
+// hole; a key equal to seq means the record now exists and the walk
+// simply retries the GET at the same seq. Each record between genesis and
+// the confirmed head is dispatched by its own "type" field, per spec
+// section 8 step 2:
 //
 //   - "key_rotation": parsed with ParseKeyRotation and applied through
 //     (*journal.SigningChain).ApplyRotation, which both advances the chain
@@ -80,11 +86,23 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 		return nil, journal.RefuseCorruptGenesis(err)
 	}
 
-	for seq := journal.Seq(1); ; seq++ {
+	for seq := journal.Seq(1); ; {
 		body, err := c.Get(ctx, journal.TxKey(journal.MetaStreamID, seq))
 		if err != nil {
 			if errors.Is(err, ErrObjectNotFound) {
-				return c.confirmMetaEndOfStream(ctx, chain, seq)
+				grew, err := c.probeMetaAfterNotFound(ctx, seq)
+				if err != nil {
+					return nil, err
+				}
+				if grew {
+					// The corroborating List proved a record now exists at
+					// exactly this seq — a concurrent append landed between
+					// the GET above and the List, not a hole. Re-read it at
+					// the same seq rather than treating the 404 as the
+					// stream's head.
+					continue
+				}
+				return chain, nil
 			}
 			return nil, wrapMetaFailure(seq, err)
 		}
@@ -140,40 +158,70 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 				return nil, refuseMetaVerificationFailed(seq, err)
 			}
 		}
+		seq++
 	}
 }
 
-// errMetaContinuesPastGap is confirmMetaEndOfStream's internal signal that
-// its corroborating List call found a key at or past the sequence whose GET
-// came back not-found: proof the walk stopped at a gap, not the head. It
-// never escapes this file — List returns a callback's error unchanged
-// (list.go's own doc comment), so this reaches confirmMetaEndOfStream
+// errMetaContinuesPastGap is probeMetaAfterNotFound's internal signal that
+// its corroborating List call found a key at a sequence strictly greater
+// than the one whose GET came back not-found: proof the walk stopped at a
+// genuine gap, not merely that the stream grew while the walk was running.
+// It never escapes this file — List returns a callback's error unchanged
+// (list.go's own doc comment), so this reaches probeMetaAfterNotFound
 // directly and is turned into refuseMetaSequenceGap there.
 var errMetaContinuesPastGap = errors.New("meta stream continues past a missing sequence")
 
-// confirmMetaEndOfStream corroborates a GET 404 at seq — the sequence
+// errMetaGrewDuringWalk is probeMetaAfterNotFound's internal signal that its
+// corroborating List call found a key at exactly the sequence whose GET
+// came back not-found: a legitimate concurrent _meta append landed in the
+// window between that GET and this List, not a hole. It never escapes this
+// file, for the same reason errMetaContinuesPastGap does not.
+var errMetaGrewDuringWalk = errors.New("meta stream grew past a sequence during replay")
+
+// probeMetaAfterNotFound corroborates a GET 404 at seq — the sequence
 // ReplayMeta's contiguous walk just failed to read — against the actual
 // listing before trusting it as _meta's head. One List call, starting
 // after seq-1's own key (already confirmed present: genesis at seq 0, or a
 // record this walk already read and applied), answers the question a
 // GET-only walk cannot: List's ascending-order-over-tx/ guarantee (spec
-// section 10, list.go's own doc comment) means any key it yields here names
-// a sequence >= seq, so a single hit proves _meta continues past a hole
-// rather than ending at it. The callback returns as soon as it sees one key
-// — List stops and returns that error immediately (list.go) — so this is a
-// one-object probe, not a second full listing of _meta.
-func (c *Client) confirmMetaEndOfStream(ctx context.Context, chain *journal.SigningChain, seq journal.Seq) (*journal.SigningChain, error) {
+// section 10, list.go's own doc comment) means the first key it yields
+// here, if any, names the smallest sequence still to be seen, and that
+// sequence can only be seq itself or something greater — nothing between
+// seq-1 and seq exists to list.
+//
+// A first key equal to TxKey(MetaStreamID, seq) is not proof of a hole: it
+// proves the record now exists, landed by a writer whose PutIfAbsent won
+// between this walk's own GET and this corroborating List (round 2 medium
+// finding — the fix this function's earlier version was missing). Only a
+// first key at a sequence strictly greater than seq proves the walk
+// genuinely skipped seq: nothing List could return names seq, so whatever
+// wrote past it did not write at it. grew reports the first case so
+// ReplayMeta's caller can retry the GET at the same seq; err carries a
+// refusal only for a genuine hole or a List failure. A completely empty
+// listing is the ordinary, expected case: the stream ends the sequence
+// before, exactly as it did before this fix.
+//
+// The callback returns as soon as it sees one key — List stops and returns
+// that error immediately (list.go) — so this is a one-object probe, not a
+// second full listing of _meta.
+func (c *Client) probeMetaAfterNotFound(ctx context.Context, seq journal.Seq) (grew bool, err error) {
 	startAfter := journal.TxKey(journal.MetaStreamID, seq-1)
-	err := c.List(ctx, journal.TxPrefix(journal.MetaStreamID), startAfter, func(key string) error {
+	wantKey := journal.TxKey(journal.MetaStreamID, seq)
+	listErr := c.List(ctx, journal.TxPrefix(journal.MetaStreamID), startAfter, func(key string) error {
+		if key == wantKey {
+			return errMetaGrewDuringWalk
+		}
 		return errMetaContinuesPastGap
 	})
 	switch {
-	case err == nil:
-		return chain, nil
-	case errors.Is(err, errMetaContinuesPastGap):
-		return nil, refuseMetaSequenceGap(seq)
+	case listErr == nil:
+		return false, nil
+	case errors.Is(listErr, errMetaGrewDuringWalk):
+		return true, nil
+	case errors.Is(listErr, errMetaContinuesPastGap):
+		return false, refuseMetaSequenceGap(seq)
 	default:
-		return nil, wrapMetaFailure(seq, err)
+		return false, wrapMetaFailure(seq, listErr)
 	}
 }
 

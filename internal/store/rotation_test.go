@@ -503,3 +503,111 @@ func TestRotateKeyRefusesOnStaleLeaseSequence(t *testing.T) {
 		t.Fatal("expected the retry against the same stale Leases registry to refuse again, got nil")
 	}
 }
+
+// racingLister wraps a journal.TxLister and runs before once, on its very
+// first List call, before delegating -- landing a rival write in exactly
+// the window between RotateKey's own ReplayMeta (which has already
+// returned by the time any Lease's List runs) and leases.Open's head
+// discovery, with no production code touched. journal.NewLeases takes a
+// journal.TxLister, and (*journal.Leases).Open is the only place in that
+// package that calls List (lease.go) -- so a wrapper here reaches exactly
+// the interleaving round 2's minor finding on this file asked for, and no
+// hook into RotateKey itself is needed.
+type racingLister struct {
+	inner  journal.TxLister
+	before func()
+	fired  bool
+}
+
+func (l *racingLister) List(ctx context.Context, prefix, startAfter string, fn func(key string) error) error {
+	if !l.fired {
+		l.fired = true
+		l.before()
+	}
+	return l.inner.List(ctx, prefix, startAfter, fn)
+}
+
+// TestRotateKeyRefusesOnConcurrentRotationDuringLeaseOpen is round 2's
+// minor finding on this file: TestRotateKeyRefusesOnStaleLeaseSequence
+// above only pins the benign sign of the round-1 major's drift (the lease
+// offering a sequence below the one ReplayMeta verified, where a 412 was
+// already safe -- nothing is lost). The harmful sign is the other
+// direction: the lease offering a sequence above the one ReplayMeta
+// verified, which is what let RotateKey land an unchainable rotation and
+// still commit signing.key to the new key. The reviewer confirmed this
+// interleaving is reproducible through the public API with no hook into
+// RotateKey: racingLister's before fires on leases.Open's own List call,
+// strictly after RotateKey's ReplayMeta has already returned a chain
+// verified only through genesis (seq 0), and lands a rival rotation --
+// signed by the genesis key, exactly as a second legitimate rotate-key
+// invocation would -- at _meta seq 1 in that window. The Lease then
+// offers seq 2, one past what this RotateKey's own chain verified, and
+// the stale-sequence check (round 1's major fix) must refuse rather than
+// sign and land a second, unchainable rotation.
+func TestRotateKeyRefusesOnConcurrentRotationDuringLeaseOpen(t *testing.T) {
+	c, _ := newFakeClient(t)
+	dataDir := t.TempDir()
+	seedChain, genesisPriv, _, err := c.EnsureGenesis(context.Background(), dataDir, fixedGenesisNow)
+	if err != nil {
+		t.Fatalf("EnsureGenesis failed: %v", err)
+	}
+	genesisKey := seedChain.ActiveKey()
+
+	_, rivalPub, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+
+	lister := &racingLister{
+		inner: c,
+		before: func() {
+			// Landed directly, bypassing RotateKey -- this simulates a
+			// second, concurrent rotate-key invocation (or any other
+			// legitimate writer of a key_rotation record) winning the
+			// race to append at _meta seq 1 before this RotateKey's own
+			// lease discovers the head.
+			putRotation(t, c, 1, genesisPriv, rivalPub, "2026-09-18T09:00:00Z")
+		},
+	}
+	leases := journal.NewLeases(lister)
+
+	_, _, err = c.RotateKey(context.Background(), dataDir, leases, fixedRotateNow)
+	if err == nil {
+		t.Fatal("expected a refusal, got nil (a rival rotation landed during leases.Open, after ReplayMeta had already verified a now-stale chain)")
+	}
+	if errors.Is(err, journal.ErrFenced) {
+		t.Error("a stale-lease refusal must not fence the stream: the lease's view is stale, not the stream (Lease.Append's own contract for a plain callback error)")
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
+	}
+
+	// signing.key is untouched, and the temp file for the key this
+	// (refused) attempt generated is removed -- nothing was ever sent to
+	// storage on this attempt's behalf.
+	loaded, err := journal.LoadSigningKey(dataDir)
+	if err != nil {
+		t.Fatalf("LoadSigningKey failed: %v", err)
+	}
+	if journal.FormatPublicKey(loaded.Public().(ed25519.PublicKey)) != genesisKey {
+		t.Error("signing.key changed after a stale-lease-sequence refusal")
+	}
+	if matches := signingKeyTempFiles(t, dataDir); len(matches) != 0 {
+		t.Errorf("temp key file(s) left behind after a stale-lease-sequence refusal: %v", matches)
+	}
+
+	// A fresh ReplayMeta must show only the rival's rotation at seq 1 --
+	// not a second, poisoned rotation this refused RotateKey attempt might
+	// otherwise have landed.
+	chain, err := c.ReplayMeta(context.Background())
+	if err != nil {
+		t.Fatalf("ReplayMeta after the refused rotation failed: %v", err)
+	}
+	if chain.LastMetaSeq() != 1 {
+		t.Errorf("LastMetaSeq() = %d, want 1 (only the rival rotation)", chain.LastMetaSeq())
+	}
+	wantActive := journal.FormatPublicKey(rivalPub)
+	if chain.ActiveKey() != wantActive {
+		t.Errorf("ActiveKey() = %q, want %q (the rival rotation's key)", chain.ActiveKey(), wantActive)
+	}
+}

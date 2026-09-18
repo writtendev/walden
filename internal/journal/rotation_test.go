@@ -25,7 +25,7 @@ func TestNewKeyRotationRecordMatchesGoldenFixture(t *testing.T) {
 	genesisKey := fixtureKey(0x01)
 	rotatedKey := fixtureKey(0x02)
 
-	rec := journal.NewKeyRotationRecord(2, genesisKey.Public().(ed25519.PublicKey), rotatedKey.Public().(ed25519.PublicKey), "2026-08-31T00:06:00Z")
+	rec := journal.NewKeyRotationRecord(2, journal.FormatPublicKey(genesisKey.Public().(ed25519.PublicKey)), rotatedKey.Public().(ed25519.PublicKey), "2026-08-31T00:06:00Z")
 	if err := journal.SignRotation(genesisKey, rec); err != nil {
 		t.Fatalf("SignRotation failed: %v", err)
 	}

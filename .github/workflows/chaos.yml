@@ -18,6 +18,12 @@ jobs:
   chaos:
     name: chaos (write path)
     runs-on: ubuntu-latest
+    # A named upper bound on the whole job, well above the go test -timeout
+    # below (which covers checkout and setup-go too): belt-and-suspenders
+    # so a hang anywhere in the step, not just inside the test binary,
+    # still ends in a named CI failure instead of running until GitHub's
+    # own default (360 minutes) cuts it off.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,10 +42,44 @@ jobs:
           # produced it: a failure's own log names the exact seed and round
           # count to replay locally.
           WALDEN_CHAOS_SEED: ${{ github.run_id }}
-          WALDEN_CHAOS_ROUNDS: 20000
+          # 5000 is chosen, not the largest round count that technically
+          # runs: WALD-35 PR #65's review measured the previous value here
+          # (20000) failing to even finish TestChaosWritePathFaultsAndRestart
+          # inside Go's 10-minute default test timeout (629s and still
+          # running when killed). Two things fed that: the per-round
+          # invariant checks used to rescan the fake's entire call log and
+          # key set from scratch every round, and nextSeqFromFake (since
+          # removed) did the same to predict each round's own key - all
+          # three now cost O(1) or a bounded number of checkpoints per run
+          # instead (see chaos_test.go's chaosInvariantState and
+          # (*chaosInvariantState).predictedSeq doc comments). Fixing that
+          # helps, but does not make the runtime linear on its own: a large
+          # chaos run's real HTTP traffic under `-race` is itself
+          # superlinear in round count (profiling shows network syscalls
+          # and the race detector's own bookkeeping dominating, not this
+          # file's Go code), so picking a bounded round count for this
+          # nightly step is still necessary, not merely a fallback. Measured
+          # locally (an M-series Mac, not this job's own runner - expect
+          # this class of hardware to be somewhat faster than
+          # ubuntu-latest) after all three fixes: 5000 rounds runs both
+          # TestChaosWritePathFaultsAndRestart and
+          # TestChaosWritePathConcurrentInstances in ~124s combined
+          # (~97s + ~26s) - comfortably inside the -timeout below with
+          # roughly 7x headroom even before accounting for a slower runner,
+          # while still exercising the write path roughly 33x further than
+          # the default per-PR budget (chaosDefaultRounds = 150) does on
+          # every push. 10000 rounds alone measured 355s for
+          # TestChaosWritePathFaultsAndRestart - continued superlinear
+          # growth, and confirmation that scaling further from here trades
+          # away the headroom this value keeps.
+          WALDEN_CHAOS_ROUNDS: 5000
         run: |
           set -o pipefail
-          go test -race -count=1 -run '^TestChaosWritePath' -v ./internal/store/ 2>&1 | tee chaos.out
+          # An explicit -timeout, rather than Go's own 10-minute default,
+          # so a hang here is this job's own named failure (and the
+          # timeout-minutes above's problem to catch only if this itself
+          # somehow wedges) instead of an ambiguous one.
+          go test -race -count=1 -timeout=15m -run '^TestChaosWritePath' -v ./internal/store/ 2>&1 | tee chaos.out
           if grep -q -- '--- SKIP: TestChaosWritePath' chaos.out; then
             echo "Error: a chaos test skipped with WALDEN_CHAOS_ROUNDS/WALDEN_CHAOS_SEED set"; exit 1
           fi

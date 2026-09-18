@@ -240,41 +240,6 @@ func newChaosClient(t *testing.T) (*store.Client, *storetest.Fake) {
 	return store.NewClient(j), fake
 }
 
-// nextSeqFromFake predicts the sequence AppendRefTx is about to hand out for
-// stream, the same way (*journal.Leases).Open discovers a head: the highest
-// existing tx/ key under the stream's prefix, plus one, or 0 if none exist.
-// It lets a round inject a fault against the exact key about to be written,
-// before making the call - "just-in-time", per the ticket's plan - without
-// reaching into journal.Lease's unexported state.
-func nextSeqFromFake(fake *storetest.Fake, stream journal.StreamID) journal.Seq {
-	prefix := journal.TxPrefix(stream)
-	var (
-		head  journal.Seq
-		found bool
-	)
-	for _, k := range fake.Keys() {
-		base, ok := strings.CutPrefix(k, prefix)
-		if !ok {
-			continue
-		}
-		base, ok = strings.CutSuffix(base, ".json")
-		if !ok || strings.Contains(base, "/") {
-			continue
-		}
-		seq, err := journal.ParseSeq(base)
-		if err != nil {
-			continue
-		}
-		if !found || seq > head {
-			head, found = seq, true
-		}
-	}
-	if !found {
-		return 0
-	}
-	return head + 1
-}
-
 // parseTxKey splits a full ("v1/streams/<stream>/tx/<seq>.json") key back
 // into its stream and sequence, or ok=false for anything else (a segment
 // key, a malformed key). Used only by chaosTxSeqsByStream below, to check
@@ -340,50 +305,208 @@ type chaosAck struct {
 	seq    journal.Seq
 }
 
-// checkChaosInvariants runs the ticket's four invariants (see this file's
-// header comment) against fake's current state. verify names the
-// acknowledged appends invariant 3 (present, intact, verifiable, segments
-// exist) checks by this call - the round loop below passes only the
+// chaosInvariantState carries the running state checkChaosInvariantsRound
+// needs to check this file's per-round invariants incrementally - in
+// O(new work this round) rather than by rescanning fake's entire history
+// every round. Before this type existed, checkChaosInvariants rescanned
+// fake.Calls() (for the no-double-land and no-unconditional-PUT checks)
+// and fake.Keys() (for the no-gap check) from scratch on every call, so a
+// chaos run's cost was quadratic in its round count - invisible at this
+// file's small default budget, but it meant the nightly workflow's much
+// larger WALDEN_CHAOS_ROUNDS never finished inside any reasonable timeout
+// (WALD-35 PR #65 review; see .github/workflows/chaos.yml). callsChecked
+// is how many of fake.Calls() the call-based checks below have already
+// scanned; landed and poisoned are the running per-key state those checks
+// need (see checkTxCallInvariants); frontier is the next sequence each
+// stream is expected to occupy, for the no-gap check (see
+// checkNoGapAtKey). checkChaosInvariantsFinal still does one full,
+// from-scratch sweep at the end with fresh state, as a check against a bug
+// in this incremental bookkeeping itself and not only against the
+// production code under test - "once at the end" per the ticket's plan,
+// the same idiom this file already used for the signature-verification
+// invariant before this split.
+//
+// callsChecked alone is not enough to make the call-based checks cheap,
+// though: storetest.Fake.Calls() (test-support code this file's approved
+// scope does not touch) copies its entire, ever-growing call log on every
+// invocation, so even a windowed scan over calls[callsChecked:] still pays
+// O(total calls so far) just to obtain that slice - the residual quadratic
+// cost that made a WALDEN_CHAOS_ROUNDS=20000 nightly run measure 629s
+// without even the first test completing. checkChaosInvariantsRound below
+// works around this by calling fake.Calls() only at a bounded number of
+// checkpoints per run (chaosCallsCheckpoints), rather than every round: see
+// its own doc comment.
+type chaosInvariantState struct {
+	callsChecked int
+	landed       map[string]int
+	poisoned     map[string]bool
+	frontier     map[journal.StreamID]journal.Seq
+}
+
+func newChaosInvariantState() *chaosInvariantState {
+	return &chaosInvariantState{
+		landed:   make(map[string]int),
+		poisoned: make(map[string]bool),
+		frontier: make(map[journal.StreamID]journal.Seq),
+	}
+}
+
+// predictedSeq returns the sequence a round about to touch stream should
+// expect - the same value (*journal.Leases).Open will discover as that
+// stream's head plus one, or 0 if the stream has no key yet, so a round can
+// inject a fault against the exact key about to be written before making
+// the call ("just-in-time", per the ticket's plan) without reaching into
+// journal.Lease's unexported state.
+//
+// This file used to compute that by scanning fake.Keys() fresh every round
+// (nextSeqFromFake, since removed) - a full copy-and-sort of every key in
+// the bucket, and, on top of the calls-based checks' own cost, a third
+// per-round O(n log n) scan WALD-35 PR #65's review named as a source of
+// the nightly's quadratic runtime (chaosCallsCheckpoints' doc comment
+// covers the other two). frontier already tracks the same value
+// incrementally, in O(1), as a side effect of checkNoGapAtKey verifying
+// every round's own write lands where expected: the two stay in lockstep
+// by construction, since every tx/ key this file's round loop ever writes
+// is written at exactly the key predictedSeq names (see buildFault, and
+// checkNoGapAtKey's own doc comment for why no round ever touches a
+// different key). checkChaosInvariantsFinal's full, from-scratch
+// checkNoGapFull sweep at the end of every run is the safety net that
+// would still catch any drift between this shortcut and the bucket's real
+// state, the same role it plays for the other invariants this file checks
+// incrementally.
+func (s *chaosInvariantState) predictedSeq(stream journal.StreamID) journal.Seq {
+	return s.frontier[stream]
+}
+
+// chaosCallsCheckpoints bounds how many times TestChaosWritePathFaultsAndRestart
+// calls fake.Calls() over one run, regardless of how many rounds that run
+// has. Fixing the number of checkpoints, rather than fixing the interval
+// between them, keeps the total cost of every fake.Calls() copy across a
+// run O(chaosCallsCheckpoints * finalCallCount) - linear in the run's own
+// size no matter how large WALDEN_CHAOS_ROUNDS scales it, unlike a fixed
+// interval (which still degrades to a call-log copy every round as rounds
+// grows) or no bound at all (the O(rounds^2) cost this const exists to
+// cap). checkNoGapAtKey and verifyAcks stay genuinely per-round regardless
+// of this constant: they read fake.Object, not fake.Calls(), so checking
+// them every round costs nothing extra. 100 checkpoints keeps a call-based
+// invariant violation attributable to a window of about rounds/100 rounds
+// even at the nightly budget - see checkChaosInvariantsRound.
+const chaosCallsCheckpoints = 100
+
+// checkTxCallInvariants scans calls - a slice of fake.Calls() in arrival
+// order - for three of this file's invariants against every tx/ key they
+// touch:
+//
+//   - a tx/ key is never written unconditionally (OpPut);
+//   - a tx/ key never lands (Landed == true) more than once - two
+//     independent instances never both land a record at one (stream, seq);
+//   - a tx/ key never sees a PUT(If-None-Match: *) after it has already
+//     seen a genuine 412 for that same key.
+//
+// The third check is the fix for what WALD-35 PR #65's review found: this
+// file's fault catalogue never deletes a tx/ key or sets IgnoreCondition,
+// so a second conditional PUT against an already-occupied key always lands
+// false, and the "landed more than once" check alone could never fire -
+// it would pass even if AppendRefTx resent PutIfAbsent after a proven 412
+// (spec/journal/v1 section 11.4 items 3 and 6, and the exact mutation the
+// ticket's own "how to know it worked" names as its demonstration).
+// Counting the request itself, not just a successful landing, is what
+// makes it falsifiable: a resend is illegal the moment it is sent, whether
+// or not it happens to land. A legitimate retry never trips this: every
+// fault class in this file that can retry the same key
+// (classProvablyUnapplied's burst of
+// 408/429/503/400-RequestTimeout/409-ConditionalRequestConflict) never
+// includes a 412, and the one fault class that does produce a real 412
+// (classProvenConflict, or a genuine race in the concurrent half) fires at
+// most once per key before the writer fences and stops - see classify in
+// client.go, which never retries past a 412 at all.
+//
+// landed and poisoned are mutated in place, so a caller can run this
+// call-window by call-window across many invocations (see
+// checkChaosInvariantsRound) and get the same result as one call over the
+// whole log (see checkChaosInvariantsFinal) - the same incremental-vs-full
+// equivalence the signature check below already relies on.
+func checkTxCallInvariants(t *testing.T, label string, fake *storetest.Fake, calls []storetest.Call, landed map[string]int, poisoned map[string]bool) {
+	t.Helper()
+	for _, call := range calls {
+		if call.Op != storetest.OpPut && call.Op != storetest.OpPutIfAbsent {
+			continue
+		}
+		if !strings.Contains(call.Key, "/tx/") {
+			continue
+		}
+		if call.Op == storetest.OpPut {
+			t.Fatalf("%s: unconditional PUT to tx key %s\ncalls:\n%s", label, call.Key, dumpCalls(fake))
+		}
+		if poisoned[call.Key] {
+			t.Fatalf("%s: PUT(If-None-Match: *) to tx key %s (call #%d) after that key already saw a proven 412 - a proven 412 must never be resent\ncalls:\n%s", label, call.Key, call.N, dumpCalls(fake))
+		}
+		if call.Landed {
+			landed[call.Key]++
+			if landed[call.Key] > 1 {
+				t.Fatalf("%s: tx key %s landed %d times (sequence forked)\ncalls:\n%s", label, call.Key, landed[call.Key], dumpCalls(fake))
+			}
+		}
+		if call.Status == http.StatusPreconditionFailed {
+			poisoned[call.Key] = true
+		}
+	}
+}
+
+// checkNoGapAtKey is the incremental form of the no-permanent-gap
+// invariant: rather than rescanning every key in the bucket every round
+// (chaosTxSeqsByStream below, over fake.Keys() - O(n log n) in the
+// bucket's current size, and the dominant cost of the quadratic runtime
+// the WALD-35 PR #65 review measured), it checks only the exact key this
+// round itself could have written, (stream, seq) - the one key any round
+// ever touches, whether via the client's own write or
+// storetest.Fault.Rival (which lands directly at the same predicted key -
+// see buildFault). If something landed there, it must be exactly the next
+// sequence this stream was expecting; if nothing did (an exhausted
+// provably-unapplied retry, or an unknown-outcome fault with Land unset),
+// the stream's frontier is unchanged, and the next round touching this
+// stream will predict the same key again via predictedSeq, which is
+// correct.
+func checkNoGapAtKey(t *testing.T, label string, fake *storetest.Fake, frontier map[journal.StreamID]journal.Seq, stream journal.StreamID, seq journal.Seq) {
+	t.Helper()
+	if _, ok := fake.Object(journal.TxKey(stream, seq)); !ok {
+		return
+	}
+	if want := frontier[stream]; seq != want {
+		t.Fatalf("%s: stream %s has a sequence gap: a key landed at seq %d, want %d next", label, stream, seq, want)
+	}
+	frontier[stream] = seq + 1
+}
+
+// checkNoGapFull is the full, from-scratch form of the no-gap invariant,
+// checked against raw key presence (see parseTxKey's doc comment) rather
+// than the acked list, since a key a rival wrote directly still occupies
+// its seq from a fresh registry's head-discovery point of view. Used only
+// by checkChaosInvariantsFinal, once, at the end of a run.
+func checkNoGapFull(t *testing.T, label string, fake *storetest.Fake) {
+	t.Helper()
+	for stream, seqs := range chaosTxSeqsByStream(fake) {
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		for i, s := range seqs {
+			if uint64(s) != uint64(i) {
+				t.Fatalf("%s: stream %s has a sequence gap: seqs=%v", label, stream, seqs)
+			}
+		}
+	}
+}
+
+// verifyAcks checks invariant 3 (present, intact, verifiable, segments
+// exist) for every entry in verify - the round loop below passes only the
 // entries newly acknowledged this round, an O(1)-amortized signature
 // re-verification per round rather than re-verifying the whole run's
 // history every round (which is what "after every round" cost before this
-// comment was added: O(rounds^2) ed25519 verifications, the dominant share
-// of this test's added runtime). The other three invariants are cheap (no
-// cryptography) and always scan fake's full current state regardless of
-// what verify contains. Called after every round with that round's new
-// acks, and once more after the loop with the complete acked slice, so
-// every acknowledged append is still verified at least once each - "once
-// at the end" per the ticket's plan, satisfied literally as well as
-// incrementally.
-func checkChaosInvariants(t *testing.T, label string, fake *storetest.Fake, verify []chaosAck) {
+// split existed: O(rounds^2) ed25519 verifications, the dominant share of
+// this test's added runtime). checkChaosInvariantsFinal calls this once
+// more with the complete acked slice, so every acknowledged append is
+// still verified at least once each - "once at the end" per the ticket's
+// plan, satisfied literally as well as incrementally.
+func verifyAcks(t *testing.T, label string, fake *storetest.Fake, verify []chaosAck) {
 	t.Helper()
-
-	// Invariant: no tx/ key ever lands twice. storetest.Fault.Rival is not
-	// logged as a Call (see this file's header comment), so this measures
-	// only walden's own writes through the client - which is exactly what
-	// "the sequence never forks" needs measured, paired with the explicit
-	// rival-bytes-survived check the proven-conflict case makes inline.
-	landed := make(map[string]int)
-	for _, call := range fake.Calls() {
-		if call.Op == storetest.OpPutIfAbsent && strings.Contains(call.Key, "/tx/") && call.Landed {
-			landed[call.Key]++
-		}
-	}
-	for k, n := range landed {
-		if n > 1 {
-			t.Fatalf("%s: tx key %s landed %d times (sequence forked)\ncalls:\n%s", label, k, n, dumpCalls(fake))
-		}
-	}
-
-	// Invariant: a tx/ key is never written unconditionally.
-	for _, call := range fake.Calls() {
-		if call.Op == storetest.OpPut && strings.Contains(call.Key, "/tx/") {
-			t.Fatalf("%s: unconditional PUT to tx key %s\ncalls:\n%s", label, call.Key, dumpCalls(fake))
-		}
-	}
-
-	// Invariant: every acknowledged append is present, intact, and
-	// verifiable, and every segment digest it references exists.
 	for _, a := range verify {
 		key := journal.TxKey(a.stream, a.seq)
 		data, ok := fake.Object(key)
@@ -409,19 +532,41 @@ func checkChaosInvariants(t *testing.T, label string, fake *storetest.Fake, veri
 			}
 		}
 	}
+}
 
-	// Invariant: no permanent sequence gap. Checked against raw key
-	// presence (see parseTxKey's doc comment), not the acked list, since a
-	// key a rival wrote directly still occupies its seq from a fresh
-	// registry's head-discovery point of view.
-	for stream, seqs := range chaosTxSeqsByStream(fake) {
-		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
-		for i, s := range seqs {
-			if uint64(s) != uint64(i) {
-				t.Fatalf("%s: stream %s has a sequence gap: seqs=%v", label, stream, seqs)
-			}
-		}
+// checkChaosInvariantsRound runs the cheap, incremental form of every
+// invariant in this file's header comment after one round of
+// TestChaosWritePathFaultsAndRestart: stream and seq are that round's own
+// predicted (stream, seq) coordinate (see
+// chaosInvariantState.predictedSeq), and newAcks is only the entries newly
+// acknowledged this round. checkCalls, computed by the caller from
+// chaosCallsCheckpoints, tells this round whether it is one of the bounded
+// number of checkpoints that pays for a fake.Calls() copy; checkNoGapAtKey
+// and verifyAcks run every round regardless, since neither needs the call
+// log. See chaosInvariantState's doc comment for why this must stay
+// incremental, and chaosCallsCheckpoints' for why "incremental" alone was
+// not enough to stop rescanning fake's whole history every round.
+func checkChaosInvariantsRound(t *testing.T, label string, fake *storetest.Fake, state *chaosInvariantState, newAcks []chaosAck, stream journal.StreamID, seq journal.Seq, checkCalls bool) {
+	t.Helper()
+	if checkCalls {
+		calls := fake.Calls()
+		checkTxCallInvariants(t, label, fake, calls[state.callsChecked:], state.landed, state.poisoned)
+		state.callsChecked = len(calls)
 	}
+	checkNoGapAtKey(t, label, fake, state.frontier, stream, seq)
+	verifyAcks(t, label, fake, newAcks)
+}
+
+// checkChaosInvariantsFinal runs every invariant in this file's header
+// comment once more, from scratch, against fake's complete final state -
+// the "once at the end" full sweep chaosInvariantState's doc comment
+// promises, and a check against a bug in the incremental bookkeeping
+// itself, not only against the production code under test.
+func checkChaosInvariantsFinal(t *testing.T, label string, fake *storetest.Fake, acked []chaosAck) {
+	t.Helper()
+	checkTxCallInvariants(t, label, fake, fake.Calls(), make(map[string]int), make(map[string]bool))
+	checkNoGapFull(t, label, fake)
+	verifyAcks(t, label, fake, acked)
 }
 
 // assertFencedThenInert checks the two properties the ticket's plan asks
@@ -548,24 +693,35 @@ func provablyUnappliedFault(r *rand.Rand) storetest.Fault {
 // TruncateBody sits here, not in provablyUnappliedFault, which is a
 // deliberate departure from the fault table in the ticket's plan (recorded
 // in the PR description): (*Client).send's wrote signal is
-// wroteOK.Load() || delivered, and delivered tracks bytes read off the
-// local io.Reader into the aws-chunked encoder, not bytes actually
-// acknowledged by the peer. A ref-transaction record is far smaller than
-// the 64 KiB chunk size, so the encoder drains it into a single chunk in
-// one local read before net/http ever tries to write it to the wire -
-// delivered goes true, and classify (client.go) treats the conditional
-// request as having reached storage, exactly as it must for a genuinely
-// larger body truncated mid-chunk. The fake proves nothing was stored
-// (TruncateBody's branch in handlePut runs and returns before the PUT
-// condition is even evaluated), but the client has no way to know that -
-// it only knows its own local write finished - so it correctly does what
-// section 11.4 item 6 requires of an unprovable outcome: fence rather than
-// guess. That is conservative, not incorrect: an unnecessary fencing costs
-// availability, never the two invariants this file exists to pin. Land is
-// irrelevant to this shape (the fake's TruncateBody branch returns before
-// Land is ever consulted), so it is deliberately left unset here - the
-// per-round assertion for this fault class already handles Land == false
-// by checking the key stays absent, which holds for this shape too.
+// wroteOK.Load() || delivered. Measured (instrumenting send during this
+// ticket's review, WALD-35 PR #65): for a body this small - a
+// ref-transaction record, far under the 64 KiB chunk size - wroteOK alone
+// already reads true, independent of delivered, because net/http's
+// WroteRequest trace hook fires with a nil error as soon as the small
+// request's local write completes into the connection's socket buffer,
+// which happens before the fake ever reads past its TruncateBody cutoff.
+// (delivered also happens to go true here, since the aws-chunked encoder
+// drains a body this size into a single chunk in one local read - but that
+// is not what decides the classification, and a future reader should not
+// "fix" delivered expecting this case to reclassify as provably-unapplied:
+// wroteOK would still make wrote true on its own.) The same measurement
+// shows where the boundary actually is: a 200000-byte body cut well before
+// the local write completes gives wroteOK=false and delivered=false, and
+// classify's wrote==false path is what makes that shape safely resendable.
+// So for this file's small bodies, wrote is true, and classify (client.go)
+// treats the conditional request as having reached storage, exactly as it
+// must for a genuinely larger body truncated mid-chunk. The fake proves
+// nothing was stored (TruncateBody's branch in handlePut runs and returns
+// before the PUT condition is even evaluated), but the client has no way
+// to know that - it only knows its own local write finished - so it
+// correctly does what section 11.4 item 6 requires of an unprovable
+// outcome: fence rather than guess. That is conservative, not incorrect:
+// an unnecessary fencing costs availability, never the two invariants this
+// file exists to pin. Land is irrelevant to this shape (the fake's
+// TruncateBody branch returns before Land is ever consulted), so it is
+// deliberately left unset here - the per-round assertion for this fault
+// class already handles Land == false by checking the key stays absent,
+// which holds for this shape too.
 func unknownOutcomeFault(r *rand.Rand) storetest.Fault {
 	statuses := []struct {
 		status int
@@ -647,7 +803,17 @@ func TestChaosWritePathFaultsAndRestart(t *testing.T) {
 	newRegistry()
 
 	var acked []chaosAck
-	lastChecked := 0 // index into acked already covered by an earlier checkChaosInvariants call
+	lastChecked := 0 // index into acked already covered by an earlier checkChaosInvariantsRound call
+	invState := newChaosInvariantState()
+
+	// callsCheckInterval spaces the run's fake.Calls() checkpoints (see
+	// chaosCallsCheckpoints) evenly across every round, rounding down to at
+	// least 1 so a small run (the default budget) still checks calls every
+	// round exactly as before this file added the checkpoint bound.
+	callsCheckInterval := rounds / chaosCallsCheckpoints
+	if callsCheckInterval < 1 {
+		callsCheckInterval = 1
+	}
 
 	fail := func(round int, stream journal.StreamID, seq journal.Seq, class faultClass, format string, args ...any) {
 		t.Helper()
@@ -677,7 +843,7 @@ func TestChaosWritePathFaultsAndRestart(t *testing.T) {
 			}
 		}
 
-		seq := nextSeqFromFake(fake, stream)
+		seq := invState.predictedSeq(stream)
 		key := journal.TxKey(stream, seq)
 
 		class := pickFaultClass(r)
@@ -772,14 +938,34 @@ func TestChaosWritePathFaultsAndRestart(t *testing.T) {
 			fencedOnRegistry[stream] = true
 		}
 
-		checkChaosInvariants(t, fmt.Sprintf("seed=%d round=%d", seed, round), fake, acked[lastChecked:])
+		checkCalls := round%callsCheckInterval == 0 || round == rounds
+		checkChaosInvariantsRound(t, fmt.Sprintf("seed=%d round=%d", seed, round), fake, invState, acked[lastChecked:], stream, seq, checkCalls)
 		lastChecked = len(acked)
 	}
 
-	// Once at the end, per the ticket's plan: a full pass re-verifying
-	// every acknowledged append from scratch, not just the ones each round
-	// added.
-	checkChaosInvariants(t, fmt.Sprintf("seed=%d final", seed), fake, acked)
+	// Once at the end, per the ticket's plan: a full pass re-checking every
+	// invariant from scratch against fake's complete final state, not just
+	// the incremental work each round added.
+	checkChaosInvariantsFinal(t, fmt.Sprintf("seed=%d final", seed), fake, acked)
+}
+
+// chaosInstanceUpdates returns a ref update unique to instance j among the
+// k racing instances in TestChaosWritePathConcurrentInstances, so the
+// "exactly one object landed, and it is the provable winner's own record"
+// check at the end of that test is actually falsifiable. WALD-35 PR #65's
+// review found that with every instance marshaling a byte-identical record
+// (same signer, same fixed clock, the same single chaosUpdates() value,
+// nil segments), that check degenerated to "some valid record is present
+// at the head sequence" - true regardless of which instance actually won.
+// A distinct ref name and OID per instance makes the landed record's
+// identity a genuine claim about who won. The value differs only by j, an
+// input fixed before the race starts, never by anything that depends on
+// scheduling, so this keeps the concurrent half interleaving-independent -
+// the property that keeps it non-flaky (see this file's header comment).
+func chaosInstanceUpdates(j int) []journal.RefUpdate {
+	return []journal.RefUpdate{
+		{Ref: fmt.Sprintf("refs/heads/instance-%d", j), OldOID: journal.ZeroOID40, NewOID: fmt.Sprintf("%040x", j+1)},
+	}
 }
 
 // dumpWinnerLoserTable renders one iteration's K outcomes for a failure
@@ -833,7 +1019,7 @@ func TestChaosWritePathConcurrentInstances(t *testing.T) {
 			go func(j int) {
 				defer wg.Done()
 				<-start
-				seq, err := c.AppendRefTx(ctx, leases[j], chaosSigner, nil, chaosUpdates(), chaosNow)
+				seq, err := c.AppendRefTx(ctx, leases[j], chaosSigner, nil, chaosInstanceUpdates(j), chaosNow)
 				results[j] = err
 				seqs[j] = seq
 			}(j)
@@ -886,6 +1072,16 @@ func TestChaosWritePathConcurrentInstances(t *testing.T) {
 		}
 		if rec.Stream != stream || rec.Seq != 0 {
 			t.Fatalf("iteration %d: stream %s: object at %s names (%s, %d) instead", i, stream, key, rec.Stream, rec.Seq)
+		}
+		// The record at the head sequence must be the winner's own -
+		// chaosInstanceUpdates(winnerIdx), not merely some instance's -
+		// which is what makes this check mean something instead of
+		// degenerating to "some valid record is present" (see
+		// chaosInstanceUpdates' doc comment).
+		wantUpdates := chaosInstanceUpdates(winnerIdx)
+		if len(rec.Updates) != len(wantUpdates) || rec.Updates[0] != wantUpdates[0] {
+			t.Fatalf("iteration %d: stream %s: object at %s carries updates %+v, want the winner's (instance %d) own: %+v",
+				i, stream, key, rec.Updates, winnerIdx, wantUpdates)
 		}
 	}
 }

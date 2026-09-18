@@ -268,9 +268,10 @@ func TestValidateHash(t *testing.T) {
 	}
 }
 
-// TestRefuseSequenceGap pins section 8.1 rule 4's exact wording. WALD-31
-// shares this constructor for _meta's own contiguity check, so the wording
-// is not repeated a second time under a second name.
+// TestRefuseSequenceGap pins section 8.1 rule 4's exact wording. WALD-31's
+// _meta contiguity check enforces the identical rule but through its own
+// differently-worded refuseMetaSequenceGap (internal/store/meta.go), not
+// this constructor.
 func TestRefuseSequenceGap(t *testing.T) {
 	err := journal.RefuseSequenceGap("repo-alpha", 2, 3)
 	if !errors.Is(err, journal.ErrSequenceGap) {

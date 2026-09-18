@@ -86,7 +86,7 @@ type RefTransactionRecord struct {
 // NewRefTransactionRecord builds a RefTransactionRecord with the fixed
 // fields spec/journal/v1 section 5.1 requires ("version": "v1", "type":
 // "ref_update") set in one place, exactly as NewGenesisRecord does for
-// section 3.1 (genesis.go) and as WALD-31's NewKeyRotationRecord will for
+// section 3.1 (genesis.go) and as WALD-31's NewKeyRotationRecord does for
 // section 4.1. timestamp is the caller's, not time.Now(), for the same
 // determinism reason NewGenesisRecord gives: a caller (or a test) controls
 // the clock, this constructor does not.

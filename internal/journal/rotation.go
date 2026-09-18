@@ -41,14 +41,11 @@ import (
 // old_public_key against ActiveKey() as strings (identity.go), not as
 // decoded key material. ParsePublicKey accepts uppercase hex, so a
 // spec-non-conformant but parseable chain entry can carry
-// "ed25519:8A88..."; a caller that checks its local signing key against the
-// chain by decoded bytes (round 2 finding, store/rotation.go) but then
-// rebuilt old_public_key from that decoded key would reformat it to
-// lowercase and produce a record no future replay's string comparison
-// could ever accept. Passing the chain's own string through unchanged is
-// what keeps the two checks — decoded-byte identity here, string identity
-// at replay — talking about the same fact. newKey has no such history: it
-// is this rotation's freshly generated key, so this constructor formats it
+// "ed25519:8A88..."; rebuilding old_public_key from decoded key bytes,
+// rather than passing the chain's own string through unchanged, would
+// reformat it to lowercase and produce a record no future replay's string
+// comparison could ever accept. newKey has no such history: it is this
+// rotation's freshly generated key, so this constructor formats it
 // directly.
 func NewKeyRotationRecord(seq Seq, oldKey string, newKey ed25519.PublicKey, timestamp string) *KeyRotationRecord {
 	return &KeyRotationRecord{

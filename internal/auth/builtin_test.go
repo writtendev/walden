@@ -297,7 +297,7 @@ func TestEnsureAdminToken(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("nil store returns refusal with ErrStoreUnavailable", func(t *testing.T) {
-		token, err := auth.EnsureAdminToken(ctx, nil)
+		token, err := auth.EnsureAdminToken(ctx, nil, nil)
 		if token != "" {
 			t.Errorf("expected empty token for nil store, got %q", token)
 		}
@@ -306,7 +306,7 @@ func TestEnsureAdminToken(t *testing.T) {
 
 	t.Run("empty memory store mints admin token and grants rwc", func(t *testing.T) {
 		store := auth.NewMemoryTokenStore()
-		token, err := auth.EnsureAdminToken(ctx, store)
+		token, err := auth.EnsureAdminToken(ctx, store, nil)
 		if err != nil {
 			t.Fatalf("EnsureAdminToken failed: %v", err)
 		}
@@ -353,7 +353,7 @@ func TestEnsureAdminToken(t *testing.T) {
 		}
 
 		// Second call on the same store returns "" and adds no tokens
-		token2, err := auth.EnsureAdminToken(ctx, store)
+		token2, err := auth.EnsureAdminToken(ctx, store, nil)
 		if err != nil {
 			t.Fatalf("second EnsureAdminToken call failed: %v", err)
 		}
@@ -372,7 +372,7 @@ func TestEnsureAdminToken(t *testing.T) {
 	t.Run("empty file store mints admin token and second call is no-op", func(t *testing.T) {
 		dir := t.TempDir()
 		store := auth.NewFileTokenStore(dir)
-		token, err := auth.EnsureAdminToken(ctx, store)
+		token, err := auth.EnsureAdminToken(ctx, store, nil)
 		if err != nil {
 			t.Fatalf("EnsureAdminToken on file store failed: %v", err)
 		}
@@ -389,7 +389,7 @@ func TestEnsureAdminToken(t *testing.T) {
 		}
 
 		// Second call returns ""
-		token2, err := auth.EnsureAdminToken(ctx, store)
+		token2, err := auth.EnsureAdminToken(ctx, store, nil)
 		if err != nil {
 			t.Fatalf("second EnsureAdminToken call failed: %v", err)
 		}
@@ -408,7 +408,7 @@ func TestEnsureAdminToken(t *testing.T) {
 			CreatedAt: time.Now().UTC(),
 		})
 
-		token, err := auth.EnsureAdminToken(ctx, store)
+		token, err := auth.EnsureAdminToken(ctx, store, nil)
 		if err != nil {
 			t.Fatalf("EnsureAdminToken failed: %v", err)
 		}
@@ -432,7 +432,7 @@ func TestEnsureAdminToken(t *testing.T) {
 		})
 		_ = store.RevokeToken(ctx, "revoked_token", time.Now().UTC())
 
-		token, err := auth.EnsureAdminToken(ctx, store)
+		token, err := auth.EnsureAdminToken(ctx, store, nil)
 		if err != nil {
 			t.Fatalf("EnsureAdminToken failed: %v", err)
 		}
@@ -447,7 +447,7 @@ func TestEnsureAdminToken(t *testing.T) {
 
 	t.Run("lost race ErrTokenExists returns empty token without error", func(t *testing.T) {
 		store := &raceMockStore{MemoryTokenStore: auth.NewMemoryTokenStore()}
-		token, err := auth.EnsureAdminToken(ctx, store)
+		token, err := auth.EnsureAdminToken(ctx, store, nil)
 		if err != nil {
 			t.Fatalf("EnsureAdminToken failed on lost race: %v", err)
 		}
@@ -455,6 +455,111 @@ func TestEnsureAdminToken(t *testing.T) {
 			t.Errorf("expected empty token on lost race, got %q", token)
 		}
 	})
+
+	t.Run("journalFn is called before store.CreateToken, with the built record", func(t *testing.T) {
+		store := auth.NewMemoryTokenStore()
+		var journaled *auth.TokenRecord
+		journalFn := func(_ context.Context, rec *auth.TokenRecord) error {
+			journaled = rec
+			// The record must not be on disk yet when journalFn runs: journal
+			// first, disk second (WALD-33).
+			if _, err := store.GetTokenByID(ctx, auth.AdminTokenID); !errors.Is(err, auth.ErrTokenNotFound) {
+				t.Errorf("store already holds the admin token when journalFn ran: err = %v", err)
+			}
+			return nil
+		}
+
+		token, err := auth.EnsureAdminToken(ctx, store, journalFn)
+		if err != nil {
+			t.Fatalf("EnsureAdminToken failed: %v", err)
+		}
+		if token == "" {
+			t.Fatal("expected a minted token")
+		}
+		if journaled == nil {
+			t.Fatal("journalFn was never called")
+		}
+		if journaled.TokenID != auth.AdminTokenID {
+			t.Errorf("journaled record token id = %q, want %q", journaled.TokenID, auth.AdminTokenID)
+		}
+		if journaled.TokenHash != auth.HashToken(token) {
+			t.Errorf("journaled record hash %q does not match hash of minted token %q", journaled.TokenHash, token)
+		}
+
+		rec, err := store.GetTokenByID(ctx, auth.AdminTokenID)
+		if err != nil {
+			t.Fatalf("GetTokenByID after EnsureAdminToken failed: %v", err)
+		}
+		if rec.TokenHash != journaled.TokenHash {
+			t.Errorf("disk record hash %q does not match journaled hash %q", rec.TokenHash, journaled.TokenHash)
+		}
+	})
+
+	t.Run("journalFn error is returned unchanged and nothing is persisted", func(t *testing.T) {
+		store := auth.NewMemoryTokenStore()
+		journalErr := errors.New("journal append refused")
+		journalFn := func(context.Context, *auth.TokenRecord) error {
+			return journalErr
+		}
+
+		token, err := auth.EnsureAdminToken(ctx, store, journalFn)
+		if token != "" {
+			t.Errorf("expected empty token when journalFn fails, got %q", token)
+		}
+		if !errors.Is(err, journalErr) {
+			t.Errorf("expected journalFn's error to be returned unchanged, got %v", err)
+		}
+		tokens, listErr := store.ListTokens(ctx)
+		if listErr != nil {
+			t.Fatalf("ListTokens failed: %v", listErr)
+		}
+		if len(tokens) != 0 {
+			t.Errorf("expected no tokens persisted after journalFn failure, got %d", len(tokens))
+		}
+	})
+
+	// TestEnsureAdminToken/journalFn_ErrTokenExists_is_swallowed... covers
+	// round 1 finding 1 on WALD-33 at the auth-layer unit: a journalFn
+	// that reports the journal already carries AdminTokenID (the shape
+	// cmd/walden/main.go's own journalFn now returns when its
+	// ReplayMetaTable pre-check finds the row) must not be treated as a
+	// boot failure. Before the fix, EnsureAdminToken returned every
+	// journalFn error unchanged, including this one — which, reproduced
+	// end to end in cmd/walden's TestServeSecondBootWithLostTokensJSON...,
+	// is exactly the sequence that let a lost tokens.json between two
+	// boots append a second token_create for the constant id "admin" and
+	// poison every future replay. This test pins the fix at the
+	// package's own boundary, independent of any store or journal
+	// client: store.CreateToken must never be reached.
+	t.Run("journalFn ErrTokenExists is swallowed like a lost race, and store is never touched", func(t *testing.T) {
+		store := &createSpyStore{MemoryTokenStore: auth.NewMemoryTokenStore()}
+		journalFn := func(context.Context, *auth.TokenRecord) error {
+			return fmt.Errorf("token id %q already exists in the journal: %w", auth.AdminTokenID, auth.ErrTokenExists)
+		}
+
+		token, err := auth.EnsureAdminToken(ctx, store, journalFn)
+		if err != nil {
+			t.Fatalf("expected journalFn's ErrTokenExists to be swallowed, got err = %v", err)
+		}
+		if token != "" {
+			t.Errorf("expected empty token when journalFn reports ErrTokenExists, got %q", token)
+		}
+		if store.createCalls != 0 {
+			t.Errorf("store.CreateToken was called %d times; want 0 (journal already holds this id, so disk must not gain a row the journal cannot agree with)", store.createCalls)
+		}
+	})
+}
+
+// createSpyStore counts CreateToken calls, so a test can prove
+// EnsureAdminToken never reaches disk once journalFn has already refused.
+type createSpyStore struct {
+	*auth.MemoryTokenStore
+	createCalls int
+}
+
+func (s *createSpyStore) CreateToken(ctx context.Context, record *auth.TokenRecord) error {
+	s.createCalls++
+	return s.MemoryTokenStore.CreateToken(ctx, record)
 }
 
 type raceMockStore struct {

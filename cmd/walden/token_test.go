@@ -12,6 +12,8 @@ import (
 
 	"github.com/writtendev/walden/internal/auth"
 	"github.com/writtendev/walden/internal/journal"
+	"github.com/writtendev/walden/internal/store"
+	"github.com/writtendev/walden/internal/store/storetest"
 )
 
 func TestTokenCreateSuccess(t *testing.T) {
@@ -552,5 +554,542 @@ func TestTokenUnexpectedArguments(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unexpected argument: extra-arg") {
 		t.Errorf("expected unexpected argument refusal, got %v", err)
+	}
+}
+
+// bootJournal boots a fresh signing identity for dataDir against a fake
+// journal (mirroring rotate_test.go's own pattern) and returns the
+// --journal URL every test below passes straight through to `walden
+// token create`/`walden token revoke`.
+func bootJournal(t *testing.T, dataDir string) string {
+	t.Helper()
+	setJournalCreds(t)
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+
+	var stdout, stderr bytes.Buffer
+	if err := runServe(cancelledContext(), []string{
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("runServe (mint) failed: %v", err)
+	}
+	return journalURL
+}
+
+// replayJournalTable replays the journal at journalURL and returns its
+// rebuilt token table, for assertions independent of the CLI's own
+// output.
+func replayJournalTable(t *testing.T, journalURL string) (*journal.SigningChain, *journal.TokenTable) {
+	t.Helper()
+	j, err := store.ResolveJournal(journalURL, os.LookupEnv)
+	if err != nil {
+		t.Fatalf("ResolveJournal: %v", err)
+	}
+	c := store.NewClient(j)
+	chain, table, err := c.ReplayMetaTable(context.Background())
+	if err != nil {
+		t.Fatalf("ReplayMetaTable: %v", err)
+	}
+	return chain, table
+}
+
+// TestTokenCreateWithJournalWritesMetaRecordAndDisk covers WALD-33's "how
+// to know it worked" item 8: `walden token create` against a fake journal
+// writes both the _meta record and tokens.json, and prints the raw token
+// only on full success.
+func TestTokenCreateWithJournalWritesMetaRecordAndDisk(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--allow", "rw:blog-*", "--id", "tok_journaled"}
+	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+	rawToken := strings.TrimSpace(stdout.String())
+	if !strings.HasPrefix(rawToken, "walden_") {
+		t.Fatalf("expected token with prefix walden_, got %q", rawToken)
+	}
+
+	_, table := replayJournalTable(t, journalURL)
+	row, ok := table.Row("tok_journaled")
+	if !ok {
+		t.Fatal("the journal's rebuilt token table does not hold tok_journaled")
+	}
+	if row.TokenHash != auth.HashToken(rawToken) {
+		t.Errorf("journaled hash %q != HashToken(printed token) = %q", row.TokenHash, auth.HashToken(rawToken))
+	}
+	if got, want := strings.Join(row.Scopes, ","), "rw:blog-*"; got != want {
+		t.Errorf("journaled scopes = %q, want %q", got, want)
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), "tok_journaled")
+	if err != nil {
+		t.Fatalf("GetTokenByID: %v", err)
+	}
+	if rec.TokenHash != auth.HashToken(rawToken) {
+		t.Errorf("tokens.json hash %q != HashToken(printed token) = %q", rec.TokenHash, auth.HashToken(rawToken))
+	}
+}
+
+// TestTokenCreateWithJournalReusedIDRefusesBeforeAnyPut covers the
+// uniqueness pre-check: a create whose id the journal already holds
+// refuses in one line before any PUT, and tokens.json gains no row for
+// it.
+func TestTokenCreateWithJournalReusedIDRefusesBeforeAnyPut(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	first := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_dup"}
+	if err := run(context.Background(), first, &stdout, &stderr); err != nil {
+		t.Fatalf("first run token create failed: %v", err)
+	}
+
+	chainBefore, _ := replayJournalTable(t, journalURL)
+	seqBefore := chainBefore.LastMetaSeq()
+
+	stdout.Reset()
+	stderr.Reset()
+	second := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_dup"}
+	err := run(context.Background(), second, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected the second create with a reused id to refuse")
+	}
+	if !errors.Is(err, auth.ErrTokenExists) {
+		t.Errorf("errors.Is(_, auth.ErrTokenExists) = false, err = %v", err)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+	if stdout.String() != "" {
+		t.Errorf("expected no token printed on a refused create, got %q", stdout.String())
+	}
+
+	chainAfter, _ := replayJournalTable(t, journalURL)
+	if chainAfter.LastMetaSeq() != seqBefore {
+		t.Errorf("LastMetaSeq() = %d after the refused create, want unchanged %d (no PUT should have happened)", chainAfter.LastMetaSeq(), seqBefore)
+	}
+
+	// tokens.json must not have gained a second row either.
+	store := auth.NewFileTokenStore(dataDir)
+	tokens, err := store.ListTokens(context.Background())
+	if err != nil {
+		t.Fatalf("ListTokens: %v", err)
+	}
+	count := 0
+	for _, tok := range tokens {
+		if tok.TokenID == "tok_dup" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("tokens.json holds %d rows named tok_dup, want 1", count)
+	}
+}
+
+// TestTokenRevokeWithJournalJournalsThenMutates covers the revoke half of
+// "how to know it worked" item 8: `walden token revoke` journals then
+// mutates tokens.json.
+func TestTokenRevokeWithJournalJournalsThenMutates(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_to_revoke"}
+	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	revoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_to_revoke"}
+	if err := run(context.Background(), revoke, &stdout, &stderr); err != nil {
+		t.Fatalf("run token revoke failed: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "revoked token tok_to_revoke") {
+		t.Errorf("expected confirmation line, got %q", stdout.String())
+	}
+
+	_, table := replayJournalTable(t, journalURL)
+	row, ok := table.Row("tok_to_revoke")
+	if !ok {
+		t.Fatal("the journal's rebuilt token table lost tok_to_revoke")
+	}
+	if !row.Revoked {
+		t.Error("the journal's rebuilt table shows tok_to_revoke as live, want revoked")
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), "tok_to_revoke")
+	if err != nil {
+		t.Fatalf("GetTokenByID: %v", err)
+	}
+	if !rec.Revoked {
+		t.Error("tokens.json still shows tok_to_revoke as live")
+	}
+}
+
+// TestTokenRevokeWithJournalUnknownOrAlreadyRevokedRefusesWithoutAppending
+// covers the same "without appending" guarantee create's uniqueness
+// check gives, on the revoke side: an unknown id and an already-revoked
+// id both refuse before any further _meta record lands.
+func TestTokenRevokeWithJournalUnknownOrAlreadyRevokedRefusesWithoutAppending(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_live"}
+	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+
+	t.Run("unknown id", func(t *testing.T) {
+		chainBefore, _ := replayJournalTable(t, journalURL)
+
+		var out, errOut bytes.Buffer
+		args := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_ghost"}
+		err := run(context.Background(), args, &out, &errOut)
+		if err == nil {
+			t.Fatal("expected revoking an unknown id to refuse")
+		}
+		if !errors.Is(err, auth.ErrTokenNotFound) {
+			t.Errorf("errors.Is(_, auth.ErrTokenNotFound) = false, err = %v", err)
+		}
+		if strings.Count(err.Error(), "\n") != 0 {
+			t.Errorf("refusal is not one line: %q", err.Error())
+		}
+
+		chainAfter, _ := replayJournalTable(t, journalURL)
+		if chainAfter.LastMetaSeq() != chainBefore.LastMetaSeq() {
+			t.Errorf("LastMetaSeq() changed from %d to %d; an unknown id must not append", chainBefore.LastMetaSeq(), chainAfter.LastMetaSeq())
+		}
+	})
+
+	t.Run("already revoked", func(t *testing.T) {
+		var out, errOut bytes.Buffer
+		firstRevoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_live"}
+		if err := run(context.Background(), firstRevoke, &out, &errOut); err != nil {
+			t.Fatalf("first revoke failed: %v", err)
+		}
+
+		chainBefore, _ := replayJournalTable(t, journalURL)
+
+		out.Reset()
+		errOut.Reset()
+		secondRevoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_live"}
+		err := run(context.Background(), secondRevoke, &out, &errOut)
+		if err == nil {
+			t.Fatal("expected revoking an already-revoked id to refuse")
+		}
+		if !errors.Is(err, auth.ErrTokenAlreadyRevoked) {
+			t.Errorf("errors.Is(_, auth.ErrTokenAlreadyRevoked) = false, err = %v", err)
+		}
+		if strings.Count(err.Error(), "\n") != 0 {
+			t.Errorf("refusal is not one line: %q", err.Error())
+		}
+
+		chainAfter, _ := replayJournalTable(t, journalURL)
+		if chainAfter.LastMetaSeq() != chainBefore.LastMetaSeq() {
+			t.Errorf("LastMetaSeq() changed from %d to %d; an already-revoked id must not append", chainBefore.LastMetaSeq(), chainAfter.LastMetaSeq())
+		}
+	})
+}
+
+// TestTokenRevokeCompletesDiskAfterJournalSucceedsButDiskFails reproduces
+// round 1 finding 2 on WALD-33: a journaled revoke whose tokens.json
+// rewrite fails used to leave the token live on disk while the journal
+// recorded it revoked, and the very next revoke attempt refused with "no
+// action needed; the token is already inactive" before ever touching
+// disk again -- a security operation silently stuck, with no recorded
+// path forward but hand-editing tokens.json.
+//
+// tokens.json.tmp (the exact sibling path FileTokenStore.save writes and
+// renames over) is pre-created here as a directory: portable fault
+// injection that fails the write with "is a directory" regardless of OS
+// or uid, unlike a chmod-based approach a root-run CI container would
+// silently not enforce.
+func TestTokenRevokeCompletesDiskAfterJournalSucceedsButDiskFails(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_probe"}
+	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+
+	tmpPath := filepath.Join(dataDir, "tokens.json.tmp")
+	if err := os.Mkdir(tmpPath, 0755); err != nil {
+		t.Fatalf("failed to pre-create %s as a directory: %v", tmpPath, err)
+	}
+
+	revoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_probe"}
+
+	stdout.Reset()
+	stderr.Reset()
+	err := run(context.Background(), revoke, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected the first revoke attempt to fail: tokens.json.tmp cannot be written")
+	}
+	if !errors.Is(err, auth.ErrStoreUnavailable) {
+		t.Errorf("expected errors.Is(err, auth.ErrStoreUnavailable), got %v", err)
+	}
+	if !strings.Contains(err.Error(), "may still authenticate") {
+		t.Errorf("expected the refusal to warn the token may still authenticate, got %v", err)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+
+	_, table := replayJournalTable(t, journalURL)
+	row, ok := table.Row("tok_probe")
+	if !ok {
+		t.Fatal("the journal's rebuilt token table lost tok_probe")
+	}
+	if !row.Revoked {
+		t.Fatal("expected the journal half of the revoke to have landed despite the disk failure")
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), "tok_probe")
+	if err != nil {
+		t.Fatalf("GetTokenByID: %v", err)
+	}
+	if rec.Revoked {
+		t.Fatal("tokens.json shows tok_probe revoked despite the write having failed -- test setup is broken")
+	}
+
+	// Clear the fault and retry: the retry must reach disk, not be
+	// short-circuited by the journal already showing the row revoked.
+	if err := os.RemoveAll(tmpPath); err != nil {
+		t.Fatalf("failed to remove blocking directory: %v", err)
+	}
+	chainBeforeRetry, _ := replayJournalTable(t, journalURL)
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := run(context.Background(), revoke, &stdout, &stderr); err != nil {
+		t.Fatalf("retry after clearing the disk fault should succeed, got: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "revoked token tok_probe") {
+		t.Errorf("expected confirmation line, got %q", stdout.String())
+	}
+
+	rec, err = store.GetTokenByID(context.Background(), "tok_probe")
+	if err != nil {
+		t.Fatalf("GetTokenByID after retry: %v", err)
+	}
+	if !rec.Revoked {
+		t.Error("tokens.json still shows tok_probe as live after the retry")
+	}
+
+	chainAfterRetry, _ := replayJournalTable(t, journalURL)
+	if chainAfterRetry.LastMetaSeq() != chainBeforeRetry.LastMetaSeq() {
+		t.Errorf("LastMetaSeq() changed from %d to %d; the retry must not append a second token_revoke", chainBeforeRetry.LastMetaSeq(), chainAfterRetry.LastMetaSeq())
+	}
+
+	// A further revoke, now that both journal and disk agree, must still
+	// refuse as "already revoked" -- round 1's own concern was that the
+	// fix must not make this pre-check useless for the ordinary case.
+	stdout.Reset()
+	stderr.Reset()
+	err = run(context.Background(), revoke, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected a third revoke attempt (already revoked on both sides) to refuse")
+	}
+	if !errors.Is(err, auth.ErrTokenAlreadyRevoked) {
+		t.Errorf("errors.Is(_, auth.ErrTokenAlreadyRevoked) = false, err = %v", err)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+}
+
+// TestTokenRevokeWithJournalRevokedButNoLocalRecordRefusesHonestly
+// reproduces round 2 finding 1 on WALD-33: when the journal's rebuilt
+// table already shows a token revoked but tokens.json carries no row for
+// it at all -- the shape a lost or restored tokens.json leaves behind --
+// store.RevokeToken reports auth.ErrTokenNotFound, which used to fall
+// into refuseTokenRevokeDiskIncomplete's wording. That refusal claims the
+// token "may still authenticate locally" (false: a store with no row for
+// the id has nothing to match) and tells the operator to retry once the
+// data directory is writable (false: the directory was writable the
+// whole time, and the retry refuses identically forever since there is
+// no row left to write). This pins the corrected refusal instead, and
+// that no second token_revoke is journaled on the retry.
+func TestTokenRevokeWithJournalRevokedButNoLocalRecordRefusesHonestly(t *testing.T) {
+	dataDir := t.TempDir()
+	journalURL := bootJournal(t, dataDir)
+
+	var stdout, stderr bytes.Buffer
+	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_ghost"}
+	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	revoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_ghost"}
+	if err := run(context.Background(), revoke, &stdout, &stderr); err != nil {
+		t.Fatalf("run token revoke failed: %v", err)
+	}
+
+	// Simulate a lost or restored tokens.json: the journal still shows
+	// tok_ghost revoked, but the local cache has no row for it at all --
+	// not merely unrevoked or already-revoked, but entirely absent.
+	tokensPath := filepath.Join(dataDir, "tokens.json")
+	if err := os.WriteFile(tokensPath, []byte(`{"version":"v1","tokens":[]}`), 0644); err != nil {
+		t.Fatalf("failed to simulate a lost tokens.json: %v", err)
+	}
+
+	chainBefore, _ := replayJournalTable(t, journalURL)
+
+	stdout.Reset()
+	stderr.Reset()
+	err := run(context.Background(), revoke, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected revoking a token with no local record to refuse")
+	}
+	if !errors.Is(err, auth.ErrTokenNotFound) {
+		t.Errorf("errors.Is(_, auth.ErrTokenNotFound) = false, err = %v", err)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "may still authenticate") {
+		t.Errorf("refusal falsely claims the token may still authenticate locally, got %v", err)
+	}
+	if strings.Contains(err.Error(), "data directory is writable") {
+		t.Errorf("refusal names a retry-once-writable next step that cannot help here, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot authenticate") {
+		t.Errorf("expected the refusal to say the token cannot authenticate, got %v", err)
+	}
+
+	chainAfter, _ := replayJournalTable(t, journalURL)
+	if chainAfter.LastMetaSeq() != chainBefore.LastMetaSeq() {
+		t.Errorf("LastMetaSeq() changed from %d to %d; a no-local-record retry must not append a second token_revoke", chainBefore.LastMetaSeq(), chainAfter.LastMetaSeq())
+	}
+
+	// tokens.json must remain untouched -- still no row for tok_ghost.
+	data, err := os.ReadFile(tokensPath)
+	if err != nil {
+		t.Fatalf("failed to read tokens.json: %v", err)
+	}
+	var table struct {
+		Tokens []struct {
+			TokenID string `json:"token_id"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(data, &table); err != nil {
+		t.Fatalf("failed to parse tokens.json: %v", err)
+	}
+	if len(table.Tokens) != 0 {
+		t.Errorf("expected tokens.json to remain empty, got %d rows", len(table.Tokens))
+	}
+}
+
+// TestTokenRevokeUnknownIDRefusalNamesRealNextStep reproduces round 1
+// finding 3 on WALD-33: a token created while journal-less can never be
+// revoked once a journal is configured, because the journal's rebuilt
+// table has no row for it -- indistinguishable, from the table's own
+// point of view, from a typo'd or nonexistent id. Before the fix, the
+// refusal's fix line sent the operator to 'walden token list', which
+// only confirms the id exists and leaves them exactly as stuck. This
+// pins two things: the refusal is now honest about the ambiguity rather
+// than claiming the id is simply unknown, and the real next step it
+// names -- revoking with the journal knob unset -- actually works.
+func TestTokenRevokeUnknownIDRefusalNamesRealNextStep(t *testing.T) {
+	dataDir := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_local"}
+	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create (journal-less) failed: %v", err)
+	}
+
+	journalURL := bootJournal(t, dataDir)
+
+	stdout.Reset()
+	stderr.Reset()
+	revoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_local"}
+	err := run(context.Background(), revoke, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected revoking a disk-only, never-journaled token to refuse")
+	}
+	if !errors.Is(err, auth.ErrTokenNotFound) {
+		t.Errorf("errors.Is(_, auth.ErrTokenNotFound) = false, err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "unset") {
+		t.Errorf("expected the refusal to name unsetting the journal knob as a real next step, got %v", err)
+	}
+	if strings.Contains(err.Error(), "not recorded in the journal") == false {
+		t.Errorf("expected the refusal to name the disk-only possibility honestly rather than call the id simply unknown, got %v", err)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+
+	// tok_local must still be live and reported active -- the refusal
+	// above must not have journaled a token_create to force it in, which
+	// would forge history for a token that was never journaled.
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), "tok_local")
+	if err != nil {
+		t.Fatalf("GetTokenByID: %v", err)
+	}
+	if rec.Revoked {
+		t.Fatal("tok_local was revoked despite the refusal above")
+	}
+	_, table := replayJournalTable(t, journalURL)
+	if _, ok := table.Row("tok_local"); ok {
+		t.Fatal("the journal now carries tok_local; the refusal must not have journaled a token_create for a token that predates the journal")
+	}
+
+	// The real next step the refusal names: revoke it with the journal
+	// knob unset, exactly as it would have worked before a journal was
+	// ever configured.
+	stdout.Reset()
+	stderr.Reset()
+	revokeNoJournal := []string{"walden", "token", "revoke", "--data-dir", dataDir, "tok_local"}
+	if err := run(context.Background(), revokeNoJournal, &stdout, &stderr); err != nil {
+		t.Fatalf("journal-less revoke (the refusal's own suggested next step) failed: %v", err)
+	}
+	rec, err = store.GetTokenByID(context.Background(), "tok_local")
+	if err != nil {
+		t.Fatalf("GetTokenByID after journal-less revoke: %v", err)
+	}
+	if !rec.Revoked {
+		t.Error("tok_local still shows live after the journal-less revoke")
+	}
+}
+
+// TestTokenCreateNoJournalBehavesAsBefore pins that omitting --journal (and
+// leaving WALDEN_JOURNAL unset) behaves exactly as it did before this
+// ticket: no network access, disk-only.
+func TestTokenCreateNoJournalBehavesAsBefore(t *testing.T) {
+	dataDir := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_no_journal"}
+	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+		t.Fatalf("run token create failed: %v", err)
+	}
+	rawToken := strings.TrimSpace(stdout.String())
+	if !strings.HasPrefix(rawToken, "walden_") {
+		t.Fatalf("expected token with prefix walden_, got %q", rawToken)
+	}
+
+	store := auth.NewFileTokenStore(dataDir)
+	rec, err := store.GetTokenByID(context.Background(), "tok_no_journal")
+	if err != nil {
+		t.Fatalf("GetTokenByID: %v", err)
+	}
+	if rec.TokenHash != auth.HashToken(rawToken) {
+		t.Errorf("tokens.json hash %q != HashToken(printed token) = %q", rec.TokenHash, auth.HashToken(rawToken))
 	}
 }

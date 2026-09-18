@@ -59,11 +59,32 @@ func GenerateToken() (rawToken, tokenHash string, err error) {
 }
 
 // EnsureAdminToken ensures a first-boot admin token exists when store has no tokens.
-// If store is empty, it generates and persists an admin token with ID AdminTokenID and
-// scope "rwc:*", returning the raw bearer token. If tokens already exist, or if another
-// concurrent process wins the race to create the token (ErrTokenExists), it returns ("", nil).
-// If store is nil, it refuses under ErrStoreUnavailable.
-func EnsureAdminToken(ctx context.Context, store TokenStore) (string, error) {
+// If store is empty, it generates an admin token with ID AdminTokenID and scope "rwc:*",
+// journals it (see journalFn below), persists it, and returns the raw bearer token. If
+// tokens already exist, or if another concurrent process wins the race to create the token
+// (ErrTokenExists), it returns ("", nil). If store is nil, it refuses under
+// ErrStoreUnavailable.
+//
+// journalFn, when non-nil, is called with the built record before store.CreateToken, and
+// any error it returns but ErrTokenExists is returned unchanged, with store never
+// touched — journal first, disk second (WALD-33), the same order as `walden token
+// create`: a disk-first order that then failed to journal would leave a live token
+// the journal never heard of, breaking walden's first promise. A journalFn error that
+// wraps ErrTokenExists is treated exactly like store.CreateToken's own ErrTokenExists
+// below: this store being empty is what let this function reach journalFn at all, so
+// the journal already holding AdminTokenID here means an earlier attempt's journal
+// half landed against a local store that was since emptied (or never written), not a
+// genuine collision this call caused — round 1 finding 1 on WALD-33. Minting and
+// journaling a second token_create for the same constant id would poison every future
+// replay (spec section 8.1 rule 10), so this returns ("", nil) instead of erroring
+// boot, the same "someone already has this" outcome a disk-side lost race gets. The
+// caller building journalFn is responsible for telling the operator anything
+// happened, since neither this return value nor its own wrapped error ever reaches
+// one. A nil journalFn is journal-less mode and behaves exactly as before this
+// parameter existed. internal/auth gains no import of internal/store from this:
+// journalFn is the caller's own closure, built from whatever store.Client and
+// journal.Leases it already has in hand (cmd/walden/main.go).
+func EnsureAdminToken(ctx context.Context, store TokenStore, journalFn func(context.Context, *TokenRecord) error) (string, error) {
 	if store == nil {
 		return "", refusal.RefuseWithCause(
 			"token store unavailable",
@@ -96,6 +117,27 @@ func EnsureAdminToken(ctx context.Context, store TokenStore) (string, error) {
 		TokenHash: tokenHash,
 		Scopes:    scopes,
 		CreatedAt: time.Now().UTC(),
+	}
+
+	if journalFn != nil {
+		if err := journalFn(ctx, record); err != nil {
+			// The same lost-race handling store.CreateToken's own
+			// ErrTokenExists gets below, extended to the journal side
+			// (WALD-33 round 1 finding 1): a journalFn that finds
+			// AdminTokenID already in the journal's rebuilt table is not
+			// a boot failure, it is "someone (an earlier boot of this
+			// same process) already minted this" — the local store being
+			// empty here is exactly what makes that indistinguishable
+			// from a genuine race at this layer. Swallowing it here,
+			// rather than aborting boot, is what keeps that situation
+			// recoverable: the caller building journalFn (main.go) is
+			// responsible for telling the operator anything happened,
+			// since this return value alone does not reach them.
+			if errors.Is(err, ErrTokenExists) {
+				return "", nil
+			}
+			return "", err
+		}
 	}
 
 	if err := store.CreateToken(ctx, record); err != nil {

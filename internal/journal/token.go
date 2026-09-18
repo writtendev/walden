@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
@@ -86,6 +87,44 @@ type TokenRevokeRecord struct {
 	TokenHash string   `json:"token_hash"`
 	Timestamp string   `json:"timestamp"`
 	Signature string   `json:"signature"`
+}
+
+// NewTokenCreateRecord builds the token_create record a create appends to
+// _meta: the fixed fields spec section 4.3 requires (version "v1", stream
+// "_meta", type "token_create"), seq supplied by the caller (a Lease's own
+// sequence issuance owns that — see lease.go — not this constructor), and
+// timestamp (RFC 3339 UTC) supplied by the caller so a create stays
+// deterministic in tests, in NewKeyRotationRecord's shape (rotation.go).
+// The record is unsigned until SignTokenCreate is called on it.
+//
+// scopes is cloned, not aliased: a caller mutating its own slice after
+// this call must not be able to change what this record ends up signing.
+func NewTokenCreateRecord(seq Seq, tokenID, tokenHash string, scopes []string, timestamp string) *TokenCreateRecord {
+	return &TokenCreateRecord{
+		Version:   VersionPrefix,
+		Stream:    MetaStreamID,
+		Seq:       seq,
+		Type:      RecordTypeTokenCreate,
+		TokenID:   tokenID,
+		TokenHash: tokenHash,
+		Scopes:    append([]string(nil), scopes...),
+		Timestamp: timestamp,
+	}
+}
+
+// NewTokenRevokeRecord builds the token_revoke record a revoke appends to
+// _meta, in NewTokenCreateRecord's shape. The record is unsigned until
+// SignTokenRevoke is called on it.
+func NewTokenRevokeRecord(seq Seq, tokenID, tokenHash, timestamp string) *TokenRevokeRecord {
+	return &TokenRevokeRecord{
+		Version:   VersionPrefix,
+		Stream:    MetaStreamID,
+		Seq:       seq,
+		Type:      RecordTypeTokenRevoke,
+		TokenID:   tokenID,
+		TokenHash: tokenHash,
+		Timestamp: timestamp,
+	}
 }
 
 // ValidateTokenID validates a token identifier: the same character class a stream ID uses,
@@ -560,4 +599,58 @@ func ParseTokenRevoke(data []byte) (*TokenRevokeRecord, error) {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidTokenRecord, err)
 	}
 	return r, nil
+}
+
+// MarshalTokenCreate serializes a TokenCreateRecord to indented JSON with
+// a trailing newline, mirroring MarshalKeyRotation (rotation.go): nil
+// check, Validate implicitly through json.MarshalIndent's own field
+// values, two-space indent, trailing newline byte.
+//
+// One check beyond that: every entry of r.Scopes must be valid UTF-8,
+// worded and structured like MarshalRefTx's existing guard for ref names
+// (reftx.go). token_id is confined to [a-zA-Z0-9._-] by ValidateTokenID
+// and token_hash to "sha256:<64-lowercase-hex>" by ValidateTokenHash, so
+// neither can trip this — both are ASCII by construction — and timestamp
+// is RFC 3339. scopes is the one field that can: ValidateTokenScope bans
+// only 0x00-0x1F and 0x7F, not invalid UTF-8. v1's on-disk record format
+// is JSON (section 4.3), and encoding/json silently replaces an invalid
+// UTF-8 byte sequence with U+FFFD instead of erroring, which would write
+// a record whose bytes no longer match the ones CanonicalTokenCreatePayload
+// signed over — permanently unverifiable. There is no v1 escape convention
+// for raw bytes in JSON (section 5.4 forbids inventing one unilaterally as
+// an unknown field), so this is refused here rather than written. In
+// practice every real caller's scopes come from auth.ParseScopes ->
+// Scope.String(), which cannot produce invalid UTF-8, so this is
+// unreachable today; it is closed in the marshaler, writer-side only, the
+// same way MarshalRefTx closes the equivalent hole for ref names (WALD-119).
+func MarshalTokenCreate(r *TokenCreateRecord) ([]byte, error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: record cannot be nil", ErrInvalidTokenRecord)
+	}
+	for i, scope := range r.Scopes {
+		if !utf8.ValidString(scope) {
+			return nil, fmt.Errorf("%w: %w: scopes[%d] is not valid UTF-8; v1's JSON record format cannot carry it losslessly (json.MarshalIndent would replace its bytes with U+FFFD, producing a record that could never verify again): %q", ErrInvalidTokenRecord, ErrInvalidTokenScope, i, scope)
+		}
+	}
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal token create record: %w", err)
+	}
+	return append(data, '\n'), nil
+}
+
+// MarshalTokenRevoke serializes a TokenRevokeRecord to indented JSON with
+// a trailing newline, matching MarshalTokenCreate's shape. A
+// TokenRevokeRecord carries no scopes, so it has no field the UTF-8 guard
+// above needs to check: token_id and token_hash are ASCII by construction
+// (ValidateTokenID, ValidateTokenHash), and timestamp is RFC 3339.
+func MarshalTokenRevoke(r *TokenRevokeRecord) ([]byte, error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: record cannot be nil", ErrInvalidTokenRecord)
+	}
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal token revoke record: %w", err)
+	}
+	return append(data, '\n'), nil
 }

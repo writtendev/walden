@@ -3,9 +3,21 @@
 // question — "what is _meta's currently active signing key, epoch, and
 // last sequence, right now" — which is exactly what both EnsureGenesis's
 // adopt path (genesis.go) and RotateKey (rotation.go) need before either
-// can safely touch signing.key or append to _meta. It does not rebuild the
-// token table (WALD-33) and does not touch repository streams (WALD-34):
-// both replay _meta for a different purpose than this one.
+// can safely touch signing.key or append to _meta.
+//
+// It also rebuilds the token table (WALD-33) as a side effect of the same
+// walk: spec section 8.1 rules 10-13 are mandatory replay refusals, not
+// something a reader may skip because no caller asked for the table this
+// time, so the table is built on every walk rather than only when a
+// caller wants it (see replayMeta below). Building it on every walk makes
+// ReplayMeta stricter than it was before this ticket: a journal carrying
+// a reused token id, an unchainable revoke, or a hash disagreement now
+// refuses at boot — where before it replayed, because nothing was
+// checking those rules at all. Operators should expect this: a journal
+// that was silently accepted before this change may now refuse to boot.
+//
+// It does not touch repository streams (WALD-34): that replays _meta for
+// a different purpose than this one.
 package store
 
 import (
@@ -47,11 +59,12 @@ import (
 //     (*journal.SigningChain).ApplyRotation, which both advances the chain
 //     and folds the sequence forward.
 //   - "token_create" / "token_revoke": parsed with the existing
-//     ParseTokenCreate/ParseTokenRevoke, verified against the chain's
-//     active key through VerifyTokenCreate/VerifyTokenRevoke, then folded
-//     into the sequence with AdvanceMetaSeq. The token table itself is not
-//     rebuilt (WALD-33 owns that); this only needs the record to have
-//     verified before the sequence can be trusted to advance past it.
+//     ParseTokenCreate/ParseTokenRevoke (a parse failure is refused with
+//     journal.RefuseInvalidTokenRecord, spec section 8.1 rule 13), verified
+//     against the chain's active key through
+//     VerifyTokenCreate/VerifyTokenRevoke, applied to the token table
+//     (journal.TokenTable, WALD-33 — rules 10-12), then folded into the
+//     sequence with AdvanceMetaSeq.
 //   - anything else: AdvanceMetaSeq alone, with no attempt to parse the
 //     record's other fields — spec section 5.4's forward-compatibility
 //     rule for a meta record type this reader does not recognise.
@@ -62,30 +75,44 @@ import (
 // apart. Every other failure — a corrupt or unchainable record, a network
 // failure, a body over maxGenesisBody — comes back as a single-line
 // refusal already, so no caller has anything left to wrap.
+//
+// ReplayMeta itself keeps its pre-WALD-33 signature: the token table
+// replayMeta also builds is discarded here, so RotateKey and EnsureGenesis
+// (the two existing callers) are untouched by this ticket. ReplayMetaTable
+// (tokens.go) is the thin wrapper that returns both.
 func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) {
+	chain, _, err := c.replayMeta(ctx)
+	return chain, err
+}
+
+// replayMeta is ReplayMeta's implementation, extended to also rebuild the
+// token table (WALD-33) as it walks: see this file's own doc comment for
+// why the table is built on every walk rather than only when asked for.
+func (c *Client) replayMeta(ctx context.Context) (*journal.SigningChain, *journal.TokenTable, error) {
 	chain := journal.NewSigningChain()
+	table := journal.NewTokenTable()
 
 	genesisBody, err := c.Get(ctx, journal.TxKey(journal.MetaStreamID, 0))
 	if err != nil {
 		if errors.Is(err, ErrObjectNotFound) {
-			return nil, err
+			return nil, nil, err
 		}
-		return nil, wrapGenesisFailure(err)
+		return nil, nil, wrapGenesisFailure(err)
 	}
 	genesisData, err := io.ReadAll(io.LimitReader(genesisBody, maxGenesisBody+1))
 	genesisBody.Close()
 	if err != nil {
-		return nil, wrapGenesisFailure(err)
+		return nil, nil, wrapGenesisFailure(err)
 	}
 	if len(genesisData) > maxGenesisBody {
-		return nil, journal.RefuseCorruptGenesis(fmt.Errorf("object exceeds %d bytes, refusing to read further", maxGenesisBody))
+		return nil, nil, journal.RefuseCorruptGenesis(fmt.Errorf("object exceeds %d bytes, refusing to read further", maxGenesisBody))
 	}
 	genesisRec, err := journal.ParseGenesis(genesisData)
 	if err != nil {
-		return nil, journal.RefuseCorruptGenesis(err)
+		return nil, nil, journal.RefuseCorruptGenesis(err)
 	}
 	if err := chain.ApplyGenesis(genesisRec); err != nil {
-		return nil, journal.RefuseCorruptGenesis(err)
+		return nil, nil, journal.RefuseCorruptGenesis(err)
 	}
 
 	for seq, growRetries := journal.Seq(1), 0; ; {
@@ -94,7 +121,7 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 			if errors.Is(err, ErrObjectNotFound) {
 				grew, err := c.probeMetaAfterNotFound(ctx, seq)
 				if err != nil {
-					return nil, err
+					return nil, nil, err
 				}
 				if grew {
 					// The corroborating List proved a record now exists at
@@ -119,65 +146,71 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 					// time a record is actually read and applied.
 					growRetries++
 					if growRetries > maxMetaGrowRetries {
-						return nil, refuseMetaGrowExhausted(seq, growRetries)
+						return nil, nil, refuseMetaGrowExhausted(seq, growRetries)
 					}
 					continue
 				}
-				return chain, nil
+				return chain, table, nil
 			}
-			return nil, wrapMetaFailure(seq, err)
+			return nil, nil, wrapMetaFailure(seq, err)
 		}
 		growRetries = 0
 		data, err := io.ReadAll(io.LimitReader(body, maxGenesisBody+1))
 		body.Close()
 		if err != nil {
-			return nil, wrapMetaFailure(seq, err)
+			return nil, nil, wrapMetaFailure(seq, err)
 		}
 		if len(data) > maxGenesisBody {
-			return nil, refuseOversizedMetaRecord(seq, maxGenesisBody)
+			return nil, nil, refuseOversizedMetaRecord(seq, maxGenesisBody)
 		}
 
 		var head struct {
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(data, &head); err != nil {
-			return nil, refuseUnreadableMetaRecord(seq, err)
+			return nil, nil, refuseUnreadableMetaRecord(seq, err)
 		}
 
 		switch head.Type {
 		case journal.RecordTypeKeyRotation:
 			rec, err := journal.ParseKeyRotation(data)
 			if err != nil {
-				return nil, journal.RefuseCorruptRotation(seq, err)
+				return nil, nil, journal.RefuseCorruptRotation(seq, err)
 			}
 			if err := chain.ApplyRotation(rec); err != nil {
-				return nil, refuseMetaVerificationFailed(seq, err)
+				return nil, nil, refuseMetaVerificationFailed(seq, err)
 			}
 		case journal.RecordTypeTokenCreate:
 			rec, err := journal.ParseTokenCreate(data)
 			if err != nil {
-				return nil, refuseMetaVerificationFailed(seq, err)
+				return nil, nil, journal.RefuseInvalidTokenRecord(seq, err.Error())
 			}
 			if err := chain.VerifyTokenCreate(rec); err != nil {
-				return nil, refuseMetaVerificationFailed(seq, err)
+				return nil, nil, refuseMetaVerificationFailed(seq, err)
+			}
+			if err := table.ApplyTokenCreate(rec); err != nil {
+				return nil, nil, err
 			}
 			if err := chain.AdvanceMetaSeq(seq); err != nil {
-				return nil, refuseMetaVerificationFailed(seq, err)
+				return nil, nil, refuseMetaVerificationFailed(seq, err)
 			}
 		case journal.RecordTypeTokenRevoke:
 			rec, err := journal.ParseTokenRevoke(data)
 			if err != nil {
-				return nil, refuseMetaVerificationFailed(seq, err)
+				return nil, nil, journal.RefuseInvalidTokenRecord(seq, err.Error())
 			}
 			if err := chain.VerifyTokenRevoke(rec); err != nil {
-				return nil, refuseMetaVerificationFailed(seq, err)
+				return nil, nil, refuseMetaVerificationFailed(seq, err)
+			}
+			if err := table.ApplyTokenRevoke(rec); err != nil {
+				return nil, nil, err
 			}
 			if err := chain.AdvanceMetaSeq(seq); err != nil {
-				return nil, refuseMetaVerificationFailed(seq, err)
+				return nil, nil, refuseMetaVerificationFailed(seq, err)
 			}
 		default:
 			if err := chain.AdvanceMetaSeq(seq); err != nil {
-				return nil, refuseMetaVerificationFailed(seq, err)
+				return nil, nil, refuseMetaVerificationFailed(seq, err)
 			}
 		}
 		seq++

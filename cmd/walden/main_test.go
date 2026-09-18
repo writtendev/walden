@@ -1535,3 +1535,100 @@ func TestServeFirstBootWithJournalJournalsAdminToken(t *testing.T) {
 		t.Errorf("LastMetaSeq() after second boot = %d, want 1 (unchanged: no further token record written)", chain2.LastMetaSeq())
 	}
 }
+
+// TestServeSecondBootWithLostTokensJSONDoesNotDoublyJournalAdminToken
+// reproduces round 1 finding 1 on WALD-33: the admin-token journalFn
+// (main.go) used to skip the uniqueness pre-check against the journal's
+// rebuilt table that runTokenCreate (token.go) already ran for `walden
+// token create`, so a second first-boot mint — here, tokens.json lost
+// between two boots, the exact "restore onto an empty disk" scenario the
+// plan calls out — appended a second token_create for the constant id
+// auth.AdminTokenID and poisoned every future replay under spec section
+// 8.1 rule 10 ("refusal: replay failed: token create at seq 2 reuses
+// token id admin"), permanently, short of hand-editing the bucket.
+//
+// The fix must leave a working path forward rather than trade one dead
+// end for another: boot 2 must still succeed (bind and serve) even
+// though the local store is empty and the journal cannot honor another
+// admin mint, and boot 3 (and every later one) must keep working too —
+// nothing about this journal may become permanently unreplayable.
+func TestServeSecondBootWithLostTokensJSONDoesNotDoublyJournalAdminToken(t *testing.T) {
+	dataDir := t.TempDir()
+	setJournalCreds(t)
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+	args := []string{"--data-dir", dataDir, "--listen", "127.0.0.1:0", "--journal", journalURL}
+
+	var stdout1, stderr1 bytes.Buffer
+	if err := runServe(cancelledContext(), args, &stdout1, &stderr1); err != nil {
+		t.Fatalf("boot 1 failed: %v", err)
+	}
+	if !strings.Contains(stdout1.String(), "admin token: walden_") {
+		t.Fatalf("boot 1: expected an admin token to be printed, got:\n%s", stdout1.String())
+	}
+
+	j, err := store.ResolveJournal(journalURL, os.LookupEnv)
+	if err != nil {
+		t.Fatalf("ResolveJournal: %v", err)
+	}
+	c := store.NewClient(j)
+	chainAfterBoot1, tableAfterBoot1, err := c.ReplayMetaTable(context.Background())
+	if err != nil {
+		t.Fatalf("ReplayMetaTable after boot 1: %v", err)
+	}
+	if chainAfterBoot1.LastMetaSeq() != 1 {
+		t.Fatalf("LastMetaSeq() after boot 1 = %d, want 1 (genesis at 0, admin token_create at 1)", chainAfterBoot1.LastMetaSeq())
+	}
+	rowAfterBoot1, ok := tableAfterBoot1.Row(auth.AdminTokenID)
+	if !ok {
+		t.Fatal("boot 1: the journal's rebuilt token table does not hold the admin token")
+	}
+
+	// The exact reproduction the round 1 finding probed: tokens.json is
+	// lost (a restore onto an empty disk mints today's local id from
+	// scratch the same way; deleting the file after a successful boot is
+	// the simplest way to put the local store back in that same empty
+	// state without wiping the signing key boot 2 also needs to adopt
+	// the journal's existing genesis record).
+	if err := os.Remove(filepath.Join(dataDir, "tokens.json")); err != nil {
+		t.Fatalf("failed to remove tokens.json: %v", err)
+	}
+
+	var stdout2, stderr2 bytes.Buffer
+	if err := runServe(cancelledContext(), args, &stdout2, &stderr2); err != nil {
+		t.Fatalf("boot 2 failed: %v (this must not brick the journal or refuse boot)", err)
+	}
+	if strings.Contains(stdout2.String(), "admin token:") {
+		t.Errorf("boot 2: expected no admin token to be minted or printed once the journal already holds one, got stdout:\n%s", stdout2.String())
+	}
+	if !strings.Contains(stderr2.String(), "already holds a token_create") {
+		t.Errorf("boot 2: expected a WARNING naming the journal's existing admin token_create, got stderr:\n%s", stderr2.String())
+	}
+
+	chainAfterBoot2, tableAfterBoot2, err := c.ReplayMetaTable(context.Background())
+	if err != nil {
+		t.Fatalf("ReplayMetaTable after boot 2: %v", err)
+	}
+	if chainAfterBoot2.LastMetaSeq() != 1 {
+		t.Fatalf("LastMetaSeq() after boot 2 = %d, want 1 unchanged (no second token_create for id %q)", chainAfterBoot2.LastMetaSeq(), auth.AdminTokenID)
+	}
+	rowAfterBoot2, ok := tableAfterBoot2.Row(auth.AdminTokenID)
+	if !ok {
+		t.Fatal("boot 2: the journal's rebuilt token table lost the admin token")
+	}
+	if rowAfterBoot2.TokenHash != rowAfterBoot1.TokenHash {
+		t.Errorf("boot 2: admin token hash in the journal changed from %q to %q; a second token_create landed", rowAfterBoot1.TokenHash, rowAfterBoot2.TokenHash)
+	}
+
+	// The disaster-recovery path the ticket exists to make work: boot 3
+	// (and by extension every subsequent boot, token command, and
+	// restore against this bucket) must keep working, not refuse forever
+	// the way the un-fixed code did from the second boot on.
+	var stdout3, stderr3 bytes.Buffer
+	if err := runServe(cancelledContext(), args, &stdout3, &stderr3); err != nil {
+		t.Fatalf("boot 3 failed: %v (the journal must not be permanently bricked)", err)
+	}
+	if !strings.Contains(stdout3.String(), "walden server starting on") {
+		t.Errorf("boot 3: expected a normal boot to reach the server-starting line, got stdout:\n%s", stdout3.String())
+	}
+}

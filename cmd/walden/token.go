@@ -197,26 +197,76 @@ func refuseTokenIDAlreadyJournaled(tokenID string) error {
 // token_revoke for it would not chain to a creation, which spec section
 // 8.1 rule 11 refuses on replay — refused here instead, before any
 // append.
+//
+// The table not holding tokenID is reachable two ways that look
+// identical to it: a typo'd or never-existed id, or a token that was
+// created while journal-less (or before --journal/WALDEN_JOURNAL was
+// ever set on this instance) and still lives only in tokens.json — the
+// journal was simply never told about it (round 1 finding 3). This
+// function cannot tell those two apart, so the refusal is worded to
+// cover both truthfully rather than assume the id is bogus, and its fix
+// names a step that actually works today instead of 'walden token
+// list', which would only confirm the id exists on disk and leave the
+// operator exactly as stuck. Unsetting the journal knob for one command
+// reaches the same disk-only revoke path this instance used before any
+// journal was configured — it is not a workaround, it is the operation
+// this token has always supported. Whether a disk-only token should
+// instead revoke through the journal, or be journaled retroactively, is
+// the open question WALD-33's own plan left to WALD-57, and is not
+// decided here: this function does not journal a token_create for an id
+// that was never journaled in order to then revoke it — that would
+// forge history.
 func refuseTokenUnknownInJournal(tokenID string) error {
 	return refusal.RefuseWithCause(
 		"token revoke refused",
-		fmt.Sprintf("no token with id %q exists in the journal", tokenID),
-		"verify the token id with 'walden token list'",
+		fmt.Sprintf("token id %q is not recorded in the journal (unknown id, or a token created before a journal was configured)", tokenID),
+		"if this token predates the journal, unset --journal/WALDEN_JOURNAL for this one command to revoke it on disk directly; otherwise verify the id with 'walden token list'",
 		auth.ErrTokenNotFound,
 	)
 }
 
 // refuseTokenAlreadyRevokedInJournal refuses a `walden token revoke`
-// naming a row the journal's rebuilt token table already carries revoked,
-// before any append — the same auth.ErrTokenAlreadyRevoked sentinel
-// FileTokenStore.RevokeToken already refuses a disk-only double revoke
-// with.
+// once both the journal's rebuilt table and tokens.json agree the token
+// is already revoked, translating FileTokenStore.RevokeToken's own
+// auth.ErrTokenAlreadyRevoked into wording that names the journal too.
+// It is not a pre-append check by itself — see runTokenRevoke, which
+// only reaches for this after store.RevokeToken has actually confirmed
+// disk agrees, so a retry completing a half-finished revoke (round 1
+// finding 2) is never short-circuited into this refusal before disk is
+// given the chance to catch up.
 func refuseTokenAlreadyRevokedInJournal(tokenID string) error {
 	return refusal.RefuseWithCause(
 		"token revoke refused",
 		fmt.Sprintf("token id %q is already revoked in the journal", tokenID),
 		"no action needed; the token is already inactive",
 		auth.ErrTokenAlreadyRevoked,
+	)
+}
+
+// refuseTokenRevokeDiskIncomplete refuses a `walden token revoke` whose
+// journal half already landed — this call's own append just above, or an
+// earlier attempt's — while the tokens.json mutation that was supposed
+// to follow it failed. diskErr is FileTokenStore.RevokeToken's own
+// error, wrapped rather than replaced so errors.Is against its sentinel
+// (typically auth.ErrStoreUnavailable) still resolves.
+//
+// This is the round 1 finding 2 fix's one-line half: the plan accepted
+// journal-lands/disk-fails as benign for a create (a row nobody holds the
+// raw token for), but for a revoke the same failure leaves a credential
+// the journal now calls dead still authenticating against tokens.json —
+// the opposite of what the operator asked for, on a security operation.
+// The wording says so plainly, rather than relaying diskErr bare, and the
+// fix names the one thing that actually clears it: run the same command
+// again once the data directory is writable. runTokenRevoke's own
+// pre-check no longer refuses that retry outright the way it used to —
+// see its doc comment — so re-running this exact command is a real path
+// forward, not a dead end.
+func refuseTokenRevokeDiskIncomplete(tokenID string, diskErr error) error {
+	return refusal.RefuseWithCause(
+		"token revoke refused",
+		fmt.Sprintf("token id %q is now revoked in the journal, but tokens.json could not be updated: %s", tokenID, diskErr.Error()),
+		fmt.Sprintf("the token may still authenticate locally until this succeeds; retry 'walden token revoke %s' once the data directory is writable", tokenID),
+		diskErr,
 	)
 }
 
@@ -468,12 +518,32 @@ func runTokenList(args []string, stdout, stderr io.Writer) error {
 //
 // The token's identity and hash are both taken from the journal's own
 // rebuilt table, not recomputed locally: an unknown id refuses (mirroring
-// spec section 8.1 rule 11) and an already-revoked row refuses too
-// (auth.ErrTokenAlreadyRevoked, the same sentinel a disk-only double
-// revoke already uses), both before any append. Because the row's own
+// spec section 8.1 rule 11), before any append. Because the row's own
 // token_hash is what gets journaled, rule 12's hash-agreement check can
 // never trip here — there is no second, operator-supplied hash for it to
 // disagree with.
+//
+// An already-revoked row is handled differently from an unknown one
+// (round 1 finding 2): this function no longer refuses the moment the
+// journal's table shows the row revoked, because that table alone cannot
+// tell "already revoked, nothing to do" apart from "a previous attempt's
+// append landed but its tokens.json write failed, and this is the
+// retry" — and short-circuiting on the first case used to make the
+// second one permanently unrecoverable except by hand-editing
+// tokens.json, leaving a credential the journal calls dead still
+// authenticating. Instead: the append is skipped when the table already
+// shows the row revoked (so a retry never journals a second
+// token_revoke for the same id), but store.RevokeToken always still
+// runs. Disk itself is what now draws the line between the two cases —
+// if it also already shows the token revoked, RevokeToken's own
+// auth.ErrTokenAlreadyRevoked says so and this refuses with
+// refuseTokenAlreadyRevokedInJournal; if disk still shows the token
+// live, RevokeToken applies the mutation this retry exists to complete.
+// Any other disk failure — including the first attempt's original
+// failure, before any retry — is refused through
+// refuseTokenRevokeDiskIncomplete, which says plainly that the journal
+// already calls this token dead while tokens.json does not yet agree,
+// rather than relaying a bare disk error that leaves that gap unstated.
 func runTokenRevoke(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("token revoke", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -535,22 +605,36 @@ func runTokenRevoke(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// journaled is whether this invocation found (or itself just left) a
+	// journal row for tokenID — nil in journal-less mode, non-nil
+	// otherwise. It gates two things below: whether store.RevokeToken's
+	// own ErrTokenAlreadyRevoked gets the journal-flavored refusal or
+	// passes through as-is (journal-less mode never mentions a journal it
+	// does not have), and whether any other disk failure is reported as
+	// an incomplete revoke (round 1 finding 2) rather than a bare error.
+	var journaled bool
 	if tj != nil {
 		row, exists := tj.table.Row(tokenID)
 		if !exists {
 			return refuseTokenUnknownInJournal(tokenID)
 		}
-		if row.Revoked {
-			return refuseTokenAlreadyRevokedInJournal(tokenID)
-		}
-		now := func() time.Time { return revokedAt }
-		if _, err := tj.client.AppendTokenRevoke(journalCtx, tj.lease, tj.priv, tj.chain, tokenID, row.TokenHash, now); err != nil {
-			return err
+		journaled = true
+		if !row.Revoked {
+			now := func() time.Time { return revokedAt }
+			if _, err := tj.client.AppendTokenRevoke(journalCtx, tj.lease, tj.priv, tj.chain, tokenID, row.TokenHash, now); err != nil {
+				return err
+			}
 		}
 	}
 
 	store := auth.NewFileTokenStore(dataDir)
 	if err := store.RevokeToken(context.Background(), tokenID, revokedAt); err != nil {
+		if journaled && errors.Is(err, auth.ErrTokenAlreadyRevoked) {
+			return refuseTokenAlreadyRevokedInJournal(tokenID)
+		}
+		if journaled {
+			return refuseTokenRevokeDiskIncomplete(tokenID, err)
+		}
 		return err
 	}
 

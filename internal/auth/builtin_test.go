@@ -517,6 +517,49 @@ func TestEnsureAdminToken(t *testing.T) {
 			t.Errorf("expected no tokens persisted after journalFn failure, got %d", len(tokens))
 		}
 	})
+
+	// TestEnsureAdminToken/journalFn_ErrTokenExists_is_swallowed... covers
+	// round 1 finding 1 on WALD-33 at the auth-layer unit: a journalFn
+	// that reports the journal already carries AdminTokenID (the shape
+	// cmd/walden/main.go's own journalFn now returns when its
+	// ReplayMetaTable pre-check finds the row) must not be treated as a
+	// boot failure. Before the fix, EnsureAdminToken returned every
+	// journalFn error unchanged, including this one — which, reproduced
+	// end to end in cmd/walden's TestServeSecondBootWithLostTokensJSON...,
+	// is exactly the sequence that let a lost tokens.json between two
+	// boots append a second token_create for the constant id "admin" and
+	// poison every future replay. This test pins the fix at the
+	// package's own boundary, independent of any store or journal
+	// client: store.CreateToken must never be reached.
+	t.Run("journalFn ErrTokenExists is swallowed like a lost race, and store is never touched", func(t *testing.T) {
+		store := &createSpyStore{MemoryTokenStore: auth.NewMemoryTokenStore()}
+		journalFn := func(context.Context, *auth.TokenRecord) error {
+			return fmt.Errorf("token id %q already exists in the journal: %w", auth.AdminTokenID, auth.ErrTokenExists)
+		}
+
+		token, err := auth.EnsureAdminToken(ctx, store, journalFn)
+		if err != nil {
+			t.Fatalf("expected journalFn's ErrTokenExists to be swallowed, got err = %v", err)
+		}
+		if token != "" {
+			t.Errorf("expected empty token when journalFn reports ErrTokenExists, got %q", token)
+		}
+		if store.createCalls != 0 {
+			t.Errorf("store.CreateToken was called %d times; want 0 (journal already holds this id, so disk must not gain a row the journal cannot agree with)", store.createCalls)
+		}
+	})
+}
+
+// createSpyStore counts CreateToken calls, so a test can prove
+// EnsureAdminToken never reaches disk once journalFn has already refused.
+type createSpyStore struct {
+	*auth.MemoryTokenStore
+	createCalls int
+}
+
+func (s *createSpyStore) CreateToken(ctx context.Context, record *auth.TokenRecord) error {
+	s.createCalls++
+	return s.MemoryTokenStore.CreateToken(ctx, record)
 }
 
 type raceMockStore struct {

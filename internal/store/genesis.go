@@ -137,44 +137,15 @@ func (c *Client) EnsureGenesis(ctx context.Context, dataDir string, now func() t
 
 // adoptGenesis handles EnsureGenesis's step 3: ReplayMeta has already
 // walked _meta from genesis to its current head, so chain.ActiveKey() is
-// the key actually in force right now, rotations included.
+// the key actually in force right now, rotations included. The actual
+// load-then-compare work is loadSigningKeyFor (signer.go), shared with
+// (*Client).LoadSigner so the boot path and the append path cannot drift
+// on what "the identity from the genesis record" means.
 func (c *Client) adoptGenesis(dataDir string, chain *journal.SigningChain) (*journal.SigningChain, ed25519.PrivateKey, bool, error) {
-	priv, err := journal.LoadSigningKey(dataDir)
+	priv, err := loadSigningKeyFor(dataDir, chain)
 	if err != nil {
-		switch {
-		case os.IsNotExist(err):
-			return nil, nil, false, journal.RefuseNoSigningKey(dataDir)
-		case errors.Is(err, journal.ErrSigningKeyUnavailable):
-			// A parse failure: LoadSigningKey wraps every malformed-content
-			// error in ErrSigningKeyUnavailable, and only those.
-			return nil, nil, false, journal.RefuseInvalidSigningKeyFile(dataDir, err)
-		default:
-			// A read failure LoadSigningKey did not wrap at all — its own
-			// doc comment says a non-missing, non-parse failure is the raw
-			// os.ReadFile error (EACCES, a bad owner, and similar). Telling
-			// the operator "malformed" here and pointing at a backup
-			// restore, as an earlier version of this file did, misdiagnoses
-			// a permissions bug as corrupted content.
-			return nil, nil, false, journal.RefuseSigningKeyUnreadable(err)
-		}
+		return nil, nil, false, err
 	}
-
-	// Compared as decoded key bytes, not formatted strings: ParsePublicKey
-	// accepts uppercase hex (hex.DecodeString does), so a chain carrying
-	// non-lowercase-but-parseable hex must not read as a mismatch against a
-	// local key that is byte-for-byte correct. chain.ActiveKey() already
-	// passed ParsePublicKey once, inside ApplyGenesis/ApplyRotation during
-	// ReplayMeta, so the error here is unreachable in practice;
-	// RefuseCorruptGenesis is only the defensive fallback.
-	wantPub, err := journal.ParsePublicKey(chain.ActiveKey())
-	if err != nil {
-		return nil, nil, false, journal.RefuseCorruptGenesis(err)
-	}
-	localPub := priv.Public().(ed25519.PublicKey)
-	if !localPub.Equal(wantPub) {
-		return nil, nil, false, journal.RefuseSigningKeyMismatch(dataDir, chain.LastMetaSeq(), chain.CurrentEpoch() != 0, chain.ActiveKey(), journal.FormatPublicKey(localPub))
-	}
-
 	return chain, priv, false, nil
 }
 

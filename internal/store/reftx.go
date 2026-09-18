@@ -24,7 +24,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"fmt"
 	"time"
 
@@ -33,9 +32,9 @@ import (
 )
 
 // AppendRefTx builds a RefTransactionRecord at the sequence lease hands
-// out, signs it with priv under keyEpoch, marshals it, and conditionally
-// writes it to "v1/streams/<stream>/tx/<seq>.json" (spec/journal/v1
-// section 9.2), returning the sequence it landed at.
+// out, signs it with signer (its epoch and private key, WALD-30), marshals
+// it, and conditionally writes it to "v1/streams/<stream>/tx/<seq>.json"
+// (spec/journal/v1 section 9.2), returning the sequence it landed at.
 //
 // The stream comes from lease.Stream(), never a separate parameter: a
 // stream argument that could disagree with the lease it is appending
@@ -55,7 +54,7 @@ import (
 // the request-signing clock, and newFakeClient builds a client on real
 // time.
 //
-// Five checks run before lease.Append is ever called, each a one-line
+// Six checks run before lease.Append is ever called, each a one-line
 // refusal with zero network calls, in the order a caller's mistake is
 // cheapest to catch:
 //
@@ -65,40 +64,54 @@ import (
 //     panics exactly where the checks below guard against panicking —
 //     and unlike the clock (see below), ctx cannot be hoisted out of the
 //     callback, because PutIfAbsent needs it at the point of the write.
-//  2. A private key of the wrong size. Also load-bearing: ed25519.Sign
-//     panics on a wrong-size key.
-//  3. A nil now. now is never called inside the callback (see below), so
+//  2. A nil signer. Also load-bearing: signer.SignRefTx is called inside
+//     the callback, and a method call through a nil *journal.Signer
+//     panics exactly where check 1 guards ctx against panicking.
+//  3. An invalid signer (signer.Valid()). Also load-bearing, and distinct
+//     from check 2: journal.NewSigner refuses a wrong-size or mismatched
+//     key when a *journal.Signer is built *through* it, but Signer's
+//     fields are unexported, not unconstructable — &journal.Signer{} and
+//     new(journal.Signer) compile from any package and produce a
+//     non-nil *Signer whose zero-value private key is the wrong size for
+//     ed25519.Sign, which panics rather than errors on that. This check
+//     is what catches a *Signer that did not come from NewSigner; the
+//     identical guard also lives inside signer.SignRefTx itself
+//     (internal/journal/signer.go) for callers that reach it some other
+//     way. It is repeated here only to keep this caller's own
+//     zero-network-calls refusal shape, not because the in-method guard
+//     alone would be insufficient.
+//  4. A nil now. now is never called inside the callback (see below), so
 //     this check is no longer load-bearing against a panic there; it
 //     stays because it is one line and turns the common "forgot to pass
 //     a clock" mistake into the same one-line refusal every other
 //     pre-check gives, rather than a bare panic.
-//  4. lease.Stream() naming the meta stream. Ref transactions never go on
+//  5. lease.Stream() naming the meta stream. Ref transactions never go on
 //     _meta (spec section 9.1); RefTransactionRecord.Validate would catch
 //     it too, but refusing here keeps it out of the append entirely.
-//  5. No ref updates at all (spec section 5.1 requires at least one).
+//  6. No ref updates at all (spec section 5.1 requires at least one).
 //
-// Checks 1 and 2 exist because the thing they guard cannot be moved out of
-// the callback and still do its job. now is different: nothing about the
-// record's timestamp depends on the sequence lease.Append hands out, so
-// now().UTC().Format(time.RFC3339) is computed once, below, before
-// lease.Append is ever called — not inside its callback. A caller-supplied
-// clock that panics when invoked (not nil, just broken) now panics there,
-// before any lease interaction: an ordinary crash reaching AppendRefTx's
-// caller, not a healthy stream permanently fenced through WALD-29's
-// unknown-outcome path. That is the failure mode round 2 of this file's
-// review found the nil check alone did not close.
+// Checks 1, 2, and 3 exist because the thing they guard cannot be moved
+// out of the callback and still do its job. now is different: nothing
+// about the record's timestamp depends on the sequence lease.Append hands
+// out, so now().UTC().Format(time.RFC3339) is computed once, below,
+// before lease.Append is ever called — not inside its callback. A
+// caller-supplied clock that panics when invoked (not nil, just broken)
+// now panics there, before any lease interaction: an ordinary crash
+// reaching AppendRefTx's caller, not a healthy stream permanently fenced
+// through WALD-29's unknown-outcome path. That is the failure mode round
+// 2 of this file's review found the nil check alone did not close.
 //
-// With ctx, priv, and the clock's call site all accounted for above, the
-// callback itself is left with: building the record (a struct literal),
-// signing it (ed25519.Sign, given a key check 2 already sized correctly),
-// marshaling it (pure, error-returning), and one conditional PUT (given a
-// ctx check 1 already proved non-nil). Nothing else in it takes
-// caller-supplied input that reaches a known panic site. That is narrower
-// than "no panic path left" — this comment does not repeat that claim a
-// third time — but it is what an audit of this callback's own call chain
-// supports today.
+// With ctx, the signer, and the clock's call site all accounted for
+// above, the callback itself is left with: building the record (a struct
+// literal), signing it (signer.SignRefTx, given a non-nil, valid signer
+// checks 2 and 3 already proved), marshaling it (pure, error-returning),
+// and one conditional PUT (given a ctx check 1 already proved non-nil).
+// Nothing else in it takes caller-supplied input that reaches a known
+// panic site. That is narrower than "no panic path left" — this comment
+// does not repeat that claim a third time — but it is what an audit of
+// this callback's own call chain supports today.
 //
-// Beyond the five checks, AppendRefTx classifies nothing: a Validate, sign,
+// Beyond the six checks, AppendRefTx classifies nothing: a Validate, sign,
 // or marshal failure inside the callback, and whatever PutIfAbsent itself
 // returns, are both passed back to lease.Append unchanged. lease.Append is
 // the only place that sorts a proven 412 from an unprovable outcome from
@@ -108,8 +121,7 @@ import (
 func (c *Client) AppendRefTx(
 	ctx context.Context,
 	lease *journal.Lease,
-	priv ed25519.PrivateKey,
-	keyEpoch journal.Epoch,
+	signer *journal.Signer,
 	segments []string,
 	updates []journal.RefUpdate,
 	now func() time.Time,
@@ -117,8 +129,11 @@ func (c *Client) AppendRefTx(
 	if ctx == nil {
 		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("ctx must not be nil"))
 	}
-	if len(priv) != ed25519.PrivateKeySize {
-		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("ed25519 private key must be %d bytes, got %d", ed25519.PrivateKeySize, len(priv)))
+	if signer == nil {
+		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("signer must not be nil"))
+	}
+	if err := signer.Valid(); err != nil {
+		return 0, refuseAppendRefTx(lease.Stream(), err)
 	}
 	if now == nil {
 		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("now must not be nil"))
@@ -139,8 +154,8 @@ func (c *Client) AppendRefTx(
 	var seq journal.Seq
 	err := lease.Append(func(s journal.Seq) error {
 		seq = s
-		rec := journal.NewRefTransactionRecord(lease.Stream(), s, keyEpoch, ts, segments, updates)
-		if err := journal.SignRefTx(priv, rec); err != nil {
+		rec := journal.NewRefTransactionRecord(lease.Stream(), s, signer.Epoch(), ts, segments, updates)
+		if err := signer.SignRefTx(rec); err != nil {
 			return err
 		}
 		data, err := journal.MarshalRefTx(rec)

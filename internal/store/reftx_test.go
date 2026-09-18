@@ -525,11 +525,11 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 }
 
 // 7. A Validate failure caught only inside lease.Append's closure - not by
-// any of AppendRefTx's five pre-checks - stays a plain error: a duplicate
-// ref in updates passes the non-nil-ctx, non-nil-signer, non-nil-now,
-// non-meta-stream, and non-empty-updates pre-checks, and is refused only
-// once SignRefTx calls RefTransactionRecord.Validate. WALD-29's Append
-// passes that error through unchanged (it matches neither
+// any of AppendRefTx's six pre-checks - stays a plain error: a duplicate
+// ref in updates passes the non-nil-ctx, non-nil-signer, valid-signer,
+// non-nil-now, non-meta-stream, and non-empty-updates pre-checks, and is
+// refused only once SignRefTx calls RefTransactionRecord.Validate.
+// WALD-29's Append passes that error through unchanged (it matches neither
 // ErrPreconditionFailed nor ErrOutcomeUnknown), so the stream is left
 // unfenced and the sequence is left unconsumed - the plan's explicit
 // "worth a test" case.
@@ -549,10 +549,11 @@ func TestAppendRefTxValidationFailureInsideClosureLeavesSequenceReusable(t *test
 		t.Fatalf("Open: %v", err)
 	}
 
-	// Two updates for the same ref: passes every pre-check (all five run
-	// against ctx, the signer, now, the stream, and the updates slice as a
-	// whole, none of them look inside individual updates) and is caught
-	// only by Validate's duplicate-ref check inside the closure.
+	// Two updates for the same ref: passes every pre-check (all six run
+	// against ctx, the signer's non-nil-ness, the signer's validity, now,
+	// the stream, and the updates slice as a whole, none of them look
+	// inside individual updates) and is caught only by Validate's
+	// duplicate-ref check inside the closure.
 	dup := []journal.RefUpdate{
 		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
 		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "5b825dc642cb6eb9a060e54bf8d69288fbee4904"},

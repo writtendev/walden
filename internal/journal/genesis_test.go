@@ -8,6 +8,7 @@ package journal_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -374,7 +375,8 @@ func TestGenesisRefusalsAreSingleLine(t *testing.T) {
 	errs := []error{
 		journal.RefuseCorruptGenesis(errors.New("unexpected end of JSON input")),
 		journal.RefuseNoSigningKey(dataDir),
-		journal.RefuseSigningKeyMismatch(dataDir, "ed25519:aa", "ed25519:bb"),
+		journal.RefuseSigningKeyMismatch(dataDir, 0, false, "ed25519:aa", "ed25519:bb"),
+		journal.RefuseSigningKeyMismatch(dataDir, 3, true, "ed25519:aa", "ed25519:bb"),
 		journal.RefuseInvalidSigningKeyFile(dataDir, errors.New("bad line")),
 		journal.RefuseSigningKeyUnreadable(errors.New("open " + dataDir + "/signing.key: permission denied")),
 		journal.RefuseSigningKeyPresentOnMint(dataDir),
@@ -396,6 +398,59 @@ func TestGenesisRefusalsAreSingleLine(t *testing.T) {
 		if !errors.Is(err, journal.ErrSigningKeyUnavailable) {
 			t.Errorf("expected ErrSigningKeyUnavailable, got %v", err)
 		}
+	}
+}
+
+// TestRefuseSigningKeyMismatchNamesTheRightRecord covers round 1's medium
+// finding: RefuseSigningKeyMismatch used to hardcode "genesis at <seq 0>
+// names <want>" regardless of whether a rotation had actually moved the
+// active key elsewhere. rotated false means no rotation has run, so want is
+// still genesis's own public_key and the original genesis wording holds;
+// rotated true means at least one key_rotation record has, so the refusal
+// must say so instead of naming a record (genesis) that does not hold the
+// key it is blaming.
+func TestRefuseSigningKeyMismatchNamesTheRightRecord(t *testing.T) {
+	dataDir := t.TempDir()
+
+	genesisCase := journal.RefuseSigningKeyMismatch(dataDir, 0, false, "ed25519:aa", "ed25519:bb")
+	if !strings.Contains(genesisCase.Error(), fmt.Sprintf("genesis at %s names", journal.TxKey(journal.MetaStreamID, 0))) {
+		t.Errorf("rotated=false should still blame genesis: %q", genesisCase.Error())
+	}
+
+	rotatedCase := journal.RefuseSigningKeyMismatch(dataDir, 4, true, "ed25519:aa", "ed25519:bb")
+	if strings.Contains(rotatedCase.Error(), fmt.Sprintf("genesis at %s names", journal.TxKey(journal.MetaStreamID, 0))) {
+		t.Errorf("rotated=true must not blame genesis for a key it never named: %q", rotatedCase.Error())
+	}
+	if !strings.Contains(rotatedCase.Error(), "_meta replayed through seq 4") {
+		t.Errorf("rotated=true should name the sequence _meta was replayed through: %q", rotatedCase.Error())
+	}
+	for _, err := range []error{genesisCase, rotatedCase} {
+		if strings.ContainsAny(err.Error(), "\n\r") {
+			t.Errorf("refusal is not a single line: %q", err.Error())
+		}
+	}
+}
+
+// TestRefuseSigningKeyMismatchNotRotatedDespiteNonZeroSeq covers round 2's
+// minor finding: an earlier version of this refusal used lastMetaSeq != 0
+// as its proxy for "a rotation has run", but LastMetaSeq() also advances on
+// token_create/token_revoke and on a meta record type ReplayMeta does not
+// recognise (spec section 5.4) — none of which move the active key. A
+// non-zero lastMetaSeq with rotated=false (the shape a _meta carrying only
+// such a record produces) must still blame genesis, not claim a rotation
+// happened that did not.
+func TestRefuseSigningKeyMismatchNotRotatedDespiteNonZeroSeq(t *testing.T) {
+	dataDir := t.TempDir()
+
+	err := journal.RefuseSigningKeyMismatch(dataDir, 1, false, "ed25519:aa", "ed25519:bb")
+	if !strings.Contains(err.Error(), fmt.Sprintf("genesis at %s names", journal.TxKey(journal.MetaStreamID, 0))) {
+		t.Errorf("rotated=false with a non-zero lastMetaSeq should still blame genesis: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "a rotation has run") {
+		t.Errorf("rotated=false must not claim a rotation has run: %q", err.Error())
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", err.Error())
 	}
 }
 
@@ -584,7 +639,7 @@ func TestLeftoverSigningKeyTempNamesEveryMatch(t *testing.T) {
 		t.Errorf("refusal is not a single line: %q", noKey.Error())
 	}
 
-	mismatch := journal.RefuseSigningKeyMismatch(dataDir, "ed25519:aa", "ed25519:bb")
+	mismatch := journal.RefuseSigningKeyMismatch(dataDir, 0, false, "ed25519:aa", "ed25519:bb")
 	if !strings.Contains(mismatch.Error(), tmpA) {
 		t.Errorf("RefuseSigningKeyMismatch does not name %s: %q", tmpA, mismatch.Error())
 	}

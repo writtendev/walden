@@ -430,6 +430,20 @@ func (w *fixtureWriter) writeToken(priv ed25519.PrivateKey, seq journal.Seq, rec
 	w.writeJSON(journal.TxKey(journal.MetaStreamID, seq), rec)
 }
 
+// writeKeyRotation marshals and writes an already-signed key rotation
+// record through MarshalKeyRotation, the production encoder, rather than
+// through writeJSON's generic json.MarshalIndent call: WALD-31 requires the
+// golden fixture to be generated from the same constructor and marshaler
+// RotateKey itself uses, not merely from the same struct type.
+func (w *fixtureWriter) writeKeyRotation(rec *journal.KeyRotationRecord) {
+	w.t.Helper()
+	data, err := journal.MarshalKeyRotation(rec)
+	if err != nil {
+		w.t.Fatalf("failed to marshal key rotation at seq %d: %v", rec.Seq, err)
+	}
+	w.write(journal.TxKey(journal.MetaStreamID, rec.Seq), data)
+}
+
 // TestRegenerateFixtures rewrites spec/journal/v1/fixtures from the generator.
 //
 // Regenerating is two obligations, not one. This test writes the fixture tree; if the pack
@@ -475,7 +489,6 @@ func generateFixtures(w *fixtureWriter) {
 	genesisKey := fixtureKey(0x01)
 	rotatedKey := fixtureKey(0x02)
 	genesisPub := journal.FormatPublicKey(genesisKey.Public().(ed25519.PublicKey))
-	rotatedPub := journal.FormatPublicKey(rotatedKey.Public().(ed25519.PublicKey))
 
 	// --- Ruling 1: the signing identity is born with the journal and rotates inside it.
 	// Written through journal.GenesisRecord, the published type, so that an encoder change
@@ -508,19 +521,11 @@ func generateFixtures(w *fixtureWriter) {
 		Timestamp: "2026-08-31T00:01:00Z",
 	})
 
-	rotation := &journal.KeyRotationRecord{
-		Version:      journal.VersionPrefix,
-		Stream:       journal.MetaStreamID,
-		Seq:          2,
-		Type:         journal.RecordTypeKeyRotation,
-		OldPublicKey: genesisPub,
-		NewPublicKey: rotatedPub,
-		Timestamp:    "2026-08-31T00:06:00Z",
-	}
+	rotation := journal.NewKeyRotationRecord(2, journal.FormatPublicKey(genesisKey.Public().(ed25519.PublicKey)), rotatedKey.Public().(ed25519.PublicKey), "2026-08-31T00:06:00Z")
 	if err := journal.SignRotation(genesisKey, rotation); err != nil {
 		t.Fatalf("failed to sign key rotation: %v", err)
 	}
-	w.writeJSON(journal.TxKey(journal.MetaStreamID, rotation.Seq), rotation)
+	w.writeKeyRotation(rotation)
 
 	w.writeToken(rotatedKey, 3, &journal.TokenRevokeRecord{
 		Version:   journal.VersionPrefix,

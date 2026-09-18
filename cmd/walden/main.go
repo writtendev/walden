@@ -25,13 +25,17 @@ import (
 // Version can be set via ldflags at build time.
 var Version = "dev"
 
-// probeTimeout bounds two boot-time preflights against object storage: the
+// probeTimeout bounds boot-time preflights against object storage — the
 // compare-and-swap probe (ProbeCAS) and, when it runs, EnsureGenesis's
-// genesis GET plus conditional PUT. Not a knob: walden's five knobs don't
-// include tuning this, so there is no flag or env var. The client's own
-// transport timeouts and retry cap bound each individual request anyway;
-// this is a backstop on the whole of either preflight (a handful of
-// requests each, retries included).
+// genesis GET plus conditional PUT — and, in rotate.go, the same shape of
+// preflight rotate-key performs from a long-lived operator command instead
+// of at boot: ReplayMeta's walk of _meta plus the rotation's own append.
+// Not a knob: walden's five knobs don't include tuning this, so there is
+// no flag or env var. The client's own transport timeouts and retry cap
+// bound each individual request anyway; this is a backstop on the whole of
+// a walk against an out-of-contract provider — see meta.go's
+// maxMetaGrowRetries doc comment for the specific hazard rotate-key's use
+// of this bound closes — rather than a single request.
 const probeTimeout = 2 * time.Minute
 
 func main() {
@@ -62,6 +66,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return dispatchServe(ctx, args[2:], stdout, stderr)
 	case "token":
 		return runToken(args[2:], stdout, stderr)
+	case "rotate-key":
+		return runRotateKey(args[2:], stdout, stderr)
 	case "pre-receive":
 		return runPreReceive(args[2:], stdout, stderr)
 	case "version", "--version", "-v":
@@ -93,10 +99,11 @@ func dispatchServe(ctx context.Context, args []string, stdout, stderr io.Writer)
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  walden serve [flags]  Start the walden git server
-  walden token <cmd>    Manage authentication tokens
-  walden pre-receive    Execute journal pre-receive hook
-  walden version        Show version information
+  walden serve [flags]      Start the walden git server
+  walden token <cmd>        Manage authentication tokens
+  walden rotate-key [flags] Rotate the server's journal signing key
+  walden pre-receive        Execute journal pre-receive hook
+  walden version            Show version information
 
 Flags for serve:
   --data-dir PATH       Path to bare git repository storage (default: /data, env: WALDEN_DATA_DIR)
@@ -108,7 +115,11 @@ Flags for serve:
 Commands for token:
   create [flags]        Create a new authentication token
   list [flags]          List existing tokens
-  revoke [flags] <id>   Revoke an authentication token`)
+  revoke [flags] <id>   Revoke an authentication token
+
+Flags for rotate-key:
+  --data-dir PATH       Path to bare git repository storage (default: /data, env: WALDEN_DATA_DIR)
+  --journal URL         S3 URL for write-ahead journal (required, env: WALDEN_JOURNAL)`)
 }
 
 func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {

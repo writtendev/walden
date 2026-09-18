@@ -103,7 +103,7 @@ func (c *Client) ReplayMeta(ctx context.Context) (*journal.SigningChain, error) 
 					// the same seq rather than treating the 404 as the
 					// stream's head.
 					//
-					// That convergence relies on spec section 11.2 item 4's
+					// That convergence relies on spec section 11.1 item 4's
 					// mandated strong read-after-write consistency: List
 					// has already proved the object exists, so the very
 					// next Get must see it, and one retry is normally
@@ -202,7 +202,7 @@ var errMetaGrewDuringWalk = errors.New("meta stream grew past a sequence during 
 
 // maxMetaGrowRetries bounds how many times ReplayMeta's walk will retry a
 // GET at the same seq after probeMetaAfterNotFound's corroborating List
-// reports grew=true there. Spec section 11.2 item 4's mandated strong
+// reports grew=true there. Spec section 11.1 item 4's mandated strong
 // read-after-write consistency means one retry is normally enough — List
 // has already proved the object exists, so the very next Get must see it —
 // but nothing here enforces that promise on an out-of-contract provider
@@ -280,7 +280,7 @@ func refuseMetaSequenceGap(seq journal.Seq) error {
 // refuseMetaGrowExhausted returns a one-line refusal when
 // probeMetaAfterNotFound has reported "grew" at the same seq more than
 // maxMetaGrowRetries times in a row: the corroborating List keeps insisting
-// the record exists while Get keeps 404ing on it, which spec section 11.2
+// the record exists while Get keeps 404ing on it, which spec section 11.1
 // item 4's read-after-write consistency requirement says should not be
 // possible after even one retry. Whatever the provider is doing, it is not
 // honoring the journal's storage contract, and the walk stops here rather
@@ -289,7 +289,7 @@ func refuseMetaGrowExhausted(seq journal.Seq, attempts int) error {
 	return refusal.Refuse(
 		"invalid journal",
 		fmt.Sprintf("_meta seq %d: object storage LIST reports this key but GET still returns not-found after %d attempts", seq, attempts),
-		"the object storage provider is not honoring strong read-after-write consistency (spec/journal/v1 section 11.2 item 4); check the provider",
+		"the object storage provider is not honoring strong read-after-write consistency (spec/journal/v1 section 11.1 item 4); check the provider",
 	)
 }
 

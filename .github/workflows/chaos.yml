@@ -80,8 +80,11 @@ jobs:
           # entirely correct code, misreported as a fencing-refusal
           # mismatch. Capping the concurrent half's own rounds independently
           # (its assertions hold under every interleaving by construction -
-          # see its own doc comment - so thousands of repeats buy
-          # confirmation, not coverage, unlike the sequential half) and
+          # see its own doc comment - so a failure here is never a flake,
+          # but repeats past a few hundred still buy real, if steeply
+          # diminishing, interleaving coverage rather than mere
+          # confirmation - unlike the sequential half's seeded fault
+          # catalogue, whose coverage keeps growing with every round) and
           # widening its connection pool well above K together remove that
           # growth rather than just slowing it: see chaosConcurrentRoundsCap
           # and newChaosConcurrentClient's doc comments in chaos_test.go for

@@ -149,20 +149,28 @@ const (
 	// does not vary round to round," which would equally have justified
 	// capping this at 5.
 	//
-	// The cap holds anyway, for the reason that actually binds: port
-	// budget, not a coverage ceiling. At K=5 shared-client connections per
-	// round, even newChaosConcurrentClient's wider pool leaves this half's
-	// port usage scaling with round count (see its own doc comment), and
-	// 500 is sized to keep that unremarkable rather than to stop sampling
-	// new schedules - see .github/workflows/chaos.yml for the measured
-	// figures. 500 is 12.5x chaosDefaultConcurrentRounds (the same order
-	// of magnitude the nightly scales the sequential half's default by),
-	// and every mutation this half alone catches, it catches by iteration
-	// 1 (see the PR's round-2 and round-3 review for the re-run mutation
-	// table) - so nothing this file currently relies on this half to
-	// detect is lost at 500. Raising the cap trades port budget for more
-	// interleaving sampling; it is not fixing an assertion that is
-	// unsound below it.
+	// The cap holds anyway, but round-4 review found the previous
+	// paragraph here naming the wrong binding constraint: port budget.
+	// newChaosConcurrentClient's wider pool (see its own doc comment)
+	// already removes the growth rather than merely slowing it, so peak
+	// port usage for this half is flat, not scaling with round count -
+	// measured locally (this machine, `go test -race -run
+	// TestChaosWritePathConcurrentInstances`), peak TIME_WAIT held at 5 at
+	// the default 40 rounds and 10 at both 500 rounds and 5000 rounds with
+	// the cap temporarily lifted. What a higher cap actually costs is
+	// wall-clock time inside the nightly's `go test -timeout=15m` budget
+	// (see .github/workflows/chaos.yml): raising this from 500 to 5000
+	// rounds cost about 21s locally in the same measurement (2.4s to
+	// 23.6s), for zero additional ports. 500 is 12.5x
+	// chaosDefaultConcurrentRounds (the same order of magnitude the
+	// nightly scales the sequential half's default by), and every
+	// mutation this half alone catches, it catches by iteration 1 (see the
+	// PR's round-2 and round-3 review for the re-run mutation table) - so
+	// nothing this file currently relies on this half to detect is lost at
+	// 500. Raising the cap trades wall clock for more interleaving
+	// sampling - real but steeply diminishing coverage, the distinction
+	// the paragraph above draws - not port budget, and it is not fixing an
+	// assertion that is unsound below it.
 	chaosConcurrentRoundsCap = 500
 )
 

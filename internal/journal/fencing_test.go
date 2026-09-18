@@ -366,6 +366,28 @@ func TestSentinelErrorsUnificationAndErrorsIs(t *testing.T) {
 	if !errors.Is(errConflict, journal.ErrFenced) {
 		t.Errorf("expected HandleConflict to match ErrFenced")
 	}
+
+	// 6. ErrOutcomeUnknown (WALD-29) is its own identity: HandleOutcomeUnknown's
+	// refusal matches ErrFenced (it fences the stream exactly as a proven 412
+	// does), but ErrOutcomeUnknown itself does not cross-match ErrFenced or
+	// ErrCASNotSupported in either direction - the same cross-contamination guard
+	// as 4c, extended to the sentinel this ticket adds.
+	errOutcomeUnknown := f.HandleOutcomeUnknown("repo-z", 3)
+	if !errors.Is(errOutcomeUnknown, journal.ErrFenced) {
+		t.Errorf("expected HandleOutcomeUnknown to match ErrFenced")
+	}
+	if errors.Is(journal.ErrOutcomeUnknown, journal.ErrFenced) {
+		t.Errorf("expected ErrOutcomeUnknown not to match ErrFenced")
+	}
+	if errors.Is(journal.ErrFenced, journal.ErrOutcomeUnknown) {
+		t.Errorf("expected ErrFenced not to match ErrOutcomeUnknown")
+	}
+	if errors.Is(journal.ErrOutcomeUnknown, journal.ErrCASNotSupported) {
+		t.Errorf("expected ErrOutcomeUnknown not to match ErrCASNotSupported")
+	}
+	if errors.Is(journal.ErrCASNotSupported, journal.ErrOutcomeUnknown) {
+		t.Errorf("expected ErrCASNotSupported not to match ErrOutcomeUnknown")
+	}
 }
 
 func TestHandleOutcomeUnknownFencesOnlyThatStream(t *testing.T) {

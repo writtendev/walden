@@ -13,8 +13,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"fmt"
-	"io"
 	"os"
 	"time"
 
@@ -35,15 +33,16 @@ const maxGenesisBody = 64 << 10 // 64 KiB
 
 // EnsureGenesis returns the signing identity a boot with a journal
 // configured runs on: adopted from an existing genesis record at _meta seq
-// 0, or minted fresh when the journal is empty. The bool result reports
-// which happened (true for minted), for the boot line
+// 0 (replayed all the way to whatever key is currently active, rotations
+// included), or minted fresh when the journal is empty. The bool result
+// reports which happened (true for minted), for the boot line
 // cmd/walden/main.go prints.
 //
 // Order of operations is the substance of this function:
 //
-//  1. Stat dataDir's signing.key, before the genesis GET rather than after
-//     it. This used to run inside the mint path, reached only once Get had
-//     already returned not-found — which left a window, in the
+//  1. Stat dataDir's signing.key, before ReplayMeta rather than after it.
+//     This used to run inside the mint path, reached only once the genesis
+//     Get had already returned not-found — which left a window, in the
 //     shared-data-directory race two instances can run by sharing one
 //     --data-dir, where a sibling's winning PutIfAbsent and rename could
 //     land in between this instance's Get and its (later) stat: the stat
@@ -53,30 +52,38 @@ const maxGenesisBody = 64 << 10 // 64 KiB
 //     internal/store/genesis.go line 183). Stat-ing first closes that
 //     window rather than merely narrowing it: a signing.key can only be on
 //     disk once some PutIfAbsent has already won, and storage's read-after-
-//     write consistency means the Get immediately below is guaranteed to
-//     see that same write, so "key present" and "record absent" can no
-//     longer both be true here — a late-arriving sibling now always reads
-//     as a found record (step 2, adopt) rather than this stale refusal.
-//  2. Get(TxKey(MetaStreamID, 0)), body bounded by maxGenesisBody.
-//  3. Present -> adopt: ParseGenesis, NewSigningChain().ApplyGenesis, then
-//     require a local signing key whose public half matches the record's
-//     (compared as decoded bytes, not formatted hex, so case differences in
-//     a spec-non-conformant but parseable record never look like a
+//     write consistency means the ReplayMeta immediately below is
+//     guaranteed to see that same write, so "key present" and "record
+//     absent" can no longer both be true here — a late-arriving sibling now
+//     always reads as a found record (step 2, adopt) rather than this stale
+//     refusal.
+//  2. ReplayMeta: GET _meta seq 0 and every record past it, contiguously,
+//     folding rotations and token mutations into a signing chain whose
+//     ActiveKey() is the key actually in force right now — not merely the
+//     genesis record's own public_key. This is what makes adoptGenesis's
+//     comparison below correct across a rotation boundary (the load-bearing
+//     defect this function used to carry: comparing against the genesis
+//     record alone made every boot after a rotation refuse with a spurious
+//     signing-key mismatch).
+//  3. ReplayMeta succeeds -> adopt: require a local signing key whose
+//     public half matches the chain's ActiveKey() (compared as decoded
+//     bytes, not formatted hex, so case differences in a
+//     spec-non-conformant but parseable record never look like a
 //     mismatch). Absent or mismatched -> a one-line refusal, because an
 //     instance that cannot sign cannot journal, and a push it could not
 //     journal must not be acknowledged (spec section 2.2).
-//  4. ErrObjectNotFound -> mint, refusing first if step 1 found dataDir
-//     already holding a signing.key (round 1 finding 2: that file belongs
-//     to some other journal, and minting would rename straight over it).
-//     Otherwise: GenerateKeypair, build the record, MarshalGenesis, write
-//     the temp key file under a name unique to this call (round 1 finding
-//     1), PutIfAbsent the record, and only then rename the temp file into
-//     place. The rename is the commit point: a crash between a winning PUT
-//     and the rename leaves a genesis record in the bucket whose signing
-//     key never reached disk under its final name — though it is very
-//     likely still sitting, fsynced, at its temp name (round 1 finding 3).
-//     That window is narrowed to one atomic rename, not eliminated — there
-//     is no recovery mode here, deliberately.
+//  4. ReplayMeta's ErrObjectNotFound -> mint, refusing first if step 1
+//     found dataDir already holding a signing.key (round 1 finding 2: that
+//     file belongs to some other journal, and minting would rename
+//     straight over it). Otherwise: GenerateKeypair, build the record,
+//     MarshalGenesis, write the temp key file under a name unique to this
+//     call (round 1 finding 1), PutIfAbsent the record, and only then
+//     rename the temp file into place. The rename is the commit point: a
+//     crash between a winning PUT and the rename leaves a genesis record in
+//     the bucket whose signing key never reached disk under its final name
+//     — though it is very likely still sitting, fsynced, at its temp name
+//     (round 1 finding 3). That window is narrowed to one atomic rename,
+//     not eliminated — there is no recovery mode here, deliberately.
 //  5. ErrPrecondition on that PUT -> the loser of the race. Spec section
 //     11.4 items 2-4: a 412 is definitive proof another writer got there
 //     first, so this instance does not re-read the head, does not retry,
@@ -91,29 +98,27 @@ const maxGenesisBody = 64 << 10 // 64 KiB
 //     not removed (round 1 finding 7): the PUT may have landed, and if it
 //     did, the temp file is the only surviving copy of a now-permanent
 //     record's private key.
-//  7. Any other GET/PUT failure, or a local filesystem failure from steps 1
-//     or 4 that never touched storage at all -> wrapped once as a single
-//     "invalid journal"-style refusal. Storage failures use the same shape
-//     wrapProbeFailure uses in probe.go, so a 403 or an unreachable
-//     endpoint does not masquerade as a corrupt journal; local failures use
-//     a data-directory-appropriate fix clause instead (round 1 finding 4),
-//     so a full disk is never misreported as a bucket-credentials problem.
+//  7. Any other ReplayMeta/PUT failure, or a local filesystem failure from
+//     steps 1 or 4 that never touched storage at all -> ReplayMeta and
+//     wrapGenesisDiskFailure/wrapGenesisKeygenFailure already return these
+//     as single "invalid journal"-style refusals (ReplayMeta's own doc
+//     comment), so this function has nothing left to wrap.
 func (c *Client) EnsureGenesis(ctx context.Context, dataDir string, now func() time.Time) (*journal.SigningChain, ed25519.PrivateKey, bool, error) {
 	key := journal.TxKey(journal.MetaStreamID, 0)
 
-	// Step 1: see this function's doc comment for why this runs before the
-	// Get rather than inside the mint path. statErr is only acted on below,
-	// in the mint branch — the adopt branch (Get succeeds) never needed
-	// this stat and must not fail boot over it; LoadSigningKey will surface
-	// the same filesystem problem there through its own refusal if it
-	// matters.
+	// Step 1: see this function's doc comment for why this runs before
+	// ReplayMeta rather than inside the mint path. statErr is only acted on
+	// below, in the mint branch — the adopt branch (ReplayMeta succeeds)
+	// never needed this stat and must not fail boot over it; LoadSigningKey
+	// will surface the same filesystem problem there through its own
+	// refusal if it matters.
 	_, statErr := os.Stat(journal.SigningKeyPath(dataDir))
 	keyPresent := statErr == nil
 
-	body, err := c.Get(ctx, key)
+	chain, err := c.ReplayMeta(ctx)
 	switch {
 	case err == nil:
-		return c.adoptGenesis(dataDir, body)
+		return c.adoptGenesis(dataDir, chain)
 	case errors.Is(err, ErrObjectNotFound):
 		if keyPresent {
 			return nil, nil, false, journal.RefuseSigningKeyPresentOnMint(dataDir)
@@ -123,43 +128,17 @@ func (c *Client) EnsureGenesis(ctx context.Context, dataDir string, now func() t
 		}
 		return c.mintGenesis(ctx, dataDir, key, now)
 	default:
-		return nil, nil, false, wrapGenesisFailure(err)
+		// ReplayMeta's own doc comment: every failure past
+		// ErrObjectNotFound is already a single-line refusal, so there is
+		// nothing left here to wrap.
+		return nil, nil, false, err
 	}
 }
 
-// adoptGenesis handles EnsureGenesis's step 3: an existing genesis record
-// was found at _meta seq 0.
-func (c *Client) adoptGenesis(dataDir string, body io.ReadCloser) (*journal.SigningChain, ed25519.PrivateKey, bool, error) {
-	defer body.Close()
-
-	// Bounded per maxGenesisBody's doc comment: reading declared+1 bytes
-	// lets a body exactly at the cap succeed while anything past it is
-	// detected without ever holding more than maxGenesisBody+1 bytes.
-	data, err := io.ReadAll(io.LimitReader(body, maxGenesisBody+1))
-	if err != nil {
-		// getBody.Read's own *refusal.Refusal (client.go) carries
-		// fixFor(ErrStorageUnavailable) = "pushes succeed when storage
-		// returns" — true mid-push, false here: EnsureGenesis runs before
-		// net.Listen, so a failure here means walden has exited and bound
-		// nothing. Re-wrapping through wrapGenesisFailure swaps in the
-		// same boot-appropriate fix clause ProbeCAS uses for the same
-		// reason (probe.go's probeUnavailableFix doc comment).
-		return nil, nil, false, wrapGenesisFailure(err)
-	}
-	if len(data) > maxGenesisBody {
-		return nil, nil, false, journal.RefuseCorruptGenesis(fmt.Errorf("object exceeds %d bytes, refusing to read further", maxGenesisBody))
-	}
-
-	rec, err := journal.ParseGenesis(data)
-	if err != nil {
-		return nil, nil, false, journal.RefuseCorruptGenesis(err)
-	}
-
-	chain := journal.NewSigningChain()
-	if err := chain.ApplyGenesis(rec); err != nil {
-		return nil, nil, false, journal.RefuseCorruptGenesis(err)
-	}
-
+// adoptGenesis handles EnsureGenesis's step 3: ReplayMeta has already
+// walked _meta from genesis to its current head, so chain.ActiveKey() is
+// the key actually in force right now, rotations included.
+func (c *Client) adoptGenesis(dataDir string, chain *journal.SigningChain) (*journal.SigningChain, ed25519.PrivateKey, bool, error) {
 	priv, err := journal.LoadSigningKey(dataDir)
 	if err != nil {
 		switch {
@@ -181,19 +160,19 @@ func (c *Client) adoptGenesis(dataDir string, body io.ReadCloser) (*journal.Sign
 	}
 
 	// Compared as decoded key bytes, not formatted strings: ParsePublicKey
-	// accepts uppercase hex (hex.DecodeString does), so a genesis record
-	// carrying non-lowercase-but-parseable hex must not read as a mismatch
-	// against a local key that is byte-for-byte correct. rec.PublicKey
-	// already passed ParsePublicKey once, in ApplyGenesis above, so the
-	// error here is unreachable in practice; RefuseCorruptGenesis is only
-	// the defensive fallback.
-	wantPub, err := journal.ParsePublicKey(rec.PublicKey)
+	// accepts uppercase hex (hex.DecodeString does), so a chain carrying
+	// non-lowercase-but-parseable hex must not read as a mismatch against a
+	// local key that is byte-for-byte correct. chain.ActiveKey() already
+	// passed ParsePublicKey once, inside ApplyGenesis/ApplyRotation during
+	// ReplayMeta, so the error here is unreachable in practice;
+	// RefuseCorruptGenesis is only the defensive fallback.
+	wantPub, err := journal.ParsePublicKey(chain.ActiveKey())
 	if err != nil {
 		return nil, nil, false, journal.RefuseCorruptGenesis(err)
 	}
 	localPub := priv.Public().(ed25519.PublicKey)
 	if !localPub.Equal(wantPub) {
-		return nil, nil, false, journal.RefuseSigningKeyMismatch(dataDir, rec.PublicKey, journal.FormatPublicKey(localPub))
+		return nil, nil, false, journal.RefuseSigningKeyMismatch(dataDir, chain.ActiveKey(), journal.FormatPublicKey(localPub))
 	}
 
 	return chain, priv, false, nil

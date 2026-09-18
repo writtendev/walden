@@ -62,6 +62,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return dispatchServe(ctx, args[2:], stdout, stderr)
 	case "token":
 		return runToken(args[2:], stdout, stderr)
+	case "rotate-key":
+		return runRotateKey(args[2:], stdout, stderr)
 	case "pre-receive":
 		return runPreReceive(args[2:], stdout, stderr)
 	case "version", "--version", "-v":
@@ -93,10 +95,11 @@ func dispatchServe(ctx context.Context, args []string, stdout, stderr io.Writer)
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  walden serve [flags]  Start the walden git server
-  walden token <cmd>    Manage authentication tokens
-  walden pre-receive    Execute journal pre-receive hook
-  walden version        Show version information
+  walden serve [flags]      Start the walden git server
+  walden token <cmd>        Manage authentication tokens
+  walden rotate-key [flags] Rotate the server's journal signing key
+  walden pre-receive        Execute journal pre-receive hook
+  walden version            Show version information
 
 Flags for serve:
   --data-dir PATH       Path to bare git repository storage (default: /data, env: WALDEN_DATA_DIR)
@@ -108,7 +111,11 @@ Flags for serve:
 Commands for token:
   create [flags]        Create a new authentication token
   list [flags]          List existing tokens
-  revoke [flags] <id>   Revoke an authentication token`)
+  revoke [flags] <id>   Revoke an authentication token
+
+Flags for rotate-key:
+  --data-dir PATH       Path to bare git repository storage (default: /data, env: WALDEN_DATA_DIR)
+  --journal URL         S3 URL for write-ahead journal (required, env: WALDEN_JOURNAL)`)
 }
 
 func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {

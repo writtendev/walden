@@ -303,9 +303,10 @@ func RemoveSigningKeyTemp(tmpPath string) {
 // (SigningKeyPath(dataDir)+".tmp.<32-hex>") left behind under dataDir and
 // returns every match it finds, sorted for a deterministic refusal message.
 //
-// There can be more than one. A mint attempt that finishes cleanly on this
-// instance always removes its temp file (RemoveSigningKeyTemp) or renames it
-// away (CommitSigningKey), but two paths deliberately retain it instead:
+// There can be more than one. A mint or rotation attempt that finishes
+// cleanly on this instance always removes its temp file
+// (RemoveSigningKeyTemp) or renames it away (CommitSigningKey), but two
+// paths deliberately retain it instead:
 // store.ErrOutcomeUnknown on the conditional PUT (the write may have
 // landed), and a CommitSigningKey failure after a winning PUT (the rename or
 // its directory fsync failed). Either can happen on more than one boot in a
@@ -402,7 +403,7 @@ func RefuseNoSigningKey(dataDir string) error {
 	fix := "restore signing.key from backup, or point this instance at a fresh journal prefix"
 	if tmps, ok := leftoverSigningKeyTemp(dataDir); ok {
 		found := strings.Join(tmps, ", ")
-		why = fmt.Sprintf("genesis record adopted but %s holds no signing key (found %s from an interrupted mint)", path, found)
+		why = fmt.Sprintf("genesis record adopted but %s holds no signing key (found %s from an interrupted mint or rotation)", path, found)
 		fix = fmt.Sprintf("check %s for the matching private key and rename the correct one to %s by hand; otherwise restore signing.key from backup", found, path)
 	}
 	return refusal.RefuseWithCause("invalid journal", why, fix, ErrSigningKeyUnavailable)
@@ -413,8 +414,8 @@ func RefuseNoSigningKey(dataDir string) error {
 // signing with it would never verify against this journal's root of trust.
 //
 // It also checks leftoverSigningKeyTemp, the way RefuseNoSigningKey does,
-// and names any match: a mismatch does not rule out an interrupted mint
-// sitting beside the wrong key (an earlier temp file recovered by hand into
+// and names any match: a mismatch does not rule out an interrupted mint or
+// rotation sitting beside the wrong key (an earlier temp file recovered by hand into
 // the wrong slot, or a second one left over from a prior ambiguous PUT), and
 // the fix below sent the operator straight to "restore from backup" without
 // ever mentioning it — a dead end when the real key was on disk the whole
@@ -425,7 +426,7 @@ func RefuseSigningKeyMismatch(dataDir, want, got string) error {
 	fix := "restore the correct signing.key, or point this instance at a fresh journal prefix"
 	if tmps, ok := leftoverSigningKeyTemp(dataDir); ok {
 		found := strings.Join(tmps, ", ")
-		why = fmt.Sprintf("%s holds key %s, genesis at %s names %s (also found %s from an earlier interrupted mint)", SigningKeyPath(dataDir), got, TxKey(MetaStreamID, 0), want, found)
+		why = fmt.Sprintf("%s holds key %s, genesis at %s names %s (also found %s from an earlier interrupted mint or rotation)", SigningKeyPath(dataDir), got, TxKey(MetaStreamID, 0), want, found)
 		fix = fmt.Sprintf("check %s for the matching private key before restoring the correct signing.key, or point this instance at a fresh journal prefix", found)
 	}
 	return refusal.RefuseWithCause("invalid journal", why, fix, ErrSigningKeyUnavailable)

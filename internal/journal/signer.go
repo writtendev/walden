@@ -27,6 +27,18 @@ import (
 // fields are set once, by NewSigner, and never written again, which is
 // what makes a Signer itself safe for concurrent use.
 //
+// NewSigner is the only place that checks a key against a chain, but it
+// is not the only way a *Signer value can come to exist: Signer's fields
+// are unexported, not unconstructable — &Signer{} and new(Signer) compile
+// from any package and produce a non-nil *Signer whose private key is
+// nil (the wrong size for ed25519.Sign, which panics rather than errors
+// on that). Valid and SignRefTx below both guard against that specific
+// shape at the point that would otherwise panic. Neither this comment nor
+// theirs claims a *Signer is guaranteed to have gone through NewSigner,
+// or that it still matches whatever chain it was checked against — only
+// that SignRefTx returns an error instead of panicking when its key is
+// the wrong size.
+//
 // A Signer must be short-lived and re-derived per process — loaded fresh
 // by whatever process is about to append, never cached across a key
 // rotation. One held past a rotation would go on stamping the epoch it
@@ -111,14 +123,49 @@ func (s *Signer) PublicKey() string {
 	return s.pub
 }
 
+// Valid reports whether s has a private key ed25519.Sign can use without
+// panicking: non-nil and exactly ed25519.PrivateKeySize bytes. It exists
+// because a *Signer can reach this package's callers without having gone
+// through NewSigner (see Signer's own doc comment) — Valid is the check a
+// caller can run before handing s to SignRefTx, so a misused Signer
+// refuses instead of only failing once something tries to sign with it.
+//
+// Valid does not check s against any *SigningChain — only NewSigner has a
+// chain to check against — so it cannot tell a Signer that never matched
+// one from a Signer that once did and has since gone stale across a
+// rotation. It reports exactly one thing: whether s.priv is a usable
+// Ed25519 key.
+func (s *Signer) Valid() error {
+	if s == nil {
+		return fmt.Errorf("%w: signer is nil", ErrInvalidKey)
+	}
+	if len(s.priv) != ed25519.PrivateKeySize {
+		return fmt.Errorf("%w: ed25519 private key must be %d bytes, got %d", ErrInvalidKey, ed25519.PrivateKeySize, len(s.priv))
+	}
+	return nil
+}
+
 // SignRefTx sets r.KeyEpoch to s.Epoch() and signs r with s's private key
 // via the package-level SignRefTx. The epoch is set here, immediately
 // before signing, and nowhere else: one source of the epoch means a
 // record can never carry a key_epoch that disagrees with the key that
 // signed it.
+//
+// SignRefTx calls s.Valid() before touching s.priv. This check is
+// load-bearing, not defensive: ed25519.Sign panics, rather than
+// returning an error, on a wrong-size key, and a *Signer built without
+// going through NewSigner — &Signer{} or new(Signer), constructible from
+// any package despite Signer's fields being unexported — reaches this
+// method with a nil, wrong-size priv. The guard has to live here, at the
+// point that would otherwise panic, because a guard placed only at
+// construction does not run for a value that was never constructed
+// through it.
 func (s *Signer) SignRefTx(r *RefTransactionRecord) error {
 	if r == nil {
 		return fmt.Errorf("%w: record cannot be nil", ErrInvalidRefTx)
+	}
+	if err := s.Valid(); err != nil {
+		return err
 	}
 	r.KeyEpoch = s.epoch
 	return SignRefTx(s.priv, r)

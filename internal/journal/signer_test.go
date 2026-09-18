@@ -229,3 +229,60 @@ func TestSignerSignRefTxNilRecord(t *testing.T) {
 		t.Errorf("errors.Is(_, ErrInvalidRefTx) = false, err = %v", err)
 	}
 }
+
+// (7) SignRefTx on a zero-value *Signer — &journal.Signer{}, never built
+// through NewSigner — refuses with ErrInvalidKey instead of panicking
+// inside ed25519.Sign. This is the direct-call path the review round
+// found: Signer's fields are unexported but not unconstructable, so a
+// *Signer can reach SignRefTx without ever having been checked against a
+// chain, and ed25519.Sign panics (does not error) on a nil, wrong-size
+// key. internal/store/reftx_test.go's "invalid signer" case in
+// TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing drives
+// the identical zero-value Signer through AppendRefTx instead of calling
+// SignRefTx directly, and pins the store-level consequence: a healthy
+// stream left unfenced rather than permanently fenced.
+func TestSignerSignRefTxZeroValueSignerRefusesInsteadOfPanicking(t *testing.T) {
+	rec := journal.NewRefTransactionRecord("repo-alpha", 0, 0, signerFixedTimestamp, nil, []journal.RefUpdate{
+		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: strings.Repeat("a", 40)},
+	})
+
+	s := &journal.Signer{}
+	err := s.SignRefTx(rec)
+	assertSignerOneLine(t, err)
+	if !errors.Is(err, journal.ErrInvalidKey) {
+		t.Errorf("errors.Is(_, ErrInvalidKey) = false, err = %v", err)
+	}
+}
+
+// (8) Valid() itself, directly: nil *Signer and a zero-value *Signer both
+// refuse with ErrInvalidKey; a *Signer built through NewSigner is valid.
+func TestSignerValid(t *testing.T) {
+	t.Run("nil signer", func(t *testing.T) {
+		var s *journal.Signer
+		err := s.Valid()
+		assertSignerOneLine(t, err)
+		if !errors.Is(err, journal.ErrInvalidKey) {
+			t.Errorf("errors.Is(_, ErrInvalidKey) = false, err = %v", err)
+		}
+	})
+
+	t.Run("zero-value signer", func(t *testing.T) {
+		s := &journal.Signer{}
+		err := s.Valid()
+		assertSignerOneLine(t, err)
+		if !errors.Is(err, journal.ErrInvalidKey) {
+			t.Errorf("errors.Is(_, ErrInvalidKey) = false, err = %v", err)
+		}
+	})
+
+	t.Run("signer built through NewSigner", func(t *testing.T) {
+		chain, priv := singleKeyChain(t)
+		s, err := journal.NewSigner(chain, priv)
+		if err != nil {
+			t.Fatalf("NewSigner: %v", err)
+		}
+		if err := s.Valid(); err != nil {
+			t.Errorf("Valid() on a signer built through NewSigner: %v", err)
+		}
+	})
+}

@@ -330,17 +330,29 @@ func TestAppendRefTxStreamIsolation(t *testing.T) {
 // 6. Each pre-check AppendRefTx makes before ever calling lease.Append
 // refuses with zero entries added to fake.Calls() beyond whatever Open
 // itself already made, leaves the stream unfenced, and is exactly one
-// line - including the nil ctx and the nil signer, the two tests that
-// prove a load-bearing pre-check refuses instead of fencing (ctx.Err() on
-// a nil ctx inside store.(*Client).do, or a method call through a nil
-// *journal.Signer, would otherwise panic inside lease.Append's callback
-// and fence a healthy stream through WALD-29's unknown-outcome path). A
-// wrong-size or otherwise-mismatched private key can no longer reach
-// AppendRefTx at all as of WALD-30: journal.NewSigner refuses it before a
-// *journal.Signer can exist, so that case is covered by
-// internal/journal/signer_test.go's TestNewSignerRefusals instead of here.
+// line - including the nil ctx, the nil signer, and the invalid signer,
+// the three tests that prove a load-bearing pre-check refuses instead of
+// fencing (ctx.Err() on a nil ctx inside store.(*Client).do, a method
+// call through a nil *journal.Signer, or ed25519.Sign on a *journal.Signer
+// whose private key is the wrong size, would otherwise panic inside
+// lease.Append's callback and fence a healthy stream through WALD-29's
+// unknown-outcome path).
+//
+// A wrong-size or otherwise-mismatched private key cannot reach
+// AppendRefTx through journal.NewSigner as of WALD-30 - NewSigner refuses
+// it before a *journal.Signer built that way can exist, and that case is
+// covered by internal/journal/signer_test.go's TestNewSignerRefusals - but
+// a *journal.Signer does not have to come from NewSigner: Signer's fields
+// are unexported, not unconstructable, and &journal.Signer{} compiles
+// from this package (or any other) with a nil, wrong-size private key.
+// "invalid signer" below is that case, driven through AppendRefTx itself
+// rather than through SignRefTx directly (internal/journal/signer_test.go
+// covers the latter): it is the regression test for the finding that
+// &journal.Signer{} used to reach ed25519.Sign inside lease.Append's
+// callback and permanently fence the stream.
+//
 // TestAppendRefTxPanickingNowSurfacesBeforeLeaseInteraction below covers
-// the third member of that family - a non-nil clock that panics when
+// the fourth member of that family - a non-nil clock that panics when
 // called - separately, since hoisting its call site out of the closure
 // means it is no longer a pre-check at all.
 func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T) {
@@ -392,6 +404,53 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 		}
 		if got := len(fake.Calls()); got != callsBefore {
 			t.Errorf("fake saw %d further requests, want 0", got-callsBefore)
+		}
+	})
+
+	// Regression test for the review finding: &journal.Signer{} (never
+	// built through NewSigner) used to pass this nil-signer check with a
+	// non-nil *Signer whose priv was nil, reach ed25519.Sign inside
+	// lease.Append's callback, panic, and permanently fence repo-alpha -
+	// so that even a later AppendRefTx with a genuinely valid signer then
+	// refused with "stream repo-alpha is permanently fenced on this
+	// instance". Asserting IsFenced is false is necessary but not
+	// sufficient to prove that is fixed; the property that actually
+	// matters is proved below it, by making that later append and
+	// requiring it to succeed.
+	t.Run("invalid signer", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		ctx := context.Background()
+		leases := journal.NewLeases(c)
+		lease, err := leases.Open(ctx, "repo-alpha")
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		callsBefore := len(fake.Calls())
+
+		_, err = c.AppendRefTx(ctx, lease, &journal.Signer{}, nil, reftxUpdates(), fixedReftxNow)
+		assertReftxOneLine(t, err)
+		if !errors.Is(err, journal.ErrInvalidKey) {
+			t.Errorf("errors.Is(_, ErrInvalidKey) = false, err = %v", err)
+		}
+		if errors.Is(err, journal.ErrFenced) {
+			t.Errorf("an invalid signer must refuse, not fence: %v", err)
+		}
+		if lease.Fencer().IsFenced("repo-alpha") {
+			t.Errorf("expected repo-alpha to remain unfenced")
+		}
+		if got := len(fake.Calls()); got != callsBefore {
+			t.Errorf("fake saw %d further requests, want 0", got-callsBefore)
+		}
+
+		// The property that actually matters: the stream is still usable.
+		// A subsequent append with a valid signer must succeed, not refuse
+		// with "permanently fenced on this instance".
+		seq, err := c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
+		if err != nil {
+			t.Fatalf("AppendRefTx with a valid signer after the invalid-signer refusal: %v", err)
+		}
+		if seq != 0 {
+			t.Errorf("seq = %d, want 0 (the sequence must still be at 0 after a rejected invalid signer)", seq)
 		}
 	})
 

@@ -43,35 +43,81 @@ jobs:
           # count to replay locally.
           WALDEN_CHAOS_SEED: ${{ github.run_id }}
           # 5000 is chosen, not the largest round count that technically
-          # runs: WALD-35 PR #65's review measured the previous value here
-          # (20000) failing to even finish TestChaosWritePathFaultsAndRestart
-          # inside Go's 10-minute default test timeout (629s and still
-          # running when killed). Two things fed that: the per-round
-          # invariant checks used to rescan the fake's entire call log and
-          # key set from scratch every round, and nextSeqFromFake (since
-          # removed) did the same to predict each round's own key - all
-          # three now cost O(1) or a bounded number of checkpoints per run
-          # instead (see chaos_test.go's chaosInvariantState and
-          # (*chaosInvariantState).predictedSeq doc comments). Fixing that
-          # helps, but does not make the runtime linear on its own: a large
-          # chaos run's real HTTP traffic under `-race` is itself
-          # superlinear in round count (profiling shows network syscalls
-          # and the race detector's own bookkeeping dominating, not this
-          # file's Go code), so picking a bounded round count for this
-          # nightly step is still necessary, not merely a fallback. Measured
-          # locally (an M-series Mac, not this job's own runner - expect
-          # this class of hardware to be somewhat faster than
-          # ubuntu-latest) after all three fixes: 5000 rounds runs both
-          # TestChaosWritePathFaultsAndRestart and
-          # TestChaosWritePathConcurrentInstances in ~124s combined
-          # (~97s + ~26s) - comfortably inside the -timeout below with
-          # roughly 7x headroom even before accounting for a slower runner,
-          # while still exercising the write path roughly 33x further than
-          # the default per-PR budget (chaosDefaultRounds = 150) does on
-          # every push. 10000 rounds alone measured 355s for
-          # TestChaosWritePathFaultsAndRestart - continued superlinear
-          # growth, and confirmation that scaling further from here trades
-          # away the headroom this value keeps.
+          # runs: WALD-35 PR #65's round-1 review measured the previous
+          # value here (20000) failing to even finish
+          # TestChaosWritePathFaultsAndRestart inside Go's 10-minute default
+          # test timeout (629s and still running when killed). Two things
+          # fed that: the per-round invariant checks used to rescan the
+          # fake's entire call log and key set from scratch every round, and
+          # nextSeqFromFake (since removed) did the same to predict each
+          # round's own key - all three now cost O(1) or a bounded number of
+          # checkpoints per run instead (see chaos_test.go's
+          # chaosInvariantState and (*chaosInvariantState).predictedSeq doc
+          # comments). Fixing that helps, but does not make the runtime
+          # linear on its own: a large chaos run's real HTTP traffic under
+          # `-race` is itself superlinear in round count (profiling shows
+          # network syscalls and the race detector's own bookkeeping
+          # dominating, not this file's Go code), so picking a bounded round
+          # count for this nightly step is still necessary, not merely a
+          # fallback.
+          #
+          # This value drives TestChaosWritePathFaultsAndRestart (the
+          # sequential, seeded, fault-catalogue half - the one whose
+          # coverage genuinely grows with more rounds) directly.
+          # TestChaosWritePathConcurrentInstances (the barrier-synchronized
+          # race half) reads it too but caps its own effective round count
+          # at chaosConcurrentRoundsCap (chaos_test.go) regardless of what
+          # this says, and always uses its own *http.Client
+          # (newChaosConcurrentClient) with a wider per-host idle-connection
+          # pool than production's own default: WALD-35 PR #65's round-2
+          # review found that at 5000 iterations, the concurrent half's K=5
+          # simultaneous PutIfAbsent calls per round - all sharing one
+          # *store.Client, hence one connection pool, capped at net/http's
+          # default MaxIdleConnsPerHost=2 - forced most of each round's
+          # connections closed instead of reused, leaving ~14,930 sockets in
+          # TIME_WAIT (~91% of this runner's ephemeral port range) and
+          # failing the job with "can't assign requested address" on
+          # entirely correct code, misreported as a fencing-refusal
+          # mismatch. Capping the concurrent half's own rounds independently
+          # (its assertions hold under every interleaving by construction -
+          # see its own doc comment - so thousands of repeats buy
+          # confirmation, not coverage, unlike the sequential half) and
+          # widening its connection pool well above K together remove that
+          # growth rather than just slowing it: see chaosConcurrentRoundsCap
+          # and newChaosConcurrentClient's doc comments in chaos_test.go for
+          # the full reasoning and the invariant this keeps (production's
+          # own NewClient/its default pool size in client.go are untouched;
+          # only this test's own transport is configured this way).
+          #
+          # Measured locally (an M-series Mac, not this job's own runner -
+          # expect this class of hardware to be somewhat faster than
+          # ubuntu-latest, but see the port measurement below, which is
+          # independent of CPU speed) after the port-exhaustion fix: 5000
+          # rounds of TestChaosWritePathFaultsAndRestart plus
+          # TestChaosWritePathConcurrentInstances capped at 500 rounds run
+          # in ~97-100s combined (~94-96s + ~2.4s, three runs) - comfortably
+          # inside the -timeout below with roughly 9x headroom even before
+          # accounting for a slower runner, while still exercising the
+          # write path roughly 33x further than the default per-PR budget
+          # (chaosDefaultRounds = 150) does on every push. Peak TIME_WAIT
+          # sockets during that run measured 380 (polled every 0.5s), on a
+          # machine whose ephemeral range (49152-65535, 16384 ports) is
+          # narrower than ubuntu-latest's (~28.2k) - about 2.3% of this
+          # machine's range, so proportionally lower still on the actual
+          # runner. That residual 380 is not connection-pool churn (the
+          # concurrent half's fix above addresses that; if it recurred,
+          # it would scale with rounds x K, not with rounds alone): it
+          # tracks the sequential half's own fault catalogue, which
+          # deliberately severs the connection (storetest.Fault.Drop, two
+          # of unknownOutcomeFault's six shapes) on roughly 1 in 12 rounds
+          # by design, each one a genuine TCP close this test exists to
+          # inject - not a bug, and not something either fix above is
+          # trying to eliminate. 10000 rounds of just the sequential half
+          # alone measured 355s in the same environment before this fix,
+          # unaffected by the port work (that half's own client and round
+          # budget are unchanged) - continued superlinear growth, and
+          # confirmation that scaling the sequential half further from here
+          # trades away the headroom this value keeps.
           WALDEN_CHAOS_ROUNDS: 5000
         run: |
           set -o pipefail

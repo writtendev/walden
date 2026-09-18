@@ -86,6 +86,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -119,6 +120,32 @@ const (
 	// the race certain every time (storetest's fake enforces the
 	// conditional PUT under one mutex - see its own package doc).
 	chaosConcurrentInstances = 5
+
+	// chaosConcurrentRoundsCap bounds how many rounds
+	// TestChaosWritePathConcurrentInstances ever runs, even when
+	// WALDEN_CHAOS_ROUNDS asks for more - deliberately decoupling the
+	// concurrent half's budget from the sequential half's. WALD-35 PR #65's
+	// round-2 review found the nightly workflow driving both halves off one
+	// WALDEN_CHAOS_ROUNDS=5000 exhausting the runner's ephemeral port range
+	// (see .github/workflows/chaos.yml and newChaosConcurrentClient's doc
+	// comment for the mechanism and the fix on the connection-reuse side).
+	// The other half of that fix is here: unlike
+	// TestChaosWritePathFaultsAndRestart, whose seeded fault catalogue keeps
+	// exploring new ground every additional round, this test has no
+	// catalogue and no seed - every round is the same fixed barrier over
+	// the same K=5 instances, and every assertion already holds under every
+	// interleaving by construction (see this test's own doc comment). More
+	// rounds past a few hundred buy back-to-back confirmations of a
+	// property that does not vary round to round, not new coverage, so
+	// capping this test's own budget independently - rather than scaling it
+	// 1:1 with the sequential half's - trades away nothing the nightly run
+	// exists to catch. 500 is 12.5x chaosDefaultConcurrentRounds (the same
+	// order of magnitude the nightly scales the sequential half's default
+	// by) and is small enough, combined with newChaosConcurrentClient's
+	// wider connection pool, to keep this test's own port usage
+	// unremarkable even at that scale - see .github/workflows/chaos.yml for
+	// the measured figures.
+	chaosConcurrentRoundsCap = 500
 )
 
 // chaosSigningKey is deterministic - not crypto/rand - so this file needs no
@@ -238,6 +265,71 @@ func newChaosClient(t *testing.T) (*store.Client, *storetest.Fake) {
 		Credentials: store.Credentials{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
 	}
 	return store.NewClient(j), fake
+}
+
+// chaosConcurrentClientMaxIdleConnsPerHost is the concurrent test's own
+// *http.Transport idle-connection-pool ceiling per host, comfortably above
+// chaosConcurrentInstances (K): TestChaosWritePathConcurrentInstances
+// routes every one of K goroutines' requests, on every round, through one
+// shared *store.Client, so that Client's Transport idle pool is shared
+// across a burst of K simultaneous requests. net/http's default
+// MaxIdleConnsPerHost (2) is far below K=5, so on every round the K-2
+// requests that exceed the idle pool close their TCP connection instead of
+// returning it to the pool when the request finishes, and each such close
+// leaves an ephemeral port in TIME_WAIT for the OS's usual linger period.
+// WALD-35 PR #65's round-2 review measured this exhausting the runner's
+// ephemeral port range at the nightly workflow's WALDEN_CHAOS_ROUNDS=5000
+// (see .github/workflows/chaos.yml, and chaosConcurrentRoundsCap's doc
+// comment for the other half of the fix). Raising the ceiling well above K
+// lets every instance's connection be reused round after round instead of
+// closed and redialed, which removes the growth rather than merely
+// slowing it.
+const chaosConcurrentClientMaxIdleConnsPerHost = 64
+
+// newChaosConcurrentClient is newChaosClient's counterpart for
+// TestChaosWritePathConcurrentInstances, the one test in this file that
+// ever has more than one request in flight on the same *store.Client at
+// once. It is built through store.NewClientForTest - exposed by
+// export_test.go for exactly this kind of test-side *http.Client injection
+// - with a wider connection pool per host
+// (chaosConcurrentClientMaxIdleConnsPerHost) than store.NewClient (used by
+// newChaosClient) sets by default, rather than through store.NewClient
+// itself: this is the concurrent test's own transport to configure, not
+// production's - client.go's NewClient, and its own default pool size, are
+// untouched. Every other Transport setting mirrors client.go's own
+// production values, duplicated here by literal value since client.go's
+// are unexported and this file's two-file scope (chaos_test.go and
+// .github/workflows/chaos.yml only) keeps this file from exporting them: a
+// staleness risk if client.go's own numbers ever change, not a correctness
+// one, since none of this test's fault injection reads these exact
+// durations (unlike TestChaosWritePathFaultsAndRestart, this test injects
+// no faults at all).
+func newChaosConcurrentClient(t *testing.T) (*store.Client, *storetest.Fake) {
+	t.Helper()
+	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
+	t.Cleanup(restore)
+
+	fake := storetest.New(t)
+	j := &store.Journal{
+		Endpoint:    fake.URL(),
+		Region:      "us-east-1",
+		Bucket:      fake.Bucket(),
+		PathStyle:   true,
+		Credentials: store.Credentials{AccessKeyID: "AKIDEXAMPLE", SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
+	}
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext, // mirrors client.go's dialTimeout
+			TLSHandshakeTimeout:   10 * time.Second,                                     // mirrors client.go's tlsHandshakeTimeout
+			ResponseHeaderTimeout: 30 * time.Second,                                     // mirrors client.go's responseHeaderTimeout
+			IdleConnTimeout:       30 * time.Second,                                     // mirrors client.go's idleConnTimeout
+			MaxIdleConnsPerHost:   chaosConcurrentClientMaxIdleConnsPerHost,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse // mirrors client.go's own CheckRedirect
+		},
+	}
+	return store.NewClientForTest(j, httpClient, chaosNow), fake
 }
 
 // parseTxKey splits a full ("v1/streams/<stream>/tx/<seq>.json") key back
@@ -416,17 +508,42 @@ const chaosCallsCheckpoints = 100
 // fault class in this file that can retry the same key
 // (classProvablyUnapplied's burst of
 // 408/429/503/400-RequestTimeout/409-ConditionalRequestConflict) never
-// includes a 412, and the one fault class that does produce a real 412
-// (classProvenConflict, or a genuine race in the concurrent half) fires at
-// most once per key before the writer fences and stops - see classify in
-// client.go, which never retries past a 412 at all.
+// includes a 412, and the one fault class in this test's sequential half
+// that does produce a real 412 (classProvenConflict) fires at most once
+// per key: assertFencedThenInert (called immediately after, in the round
+// loop) proves the writer fences and makes zero further requests, and
+// frontier (chaosInvariantState) only ever advances predictedSeq past a
+// key once something has landed there, so no later round in the
+// sequential half ever asks buildFault to target an already-occupied key
+// again - see classify in client.go, which never retries past a 412 at
+// all.
+//
+// This checker is not valid for TestChaosWritePathConcurrentInstances'
+// race, and must not be wired into it without reworking it first: there, K
+// independent instances all send PutIfAbsent against the very same key at
+// once, and a genuine, entirely correct race produces up to K-1 real 412s
+// on that one key (one winner, K-1 losers) - "fires at most once per key"
+// above holds only because the sequential half never retries a key past a
+// proven 412, not because a 412 is inherently rare there. The concurrent
+// test happens to never call checkTxCallInvariants today, which is the
+// only reason this file's current behavior is correct; wiring it in as
+// written would fail on entirely correct concurrent code.
 //
 // landed and poisoned are mutated in place, so a caller can run this
 // call-window by call-window across many invocations (see
 // checkChaosInvariantsRound) and get the same result as one call over the
 // whole log (see checkChaosInvariantsFinal) - the same incremental-vs-full
 // equivalence the signature check below already relies on.
-func checkTxCallInvariants(t *testing.T, label string, fake *storetest.Fake, calls []storetest.Call, landed map[string]int, poisoned map[string]bool) {
+//
+// fail reports a violation found among calls; it does not call t.Fatalf
+// itself, because what a caller can honestly say about "where" a violation
+// happened differs by who is calling: checkChaosInvariantsRound only owns
+// a checkpoint's own round range (see chaosCallFailf), and
+// checkChaosInvariantsFinal owns the whole run. Both build fail with
+// chaosCallFailf so every call-based failure - checkpoint or final - still
+// carries the seed, round count, and replay command every other failure in
+// this file does.
+func checkTxCallInvariants(t *testing.T, fail func(format string, args ...any), fake *storetest.Fake, calls []storetest.Call, landed map[string]int, poisoned map[string]bool) {
 	t.Helper()
 	for _, call := range calls {
 		if call.Op != storetest.OpPut && call.Op != storetest.OpPutIfAbsent {
@@ -436,20 +553,47 @@ func checkTxCallInvariants(t *testing.T, label string, fake *storetest.Fake, cal
 			continue
 		}
 		if call.Op == storetest.OpPut {
-			t.Fatalf("%s: unconditional PUT to tx key %s\ncalls:\n%s", label, call.Key, dumpCalls(fake))
+			fail("unconditional PUT to tx key %s\ncalls:\n%s", call.Key, dumpCalls(fake))
 		}
 		if poisoned[call.Key] {
-			t.Fatalf("%s: PUT(If-None-Match: *) to tx key %s (call #%d) after that key already saw a proven 412 - a proven 412 must never be resent\ncalls:\n%s", label, call.Key, call.N, dumpCalls(fake))
+			fail("PUT(If-None-Match: *) to tx key %s (call #%d) after that key already saw a proven 412 - a proven 412 must never be resent\ncalls:\n%s", call.Key, call.N, dumpCalls(fake))
 		}
 		if call.Landed {
 			landed[call.Key]++
 			if landed[call.Key] > 1 {
-				t.Fatalf("%s: tx key %s landed %d times (sequence forked)\ncalls:\n%s", label, call.Key, landed[call.Key], dumpCalls(fake))
+				fail("tx key %s landed %d times (sequence forked)\ncalls:\n%s", call.Key, landed[call.Key], dumpCalls(fake))
 			}
 		}
 		if call.Status == http.StatusPreconditionFailed {
 			poisoned[call.Key] = true
 		}
+	}
+}
+
+// chaosCallFailf builds the failure formatter checkTxCallInvariants reports
+// every call-based invariant violation through. Unlike checkNoGapAtKey and
+// verifyAcks, which run every round and can honestly name the exact round a
+// violation happened on, checkTxCallInvariants only inspects fake.Calls()
+// at a bounded number of checkpoints (chaosCallsCheckpoints) - so all a
+// mid-run match actually establishes is that some call within window (a
+// round range, described by the caller) is the culprit, never that the
+// checkpoint's own round is where it happened. WALD-35 PR #65's round-2
+// review found the previous version of this file printing the checkpoint
+// round as if it were the violating round, with no round count and no
+// replay command - unlike fail() in the round loop below. window names
+// what this call actually knows (a round range for a mid-run checkpoint,
+// or that it swept the complete history for the final, once-at-the-end
+// check - see checkChaosInvariantsFinal), and this always prints the same
+// seed, rounds, and replay command fail() does, so a call-based failure
+// stays exactly as reproducible from its own output as every other
+// failure in this file.
+func chaosCallFailf(t *testing.T, seed, rounds int, window string) func(format string, args ...any) {
+	return func(format string, args ...any) {
+		t.Helper()
+		t.Fatalf(
+			"chaos seed=%d rounds=%d %s: %s\nreproduce with:\n  WALDEN_CHAOS_SEED=%d WALDEN_CHAOS_ROUNDS=%d go test -race -count=1 -run '^TestChaosWritePathFaultsAndRestart$' ./internal/store/",
+			seed, rounds, window, fmt.Sprintf(format, args...), seed, rounds,
+		)
 	}
 }
 
@@ -536,21 +680,28 @@ func verifyAcks(t *testing.T, label string, fake *storetest.Fake, verify []chaos
 
 // checkChaosInvariantsRound runs the cheap, incremental form of every
 // invariant in this file's header comment after one round of
-// TestChaosWritePathFaultsAndRestart: stream and seq are that round's own
-// predicted (stream, seq) coordinate (see
-// chaosInvariantState.predictedSeq), and newAcks is only the entries newly
-// acknowledged this round. checkCalls, computed by the caller from
-// chaosCallsCheckpoints, tells this round whether it is one of the bounded
-// number of checkpoints that pays for a fake.Calls() copy; checkNoGapAtKey
-// and verifyAcks run every round regardless, since neither needs the call
-// log. See chaosInvariantState's doc comment for why this must stay
-// incremental, and chaosCallsCheckpoints' for why "incremental" alone was
-// not enough to stop rescanning fake's whole history every round.
-func checkChaosInvariantsRound(t *testing.T, label string, fake *storetest.Fake, state *chaosInvariantState, newAcks []chaosAck, stream journal.StreamID, seq journal.Seq, checkCalls bool) {
+// TestChaosWritePathFaultsAndRestart: seed and rounds are the run's own
+// parameters (for chaosCallFailf's replay command below), round is this
+// round's number, stream and seq are that round's own predicted (stream,
+// seq) coordinate (see chaosInvariantState.predictedSeq), and newAcks is
+// only the entries newly acknowledged this round. checkCalls, computed by
+// the caller from chaosCallsCheckpoints, tells this round whether it is
+// one of the bounded number of checkpoints that pays for a fake.Calls()
+// copy; checkNoGapAtKey and verifyAcks run every round regardless, since
+// neither needs the call log. See chaosInvariantState's doc comment for
+// why this must stay incremental, and chaosCallsCheckpoints' for why
+// "incremental" alone was not enough to stop rescanning fake's whole
+// history every round. checkpointStart is the last round an earlier
+// checkpoint already covered (0 if this is the first), so a call-based
+// violation here is reported honestly as somewhere within
+// (checkpointStart, round], not as round itself - see chaosCallFailf.
+func checkChaosInvariantsRound(t *testing.T, seed, rounds, round, checkpointStart int, fake *storetest.Fake, state *chaosInvariantState, newAcks []chaosAck, stream journal.StreamID, seq journal.Seq, checkCalls bool) {
 	t.Helper()
+	label := fmt.Sprintf("seed=%d round=%d", seed, round)
 	if checkCalls {
 		calls := fake.Calls()
-		checkTxCallInvariants(t, label, fake, calls[state.callsChecked:], state.landed, state.poisoned)
+		window := fmt.Sprintf("checkpoint round=%d (a call-based check runs only at checkpoints, chaosCallsCheckpoints of them per run - this failure was found somewhere within rounds %d-%d, not necessarily at round %d itself)", round, checkpointStart+1, round, round)
+		checkTxCallInvariants(t, chaosCallFailf(t, seed, rounds, window), fake, calls[state.callsChecked:], state.landed, state.poisoned)
 		state.callsChecked = len(calls)
 	}
 	checkNoGapAtKey(t, label, fake, state.frontier, stream, seq)
@@ -561,10 +712,13 @@ func checkChaosInvariantsRound(t *testing.T, label string, fake *storetest.Fake,
 // comment once more, from scratch, against fake's complete final state -
 // the "once at the end" full sweep chaosInvariantState's doc comment
 // promises, and a check against a bug in the incremental bookkeeping
-// itself, not only against the production code under test.
-func checkChaosInvariantsFinal(t *testing.T, label string, fake *storetest.Fake, acked []chaosAck) {
+// itself, not only against the production code under test. seed and
+// rounds feed chaosCallFailf's replay command, the same as
+// checkChaosInvariantsRound; label is used only for the two checks that
+// already honestly name "final" (checkNoGapFull, verifyAcks).
+func checkChaosInvariantsFinal(t *testing.T, seed, rounds int, label string, fake *storetest.Fake, acked []chaosAck) {
 	t.Helper()
-	checkTxCallInvariants(t, label, fake, fake.Calls(), make(map[string]int), make(map[string]bool))
+	checkTxCallInvariants(t, chaosCallFailf(t, seed, rounds, "final sweep (complete call history, every round)"), fake, fake.Calls(), make(map[string]int), make(map[string]bool))
 	checkNoGapFull(t, label, fake)
 	verifyAcks(t, label, fake, acked)
 }
@@ -803,7 +957,8 @@ func TestChaosWritePathFaultsAndRestart(t *testing.T) {
 	newRegistry()
 
 	var acked []chaosAck
-	lastChecked := 0 // index into acked already covered by an earlier checkChaosInvariantsRound call
+	lastChecked := 0              // index into acked already covered by an earlier checkChaosInvariantsRound call
+	lastCallsCheckpointRound := 0 // most recent round whose checkpoint already scanned fake.Calls(); see checkChaosInvariantsRound's checkpointStart
 	invState := newChaosInvariantState()
 
 	// callsCheckInterval spaces the run's fake.Calls() checkpoints (see
@@ -939,14 +1094,17 @@ func TestChaosWritePathFaultsAndRestart(t *testing.T) {
 		}
 
 		checkCalls := round%callsCheckInterval == 0 || round == rounds
-		checkChaosInvariantsRound(t, fmt.Sprintf("seed=%d round=%d", seed, round), fake, invState, acked[lastChecked:], stream, seq, checkCalls)
+		checkChaosInvariantsRound(t, seed, rounds, round, lastCallsCheckpointRound, fake, invState, acked[lastChecked:], stream, seq, checkCalls)
 		lastChecked = len(acked)
+		if checkCalls {
+			lastCallsCheckpointRound = round
+		}
 	}
 
 	// Once at the end, per the ticket's plan: a full pass re-checking every
 	// invariant from scratch against fake's complete final state, not just
 	// the incremental work each round added.
-	checkChaosInvariantsFinal(t, fmt.Sprintf("seed=%d final", seed), fake, acked)
+	checkChaosInvariantsFinal(t, seed, rounds, fmt.Sprintf("seed=%d final", seed), fake, acked)
 }
 
 // chaosInstanceUpdates returns a ref update unique to instance j among the
@@ -981,19 +1139,25 @@ func dumpWinnerLoserTable(results []error, seqs []journal.Seq) string {
 // TestChaosWritePathConcurrentInstances races chaosConcurrentInstances
 // independent journal.NewLeases registries - standing in for separate
 // walden processes - against one shared stream over one shared fake,
-// repeated across chaosDefaultConcurrentRounds (WALDEN_CHAOS_ROUNDS) fresh
-// streams. Every registry opens the stream before any of them appends, so
-// the race is certain; a channel close releases them together as a fixed
-// barrier. Every assertion below holds under every possible interleaving -
-// exactly one winner, K-1 refusals carrying journal.ErrFenced and the
-// section 11.5 item-1 wording, and exactly one object at the head sequence
-// holding the winner's own record - so this test needs no seed to be
-// reproducible (see this file's header comment for why that matters here).
+// repeated across chaosDefaultConcurrentRounds (WALDEN_CHAOS_ROUNDS, capped
+// at chaosConcurrentRoundsCap - see its own doc comment for why this half
+// keeps its own, smaller budget rather than scaling 1:1 with
+// WALDEN_CHAOS_ROUNDS the way it used to) fresh streams. Every registry
+// opens the stream before any of them appends, so the race is certain; a
+// channel close releases them together as a fixed barrier. Every assertion
+// below holds under every possible interleaving - exactly one winner, K-1
+// refusals carrying journal.ErrFenced and the section 11.5 item-1 wording,
+// and exactly one object at the head sequence holding the winner's own
+// record - so this test needs no seed to be reproducible (see this file's
+// header comment for why that matters here).
 func TestChaosWritePathConcurrentInstances(t *testing.T) {
 	rounds := chaosEnvInt(t, "WALDEN_CHAOS_ROUNDS", chaosDefaultConcurrentRounds)
+	if rounds > chaosConcurrentRoundsCap {
+		rounds = chaosConcurrentRoundsCap
+	}
 	const k = chaosConcurrentInstances
 
-	c, fake := newChaosClient(t)
+	c, fake := newChaosConcurrentClient(t)
 	ctx := context.Background()
 
 	for i := 1; i <= rounds; i++ {

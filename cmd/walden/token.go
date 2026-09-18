@@ -270,6 +270,37 @@ func refuseTokenRevokeDiskIncomplete(tokenID string, diskErr error) error {
 	)
 }
 
+// refuseTokenRevokeNoLocalRecord refuses a `walden token revoke` whose
+// journal half already shows tokenID revoked while tokens.json carries no
+// row for it at all -- not an unrevoked or already-revoked row, but no
+// row whatsoever, the shape a lost or restored tokens.json leaves behind
+// (round 2 finding 1). store.RevokeToken reports this shape as
+// auth.ErrTokenNotFound, which used to fall through to
+// refuseTokenRevokeDiskIncomplete above; that wording is wrong on both of
+// its claims for this case. It says the token "may still authenticate
+// locally," but a store with no row for tokenID has nothing a lookup
+// could match, so the credential demonstrably cannot authenticate against
+// this instance. And it tells the operator to retry once the data
+// directory is writable, but the directory was writable the whole
+// time -- the retry reaches this exact refusal again, forever, because
+// there is no row on disk left to write.
+//
+// The credential is therefore already inert everywhere this instance is
+// concerned, and there is nothing left to do to tokens.json. This is
+// treated as a refusal that says so plainly rather than a printed
+// confirmation the CLI never itself enacted this call -- the same choice
+// refuseTokenAlreadyRevokedInJournal makes for the "both sides already
+// agree" case, just for the shape where disk does not merely agree but
+// has no opinion at all.
+func refuseTokenRevokeNoLocalRecord(tokenID string) error {
+	return refusal.RefuseWithCause(
+		"token revoke refused",
+		fmt.Sprintf("token id %q is revoked in the journal, but tokens.json holds no record of it at all", tokenID),
+		"no action needed; with no local record for this id, the token cannot authenticate on this instance",
+		auth.ErrTokenNotFound,
+	)
+}
+
 func runToken(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return refusal.Refuse("missing token subcommand", "no action specified", "expected create, list, or revoke")
@@ -544,6 +575,18 @@ func runTokenList(args []string, stdout, stderr io.Writer) error {
 // refuseTokenRevokeDiskIncomplete, which says plainly that the journal
 // already calls this token dead while tokens.json does not yet agree,
 // rather than relaying a bare disk error that leaves that gap unstated.
+//
+// A third shape (round 2 finding 1) is disk carrying no row for tokenID
+// at all — not live, not revoked, absent, the state a lost or restored
+// tokens.json leaves behind. RevokeToken reports that as
+// auth.ErrTokenNotFound, and it is refused separately through
+// refuseTokenRevokeNoLocalRecord rather than falling into
+// refuseTokenRevokeDiskIncomplete's wording above: that wording claims
+// the token "may still authenticate locally" and tells the operator to
+// retry once the data directory is writable, both false here — a store
+// with no row for tokenID cannot authenticate it, and the directory was
+// writable the whole time, so the same retry refuses identically
+// forever.
 func runTokenRevoke(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("token revoke", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -631,6 +674,9 @@ func runTokenRevoke(args []string, stdout, stderr io.Writer) error {
 	if err := store.RevokeToken(context.Background(), tokenID, revokedAt); err != nil {
 		if journaled && errors.Is(err, auth.ErrTokenAlreadyRevoked) {
 			return refuseTokenAlreadyRevokedInJournal(tokenID)
+		}
+		if journaled && errors.Is(err, auth.ErrTokenNotFound) {
+			return refuseTokenRevokeNoLocalRecord(tokenID)
 		}
 		if journaled {
 			return refuseTokenRevokeDiskIncomplete(tokenID, err)

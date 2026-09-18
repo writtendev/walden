@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/writtendev/walden/internal/refusal"
 )
 
 var (
@@ -17,6 +19,20 @@ var (
 	ErrInvalidStream  = errors.New("invalid stream id")
 	ErrInvalidSeq     = errors.New("invalid sequence format")
 	ErrInvalidHash    = errors.New("invalid hash format")
+
+	// ErrObjectNotFound marks a Get against a key that does not exist. An
+	// absent marker.json is the ordinary genesis-replay path (spec section
+	// 7.5 step 1), not a failure, so callers test for this sentinel rather
+	// than treat every Get error alike. store.ErrObjectNotFound
+	// (internal/store/client.go) is aliased to this one sentinel rather
+	// than declaring its own — the same one-sentinel-not-two pattern
+	// store.ErrPrecondition already uses for journal.ErrPreconditionFailed.
+	ErrObjectNotFound = errors.New("object not found")
+
+	// ErrSequenceGap indicates that transaction sequence numbers on a
+	// stream are not strictly contiguous during replay (spec section 8.1
+	// rule 4).
+	ErrSequenceGap = errors.New("sequence gap")
 )
 
 // StreamID uniquely identifies a journal stream (e.g. a repository or meta stream).
@@ -195,6 +211,21 @@ func ValidateHash(hash string) error {
 		return fmt.Errorf("%w: must be 64 hexadecimal characters, got %q", ErrInvalidHash, hash)
 	}
 	return nil
+}
+
+// RefuseSequenceGap returns a single-line operator-facing refusal when
+// sequence numbers on a stream are not strictly contiguous during replay
+// (spec section 8.1 rule 4): the reader found actual where it expected
+// expected, and stops rather than skip over or guess at what filled the
+// gap. Shared with WALD-31's _meta contiguity check, which needs the
+// identical wording for the identical rule on a different stream.
+func RefuseSequenceGap(stream StreamID, expected, actual Seq) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("sequence gap detected on stream %s (expected %d, got %d)", stream, expected, actual),
+		"",
+		ErrSequenceGap,
+	)
 }
 
 // RefUpdate represents a single ref transition (e.g., refs/heads/main: OldOID -> NewOID).

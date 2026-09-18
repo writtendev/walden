@@ -266,3 +266,32 @@ func TestValidateHash(t *testing.T) {
 		}
 	}
 }
+
+// TestRefuseSequenceGap pins section 8.1 rule 4's exact wording. WALD-31
+// shares this constructor for _meta's own contiguity check, so the wording
+// is not repeated a second time under a second name.
+func TestRefuseSequenceGap(t *testing.T) {
+	err := journal.RefuseSequenceGap("repo-alpha", 2, 3)
+	if !errors.Is(err, journal.ErrSequenceGap) {
+		t.Errorf("errors.Is(_, journal.ErrSequenceGap) = false, err = %v", err)
+	}
+	want := "refusal: replay failed: sequence gap detected on stream repo-alpha (expected 2, got 3)"
+	if err.Error() != want {
+		t.Errorf("RefuseSequenceGap = %q, want %q", err.Error(), want)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+}
+
+// TestErrObjectNotFoundIsSharedWithStore pins the one-sentinel-not-two
+// pattern this ticket applies to ErrObjectNotFound, the same pattern
+// journal.ErrPreconditionFailed/store.ErrPrecondition already use: nothing
+// beyond identity is asserted here, since store's own alias
+// (internal/store/client.go) is what makes errors.Is(_, store.ErrObjectNotFound)
+// and errors.Is(_, journal.ErrObjectNotFound) the same question.
+func TestErrObjectNotFoundIsSharedWithStore(t *testing.T) {
+	if journal.ErrObjectNotFound == nil {
+		t.Fatal("journal.ErrObjectNotFound is nil")
+	}
+}

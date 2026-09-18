@@ -1438,3 +1438,310 @@ func TestMarshalRefTxRefusesNonUTF8RefName(t *testing.T) {
 		t.Errorf("refusal is not one line: %q", err.Error())
 	}
 }
+
+// WALD-34: ParseRefTx and RefuseRefTxSignatureMismatch — the read side of
+// the ref-transaction record, in the style of ParseMarker/ParseTokenCreate.
+
+// TestParseRefTx covers the round trip: a record built, signed, and
+// marshaled through MarshalRefTx parses back through ParseRefTx to an
+// identical record.
+func TestParseRefTx(t *testing.T) {
+	priv, _ := deterministicKeypair(0x05)
+
+	rec := journal.NewRefTransactionRecord("repo-alpha", 3, 1, "2026-08-31T00:02:00Z",
+		[]string{"4a49646b96dbca4f1eb8699ef7cefdcae68fefc6ee7ae6305a3f25c7e1ef5638"},
+		[]journal.RefUpdate{
+			{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+		},
+	)
+	if err := journal.SignRefTx(priv, rec); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	data, err := journal.MarshalRefTx(rec)
+	if err != nil {
+		t.Fatalf("MarshalRefTx failed: %v", err)
+	}
+
+	parsed, err := journal.ParseRefTx(data)
+	if err != nil {
+		t.Fatalf("ParseRefTx failed: %v", err)
+	}
+	if !reflect.DeepEqual(*parsed, *rec) {
+		t.Errorf("ParseRefTx round trip mismatch:\ngot:  %+v\nwant: %+v", *parsed, *rec)
+	}
+}
+
+// TestParseRefTxEmptyData covers the same "nothing to parse" guard
+// ParseMarker and ParseGenesis apply to their own empty-input case.
+func TestParseRefTxEmptyData(t *testing.T) {
+	_, err := journal.ParseRefTx(nil)
+	if err == nil {
+		t.Fatal("expected an error for empty ref transaction data, got nil")
+	}
+	if !errors.Is(err, journal.ErrInvalidRefTx) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+	}
+}
+
+// TestParseRefTxCorruptJSON covers malformed JSON bytes, distinct from a
+// well-formed document missing a required field.
+func TestParseRefTxCorruptJSON(t *testing.T) {
+	_, err := journal.ParseRefTx([]byte("{not json"))
+	if err == nil {
+		t.Fatal("expected an error for corrupt JSON, got nil")
+	}
+	if !errors.Is(err, journal.ErrInvalidRefTx) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+	}
+}
+
+// TestParseRefTxMissingFields covers every field ParseRefTx requires to be
+// present, styled on TestParseMarkerMissingFields: each one, removed alone
+// from an otherwise-complete document, is refused by name; the complete
+// document is the control that proves each failure comes from the field
+// actually being absent.
+func TestParseRefTxMissingFields(t *testing.T) {
+	priv, _ := deterministicKeypair(0x06)
+	rec := journal.NewRefTransactionRecord("repo-alpha", 0, 0, "2026-08-31T00:02:00Z", nil,
+		[]journal.RefUpdate{
+			{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+		},
+	)
+	if err := journal.SignRefTx(priv, rec); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+	data, err := journal.MarshalRefTx(rec)
+	if err != nil {
+		t.Fatalf("MarshalRefTx failed: %v", err)
+	}
+
+	var complete map[string]any
+	if err := json.Unmarshal(data, &complete); err != nil {
+		t.Fatalf("failed to unmarshal the marshaled record into a map: %v", err)
+	}
+
+	for _, field := range []string{"version", "stream", "seq", "type", "timestamp", "signature"} {
+		t.Run("missing "+field, func(t *testing.T) {
+			doc := make(map[string]any, len(complete))
+			for k, v := range complete {
+				if k == field {
+					continue
+				}
+				doc[k] = v
+			}
+			docData, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatalf("failed to marshal test document: %v", err)
+			}
+			_, err = journal.ParseRefTx(docData)
+			if err == nil {
+				t.Fatalf("expected error for a ref transaction missing %q, got nil", field)
+			}
+			if !errors.Is(err, journal.ErrInvalidRefTx) {
+				t.Errorf("expected ErrInvalidRefTx for missing %q, got %v", field, err)
+			}
+			if !strings.Contains(err.Error(), field) {
+				t.Errorf("expected error naming the missing field %q, got %q", field, err.Error())
+			}
+		})
+	}
+
+	// The complete document, unmodified, must parse.
+	if _, err := journal.ParseRefTx(data); err != nil {
+		t.Fatalf("ParseRefTx failed on a complete document: %v", err)
+	}
+}
+
+// TestParseRefTxKeyEpochAbsentDefaultsToZero pins spec section 5.1's own
+// words: "A record with no key_epoch at all is read as epoch 0,
+// identically to an explicit 'key_epoch': '0'." Unlike every other field
+// ParseRefTx requires, an absent key_epoch is not a parse failure —
+// segments and updates default the same way TestParseRefTxSegmentsAndUpdatesOptional
+// below pins.
+func TestParseRefTxKeyEpochAbsentDefaultsToZero(t *testing.T) {
+	raw := `{
+		"version": "v1",
+		"stream": "repo-alpha",
+		"seq": "0",
+		"type": "ref_update",
+		"segments": [],
+		"updates": [{"ref": "refs/heads/main", "old_oid": "` + journal.ZeroOID40 + `", "new_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"}],
+		"timestamp": "2026-08-31T00:02:00Z",
+		"signature": "ed25519:e3663b676f671095e4b8653ddc1419b2349d39a8adab7f28b1cb6574bc62963ec2f03996af92d34d6e2fab685c365a180d411053af476d4b319fe6a9359a8805"
+	}`
+
+	rec, err := journal.ParseRefTx([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseRefTx failed on a record with no key_epoch field: %v", err)
+	}
+	if rec.KeyEpoch != 0 {
+		t.Errorf("KeyEpoch = %d, want 0 for an absent key_epoch field", rec.KeyEpoch)
+	}
+}
+
+// TestParseRefTxSegmentsAndUpdatesOptional covers the two fields whose
+// absence Validate() already turns into either the empty slice (Segments)
+// or a refusal with its own established wording (Updates) — ParseRefTx
+// adds no separate presence check for either, since doing so would only
+// duplicate what Validate does.
+func TestParseRefTxSegmentsAndUpdatesOptional(t *testing.T) {
+	t.Run("segments absent defaults to empty", func(t *testing.T) {
+		raw := `{
+			"version": "v1",
+			"stream": "repo-alpha",
+			"seq": "0",
+			"type": "ref_update",
+			"key_epoch": "0",
+			"updates": [{"ref": "refs/heads/main", "old_oid": "` + journal.ZeroOID40 + `", "new_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"}],
+			"timestamp": "2026-08-31T00:02:00Z",
+			"signature": "ed25519:e3663b676f671095e4b8653ddc1419b2349d39a8adab7f28b1cb6574bc62963ec2f03996af92d34d6e2fab685c365a180d411053af476d4b319fe6a9359a8805"
+		}`
+		rec, err := journal.ParseRefTx([]byte(raw))
+		if err != nil {
+			t.Fatalf("ParseRefTx failed on a record with no segments field: %v", err)
+		}
+		if rec.Segments == nil || len(rec.Segments) != 0 {
+			t.Errorf("Segments = %+v, want a non-nil empty slice", rec.Segments)
+		}
+	})
+
+	t.Run("updates absent is refused, not defaulted", func(t *testing.T) {
+		raw := `{
+			"version": "v1",
+			"stream": "repo-alpha",
+			"seq": "0",
+			"type": "ref_update",
+			"key_epoch": "0",
+			"segments": [],
+			"timestamp": "2026-08-31T00:02:00Z",
+			"signature": "ed25519:e3663b676f671095e4b8653ddc1419b2349d39a8adab7f28b1cb6574bc62963ec2f03996af92d34d6e2fab685c365a180d411053af476d4b319fe6a9359a8805"
+		}`
+		_, err := journal.ParseRefTx([]byte(raw))
+		if !errors.Is(err, journal.ErrInvalidRefTx) {
+			t.Errorf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+		}
+	})
+}
+
+// TestParseRefTxUnknownFieldsIgnored covers spec section 5.4: readers
+// ignore unrecognized JSON object keys.
+func TestParseRefTxUnknownFieldsIgnored(t *testing.T) {
+	priv, pub := deterministicKeypair(0x07)
+	formattedPub := journal.FormatPublicKey(pub)
+	rec := journal.NewRefTransactionRecord("repo-alpha", 0, 0, "2026-08-31T00:02:00Z", nil,
+		[]journal.RefUpdate{
+			{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+		},
+	)
+	if err := journal.SignRefTx(priv, rec); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+
+	raw := `{
+		"version": "v1",
+		"stream": "repo-alpha",
+		"seq": "0",
+		"type": "ref_update",
+		"key_epoch": "0",
+		"segments": [],
+		"updates": [{"ref": "refs/heads/main", "old_oid": "` + journal.ZeroOID40 + `", "new_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904", "extra": "ignored"}],
+		"timestamp": "2026-08-31T00:02:00Z",
+		"signature": "` + rec.Signature + `",
+		"future_field": "ignored too"
+	}`
+
+	parsed, err := journal.ParseRefTx([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseRefTx failed on a record with unknown fields: %v", err)
+	}
+	if err := journal.VerifyRefTx(parsed, formattedPub); err != nil {
+		t.Errorf("VerifyRefTx failed on a record round-tripped through unknown fields: %v", err)
+	}
+}
+
+// TestParseRefTxNonUTF8RefNameFailsClosedOnVerify answers the question
+// WALD-27 left open for this ticket: what should ParseRefTx do with a ref
+// name that is not valid UTF-8?
+//
+// MarshalRefTx already refuses to write one (TestMarshalRefTxRefusesNonUTF8RefName),
+// because JSON cannot carry arbitrary bytes losslessly — encoding/json
+// substitutes U+FFFD for an invalid byte sequence instead of erroring, on
+// both encode and decode. That guard is the only thing keeping such a
+// record out of the journal in the first place, so a record like this can
+// only exist if something other than this package's own writer put it
+// there. When it does, ParseRefTx has no way to recover the original
+// bytes either: it decodes through the same encoding/json, which performs
+// the identical substitution going in. The record does not come back
+// looking valid with a corrupted ref name — the substitution changes the
+// bytes CanonicalRefUpdatePayload is computed over, so the signature that
+// was computed over the real bytes no longer matches, and
+// chain.VerifyRefTx refuses it as an ordinary signature mismatch (rule
+// 3). No separate check is added to ParseRefTx for this case: the
+// existing signature check already closes it. See WALD-119 for the
+// analogous, still-open gap in MarshalMarker.
+func TestParseRefTxNonUTF8RefNameFailsClosedOnVerify(t *testing.T) {
+	priv, pub := deterministicKeypair(0x08)
+	formattedPub := journal.FormatPublicKey(pub)
+
+	// "café" encoded as Latin-1 rather than UTF-8, as in
+	// TestMarshalRefTxRefusesNonUTF8RefName: legal per
+	// git-check-ref-format, but not valid UTF-8.
+	nonUTF8Ref := "refs/heads/caf\xe9"
+	if utf8.ValidString(nonUTF8Ref) {
+		t.Fatalf("test fixture %q is valid UTF-8; this test needs a byte sequence that genuinely is not", nonUTF8Ref)
+	}
+
+	rec := journal.NewRefTransactionRecord("repo-alpha", 0, 0, "2026-08-31T00:00:00Z", nil,
+		[]journal.RefUpdate{
+			{Ref: nonUTF8Ref, OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+		},
+	)
+	if err := journal.SignRefTx(priv, rec); err != nil {
+		t.Fatalf("SignRefTx failed: %v", err)
+	}
+
+	// Hand-built JSON carrying the exact raw bytes, standing in for a
+	// record written by something other than MarshalRefTx: string
+	// concatenation, not json.Marshal, which would perform the same
+	// U+FFFD substitution on the way out that this test needs ParseRefTx
+	// to perform on the way in.
+	raw := []byte(`{
+		"version": "v1",
+		"stream": "repo-alpha",
+		"seq": "0",
+		"type": "ref_update",
+		"key_epoch": "0",
+		"segments": [],
+		"updates": [{"ref": "` + nonUTF8Ref + `", "old_oid": "` + journal.ZeroOID40 + `", "new_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"}],
+		"timestamp": "2026-08-31T00:00:00Z",
+		"signature": "` + rec.Signature + `"
+	}`)
+
+	parsed, err := journal.ParseRefTx(raw)
+	if err != nil {
+		t.Fatalf("ParseRefTx failed: %v", err)
+	}
+	if parsed.Updates[0].Ref == nonUTF8Ref {
+		t.Fatalf("test fixture did not exercise JSON's own U+FFFD substitution; got back the exact non-UTF-8 bytes")
+	}
+
+	err = journal.VerifyRefTx(parsed, formattedPub)
+	if !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("expected ErrSignatureMismatch once JSON has mangled the non-UTF-8 ref name, got %v", err)
+	}
+}
+
+// TestRefuseRefTxSignatureMismatch pins section 8.1 rule 3's exact wording.
+func TestRefuseRefTxSignatureMismatch(t *testing.T) {
+	err := journal.RefuseRefTxSignatureMismatch("repo-alpha", 4)
+	if !errors.Is(err, journal.ErrSignatureMismatch) {
+		t.Errorf("errors.Is(_, journal.ErrSignatureMismatch) = false, err = %v", err)
+	}
+	want := "refusal: replay failed: signature mismatch for ref update on stream repo-alpha at seq 4"
+	if err.Error() != want {
+		t.Errorf("RefuseRefTxSignatureMismatch = %q, want %q", err.Error(), want)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+}

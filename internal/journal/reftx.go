@@ -345,6 +345,87 @@ func (r *RefTransactionRecord) Validate() error {
 	return nil
 }
 
+// refTxShadow decodes tx/<seq>.json into pointer fields so that ParseRefTx
+// can tell a field that is genuinely absent from one that decoded to its
+// zero value — the same discipline markerShadow (marker.go) and
+// tokenCreateShadow (token.go) already apply to their own record types.
+//
+// KeyEpoch is deliberately not a pointer here, unlike every other field:
+// section 5.1 states plainly that "a record with no key_epoch at all is
+// read as epoch 0, identically to an explicit 'key_epoch': '0'" — an
+// absent key_epoch is not an error to catch, it is the documented
+// default. Segments and Updates are plain slices for the same reason:
+// Validate() already turns a nil Segments into an empty one and already
+// refuses an Updates array with no entries (nil included), so a shadow
+// presence check would only duplicate what Validate does, not catch
+// anything it misses.
+type refTxShadow struct {
+	Version   *string     `json:"version"`
+	Stream    *StreamID   `json:"stream"`
+	Seq       *Seq        `json:"seq"`
+	Type      *string     `json:"type"`
+	KeyEpoch  Epoch       `json:"key_epoch"`
+	Segments  []string    `json:"segments"`
+	Updates   []RefUpdate `json:"updates"`
+	Timestamp *string     `json:"timestamp"`
+	Signature *string     `json:"signature"`
+}
+
+// ParseRefTx parses and validates a tx/<seq>.json ref-transaction record's
+// JSON bytes, in the style of ParseMarker and ParseTokenCreate: decode into
+// a shadow of pointer fields so a genuinely missing required field is
+// refused by name rather than silently read as its zero value, then run
+// Validate() before returning. Unknown JSON keys are ignored, per spec
+// section 5.4's forward-compatibility rule.
+//
+// ParseRefTx does not itself verify the signature or assert Type ==
+// "ref_update" beyond what Validate() already checks — callers replaying a
+// stream do that against a *SigningChain (see (*SigningChain).VerifyRefTx),
+// using the record's own declared Type rather than inferring it from where
+// its key was found.
+func ParseRefTx(data []byte) (*RefTransactionRecord, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%w: empty ref transaction data", ErrInvalidRefTx)
+	}
+	var shadow refTxShadow
+	if err := json.Unmarshal(data, &shadow); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidRefTx, err)
+	}
+	missing := ""
+	switch {
+	case shadow.Version == nil:
+		missing = "version"
+	case shadow.Stream == nil:
+		missing = "stream"
+	case shadow.Seq == nil:
+		missing = "seq"
+	case shadow.Type == nil:
+		missing = "type"
+	case shadow.Timestamp == nil:
+		missing = "timestamp"
+	case shadow.Signature == nil:
+		missing = "signature"
+	}
+	if missing != "" {
+		return nil, fmt.Errorf("%w: missing required field %q", ErrInvalidRefTx, missing)
+	}
+	r := &RefTransactionRecord{
+		Version:   *shadow.Version,
+		Stream:    *shadow.Stream,
+		Seq:       *shadow.Seq,
+		Type:      *shadow.Type,
+		KeyEpoch:  shadow.KeyEpoch,
+		Segments:  shadow.Segments,
+		Updates:   shadow.Updates,
+		Timestamp: *shadow.Timestamp,
+		Signature: *shadow.Signature,
+	}
+	if err := r.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidRefTx, err)
+	}
+	return r, nil
+}
+
 // CanonicalRefUpdatePayload returns the deterministic canonical byte payload to sign/verify for a RefTransactionRecord.
 // Ref names are embedded as exact byte sequences without Unicode normalization.
 func CanonicalRefUpdatePayload(stream StreamID, seq Seq, keyEpoch Epoch, timestamp string, segments []string, updates []RefUpdate) []byte {
@@ -484,5 +565,20 @@ func RefuseKeyEpochRegression(stream StreamID, seq Seq, epoch, lastEpoch Epoch) 
 		fmt.Sprintf("ref update on stream %s at seq %d names key epoch %s below epoch %s already seen on this stream", stream, seq, epoch, lastEpoch),
 		"",
 		ErrKeyEpochRegression,
+	)
+}
+
+// RefuseRefTxSignatureMismatch returns a single-line operator-facing refusal
+// when a ref-transaction record's signature does not verify against the key
+// its own key_epoch names (spec section 8.1 rule 3). A reader replaying a
+// stream maps the raw ErrSignatureMismatch VerifyRefTx returns onto this
+// constructor rather than surfacing VerifyRefTx's own message, which quotes
+// the stream id and is not the wording section 8.1 publishes.
+func RefuseRefTxSignatureMismatch(stream StreamID, seq Seq) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("signature mismatch for ref update on stream %s at seq %d", stream, seq),
+		"",
+		ErrSignatureMismatch,
 	)
 }

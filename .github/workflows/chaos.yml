@@ -108,11 +108,27 @@ jobs:
           # concurrent half's fix above addresses that; if it recurred,
           # it would scale with rounds x K, not with rounds alone): it
           # tracks the sequential half's own fault catalogue, which
-          # deliberately severs the connection (storetest.Fault.Drop, two
-          # of unknownOutcomeFault's six shapes) on roughly 1 in 12 rounds
-          # by design, each one a genuine TCP close this test exists to
+          # deliberately severs the connection on roughly 1 in 6 rounds by
+          # design, not 1 in 12 - a round-3 review correction to this
+          # comment. classUnknownOutcome is drawn 1 in 4 rounds
+          # (pickFaultClass), and within it unknownOutcomeFault draws six
+          # shapes uniformly (r.Intn(6)), of which four - not two - sever
+          # the connection: storetest.Fault.Drop, with or without Land
+          # (cases 0-1), and storetest.Fault.TruncateBody (the default
+          # case, 4-5), which also hijackDrops the connection after
+          # writing its truncated bytes (storetest.go's handlePut). Only
+          # the remaining two of six (cases 2-3) are a bare 500/502/504
+          # with no connection close. So 4/6 x 1/4 = 1/6 rounds sever the
+          # connection, each one a genuine TCP close this test exists to
           # inject - not a bug, and not something either fix above is
-          # trying to eliminate. 10000 rounds of just the sequential half
+          # trying to eliminate. The rate correction does not change the
+          # peak or the headroom claim above: both were measured directly
+          # from a real run, which already exercised TruncateBody's own
+          # hijackDrop alongside Drop's, not derived from the (previously
+          # wrong) 1-in-12 figure; re-measured after this correction
+          # (same machine, same method): 96.44s combined and a peak of
+          # 383 TIME_WAIT sockets, in line with the original 380. 10000
+          # rounds of just the sequential half
           # alone measured 355s in the same environment before this fix,
           # unaffected by the port work (that half's own client and round
           # budget are unchanged) - continued superlinear growth, and

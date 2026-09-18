@@ -133,18 +133,36 @@ const (
 	// TestChaosWritePathFaultsAndRestart, whose seeded fault catalogue keeps
 	// exploring new ground every additional round, this test has no
 	// catalogue and no seed - every round is the same fixed barrier over
-	// the same K=5 instances, and every assertion already holds under every
-	// interleaving by construction (see this test's own doc comment). More
-	// rounds past a few hundred buy back-to-back confirmations of a
-	// property that does not vary round to round, not new coverage, so
-	// capping this test's own budget independently - rather than scaling it
-	// 1:1 with the sequential half's - trades away nothing the nightly run
-	// exists to catch. 500 is 12.5x chaosDefaultConcurrentRounds (the same
-	// order of magnitude the nightly scales the sequential half's default
-	// by) and is small enough, combined with newChaosConcurrentClient's
-	// wider connection pool, to keep this test's own port usage
-	// unremarkable even at that scale - see .github/workflows/chaos.yml for
-	// the measured figures.
+	// the same K=5 instances.
+	//
+	// Round-3 review corrected the reasoning that used to stand here.
+	// "Every assertion already holds under every interleaving by
+	// construction" is true, and it is why a failure in this test is never
+	// a flake (see this test's own doc comment) - but that is a claim
+	// about the assertions, not about what repeating the race explores.
+	// What varies round to round is the schedule, not the property:
+	// which of the K instances reaches the fake's CAS mutex first, and
+	// where the Go runtime preempts each goroutine. Sampling schedules is
+	// the only reason to run a race test more than once at all, so rounds
+	// past a few hundred still buy real, if steeply diminishing,
+	// interleaving coverage - not merely "confirmation of a property that
+	// does not vary round to round," which would equally have justified
+	// capping this at 5.
+	//
+	// The cap holds anyway, for the reason that actually binds: port
+	// budget, not a coverage ceiling. At K=5 shared-client connections per
+	// round, even newChaosConcurrentClient's wider pool leaves this half's
+	// port usage scaling with round count (see its own doc comment), and
+	// 500 is sized to keep that unremarkable rather than to stop sampling
+	// new schedules - see .github/workflows/chaos.yml for the measured
+	// figures. 500 is 12.5x chaosDefaultConcurrentRounds (the same order
+	// of magnitude the nightly scales the sequential half's default by),
+	// and every mutation this half alone catches, it catches by iteration
+	// 1 (see the PR's round-2 and round-3 review for the re-run mutation
+	// table) - so nothing this file currently relies on this half to
+	// detect is lost at 500. Raising the cap trades port budget for more
+	// interleaving sampling; it is not fixing an assertion that is
+	// unsound below it.
 	chaosConcurrentRoundsCap = 500
 )
 

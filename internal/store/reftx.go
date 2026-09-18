@@ -24,7 +24,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"fmt"
 	"time"
 
@@ -33,9 +32,9 @@ import (
 )
 
 // AppendRefTx builds a RefTransactionRecord at the sequence lease hands
-// out, signs it with priv under keyEpoch, marshals it, and conditionally
-// writes it to "v1/streams/<stream>/tx/<seq>.json" (spec/journal/v1
-// section 9.2), returning the sequence it landed at.
+// out, signs it with signer (its epoch and private key, WALD-30), marshals
+// it, and conditionally writes it to "v1/streams/<stream>/tx/<seq>.json"
+// (spec/journal/v1 section 9.2), returning the sequence it landed at.
 //
 // The stream comes from lease.Stream(), never a separate parameter: a
 // stream argument that could disagree with the lease it is appending
@@ -65,8 +64,12 @@ import (
 //     panics exactly where the checks below guard against panicking —
 //     and unlike the clock (see below), ctx cannot be hoisted out of the
 //     callback, because PutIfAbsent needs it at the point of the write.
-//  2. A private key of the wrong size. Also load-bearing: ed25519.Sign
-//     panics on a wrong-size key.
+//  2. A nil signer. Also load-bearing: signer.SignRefTx is called inside
+//     the callback, and a method call through a nil *journal.Signer
+//     panics exactly where check 1 guards ctx against panicking.
+//     (journal.NewSigner already refuses a wrong-size or mismatched key
+//     when the signer is built, so that check now lives there instead of
+//     here — see WALD-30.)
 //  3. A nil now. now is never called inside the callback (see below), so
 //     this check is no longer load-bearing against a panic there; it
 //     stays because it is one line and turns the common "forgot to pass
@@ -88,11 +91,11 @@ import (
 // unknown-outcome path. That is the failure mode round 2 of this file's
 // review found the nil check alone did not close.
 //
-// With ctx, priv, and the clock's call site all accounted for above, the
+// With ctx, signer, and the clock's call site all accounted for above, the
 // callback itself is left with: building the record (a struct literal),
-// signing it (ed25519.Sign, given a key check 2 already sized correctly),
-// marshaling it (pure, error-returning), and one conditional PUT (given a
-// ctx check 1 already proved non-nil). Nothing else in it takes
+// signing it (signer.SignRefTx, given a non-nil signer check 2 already
+// proved), marshaling it (pure, error-returning), and one conditional PUT
+// (given a ctx check 1 already proved non-nil). Nothing else in it takes
 // caller-supplied input that reaches a known panic site. That is narrower
 // than "no panic path left" — this comment does not repeat that claim a
 // third time — but it is what an audit of this callback's own call chain
@@ -108,8 +111,7 @@ import (
 func (c *Client) AppendRefTx(
 	ctx context.Context,
 	lease *journal.Lease,
-	priv ed25519.PrivateKey,
-	keyEpoch journal.Epoch,
+	signer *journal.Signer,
 	segments []string,
 	updates []journal.RefUpdate,
 	now func() time.Time,
@@ -117,8 +119,8 @@ func (c *Client) AppendRefTx(
 	if ctx == nil {
 		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("ctx must not be nil"))
 	}
-	if len(priv) != ed25519.PrivateKeySize {
-		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("ed25519 private key must be %d bytes, got %d", ed25519.PrivateKeySize, len(priv)))
+	if signer == nil {
+		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("signer must not be nil"))
 	}
 	if now == nil {
 		return 0, refuseAppendRefTx(lease.Stream(), fmt.Errorf("now must not be nil"))
@@ -139,8 +141,8 @@ func (c *Client) AppendRefTx(
 	var seq journal.Seq
 	err := lease.Append(func(s journal.Seq) error {
 		seq = s
-		rec := journal.NewRefTransactionRecord(lease.Stream(), s, keyEpoch, ts, segments, updates)
-		if err := journal.SignRefTx(priv, rec); err != nil {
+		rec := journal.NewRefTransactionRecord(lease.Stream(), s, signer.Epoch(), ts, segments, updates)
+		if err := signer.SignRefTx(rec); err != nil {
 			return err
 		}
 		data, err := journal.MarshalRefTx(rec)

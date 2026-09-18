@@ -1,16 +1,18 @@
-// Tests for (*Client).AppendRefTx (WALD-27), driven against storetest.Fake
-// the same way storetest_client_test.go and genesis_test.go are: a pass
-// here means the write path proves spec/journal/v1 section 11's actual
-// "done when" end to end — a real 412 through PutIfAbsent becomes a fencing
-// refusal, and a merely retryable failure never does, with the sequence
-// left reusable — against something that actually enforces the
-// compare-and-swap contract, not a mock that only knows what a test author
-// remembered to assert.
+// Tests for (*Client).AppendRefTx (WALD-27, reshaped by WALD-30 to take a
+// *journal.Signer in place of a bare priv/keyEpoch pair), driven against
+// storetest.Fake the same way storetest_client_test.go and genesis_test.go
+// are: a pass here means the write path proves spec/journal/v1 section
+// 11's actual "done when" end to end — a real 412 through PutIfAbsent
+// becomes a fencing refusal, and a merely retryable failure never does,
+// with the sequence left reusable — against something that actually
+// enforces the compare-and-swap contract, not a mock that only knows what
+// a test author remembered to assert.
 package store_test
 
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -51,6 +53,27 @@ func assertReftxOneLine(t *testing.T, err error) {
 	}
 }
 
+// testSigner builds a *journal.Signer for priv against a fresh single-key
+// signing chain whose genesis record names priv's own public half at
+// epoch 0 — a self-contained signer for tests that only care that
+// AppendRefTx receives a valid one, not that it came from a real journal's
+// genesis record (internal/store/signer_test.go covers deriving a Signer
+// from an actual journal via LoadSigner).
+func testSigner(t *testing.T, priv ed25519.PrivateKey) *journal.Signer {
+	t.Helper()
+	pub := priv.Public().(ed25519.PublicKey)
+	rec := journal.NewGenesisRecord(pub, fixedReftxNow().UTC().Format(time.RFC3339))
+	chain := journal.NewSigningChain()
+	if err := chain.ApplyGenesis(rec); err != nil {
+		t.Fatalf("ApplyGenesis: %v", err)
+	}
+	s, err := journal.NewSigner(chain, priv)
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+	return s
+}
+
 // 1. Happy path: the written key is fullKey(journal.TxKey(stream, 0)), the
 // bytes at it equal MarshalRefTx's own output, the returned seq is 0, and
 // the record we wrote is one a replay can verify (journal.VerifyRefTx
@@ -64,6 +87,7 @@ func TestAppendRefTxHappyPathAndLeaseAdvance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	leases := journal.NewLeases(c)
 	lease, err := leases.Open(ctx, "repo-alpha")
@@ -74,7 +98,7 @@ func TestAppendRefTxHappyPathAndLeaseAdvance(t *testing.T) {
 	segments := []string{"db89aeed94af475ae97ce5fe75618d404f017d23e0aa61ce1c7abd11707dbbab"}
 	updates := reftxUpdates()
 
-	seq, err := c.AppendRefTx(ctx, lease, priv, 0, segments, updates, fixedReftxNow)
+	seq, err := c.AppendRefTx(ctx, lease, signer, segments, updates, fixedReftxNow)
 	if err != nil {
 		t.Fatalf("AppendRefTx: %v", err)
 	}
@@ -96,7 +120,7 @@ func TestAppendRefTxHappyPathAndLeaseAdvance(t *testing.T) {
 		t.Fatalf("VerifyRefTx on the written record: %v", err)
 	}
 
-	rebuilt := journal.NewRefTransactionRecord("repo-alpha", 0, 0, fixedReftxNow().UTC().Format(time.RFC3339), segments, updates)
+	rebuilt := journal.NewRefTransactionRecord("repo-alpha", 0, signer.Epoch(), fixedReftxNow().UTC().Format(time.RFC3339), segments, updates)
 	rebuilt.Signature = rec.Signature
 	want, err := journal.MarshalRefTx(rebuilt)
 	if err != nil {
@@ -107,7 +131,7 @@ func TestAppendRefTxHappyPathAndLeaseAdvance(t *testing.T) {
 	}
 
 	// The lease advances: a second AppendRefTx on the same lease writes seq 1.
-	seq2, err := c.AppendRefTx(ctx, lease, priv, 0, segments, updates, fixedReftxNow)
+	seq2, err := c.AppendRefTx(ctx, lease, signer, segments, updates, fixedReftxNow)
 	if err != nil {
 		t.Fatalf("second AppendRefTx: %v", err)
 	}
@@ -131,6 +155,7 @@ func TestAppendRefTxPreconditionFencesStreamAndStopsFurtherWrites(t *testing.T) 
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	leases := journal.NewLeases(c)
 	lease, err := leases.Open(ctx, "repo-alpha")
@@ -145,7 +170,7 @@ func TestAppendRefTxPreconditionFencesStreamAndStopsFurtherWrites(t *testing.T) 
 		Fault: storetest.Fault{Rival: []byte(`{"rival":true}`)},
 	})
 
-	_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	_, err = c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 	want := journal.RefuseStreamFenced("repo-alpha", 0).Error()
 	if err == nil || err.Error() != want {
 		t.Fatalf("AppendRefTx error:\ngot:  %v\nwant: %q", err, want)
@@ -156,7 +181,7 @@ func TestAppendRefTxPreconditionFencesStreamAndStopsFurtherWrites(t *testing.T) 
 
 	callsBefore := len(fake.Calls())
 
-	_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	_, err = c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 	wantPerm := journal.RefusePermanentlyFenced("repo-alpha").Error()
 	if err == nil || err.Error() != wantPerm {
 		t.Fatalf("AppendRefTx after fencing:\ngot:  %v\nwant: %q", err, wantPerm)
@@ -178,6 +203,7 @@ func TestAppendRefTxLandedThenUnacknowledgedFencesWithUnknownOutcome(t *testing.
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	leases := journal.NewLeases(c)
 	lease, err := leases.Open(ctx, "repo-gamma")
@@ -192,7 +218,7 @@ func TestAppendRefTxLandedThenUnacknowledgedFencesWithUnknownOutcome(t *testing.
 		Fault: storetest.Fault{Land: true, Status: http.StatusInternalServerError},
 	})
 
-	_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	_, err = c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 	want := journal.RefuseAppendOutcomeUnknown("repo-gamma", 0).Error()
 	if err == nil || err.Error() != want {
 		t.Fatalf("AppendRefTx error:\ngot:  %v\nwant: %q", err, want)
@@ -218,6 +244,7 @@ func TestAppendRefTxRetryableFailureLeavesSequenceReusable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	leases := journal.NewLeases(c)
 	lease, err := leases.Open(ctx, "repo-delta")
@@ -234,7 +261,7 @@ func TestAppendRefTxRetryableFailureLeavesSequenceReusable(t *testing.T) {
 		Fault: storetest.Fault{Status: http.StatusServiceUnavailable, Code: "SlowDown"},
 	})
 
-	_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	_, err = c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 	if !errors.Is(err, store.ErrStorageUnavailable) {
 		t.Fatalf("errors.Is(_, ErrStorageUnavailable) = false, err = %v", err)
 	}
@@ -245,7 +272,7 @@ func TestAppendRefTxRetryableFailureLeavesSequenceReusable(t *testing.T) {
 		t.Errorf("expected no object written once retries were exhausted")
 	}
 
-	seq, err := c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	seq, err := c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 	if err != nil {
 		t.Fatalf("second AppendRefTx (after the retryable failure): %v", err)
 	}
@@ -265,6 +292,7 @@ func TestAppendRefTxStreamIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	leases := journal.NewLeases(c)
 	alpha, err := leases.Open(ctx, "repo-alpha")
@@ -283,11 +311,11 @@ func TestAppendRefTxStreamIsolation(t *testing.T) {
 		Fault: storetest.Fault{Rival: []byte(`{"rival":true}`)},
 	})
 
-	if _, err := c.AppendRefTx(ctx, alpha, priv, 0, nil, reftxUpdates(), fixedReftxNow); !errors.Is(err, journal.ErrFenced) {
+	if _, err := c.AppendRefTx(ctx, alpha, signer, nil, reftxUpdates(), fixedReftxNow); !errors.Is(err, journal.ErrFenced) {
 		t.Fatalf("expected repo-alpha to fence, got %v", err)
 	}
 
-	seq, err := c.AppendRefTx(ctx, beta, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	seq, err := c.AppendRefTx(ctx, beta, signer, nil, reftxUpdates(), fixedReftxNow)
 	if err != nil {
 		t.Fatalf("AppendRefTx(repo-beta) after repo-alpha fenced: %v", err)
 	}
@@ -302,11 +330,15 @@ func TestAppendRefTxStreamIsolation(t *testing.T) {
 // 6. Each pre-check AppendRefTx makes before ever calling lease.Append
 // refuses with zero entries added to fake.Calls() beyond whatever Open
 // itself already made, leaves the stream unfenced, and is exactly one
-// line - including the nil ctx and the wrong-size private key, the two
-// tests that prove a load-bearing pre-check refuses instead of fencing
-// (ctx.Err() on a nil ctx inside store.(*Client).do, or ed25519.Sign on a
-// wrong-size key, would otherwise panic inside lease.Append's callback
-// and fence a healthy stream through WALD-29's unknown-outcome path).
+// line - including the nil ctx and the nil signer, the two tests that
+// prove a load-bearing pre-check refuses instead of fencing (ctx.Err() on
+// a nil ctx inside store.(*Client).do, or a method call through a nil
+// *journal.Signer, would otherwise panic inside lease.Append's callback
+// and fence a healthy stream through WALD-29's unknown-outcome path). A
+// wrong-size or otherwise-mismatched private key can no longer reach
+// AppendRefTx at all as of WALD-30: journal.NewSigner refuses it before a
+// *journal.Signer can exist, so that case is covered by
+// internal/journal/signer_test.go's TestNewSignerRefusals instead of here.
 // TestAppendRefTxPanickingNowSurfacesBeforeLeaseInteraction below covers
 // the third member of that family - a non-nil clock that panics when
 // called - separately, since hoisting its call site out of the closure
@@ -316,6 +348,7 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	t.Run("nil ctx", func(t *testing.T) {
 		c, fake := newFakeClient(t)
@@ -326,7 +359,7 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 		}
 		callsBefore := len(fake.Calls())
 
-		_, err = c.AppendRefTx(nil, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+		_, err = c.AppendRefTx(nil, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 		assertReftxOneLine(t, err)
 		if errors.Is(err, journal.ErrFenced) {
 			t.Errorf("a nil ctx must refuse, not fence: %v", err)
@@ -339,7 +372,7 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 		}
 	})
 
-	t.Run("wrong-size private key", func(t *testing.T) {
+	t.Run("nil signer", func(t *testing.T) {
 		c, fake := newFakeClient(t)
 		ctx := context.Background()
 		leases := journal.NewLeases(c)
@@ -349,11 +382,10 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 		}
 		callsBefore := len(fake.Calls())
 
-		badPriv := priv[:len(priv)-1]
-		_, err = c.AppendRefTx(ctx, lease, badPriv, 0, nil, reftxUpdates(), fixedReftxNow)
+		_, err = c.AppendRefTx(ctx, lease, nil, nil, reftxUpdates(), fixedReftxNow)
 		assertReftxOneLine(t, err)
 		if errors.Is(err, journal.ErrFenced) {
-			t.Errorf("a malformed key must refuse, not fence: %v", err)
+			t.Errorf("a nil signer must refuse, not fence: %v", err)
 		}
 		if lease.Fencer().IsFenced("repo-alpha") {
 			t.Errorf("expected repo-alpha to remain unfenced")
@@ -373,7 +405,7 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 		}
 		callsBefore := len(fake.Calls())
 
-		_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), nil)
+		_, err = c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), nil)
 		assertReftxOneLine(t, err)
 		if errors.Is(err, journal.ErrFenced) {
 			t.Errorf("a nil now must refuse, not fence: %v", err)
@@ -396,7 +428,7 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 		}
 		callsBefore := len(fake.Calls())
 
-		_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+		_, err = c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 		assertReftxOneLine(t, err)
 		if errors.Is(err, journal.ErrFenced) {
 			t.Errorf("a ref transaction targeting _meta must refuse, not fence: %v", err)
@@ -419,7 +451,7 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 		}
 		callsBefore := len(fake.Calls())
 
-		_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, nil, fixedReftxNow)
+		_, err = c.AppendRefTx(ctx, lease, signer, nil, nil, fixedReftxNow)
 		assertReftxOneLine(t, err)
 		if errors.Is(err, journal.ErrFenced) {
 			t.Errorf("an empty updates array must refuse, not fence: %v", err)
@@ -435,7 +467,7 @@ func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T
 
 // 7. A Validate failure caught only inside lease.Append's closure - not by
 // any of AppendRefTx's five pre-checks - stays a plain error: a duplicate
-// ref in updates passes the non-nil-ctx, valid-key, non-nil-now,
+// ref in updates passes the non-nil-ctx, non-nil-signer, non-nil-now,
 // non-meta-stream, and non-empty-updates pre-checks, and is refused only
 // once SignRefTx calls RefTransactionRecord.Validate. WALD-29's Append
 // passes that error through unchanged (it matches neither
@@ -450,6 +482,7 @@ func TestAppendRefTxValidationFailureInsideClosureLeavesSequenceReusable(t *test
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	leases := journal.NewLeases(c)
 	lease, err := leases.Open(ctx, "repo-alpha")
@@ -458,15 +491,15 @@ func TestAppendRefTxValidationFailureInsideClosureLeavesSequenceReusable(t *test
 	}
 
 	// Two updates for the same ref: passes every pre-check (all five run
-	// against ctx, priv, now, the stream, and the updates slice as a whole,
-	// none of them look inside individual updates) and is caught only by
-	// Validate's duplicate-ref check inside the closure.
+	// against ctx, the signer, now, the stream, and the updates slice as a
+	// whole, none of them look inside individual updates) and is caught
+	// only by Validate's duplicate-ref check inside the closure.
 	dup := []journal.RefUpdate{
 		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
 		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: "5b825dc642cb6eb9a060e54bf8d69288fbee4904"},
 	}
 
-	_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, dup, fixedReftxNow)
+	_, err = c.AppendRefTx(ctx, lease, signer, nil, dup, fixedReftxNow)
 	if !errors.Is(err, journal.ErrInvalidRefTx) {
 		t.Fatalf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
 	}
@@ -482,7 +515,7 @@ func TestAppendRefTxValidationFailureInsideClosureLeavesSequenceReusable(t *test
 
 	// The sequence is unconsumed: the next AppendRefTx on the same lease
 	// still writes seq 0.
-	seq, err := c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	seq, err := c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 	if err != nil {
 		t.Fatalf("AppendRefTx after the validation failure: %v", err)
 	}
@@ -509,6 +542,7 @@ func TestAppendRefTxPanickingNowSurfacesBeforeLeaseInteraction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	leases := journal.NewLeases(c)
 	lease, err := leases.Open(ctx, "repo-alpha")
@@ -531,7 +565,7 @@ func TestAppendRefTxPanickingNowSurfacesBeforeLeaseInteraction(t *testing.T) {
 				t.Errorf("recovered panic = %v, want %q", r, "clock unavailable")
 			}
 		}()
-		_, _ = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), panickingNow)
+		_, _ = c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), panickingNow)
 		t.Fatal("AppendRefTx returned instead of panicking")
 	}()
 
@@ -560,6 +594,7 @@ func TestAppendRefTxNonUTF8RefNameRefusesInsideClosureLeavesSequenceReusable(t *
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+	signer := testSigner(t, priv)
 
 	leases := journal.NewLeases(c)
 	lease, err := leases.Open(ctx, "repo-alpha")
@@ -576,7 +611,7 @@ func TestAppendRefTxNonUTF8RefNameRefusesInsideClosureLeavesSequenceReusable(t *
 		{Ref: "refs/heads/caf\xe9", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
 	}
 
-	_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, nonUTF8Updates, fixedReftxNow)
+	_, err = c.AppendRefTx(ctx, lease, signer, nil, nonUTF8Updates, fixedReftxNow)
 	if !errors.Is(err, journal.ErrInvalidRefTx) {
 		t.Fatalf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
 	}
@@ -598,7 +633,7 @@ func TestAppendRefTxNonUTF8RefNameRefusesInsideClosureLeavesSequenceReusable(t *
 
 	// The sequence is unconsumed: the next AppendRefTx on the same lease
 	// still writes seq 0.
-	seq, err := c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	seq, err := c.AppendRefTx(ctx, lease, signer, nil, reftxUpdates(), fixedReftxNow)
 	if err != nil {
 		t.Fatalf("AppendRefTx after the non-UTF-8 refusal: %v", err)
 	}

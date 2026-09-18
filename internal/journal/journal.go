@@ -4,7 +4,6 @@
 package journal
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -204,10 +203,4 @@ type RefUpdate struct {
 	Ref    string `json:"ref"`
 	OldOID string `json:"old_oid"`
 	NewOID string `json:"new_oid"`
-}
-
-// Journal represents the write-ahead append-only log interface.
-type Journal interface {
-	// AppendRefTx conditionally appends a ref transaction to the specified stream.
-	AppendRefTx(ctx context.Context, stream StreamID, expectedSeq Seq, segments []string, updates []RefUpdate) (Seq, error)
 }

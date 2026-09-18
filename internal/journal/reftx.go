@@ -2,6 +2,7 @@ package journal
 
 import (
 	"crypto/ed25519"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -61,6 +62,77 @@ type RefTransactionRecord struct {
 	Updates   []RefUpdate `json:"updates"`
 	Timestamp string      `json:"timestamp"`
 	Signature string      `json:"signature,omitempty"`
+}
+
+// NewRefTransactionRecord builds a RefTransactionRecord with the fixed
+// fields spec/journal/v1 section 5.1 requires ("version": "v1", "type":
+// "ref_update") set in one place, exactly as NewGenesisRecord does for
+// section 3.1 (genesis.go) and as WALD-31's NewKeyRotationRecord will for
+// section 4.1. timestamp is the caller's, not time.Now(), for the same
+// determinism reason NewGenesisRecord gives: a caller (or a test) controls
+// the clock, this constructor does not.
+func NewRefTransactionRecord(stream StreamID, seq Seq, keyEpoch Epoch, timestamp string, segments []string, updates []RefUpdate) *RefTransactionRecord {
+	return &RefTransactionRecord{
+		Version:   VersionPrefix,
+		Stream:    stream,
+		Seq:       seq,
+		Type:      RecordTypeRefUpdate,
+		KeyEpoch:  keyEpoch,
+		Segments:  segments,
+		Updates:   updates,
+		Timestamp: timestamp,
+	}
+}
+
+// MarshalRefTx serializes a RefTransactionRecord to indented JSON with a
+// trailing newline, mirroring MarshalMarker (marker.go): refuse nil,
+// Validate() first, then json.MarshalIndent with a two-space indent and an
+// appended trailing newline byte. That is byte-for-byte what the fixture
+// generator's writeJSON produces, and RefTransactionRecord's field order
+// already matches section 5.1, so the published golden records become
+// reproducible by production code rather than only by a test helper.
+//
+// Two checks beyond Validate: r must already carry a non-empty signature
+// ParseSignature accepts — section 5.1 lists signature as required, and an
+// unsigned record can never be verified on replay, so it is refused here
+// rather than written — and segments and every update's OIDs are lowercased
+// in a copy before marshaling (section 5.1 requires lowercase hex), the same
+// way MarshalMarker lowercases Snapshot. The copy is real, not a struct
+// copy sharing r's backing arrays: a struct copy alone would still let this
+// mutate the caller's own Segments and Updates slices in place.
+func MarshalRefTx(r *RefTransactionRecord) ([]byte, error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: record cannot be nil", ErrInvalidRefTx)
+	}
+	if err := r.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidRefTx, err)
+	}
+	if r.Signature == "" {
+		return nil, fmt.Errorf("%w: missing signature", ErrInvalidSignature)
+	}
+	if _, err := ParseSignature(r.Signature); err != nil {
+		return nil, err
+	}
+
+	rCopy := *r
+	rCopy.Segments = make([]string, len(r.Segments))
+	for i, seg := range r.Segments {
+		rCopy.Segments[i] = strings.ToLower(seg)
+	}
+	rCopy.Updates = make([]RefUpdate, len(r.Updates))
+	for i, u := range r.Updates {
+		rCopy.Updates[i] = RefUpdate{
+			Ref:    u.Ref,
+			OldOID: strings.ToLower(u.OldOID),
+			NewOID: strings.ToLower(u.NewOID),
+		}
+	}
+
+	data, err := json.MarshalIndent(&rCopy, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ref transaction: %w", err)
+	}
+	return append(data, '\n'), nil
 }
 
 // ValidateOID validates that an object ID is a 40-hex (SHA-1) or 64-hex (SHA-256) string.

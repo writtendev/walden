@@ -541,3 +541,67 @@ func TestAppendRefTxPanickingNowSurfacesBeforeLeaseInteraction(t *testing.T) {
 		t.Errorf("fake saw %d further requests, want 0 (lease.Append must never have run)", got-callsBefore)
 	}
 }
+
+// TestAppendRefTxNonUTF8RefNameRefusesInsideClosureLeavesSequenceReusable is
+// the store-side half of WALD-27 round 3's finding (journal.MarshalRefTx
+// now refuses a ref name that is not valid UTF-8, per reftx_test.go's
+// TestMarshalRefTxRefusesNonUTF8RefName). It proves the failure behaves
+// exactly like every other Validate/sign/marshal failure this file already
+// pins for the closure passed to lease.Append: a plain error, not a panic
+// and not a fencing outcome, with zero storage calls made (the refusal
+// happens inside the closure but before PutIfAbsent is ever reached) and
+// the sequence left reusable.
+func TestAppendRefTxNonUTF8RefNameRefusesInsideClosureLeavesSequenceReusable(t *testing.T) {
+	c, fake := newFakeClient(t)
+	ctx := context.Background()
+
+	priv, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair: %v", err)
+	}
+
+	leases := journal.NewLeases(c)
+	lease, err := leases.Open(ctx, "repo-alpha")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	callsBefore := len(fake.Calls())
+
+	// "café" as Latin-1 rather than UTF-8: passes every AppendRefTx
+	// pre-check (none of them look inside individual updates) and passes
+	// journal.ValidateRefName and SignRefTx too - it is caught only once
+	// inside the closure, by MarshalRefTx.
+	nonUTF8Updates := []journal.RefUpdate{
+		{Ref: "refs/heads/caf\xe9", OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+	}
+
+	_, err = c.AppendRefTx(ctx, lease, priv, 0, nil, nonUTF8Updates, fixedReftxNow)
+	if !errors.Is(err, journal.ErrInvalidRefTx) {
+		t.Fatalf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+	}
+	if !errors.Is(err, journal.ErrInvalidRef) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRef) = false, err = %v", err)
+	}
+	if errors.Is(err, journal.ErrFenced) {
+		t.Errorf("a non-UTF-8 ref name must refuse, not fence: %v", err)
+	}
+	if lease.Fencer().IsFenced("repo-alpha") {
+		t.Errorf("expected repo-alpha to remain unfenced")
+	}
+	if got := len(fake.Calls()); got != callsBefore {
+		t.Errorf("fake saw %d further requests, want 0 (the refusal happens before PutIfAbsent)", got-callsBefore)
+	}
+	if _, ok := fake.Object(fullKey(journal.TxKey("repo-alpha", 0))); ok {
+		t.Errorf("expected no object written for a rejected transaction")
+	}
+
+	// The sequence is unconsumed: the next AppendRefTx on the same lease
+	// still writes seq 0.
+	seq, err := c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+	if err != nil {
+		t.Fatalf("AppendRefTx after the non-UTF-8 refusal: %v", err)
+	}
+	if seq != 0 {
+		t.Errorf("seq = %d, want 0 (the sequence must be reusable after a non-UTF-8 refusal)", seq)
+	}
+}

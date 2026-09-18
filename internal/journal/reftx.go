@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
@@ -92,14 +93,32 @@ func NewRefTransactionRecord(stream StreamID, seq Seq, keyEpoch Epoch, timestamp
 // already matches section 5.1, so the published golden records become
 // reproducible by production code rather than only by a test helper.
 //
-// Two checks beyond Validate: r must already carry a non-empty signature
-// ParseSignature accepts — section 5.1 lists signature as required, and an
-// unsigned record can never be verified on replay, so it is refused here
-// rather than written — and segments and every update's OIDs are lowercased
-// in a copy before marshaling (section 5.1 requires lowercase hex), the same
-// way MarshalMarker lowercases Snapshot. The copy is real, not a struct
-// copy sharing r's backing arrays: a struct copy alone would still let this
-// mutate the caller's own Segments and Updates slices in place.
+// Three checks beyond Validate:
+//
+//   - r must already carry a non-empty signature ParseSignature accepts —
+//     section 5.1 lists signature as required, and an unsigned record can
+//     never be verified on replay, so it is refused here rather than
+//     written.
+//   - Every update's Ref must be valid UTF-8. Section 5.2 requires ref
+//     names to round-trip as exact, opaque byte sequences, and
+//     CanonicalRefUpdatePayload (section 5.3) honors that: it is a raw
+//     byte stream, not JSON, so SignRefTx and VerifyRefTx preserve any
+//     byte sequence git itself accepts, including one that is not valid
+//     UTF-8. v1's on-disk record format cannot make the same promise: it
+//     is JSON (section 5.1), and encoding/json silently replaces an
+//     invalid UTF-8 byte sequence with U+FFFD instead of erroring, which
+//     would write a record whose bytes no longer match the ones the
+//     signature above was computed over — permanently unverifiable, and
+//     spec section 8.1 rule 3 aborts replay of the whole stream on
+//     exactly that. There is no v1 escape convention for raw bytes in
+//     JSON (section 5.4 forbids inventing one unilaterally as an unknown
+//     field), so this is refused rather than written.
+//   - Segments and every update's OIDs are lowercased in a copy before
+//     marshaling (section 5.1 requires lowercase hex), the same way
+//     MarshalMarker lowercases Snapshot. The copy is real, not a struct
+//     copy sharing r's backing arrays: a struct copy alone would still
+//     let this mutate the caller's own Segments and Updates slices in
+//     place.
 func MarshalRefTx(r *RefTransactionRecord) ([]byte, error) {
 	if r == nil {
 		return nil, fmt.Errorf("%w: record cannot be nil", ErrInvalidRefTx)
@@ -112,6 +131,11 @@ func MarshalRefTx(r *RefTransactionRecord) ([]byte, error) {
 	}
 	if _, err := ParseSignature(r.Signature); err != nil {
 		return nil, err
+	}
+	for i, u := range r.Updates {
+		if !utf8.ValidString(u.Ref) {
+			return nil, fmt.Errorf("%w: %w: update[%d] ref is not valid UTF-8; v1's JSON record format cannot carry it losslessly (json.MarshalIndent would replace its bytes with U+FFFD, producing a record that could never verify again): %q", ErrInvalidRefTx, ErrInvalidRef, i, u.Ref)
+		}
 	}
 
 	rCopy := *r
@@ -155,6 +179,16 @@ func ValidateOID(oid string) error {
 // ValidateRefName validates a Git ref name according to git-check-ref-format rules.
 // Note: Git ref names are raw byte sequences. This validator enforces format invariants
 // while preserving exact byte representation.
+//
+// Deliberately not checked here: whether ref is valid UTF-8. Git does not
+// require it, and this function is shared by paths that do not either —
+// SigningChain's callers and MarshalMarker (marker.go) — where a raw,
+// non-UTF-8 byte sequence is preserved exactly through CanonicalRefUpdatePayload
+// / CanonicalMarkerPayload's plain byte streams and verifies correctly
+// (TestRefNameRawBytePreservationNonUTF8). It is v1's JSON record format
+// specifically that cannot carry those bytes losslessly, so that check
+// belongs at the point a record is serialized to JSON: see MarshalRefTx's
+// own doc comment for why, rather than here.
 func ValidateRefName(ref string) error {
 	if ref == "" {
 		return fmt.Errorf("%w: cannot be empty", ErrInvalidRef)

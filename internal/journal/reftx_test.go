@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/writtendev/walden/internal/journal"
 )
@@ -1385,4 +1386,55 @@ func TestMarshalRefTxRefusals(t *testing.T) {
 		}
 		assertOneLine(t, err)
 	})
+}
+
+// TestMarshalRefTxRefusesNonUTF8RefName is WALD-27 round 3's finding, made
+// permanent: a ref name git and journal.ValidateRefName both accept but
+// that is not valid UTF-8 (Latin-1 "café", the reviewer's own example) must
+// never reach json.MarshalIndent, which silently replaces such bytes with
+// U+FFFD rather than erroring — producing a record whose signature, computed
+// over the raw bytes via CanonicalRefUpdatePayload, can never verify again
+// (spec section 5.2; spec section 8.1 rule 3 aborts replay of the whole
+// stream on exactly that).
+//
+// ValidateRefName and SignRefTx still accept this ref name — they operate
+// on raw bytes, never JSON, and TestRefNameRawBytePreservationNonUTF8 above
+// pins that this is deliberate, not an oversight this test contradicts.
+// v1's on-disk record format is JSON (section 5.1), so that is where the
+// two representations diverge, and MarshalRefTx is where this refuses.
+func TestMarshalRefTxRefusesNonUTF8RefName(t *testing.T) {
+	priv, _ := deterministicKeypair(0x01)
+
+	// "café" encoded as Latin-1 rather than UTF-8: 'c', 'a', 'f', 0xE9. Legal
+	// per git-check-ref-format (no control character, no reserved byte), so
+	// ValidateRefName accepts it — but a lone 0xE9 is not a valid UTF-8 byte
+	// sequence.
+	nonUTF8Ref := "refs/heads/caf\xe9"
+	if utf8.ValidString(nonUTF8Ref) {
+		t.Fatalf("test fixture %q is valid UTF-8; this test needs a byte sequence that genuinely is not", nonUTF8Ref)
+	}
+	if err := journal.ValidateRefName(nonUTF8Ref); err != nil {
+		t.Fatalf("ValidateRefName(%q) = %v, want nil: this ref name is legal per git-check-ref-format", nonUTF8Ref, err)
+	}
+
+	rec := journal.NewRefTransactionRecord("repo-alpha", 0, 0, "2026-08-31T00:00:00Z", nil, []journal.RefUpdate{
+		{Ref: nonUTF8Ref, OldOID: journal.ZeroOID40, NewOID: "4b825dc642cb6eb9a060e54bf8d69288fbee4904"},
+	})
+	if err := journal.SignRefTx(priv, rec); err != nil {
+		t.Fatalf("SignRefTx(%q) = %v, want nil: CanonicalRefUpdatePayload is a raw byte stream, not JSON, so it preserves this ref name exactly", nonUTF8Ref, err)
+	}
+
+	_, err := journal.MarshalRefTx(rec)
+	if err == nil {
+		t.Fatal("MarshalRefTx succeeded on a non-UTF-8 ref name; it must refuse rather than silently write a record that can never verify again")
+	}
+	if !errors.Is(err, journal.ErrInvalidRefTx) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+	}
+	if !errors.Is(err, journal.ErrInvalidRef) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRef) = false, err = %v", err)
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
 }

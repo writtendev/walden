@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/writtendev/walden/internal/journal"
+	"github.com/writtendev/walden/internal/store"
 )
 
 func TestMetaStreamID(t *testing.T) {
@@ -286,12 +287,22 @@ func TestRefuseSequenceGap(t *testing.T) {
 
 // TestErrObjectNotFoundIsSharedWithStore pins the one-sentinel-not-two
 // pattern this ticket applies to ErrObjectNotFound, the same pattern
-// journal.ErrPreconditionFailed/store.ErrPrecondition already use: nothing
-// beyond identity is asserted here, since store's own alias
-// (internal/store/client.go) is what makes errors.Is(_, store.ErrObjectNotFound)
-// and errors.Is(_, journal.ErrObjectNotFound) the same question.
+// journal.ErrPreconditionFailed/store.ErrPrecondition already use: that
+// store.ErrObjectNotFound (internal/store/client.go) really is an alias
+// for journal.ErrObjectNotFound, not a second, independently constructed
+// sentinel that merely compares equal today. errors.Is(_, nonNilErr) is
+// always false for a nil first argument, so asserting non-nilness alone
+// (as an earlier version of this test did) can never fail and guards
+// nothing; this asserts the identity the name promises instead. The
+// regression this exists to catch - store.ErrObjectNotFound quietly
+// becoming its own errors.New("object not found") - is covered again,
+// implicitly, by internal/store/reader_test.go's
+// TestPlanStreamGenesisPathResumesAcrossPagination, which drops
+// marker.json and expects PlanStream's ErrObjectNotFound branch (reader.go)
+// to fire across the package boundary; this test pins the same fact
+// directly, where both packages are already imported.
 func TestErrObjectNotFoundIsSharedWithStore(t *testing.T) {
-	if journal.ErrObjectNotFound == nil {
-		t.Fatal("journal.ErrObjectNotFound is nil")
+	if !errors.Is(store.ErrObjectNotFound, journal.ErrObjectNotFound) {
+		t.Fatalf("store.ErrObjectNotFound is not journal.ErrObjectNotFound: they no longer share one sentinel")
 	}
 }

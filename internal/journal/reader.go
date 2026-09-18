@@ -213,6 +213,31 @@ func (r *Reader) PlanStream(ctx context.Context, chain *SigningChain, stream Str
 			return perr
 		}
 
+		// spec section 1.1 rule 3: "a record's sequence MUST still equal
+		// the sequence in its key." rec.Seq comes from the record body -
+		// what chain.VerifyRefTx signs over - and seq above is parsed
+		// from the object key this record was read from; nothing before
+		// this line ever compares the two. Without this check a record's
+		// bytes copied onto a different key still verify (the signature
+		// is self-consistent) and replay as if they were genuinely found
+		// at that key.
+		if rec.Seq != seq {
+			return RefuseRefTxKeySeqMismatch(stream, seq, rec.Seq)
+		}
+		// The same binding, on the stream half of the (stream-id, seq)
+		// coordinate this format replays by (section 8 step 3): mirrors
+		// the marker.Stream != stream check above (section 7.5 step 2),
+		// worded the same way, so a record genuinely signed for another
+		// stream but filed under this one's tx/ prefix gets the same
+		// class of refusal an operator already gets for the marker's
+		// version of this problem. chain.VerifyRefTx cannot catch this
+		// either - it builds its canonical payload from rec.Stream, so a
+		// record signed for stream B verifies perfectly when read out of
+		// stream A's tx/.
+		if rec.Stream != stream {
+			return RefuseRefTxStreamMismatch(stream, seq, rec.Stream)
+		}
+
 		if verr := chain.VerifyRefTx(rec); verr != nil {
 			if errors.Is(verr, ErrSignatureMismatch) {
 				return RefuseRefTxSignatureMismatch(stream, seq)

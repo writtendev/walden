@@ -27,6 +27,24 @@ var (
 
 	// ErrInvalidOID indicates an invalid Git object ID.
 	ErrInvalidOID = errors.New("invalid object id")
+
+	// ErrRefTxKeySeqMismatch indicates a ref-transaction record's own "seq"
+	// field disagrees with the sequence encoded in the object key it was
+	// read from: spec section 1.1 rule 3, "a record's sequence MUST still
+	// equal the sequence in its key." This is a distinct sentinel from
+	// ErrSequenceGap: rule 4 (ErrSequenceGap) checks that the *keys* a
+	// listing returns are strictly contiguous, never that a key and the
+	// record body found at it agree with each other.
+	ErrRefTxKeySeqMismatch = errors.New("ref transaction sequence does not match its key")
+
+	// ErrRefTxStreamMismatch indicates a ref-transaction record's own
+	// "stream" field disagrees with the stream being planned: a record
+	// genuinely signed for one stream, found filed under another's tx/
+	// prefix. chain.VerifyRefTx cannot catch this on its own - it builds
+	// its canonical payload from the record's own Stream field, so a
+	// record signed for stream B verifies perfectly when read out of
+	// stream A's tx/.
+	ErrRefTxStreamMismatch = errors.New("ref transaction stream does not match its location")
 )
 
 var (
@@ -580,5 +598,44 @@ func RefuseRefTxSignatureMismatch(stream StreamID, seq Seq) error {
 		fmt.Sprintf("signature mismatch for ref update on stream %s at seq %d", stream, seq),
 		"",
 		ErrSignatureMismatch,
+	)
+}
+
+// RefuseRefTxKeySeqMismatch returns a single-line operator-facing refusal
+// when a ref-transaction record's own seq disagrees with the sequence in
+// the object key it was read from (spec section 1.1 rule 3: "a record's
+// sequence MUST still equal the sequence in its key"). Section 8.1 does
+// not publish wording of its own for this failure - rule 4's
+// RefuseSequenceGap checks that the *keys* a listing returns are strictly
+// contiguous, never that a key and the record body found at it agree with
+// each other - so this uses the refusal.RefuseWithCause <what>: <why>
+// (<fix>) shape directly, the same shape the malformed-transaction-key
+// refusal in (*Reader).PlanStream's own List callback already uses for a
+// sibling problem (a key that does not parse at all, versus one that
+// parses but disagrees with the body found at it).
+func RefuseRefTxKeySeqMismatch(stream StreamID, keySeq, recordSeq Seq) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("ref transaction at %s: record seq %d does not match key seq %d", TxKey(stream, keySeq), recordSeq, keySeq),
+		fmt.Sprintf("remove or restore the object at %s; a record's seq must equal the sequence in its own key", TxKey(stream, keySeq)),
+		ErrRefTxKeySeqMismatch,
+	)
+}
+
+// RefuseRefTxStreamMismatch returns a single-line operator-facing refusal
+// when a ref-transaction record's own stream disagrees with the stream
+// being planned - the same class of problem (*Reader).PlanStream's marker
+// path already checks (marker.Stream != stream, reader.go, citing spec
+// section 7.5 step 2), worded the same way for consistency: "<kind> stream
+// %q does not match stream %q". Section 8.1 does not publish wording of
+// its own for this failure either, so this uses the
+// refusal.RefuseWithCause <what>: <why> (<fix>) shape directly rather than
+// inventing a spec-rule-style line.
+func RefuseRefTxStreamMismatch(stream StreamID, seq Seq, recordStream StreamID) error {
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("ref transaction at %s: record stream %q does not match stream %q", TxKey(stream, seq), recordStream, stream),
+		fmt.Sprintf("remove the object at %s; it belongs under stream %q's own tx/ prefix, not %q's", TxKey(stream, seq), recordStream, stream),
+		ErrRefTxStreamMismatch,
 	)
 }

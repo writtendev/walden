@@ -557,3 +557,86 @@ func TestPlanStreamRejectsUnknownStream(t *testing.T) {
 		t.Errorf("errors.Is(_, journal.ErrInvalidStream) = false, err = %v", err)
 	}
 }
+
+// TestPlanStreamRefusesRecordSeqDisagreeingWithKey is round-1 review's
+// first major finding on this file: a record is never checked against the
+// key it was found at, so a misfiled record yields a wrong, signature-
+// verified plan with a nil error. This reproduces it exactly as reported -
+// marker.json removed and tx/00000000000000000002.json's bytes copied
+// verbatim onto tx/00000000000000000003.json's key - and pins that
+// PlanStream now refuses rather than silently replaying seq 2 a second
+// time under seq 3's key and dropping repo-alpha's real seq-3 force-push.
+func TestPlanStreamRefusesRecordSeqDisagreeingWithKey(t *testing.T) {
+	src := newFixtureSource(t)
+	src.delete(journal.MarkerKey(fixtureRepoStream))
+
+	seq2Key := journal.TxKey(fixtureRepoStream, 2)
+	seq2Data, err := os.ReadFile(fixtureKeyPath(seq2Key))
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+	seq3Key := journal.TxKey(fixtureRepoStream, 3)
+	src.set(seq3Key, seq2Data)
+
+	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	plan, err := journal.NewReader(src).PlanStream(context.Background(), chain, fixtureRepoStream)
+	if plan != nil {
+		t.Errorf("plan = %+v, want nil (not a 5-transaction plan that replays seq 2 twice)", plan)
+	}
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+	if !errors.Is(err, journal.ErrRefTxKeySeqMismatch) {
+		t.Errorf("errors.Is(_, journal.ErrRefTxKeySeqMismatch) = false, err = %v", err)
+	}
+	want := journal.RefuseRefTxKeySeqMismatch(fixtureRepoStream, 3, 2)
+	if err.Error() != want.Error() {
+		t.Errorf("err = %q, want %q", err.Error(), want.Error())
+	}
+}
+
+// TestPlanStreamRefusesRecordFromAnotherStream is round-1 review's second
+// major finding: rec.Stream is never checked against the stream being
+// planned, so a genuine record from another stream, filed under this
+// one's tx/ prefix, verifies (chain.VerifyRefTx builds its payload from
+// the record's own Stream field) and is silently accepted - raising the
+// chain's rule-15 epoch floor on the wrong stream in the process. This
+// reproduces it exactly as reported: repo-alpha's marker and every tx/
+// entry cleared, and the opaque stream's genuinely signed seq-0 record
+// planted at repo-alpha/tx/00000000000000000000.json.
+func TestPlanStreamRefusesRecordFromAnotherStream(t *testing.T) {
+	src := newFixtureSource(t)
+	src.delete(journal.MarkerKey(fixtureRepoStream))
+	for seq := journal.Seq(0); seq <= 4; seq++ {
+		src.delete(journal.TxKey(fixtureRepoStream, seq))
+	}
+
+	opaqueSeq0Key := journal.TxKey(fixtureOpaqueStream, 0)
+	opaqueSeq0Data, err := os.ReadFile(fixtureKeyPath(opaqueSeq0Key))
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+	src.set(journal.TxKey(fixtureRepoStream, 0), opaqueSeq0Data)
+
+	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	plan, err := journal.NewReader(src).PlanStream(context.Background(), chain, fixtureRepoStream)
+	if plan != nil {
+		t.Errorf("plan = %+v, want nil (not a 1-transaction plan planting another stream's ref update onto this one)", plan)
+	}
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+	if !errors.Is(err, journal.ErrRefTxStreamMismatch) {
+		t.Errorf("errors.Is(_, journal.ErrRefTxStreamMismatch) = false, err = %v", err)
+	}
+	want := journal.RefuseRefTxStreamMismatch(fixtureRepoStream, 0, fixtureOpaqueStream)
+	if err.Error() != want.Error() {
+		t.Errorf("err = %q, want %q", err.Error(), want.Error())
+	}
+}

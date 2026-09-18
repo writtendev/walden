@@ -302,16 +302,42 @@ func TestAppendRefTxStreamIsolation(t *testing.T) {
 // 6. Each pre-check AppendRefTx makes before ever calling lease.Append
 // refuses with zero entries added to fake.Calls() beyond whatever Open
 // itself already made, leaves the stream unfenced, and is exactly one
-// line - including the wrong-size private key and the nil now, the two
+// line - including the nil ctx and the wrong-size private key, the two
 // tests that prove a load-bearing pre-check refuses instead of fencing
-// (ed25519.Sign on a wrong-size key, or calling a nil now inside the
-// closure, would otherwise panic inside lease.Append's callback and fence
-// a healthy stream through WALD-29's unknown-outcome path).
+// (ctx.Err() on a nil ctx inside store.(*Client).do, or ed25519.Sign on a
+// wrong-size key, would otherwise panic inside lease.Append's callback
+// and fence a healthy stream through WALD-29's unknown-outcome path).
+// TestAppendRefTxPanickingNowSurfacesBeforeLeaseInteraction below covers
+// the third member of that family - a non-nil clock that panics when
+// called - separately, since hoisting its call site out of the closure
+// means it is no longer a pre-check at all.
 func TestAppendRefTxPreChecksRefuseWithZeroNetworkCallsAndNoFencing(t *testing.T) {
 	priv, _, err := journal.GenerateKeypair()
 	if err != nil {
 		t.Fatalf("GenerateKeypair: %v", err)
 	}
+
+	t.Run("nil ctx", func(t *testing.T) {
+		c, fake := newFakeClient(t)
+		leases := journal.NewLeases(c)
+		lease, err := leases.Open(context.Background(), "repo-alpha")
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		callsBefore := len(fake.Calls())
+
+		_, err = c.AppendRefTx(nil, lease, priv, 0, nil, reftxUpdates(), fixedReftxNow)
+		assertReftxOneLine(t, err)
+		if errors.Is(err, journal.ErrFenced) {
+			t.Errorf("a nil ctx must refuse, not fence: %v", err)
+		}
+		if lease.Fencer().IsFenced("repo-alpha") {
+			t.Errorf("expected repo-alpha to remain unfenced")
+		}
+		if got := len(fake.Calls()); got != callsBefore {
+			t.Errorf("fake saw %d further requests, want 0", got-callsBefore)
+		}
+	})
 
 	t.Run("wrong-size private key", func(t *testing.T) {
 		c, fake := newFakeClient(t)
@@ -461,5 +487,57 @@ func TestAppendRefTxValidationFailureInsideClosureLeavesSequenceReusable(t *test
 	}
 	if seq != 0 {
 		t.Errorf("seq = %d, want 0 (the sequence must be reusable after a validation failure)", seq)
+	}
+}
+
+// 8. A clock that panics when called - not nil, just broken - must not be
+// able to reach lease.Append's callback the way a nil now once could
+// (finding 2 of round 2 on this file's review). Because AppendRefTx now
+// computes now().UTC().Format(time.RFC3339) once, before lease.Append is
+// ever called, a panicking now surfaces directly to this call's own
+// caller: no lease interaction has happened yet, so the stream is left
+// unfenced and fake sees no additional requests. This is the behaviour
+// change that matters, not merely that the panic happens - before
+// hoisting, the identical clock reached lease.Append's callback and its
+// panic was recovered and fenced there instead.
+func TestAppendRefTxPanickingNowSurfacesBeforeLeaseInteraction(t *testing.T) {
+	c, fake := newFakeClient(t)
+	ctx := context.Background()
+
+	priv, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair: %v", err)
+	}
+
+	leases := journal.NewLeases(c)
+	lease, err := leases.Open(ctx, "repo-alpha")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	callsBefore := len(fake.Calls())
+
+	panickingNow := func() time.Time {
+		panic("clock unavailable")
+	}
+
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected AppendRefTx to panic when now panics")
+			}
+			if r != "clock unavailable" {
+				t.Errorf("recovered panic = %v, want %q", r, "clock unavailable")
+			}
+		}()
+		_, _ = c.AppendRefTx(ctx, lease, priv, 0, nil, reftxUpdates(), panickingNow)
+		t.Fatal("AppendRefTx returned instead of panicking")
+	}()
+
+	if lease.Fencer().IsFenced("repo-alpha") {
+		t.Errorf("a panicking clock must leave the stream unfenced: it must surface before lease.Append ever runs, so lease.Append's own panic recovery and fencing never execute")
+	}
+	if got := len(fake.Calls()); got != callsBefore {
+		t.Errorf("fake saw %d further requests, want 0 (lease.Append must never have run)", got-callsBefore)
 	}
 }

@@ -438,8 +438,15 @@ func ParseRefTx(data []byte) (*RefTransactionRecord, error) {
 		Timestamp: *shadow.Timestamp,
 		Signature: *shadow.Signature,
 	}
+	// Validate() already wraps ErrInvalidRefTx around whatever field rule
+	// failed (see its own definition above): returning err as-is, rather
+	// than wrapping it a second time, is the same error either way for
+	// errors.Is, but avoids doubling the "invalid ref transaction record"
+	// prefix in the message text - a reader that surfaces this error
+	// verbatim (as (*Reader).PlanStream's tx/ walk does, via
+	// RefuseWithCause) would otherwise show it twice.
 	if err := r.Validate(); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidRefTx, err)
+		return nil, err
 	}
 	return r, nil
 }
@@ -637,5 +644,34 @@ func RefuseRefTxStreamMismatch(stream StreamID, seq Seq, recordStream StreamID) 
 		fmt.Sprintf("ref transaction at %s: record stream %q does not match stream %q", TxKey(stream, seq), recordStream, stream),
 		fmt.Sprintf("remove the object at %s; it belongs under stream %q's own tx/ prefix, not %q's", TxKey(stream, seq), recordStream, stream),
 		ErrRefTxStreamMismatch,
+	)
+}
+
+// RefuseRefTxMalformed returns a single-line operator-facing refusal when a
+// tx/<seq>.json record body itself fails to parse - malformed JSON, a
+// missing required field, or a well-formed document that still fails
+// Validate() (a wrong "type", say) - found while walking a stream's tx/
+// listing, before the record can even be checked against chain. Section
+// 8.1 publishes wording for every other failure this file's constructors
+// cover, but not this one: rule 13's "Malformed Token Record" line is the
+// _meta stream's analogue (token_create/token_revoke, section 4.3/4.4),
+// and section 8.1 has no equivalent for a malformed ref_update body, so
+// this uses the refusal.RefuseWithCause <what>: <why> (<fix>) shape
+// directly - the same shape RefuseRefTxKeySeqMismatch and
+// RefuseRefTxStreamMismatch above already use for their own unpublished
+// failures. It locates the failure the way the malformed-transaction-key
+// refusal in (*Reader).PlanStream's own List callback already does for a
+// sibling problem (a key that does not parse at all, versus a key that
+// parses but names a body that does not): naming the stream, the sequence
+// parsed from the key, and the key itself, with reason - ParseRefTx's own
+// error - folded in as the cause for errors.Is/errors.As rather than
+// surfaced as the located message's own text.
+func RefuseRefTxMalformed(stream StreamID, seq Seq, reason error) error {
+	key := TxKey(stream, seq)
+	return refusal.RefuseWithCause(
+		"refusal: replay failed",
+		fmt.Sprintf("ref transaction at %s does not parse: %s", key, reason),
+		fmt.Sprintf("inspect and, if necessary, restore or remove the object at %s", key),
+		reason,
 	)
 }

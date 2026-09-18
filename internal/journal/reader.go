@@ -210,7 +210,15 @@ func (r *Reader) PlanStream(ctx context.Context, chain *SigningChain, stream Str
 
 		rec, perr := ParseRefTx(raw)
 		if perr != nil {
-			return perr
+			// A malformed or corrupt record body - bad JSON, a missing
+			// required field, a well-formed document that still fails
+			// Validate() (wrong "type", say) - is located the same way
+			// the malformed-key branch immediately above locates a key
+			// that does not parse at all, rather than surfaced as
+			// ParseRefTx's own unlocated error: see RefuseRefTxMalformed
+			// (reftx.go) for why section 8.1 has no published wording for
+			// this failure.
+			return RefuseRefTxMalformed(stream, seq, perr)
 		}
 
 		// spec section 1.1 rule 3: "a record's sequence MUST still equal

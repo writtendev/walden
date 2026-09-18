@@ -640,3 +640,56 @@ func TestPlanStreamRefusesRecordFromAnotherStream(t *testing.T) {
 		t.Errorf("err = %q, want %q", err.Error(), want.Error())
 	}
 }
+
+// TestPlanStreamRefusesMalformedRecordBody is round-2 review's minor
+// finding: a corrupt or malformed tx/<seq>.json record body was the one
+// branch in this walk that did not locate its failure - ParseRefTx's raw,
+// unlocated error propagated straight up, naming no stream, no seq, and no
+// key, unlike every sibling refusal in this function (the malformed-key
+// branch two lines above it, RefuseSequenceGap, RefuseRefTxSignatureMismatch,
+// and this round's own RefuseRefTxKeySeqMismatch/RefuseRefTxStreamMismatch
+// checks). This reproduces it with a tx/ object missing a required field -
+// "signature" dropped from otherwise-untouched fixture bytes at seq 4 -
+// and pins that PlanStream now refuses with a located, one-line
+// RefuseRefTxMalformed line naming the object, rather than ParseRefTx's
+// bare, unlocated error text.
+func TestPlanStreamRefusesMalformedRecordBody(t *testing.T) {
+	src := newFixtureSource(t)
+	key := journal.TxKey(fixtureRepoStream, 4)
+	data, err := os.ReadFile(fixtureKeyPath(key))
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+	mutated := dropField(t, data, "signature")
+	src.set(key, mutated)
+
+	chain := loadFixtureChain(t, fixtureMetaHeadSeq)
+	plan, err := journal.NewReader(src).PlanStream(context.Background(), chain, fixtureRepoStream)
+	if plan != nil {
+		t.Errorf("plan = %+v, want nil (not a plan built from an unparseable record)", plan)
+	}
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if strings.Count(err.Error(), "\n") != 0 {
+		t.Errorf("refusal is not one line: %q", err.Error())
+	}
+	if !errors.Is(err, journal.ErrInvalidRefTx) {
+		t.Errorf("errors.Is(_, journal.ErrInvalidRefTx) = false, err = %v", err)
+	}
+	if !strings.Contains(err.Error(), key) {
+		t.Errorf("refusal does not name the malformed object's key %q: %q", key, err.Error())
+	}
+	if strings.Contains(err.Error(), "invalid ref transaction record: invalid ref transaction record") {
+		t.Errorf("refusal still carries ParseRefTx's doubled ErrInvalidRefTx prefix: %q", err.Error())
+	}
+
+	_, perr := journal.ParseRefTx(mutated)
+	if perr == nil {
+		t.Fatal("expected ParseRefTx to fail on a record missing its signature field")
+	}
+	want := journal.RefuseRefTxMalformed(fixtureRepoStream, 4, perr)
+	if err.Error() != want.Error() {
+		t.Errorf("err = %q, want %q", err.Error(), want.Error())
+	}
+}

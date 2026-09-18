@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/writtendev/walden/internal/refusal"
@@ -315,12 +314,37 @@ func RemoveSigningKeyTemp(tmpPath string) {
 // first match found is the only or the right one. RefuseNoSigningKey and
 // RefuseSigningKeyMismatch both use this so an operator is pointed at every
 // candidate on disk rather than one picked arbitrarily.
+//
+// This reads dataDir's entries and matches filenames with a plain string
+// prefix rather than calling filepath.Glob on a pattern built from dataDir.
+// An operator-supplied --data-dir containing a glob metacharacter ('[',
+// '*', '?' — e.g. "/srv/walden[prod]") makes a Glob pattern built from it
+// match nothing, so leftoverSigningKeyTemp would report no candidates while
+// the only surviving private key sits fsynced right there, and
+// RefuseNoSigningKey would send the operator to "restore from backup"
+// instead. Reading directory entries and comparing names verbatim has no
+// pattern for a data-dir character to be misread as, so it avoids that
+// problem class rather than escaping around it. os.ReadDir already returns
+// entries sorted by filename, so the matches built from them come back
+// sorted too — no separate sort needed.
 func leftoverSigningKeyTemp(dataDir string) ([]string, bool) {
-	matches, err := filepath.Glob(SigningKeyPath(dataDir) + signingKeyTmpSuffix + ".*")
-	if err != nil || len(matches) == 0 {
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
 		return nil, false
 	}
-	sort.Strings(matches)
+	prefix := signingKeyFileName + signingKeyTmpSuffix + "."
+	var matches []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), prefix) {
+			matches = append(matches, filepath.Join(dataDir, entry.Name()))
+		}
+	}
+	if len(matches) == 0 {
+		return nil, false
+	}
 	return matches, true
 }
 

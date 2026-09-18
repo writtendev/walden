@@ -531,12 +531,32 @@ func TestEnsureGenesisAdoptToleratesUppercaseHexKey(t *testing.T) {
 
 // The ticket's real acceptance test: two Clients over one Fake, each with
 // its own data directory, calling EnsureGenesis concurrently. Exactly one
-// object lands under _meta, exactly one caller succeeds (minted), the other
-// is fenced with RefuseStreamFenced's exact text, and exactly one
-// signing.key exists across the two directories — no temp litter on
-// either side. The fake's conditional PUT is check-and-create under one
-// mutex (storetest doc comment), so the winner is genuine rather than
-// simulated; run under -race.
+// object lands under _meta, exactly one caller succeeds (minted), and
+// exactly one signing.key exists across the two directories — no temp
+// litter on either side. The fake's conditional PUT is check-and-create
+// under one mutex (storetest doc comment), so the winner is genuine rather
+// than simulated; run under -race.
+//
+// The loser's refusal is not pinned to RefuseStreamFenced alone. With
+// separate data directories, the loser has no local signing key of its own
+// to adopt with, so which one-line refusal it produces depends on pure
+// goroutine scheduling relative to the winner's conditional PUT:
+//   - if the loser's Get lands before the winner's PutIfAbsent is visible,
+//     it takes the mint path, loses its own PutIfAbsent, and refuses with
+//     RefuseStreamFenced (journal.ErrFenced);
+//   - if the loser's Get lands after, it sees the winner's genesis record
+//     already present and takes the adopt path — but this data directory
+//     has no signing.key of its own, so it refuses with RefuseNoSigningKey
+//     (journal.ErrSigningKeyUnavailable) rather than fencing.
+//
+// A round 3 review reproduced the adopt-path outcome at 8/200, 3/200, and
+// 1/20 under GOMAXPROCS=1 (0/200 on an idle machine, which is why an
+// assertion pinned to RefuseStreamFenced alone passed in CI and would still
+// fail under load). Both outcomes are correct — the sibling
+// TestEnsureGenesisConcurrentRaceSharedDataDir already treats "which correct
+// refusal fired" as immaterial to a race test's real job, and this test
+// follows that shape rather than pinning one interleaving as the only
+// correct one.
 func TestEnsureGenesisConcurrentRaceSingleWinner(t *testing.T) {
 	restore := store.SetBackoffForTest(time.Millisecond, 5*time.Millisecond)
 	t.Cleanup(restore)
@@ -577,8 +597,7 @@ func TestEnsureGenesisConcurrentRaceSingleWinner(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	var successes, fenced int
-	wantFenced := journal.RefuseStreamFenced(journal.MetaStreamID, 0).Error()
+	var successes, refused int
 	for i, err := range errs {
 		if err == nil {
 			successes++
@@ -587,16 +606,19 @@ func TestEnsureGenesisConcurrentRaceSingleWinner(t *testing.T) {
 			}
 			continue
 		}
-		fenced++
-		if err.Error() != wantFenced {
-			t.Errorf("loser %d error = %q, want %q", i, err.Error(), wantFenced)
+		refused++
+		if !errors.Is(err, journal.ErrFenced) && !errors.Is(err, journal.ErrSigningKeyUnavailable) {
+			t.Errorf("loser %d: unexpected refusal, want RefuseStreamFenced or RefuseNoSigningKey: %v", i, err)
+		}
+		if strings.ContainsAny(err.Error(), "\n\r") {
+			t.Errorf("loser %d: refusal is not a single line: %q", i, err.Error())
 		}
 	}
 	if successes != 1 {
 		t.Errorf("successes = %d, want 1", successes)
 	}
-	if fenced != 1 {
-		t.Errorf("fenced = %d, want 1", fenced)
+	if refused != 1 {
+		t.Errorf("refused = %d, want 1", refused)
 	}
 
 	if n := metaObjectCount(fake); n != 1 {

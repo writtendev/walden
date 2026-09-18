@@ -595,3 +595,42 @@ func TestLeftoverSigningKeyTempNamesEveryMatch(t *testing.T) {
 		t.Errorf("refusal is not a single line: %q", mismatch.Error())
 	}
 }
+
+// TestLeftoverSigningKeyTempSurvivesGlobMetacharacter is the round 3 fix for
+// a minor finding: leftoverSigningKeyTemp used to build a filepath.Glob
+// pattern out of the operator-supplied data directory. A --data-dir
+// containing a glob metacharacter ('[', '*', or '?' — e.g.
+// "/srv/walden[prod]") made that pattern match nothing, so
+// RefuseNoSigningKey would fall back to its "restore signing.key from
+// backup" wording while the only surviving private key sat fsynced right
+// there in the temp file leftoverSigningKeyTemp failed to see. dataDir here
+// carries a literal '[' and ']' in its own path component to prove the fix
+// reads directory entries by name rather than interpreting any part of
+// dataDir as a glob pattern.
+func TestLeftoverSigningKeyTempSurvivesGlobMetacharacter(t *testing.T) {
+	parent := t.TempDir()
+	dataDir := filepath.Join(parent, "walden[prod]")
+	if err := os.Mkdir(dataDir, 0700); err != nil {
+		t.Fatalf("failed to create data dir with glob metacharacter: %v", err)
+	}
+
+	priv, _, err := journal.GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair failed: %v", err)
+	}
+	tmpPath, err := journal.WriteSigningKeyTemp(dataDir, priv)
+	if err != nil {
+		t.Fatalf("WriteSigningKeyTemp failed: %v", err)
+	}
+
+	withLeftover := journal.RefuseNoSigningKey(dataDir)
+	if !strings.Contains(withLeftover.Error(), tmpPath) {
+		t.Errorf("refusal does not name the leftover temp file %s under a data dir containing a glob metacharacter: %q", tmpPath, withLeftover.Error())
+	}
+	if strings.Contains(withLeftover.Error(), "restore signing.key from backup, or point") {
+		t.Errorf("refusal fell back to the no-leftover wording even though a temp file is present: %q", withLeftover.Error())
+	}
+	if strings.ContainsAny(withLeftover.Error(), "\n\r") {
+		t.Errorf("refusal is not a single line: %q", withLeftover.Error())
+	}
+}

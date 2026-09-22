@@ -18,7 +18,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"fmt"
@@ -65,20 +64,19 @@ func (c *Client) ReplayMetaTable(ctx context.Context) (*journal.SigningChain, *j
 //     names it as "token create" or "token revoke" without needing
 //     lease.Stream() — but the stream check itself (4) does, so a nil
 //     lease has to be ruled out before that call could panic.
-//  2. A nil ctx. Load-bearing, not defensive, exactly as it is in
-//     AppendRefTx: ctx is handed to PutIfAbsent inside the closure, and
-//     store.(*Client).do's first statement calls ctx.Err() — a method
-//     call on a nil interface value panics exactly where this guards
-//     against it — and ctx cannot be hoisted out of the closure, because
-//     PutIfAbsent needs it at the point of the write.
+//  2. A nil ctx. lease.Append (lease.go, WALD-118) refuses a nil ctx
+//     itself, before issuing its PUT, so this check is no longer the only
+//     thing standing between a nil ctx and a panic; it stays because it
+//     gives this caller's own refusal shape rather than lease.Append's.
 //  3. A private key of the wrong size. Load-bearing: ed25519.Sign panics
-//     on a wrong-size key, inside SignTokenCreate, inside the closure.
+//     on a wrong-size key, inside SignTokenCreate, inside prepare (the
+//     closure below).
 //  4. A nil now.
-//  5. A nil or uninitialized chain. Load-bearing: the closure below calls
+//  5. A nil or uninitialized chain. Load-bearing: prepare below calls
 //     chain.LastMetaSeq(), and (*journal.SigningChain).LastMetaSeq is a
-//     method on a pointer receiver — a nil chain panics there, inside the
-//     closure, exactly the class of bug this file exists to keep out of
-//     lease.Append's callback.
+//     method on a pointer receiver — a nil chain panics there, exactly
+//     the class of bug this file exists to keep out of lease.Append's
+//     prepare.
 //  6. lease.Stream() naming anything but the meta stream. Token records
 //     only ever go on _meta (spec section 9.1) — the inverse of
 //     AppendRefTx's own check, which refuses _meta for a ref
@@ -89,9 +87,8 @@ func (c *Client) ReplayMetaTable(ctx context.Context) (*journal.SigningChain, *j
 //     journal.ValidateTokenScope on each, utf8.ValidString on each — the
 //     same rules TokenCreateRecord.Validate itself enforces (spec section
 //     4.3), checked here so that SignTokenCreate's own Validate call
-//     inside the closure can only ever fail on the one field it cannot
-//     check ahead of time: seq, which the closure only learns from
-//     lease.Append.
+//     inside prepare can only ever fail on the one field it cannot check
+//     ahead of time: seq, which prepare only learns from lease.Append.
 //
 // The signing key must be the chain's active key. A token record carries
 // no key_epoch of its own (unlike a ref transaction or a marker) and is
@@ -110,24 +107,21 @@ func (c *Client) ReplayMetaTable(ctx context.Context) (*journal.SigningChain, *j
 // exactly as AppendRefTx and RotateKey compute their own timestamp: a
 // caller-supplied clock that panics when invoked now panics here, in this
 // function's own frame, before lease.Append — and therefore its panic
-// recovery and permanent fencing — ever runs. scopes is cloned above the
-// closure for the same reason: a caller mutating its own slice between
-// this call and the closure's eventual Sign/Marshal must not be able to
-// produce a record whose signature covers different bytes than its JSON.
+// recovery and fencing — ever runs. scopes is cloned above prepare for the
+// same reason: a caller mutating its own slice between this call and
+// prepare's eventual Sign/Marshal must not be able to produce a record
+// whose signature covers different bytes than its JSON.
 //
-// Inside the closure: the sequence-drift check, then build, sign,
-// marshal, and one conditional PUT. Beyond that this function classifies
-// nothing — a Sign, Marshal, or PutIfAbsent failure is passed back to
-// lease.Append unchanged, exactly as AppendRefTx's own closure does.
-// lease.Append is the only place a proven 412 is sorted from an
-// unprovable outcome from every other failure (spec section 11.4); this
-// file does not touch a Fencer, does not GET or LIST, and does not call
-// PutIfAbsent twice.
-//
-// This is narrower than "no panic path left" inside the closure, not that
-// claim restated a third time: it is what an audit of this closure's own
-// call chain supports today, the same qualification AppendRefTx's doc
-// comment gives its own closure.
+// prepare itself: the sequence-drift check, then build, sign, and
+// marshal. It does not write to storage or call anything that does —
+// lease.Append issues the one conditional PUT itself, once prepare has
+// returned bytes with no error. Beyond the checks above, this function
+// classifies nothing — a drift refusal, or a Sign or Marshal failure
+// inside prepare, is passed back to lease.Append unchanged, exactly as
+// AppendRefTx's own prepare does. lease.Append is the only place a proven
+// 412 is sorted from an unprovable outcome from every other failure (spec
+// section 11.4); this file does not touch a Fencer, does not GET or LIST,
+// and does not call PutIfAbsent at all.
 func (c *Client) AppendTokenCreate(
 	ctx context.Context,
 	lease *journal.Lease,
@@ -170,27 +164,23 @@ func (c *Client) AppendTokenCreate(
 
 	// See the doc comment above: hoisted so a panicking clock panics here,
 	// to this call's own caller, rather than through lease.Append's panic
-	// recovery and permanent fencing. scopesCopy is likewise hoisted so
-	// nothing the closure signs and marshals can be mutated out from under
-	// it between the two.
+	// recovery and fencing. scopesCopy is likewise hoisted so nothing
+	// prepare signs and marshals can be mutated out from under it between
+	// the two.
 	ts := now().UTC().Format(time.RFC3339)
 	scopesCopy := append([]string(nil), scopes...)
 
 	var seq journal.Seq
-	err := lease.Append(func(s journal.Seq) error {
+	err := lease.Append(ctx, func(s journal.Seq) ([]byte, error) {
 		if want := chain.LastMetaSeq() + 1; s != want {
-			return refuseTokenSequenceDrift("token create", chain.LastMetaSeq(), s)
+			return nil, refuseTokenSequenceDrift("token create", chain.LastMetaSeq(), s)
 		}
 		seq = s
 		rec := journal.NewTokenCreateRecord(s, tokenID, tokenHash, scopesCopy, ts)
 		if err := journal.SignTokenCreate(priv, rec); err != nil {
-			return err
+			return nil, err
 		}
-		data, err := journal.MarshalTokenCreate(rec)
-		if err != nil {
-			return err
-		}
-		return c.PutIfAbsent(ctx, journal.TxKey(journal.MetaStreamID, s), bytes.NewReader(data), int64(len(data)))
+		return journal.MarshalTokenCreate(rec)
 	})
 	if err != nil {
 		return 0, err
@@ -244,20 +234,16 @@ func (c *Client) AppendTokenRevoke(
 	ts := now().UTC().Format(time.RFC3339)
 
 	var seq journal.Seq
-	err := lease.Append(func(s journal.Seq) error {
+	err := lease.Append(ctx, func(s journal.Seq) ([]byte, error) {
 		if want := chain.LastMetaSeq() + 1; s != want {
-			return refuseTokenSequenceDrift("token revoke", chain.LastMetaSeq(), s)
+			return nil, refuseTokenSequenceDrift("token revoke", chain.LastMetaSeq(), s)
 		}
 		seq = s
 		rec := journal.NewTokenRevokeRecord(s, tokenID, tokenHash, ts)
 		if err := journal.SignTokenRevoke(priv, rec); err != nil {
-			return err
+			return nil, err
 		}
-		data, err := journal.MarshalTokenRevoke(rec)
-		if err != nil {
-			return err
-		}
-		return c.PutIfAbsent(ctx, journal.TxKey(journal.MetaStreamID, s), bytes.NewReader(data), int64(len(data)))
+		return journal.MarshalTokenRevoke(rec)
 	})
 	if err != nil {
 		return 0, err

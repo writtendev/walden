@@ -10,6 +10,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -505,17 +506,19 @@ func TestRotateKeyRefusesOnStaleLeaseSequence(t *testing.T) {
 	}
 }
 
-// racingLister wraps a journal.TxLister and runs before once, on its very
+// racingLister wraps a journal.TxStore and runs before once, on its very
 // first List call, before delegating -- landing a rival write in exactly
 // the window between RotateKey's own ReplayMeta (which has already
 // returned by the time any Lease's List runs) and leases.Open's head
 // discovery, with no production code touched. journal.NewLeases takes a
-// journal.TxLister, and (*journal.Leases).Open is the only place in that
+// journal.TxStore, and (*journal.Leases).Open is the only place in that
 // package that calls List (lease.go) -- so a wrapper here reaches exactly
 // the interleaving round 2's minor finding on this file asked for, and no
-// hook into RotateKey itself is needed.
+// hook into RotateKey itself is needed. PutIfAbsent is a plain delegate to
+// inner: (*journal.Lease).Append (WALD-118) is what calls it, and this
+// wrapper has no interest in that call, only in List.
 type racingLister struct {
-	inner  journal.TxLister
+	inner  journal.TxStore
 	before func()
 	fired  bool
 }
@@ -526,6 +529,10 @@ func (l *racingLister) List(ctx context.Context, prefix, startAfter string, fn f
 		l.before()
 	}
 	return l.inner.List(ctx, prefix, startAfter, fn)
+}
+
+func (l *racingLister) PutIfAbsent(ctx context.Context, key string, body io.ReaderAt, size int64) error {
+	return l.inner.PutIfAbsent(ctx, key, body, size)
 }
 
 // TestRotateKeyRefusesOnConcurrentRotationDuringLeaseOpen is round 2's

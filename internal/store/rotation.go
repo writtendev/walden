@@ -14,7 +14,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -58,8 +57,8 @@ import (
 //     before the record's fate is known, exactly as mintGenesis writes the
 //     genesis key's temp file before its own conditional PUT — signing.key
 //     itself is not touched yet.
-//  5. leases.Open(ctx, journal.MetaStreamID), then Lease.Append: inside the
-//     callback, first confirm the sequence the Lease hands it is the one
+//  5. leases.Open(ctx, journal.MetaStreamID), then Lease.Append: inside
+//     prepare, first confirm the sequence the Lease hands it is the one
 //     ReplayMeta's chain (step 1) actually verified up to — seq must equal
 //     chain.LastMetaSeq()+1, or refuse (round 1 major finding: a concurrent
 //     _meta append between step 1 and this Open, or a pre-existing gap, can
@@ -70,7 +69,9 @@ import (
 //     chain.ActiveKey()'s own string, not a copy reformatted from the
 //     local key's decoded bytes, since VerifyRotation compares
 //     old_public_key to ActiveKey() as strings (round 2 finding) — sign it
-//     with the *outgoing* private key, marshal it, and PutIfAbsent it.
+//     with the *outgoing* private key, marshal it, and return the bytes for
+//     Lease.Append itself to PutIfAbsent (WALD-118: prepare no longer
+//     writes to storage; it only builds the bytes).
 //  6. On success, CommitSigningKey renames the new key into place — the
 //     commit point, matching mintGenesis's own. A failure here refuses
 //     with RefuseSigningKeyCommitFailed, naming whichever path (temp or
@@ -153,28 +154,26 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 	}
 
 	newPubFormatted := journal.FormatPublicKey(newPub)
-	// Computed once, here, rather than inside the closure below: the
-	// timestamp does not depend on seq, so it has no reason to be part of
-	// the checkout at all, and now() is a caller-supplied clock this
-	// function does not control — a nil now or a panicking clock, called
-	// from inside lease.Append's fn, would panic there, and Append routes
-	// a panic through Fencer.HandleOutcomeUnknown and re-panics (lease.go),
-	// fencing _meta for a failure that never touched storage. Hoisting is
-	// the same fix WALD-27 gave the same class of bug in its own file: it
-	// removes the panic surface rather than adding a recover around it.
-	// Nothing else inside the closure below panics, checked rather than
-	// assumed: journal.NewKeyRotationRecord and FormatPublicKey are pure
+	// Computed once, here, rather than inside prepare below: the timestamp
+	// does not depend on seq, so it has no reason to be part of the
+	// checkout at all, and now() is a caller-supplied clock this function
+	// does not control — a nil now or a panicking clock, called from
+	// inside prepare, would panic there, and lease.Append fences _meta
+	// only once its own PUT has been issued (lease.go, WALD-118), so
+	// hoisting keeps a broken clock from fencing a healthy _meta for a
+	// failure that never touched storage. Hoisting is the same fix
+	// WALD-27 gave the same class of bug in its own file: it removes the
+	// panic surface rather than adding a recover around it. Nothing else
+	// inside prepare below panics, checked rather than assumed:
+	// journal.NewKeyRotationRecord and FormatPublicKey are pure
 	// string/hex formatting over newPub, always a valid key fresh from
 	// GenerateKeypair; SignRotation's priv.Public().(ed25519.PublicKey)
 	// assertion always holds for an ed25519.PrivateKey, and ed25519.Sign
 	// cannot panic on priv because LoadSigningKey above already validated
-	// its seed length; MarshalKeyRotation nil-checks its argument before
-	// touching it; and PutIfAbsent's ctx, key, and body are all
-	// already-validated local values, not caller input this function
-	// leaves unchecked.
+	// its seed length; and MarshalKeyRotation nil-checks its argument
+	// before touching it.
 	timestamp := now().UTC().Format(time.RFC3339)
-	var putErr error
-	appendErr := lease.Append(func(seq journal.Seq) error {
+	appendErr := lease.Append(ctx, func(seq journal.Seq) ([]byte, error) {
 		// The consistency check the write side never asserted (round 1
 		// major finding): old_public_key above was verified against
 		// chain as of chain.LastMetaSeq(), but seq comes from the
@@ -186,8 +185,8 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 		// record there would land one no future replay could ever
 		// accept. ApplyRotation already enforces exactly this invariant
 		// on the read side (identity.go: "r.Seq != c.lastMetaSeq+1");
-		// this is its write-side counterpart, checked here (inside the
-		// closure, where seq is finally known) rather than by re-reading
+		// this is its write-side counterpart, checked here (inside
+		// prepare, where seq is finally known) rather than by re-reading
 		// the head and retrying, which spec section 11.4 item 4 forbids.
 		// A plain error is deliberate, not a fabricated precondition or
 		// outcome-unknown: Lease.Append's own contract (lease.go) is
@@ -197,21 +196,13 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 		// caller that replays _meta again gets a fresh, consistent
 		// chain to rotate from.
 		if want := chain.LastMetaSeq() + 1; seq != want {
-			putErr = refuseMetaSequenceDrift(chain.LastMetaSeq(), seq)
-			return putErr
+			return nil, refuseMetaSequenceDrift(chain.LastMetaSeq(), seq)
 		}
 		rec := journal.NewKeyRotationRecord(seq, chain.ActiveKey(), newPub, timestamp)
 		if err := journal.SignRotation(priv, rec); err != nil {
-			putErr = err
-			return err
+			return nil, err
 		}
-		data, err := journal.MarshalKeyRotation(rec)
-		if err != nil {
-			putErr = err
-			return err
-		}
-		putErr = c.PutIfAbsent(ctx, journal.TxKey(journal.MetaStreamID, seq), bytes.NewReader(data), int64(len(data)))
-		return putErr
+		return journal.MarshalKeyRotation(rec)
 	})
 
 	switch {
@@ -225,27 +216,27 @@ func (c *Client) RotateKey(ctx context.Context, dataDir string, leases *journal.
 			return "", "", journal.RefuseSigningKeyCommitFailed(dataDir, tmpPath, renamed, err)
 		}
 		return localPubFormatted, newPubFormatted, nil
-	case errors.Is(putErr, ErrPrecondition):
-		// A proven 412: Lease.Append has already fenced _meta through
-		// Fencer.HandleConflict and returned RefuseStreamFenced. This
-		// instance lost the race to append the rotation, so the new key
-		// never became live; the temp file is litter, exactly as
-		// mintGenesis's own ErrPrecondition branch treats it.
-		journal.RemoveSigningKeyTemp(tmpPath)
-		return "", "", appendErr
-	case errors.Is(putErr, ErrOutcomeUnknown):
-		// An unprovable outcome: Lease.Append has fenced _meta through
-		// Fencer.HandleOutcomeUnknown and returned
-		// RefuseAppendOutcomeUnknown. The append may have landed, in
-		// which case tmpPath is the only surviving copy of a now-live
-		// key — deliberately not removed, mirroring mintGenesis's own
-		// ErrOutcomeUnknown branch exactly.
+	case errors.Is(appendErr, journal.ErrOutcomeUnknown):
+		// An unprovable outcome: Lease.Append has already issued its PUT,
+		// fenced _meta through Fencer.HandleOutcomeUnknown, and returned
+		// RefuseAppendOutcomeUnknown (its cause now joins ErrFenced and
+		// ErrOutcomeUnknown - fencing.go, WALD-118 - so errors.Is reaches
+		// this case directly on appendErr; putErr's old job of telling
+		// this apart from a proven 412 is gone along with it). The append
+		// may have landed, in which case tmpPath is the only surviving
+		// copy of a now-live key — deliberately not removed, mirroring
+		// mintGenesis's own ErrOutcomeUnknown branch exactly.
 		return "", "", appendErr
 	default:
-		// Any other error — a Sign or Marshal failure inside the
-		// callback — never reached storage at all. Lease.Append leaves
-		// _meta unfenced and the sequence unconsumed in this case (its
-		// own doc comment), so the temp key is litter, not evidence.
+		// Everything else: a proven 412 (Lease.Append has already fenced
+		// _meta through Fencer.HandleConflict and returned
+		// RefuseStreamFenced - this instance lost the race, and the new
+		// key never became live), a stale-sequence drift refusal, or a
+		// Sign/Marshal failure inside prepare that never reached storage
+		// at all. None of these leave any ambiguity about whether this
+		// attempt's write landed, so the temp key is litter, not
+		// evidence, exactly as mintGenesis's own non-ErrOutcomeUnknown
+		// branches treat it.
 		journal.RemoveSigningKeyTemp(tmpPath)
 		return "", "", appendErr
 	}

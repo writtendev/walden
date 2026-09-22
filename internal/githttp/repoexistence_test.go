@@ -198,6 +198,143 @@ func TestRepoExistenceEscapingSymlinkKnownDisagreement(t *testing.T) {
 	}
 }
 
+// repoExistenceRouteByName returns the route named name from
+// repoExistenceRoutes. A test that is deliberately about one entry point
+// drives the same request the cross-product tests above drive, rather than
+// spelling a second copy of it that could drift from them.
+func repoExistenceRouteByName(t *testing.T, name string) repoExistenceRoute {
+	t.Helper()
+	for _, route := range repoExistenceRoutes {
+		if route.name == name {
+			return route
+		}
+	}
+	t.Fatalf("no route named %q in repoExistenceRoutes", name)
+	return repoExistenceRoute{}
+}
+
+// resolutionFailureBody drives the resolution-side ErrStoreUnavailable -- a
+// regular file sitting at a repository's path, the state
+// TestRepoExistenceAgreesAcrossEntryPoints pins -- through route and returns
+// the response body. The creation-side test below compares against the wording
+// this build actually produces rather than against a string literal, so the two
+// branches of writeAuthRefusal's ErrStoreUnavailable case cannot quietly
+// converge on one message.
+func resolutionFailureBody(t *testing.T, route repoExistenceRoute) string {
+	t.Helper()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	const repo = "occupied"
+	path, err := s.RepoPath(repo)
+	if err != nil {
+		t.Fatalf("RepoPath(%q): %v", repo, err)
+	}
+	if err := os.WriteFile(path, []byte("not a repo"), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+	h, tok := newTestHandler(t, s, "")
+	status, body := doRepoExistenceRequest(h, tok, repo, route)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("resolution-side control: %s status = %d, want %d; body %q",
+			route.name, status, http.StatusInternalServerError, body)
+	}
+	return body
+}
+
+// TestRepoCreationFailureSaysCreationNotResolution pins the other half of
+// writeAuthRefusal's ErrStoreUnavailable case: create.go's repoCreateError
+// wrap. Both halves refuse with 500 and both wrap store.ErrStoreUnavailable,
+// so nothing about the status code or the sentinel distinguishes them -- only
+// the wording does, and only because ensureRepoForPush marks the error
+// CreateRepo returned. Remove that wrap and this test is what goes red: the
+// operator whose data directory is unwritable, or whose git binary is missing,
+// is told the server could not resolve the repository path, when the path
+// resolved fine and the creation is what failed.
+//
+// receive-pack is the only route that can reach this branch, because it is the
+// only one that ever creates a repository.
+func TestRepoCreationFailureSaysCreationNotResolution(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, dataDir string)
+	}{
+		{
+			// The operator-facing case the reviewer named: the data
+			// directory resolves and the repository is genuinely absent, but
+			// CreateRepo's MkdirTemp cannot write the staging directory.
+			name: "unwritable-data-dir",
+			setup: func(t *testing.T, dataDir string) {
+				t.Helper()
+				if err := os.Chmod(dataDir, 0o555); err != nil {
+					t.Fatalf("Chmod(%q, 0o555): %v", dataDir, err)
+				}
+				t.Cleanup(func() {
+					// Restore write permission so t.TempDir's own cleanup can
+					// remove the directory on every platform.
+					_ = os.Chmod(dataDir, 0o700)
+				})
+				probe := filepath.Join(dataDir, ".write-probe")
+				if err := os.Mkdir(probe, 0o700); err == nil {
+					_ = os.Remove(probe)
+					t.Skipf("LOUD SKIP: %q is still writable at mode 0555, so this process cannot simulate an unwritable data directory -- it is running as root, or on a filesystem that ignores mode bits. The git-not-on-PATH case of this same test exercises the identical repoCreateError wrap and never skips, so the wrap is still covered here.", dataDir)
+				}
+			},
+		},
+		{
+			// The second failure CreateRepo names, and the one that needs no
+			// permission games: it runs as root, and on a filesystem that
+			// ignores mode bits, so this test never reports zero coverage of
+			// the wrap.
+			name: "git-not-on-PATH",
+			setup: func(t *testing.T, dataDir string) {
+				t.Helper()
+				t.Setenv("PATH", "")
+			},
+		},
+	}
+
+	route := repoExistenceRouteByName(t, "receive-pack")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+			const repo = "newrepo"
+
+			// The store is built before the data directory is broken: the
+			// repository must be genuinely missing and the path must resolve,
+			// so the refusal can only come from CreateRepo.
+			tt.setup(t, dataDir)
+
+			h, tok := newTestHandler(t, s, "")
+			status, body := doRepoExistenceRequest(h, tok, repo, route)
+
+			if status != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want %d; body %q", status, http.StatusInternalServerError, body)
+			}
+			if !strings.Contains(body, "could not create the repository") {
+				t.Errorf("body = %q, want it to describe a creation failure (%q)", body, "could not create the repository")
+			}
+			if strings.Contains(body, "could not resolve the repository path") {
+				t.Errorf("body = %q describes a path-resolution failure, but the path resolved and CreateRepo is what failed", body)
+			}
+			if other := resolutionFailureBody(t, route); body == other {
+				t.Errorf("creation-failure body %q is byte-identical to the resolution-failure body; the two must stay distinguishable", body)
+			}
+			// Mechanical rule 6: one line, and nothing else.
+			if trimmed := strings.TrimRight(body, "\n"); strings.Contains(trimmed, "\n") {
+				t.Errorf("refusal body contains an embedded newline: %q", trimmed)
+			}
+			// Matches secrets_test.go's positive-control-500 discipline: an
+			// operator-fault 500 must never put the data directory's absolute
+			// path on the wire.
+			if strings.Contains(body, dataDir) {
+				t.Errorf("response body contains the data directory path %q: %q", dataDir, body)
+			}
+		})
+	}
+}
+
 // TestNoDirectRepositoryStat pins done-when #1: no git-HTTP handler calls
 // os.Stat on a repository path directly -- existence is decided in exactly
 // one place, store.ResolveRepo, and every entry point asks it rather than

@@ -229,6 +229,19 @@ func resolveHook(ctx context.Context, lookupEnv func(string) (string, bool), upd
 // GIT_QUARANTINE_PATH as the variable a pre-receive hook reads, so it is
 // the single authority here, and an equality check would turn a future
 // git's harmless divergence into a refused push.
+//
+// The containment test runs against a symlink-resolved repoPath because
+// git's side is already resolved: it derives GIT_QUARANTINE_PATH from
+// getcwd() after chdir'ing into the repository, so every symlink in the
+// path it was handed is gone by the time the hook reads it. store.RepoPath
+// resolves the data directory but deliberately leaves the "<repo>.git"
+// leaf as written, so a repository that is itself a symlink -- an operator
+// moving one big repository onto another volume -- would otherwise put a
+// lexical prefix test on two spellings of the same directory and refuse
+// every push to it. Resolving repoPath is the whole fix; abs is left as
+// git wrote it, since git sets that variable and creates the directory
+// itself, so there is no attacker-influenced input on this path to resolve
+// away (round 1 finding 2).
 func resolveQuarantine(lookupEnv func(string) (string, bool), repoPath string) (string, error) {
 	quarantine, _ := lookupEnv("GIT_QUARANTINE_PATH")
 	if quarantine == "" {
@@ -252,10 +265,19 @@ func resolveQuarantine(lookupEnv func(string) (string, bool), repoPath string) (
 		)
 	}
 	abs = filepath.Clean(abs)
-	if !dirWithin(abs, repoPath) {
+	root, err := filepath.EvalSymlinks(repoPath)
+	if err != nil {
+		return "", refusal.RefuseWithCause(
+			"pre-receive refused",
+			fmt.Sprintf("cannot resolve the repository path %s: %s", repoPath, err.Error()),
+			"verify the repository path is accessible",
+			err,
+		)
+	}
+	if !dirWithin(abs, root) {
 		return "", refusal.Refuse(
 			"pre-receive refused",
-			fmt.Sprintf("GIT_QUARANTINE_PATH %s resolves outside the repository at %s", abs, repoPath),
+			fmt.Sprintf("GIT_QUARANTINE_PATH %s resolves outside the repository at %s", abs, root),
 			"",
 		)
 	}
@@ -281,6 +303,16 @@ func dirWithin(path, root string) bool {
 // transaction with no segments, which spec/journal/v1 section 5.1 permits
 // explicitly.
 //
+// "No packfile" and "no objects" are not the same statement, and
+// quarantineWithoutPack below is what keeps them apart: git unpacks a
+// small push into loose objects rather than a pack unless
+// receive.unpackLimit=0 is set, and internal/githttp/receivepack.go sets
+// it on every receive-pack it starts. Trusting that knob alone would mean
+// journaling "this push introduced no objects" for a quarantine full of
+// objects the moment the knob ever failed to take -- a future git, a
+// receive-pack walden did not start -- with nothing on the machine
+// noticing. So the absence of a pack is a question, not an answer.
+//
 // Only the pack's leading header bytes are read here, through
 // journal.PackfileObjectCount; the returned *os.File is handed to
 // (*store.Client).AppendSegment as the io.ReaderAt it wants, so the pack's
@@ -299,9 +331,10 @@ func captureSegment(req *hookRequest) (*os.File, int64, error) {
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// git creates pack/ lazily; no directory means index-pack
-			// wrote no pack, the same "nothing to capture" as no
-			// quarantine at all.
-			return nil, 0, nil
+			// wrote no pack. Whether that means this push carried no
+			// objects is the quarantine directory's own contents to
+			// answer, not pack/'s absence.
+			return nil, 0, quarantineWithoutPack(req.Quarantine)
 		}
 		return nil, 0, refusal.RefuseWithCause(
 			"pre-receive refused",
@@ -322,7 +355,7 @@ func captureSegment(req *hookRequest) (*os.File, int64, error) {
 
 	switch len(packs) {
 	case 0:
-		return nil, 0, nil
+		return nil, 0, quarantineWithoutPack(req.Quarantine)
 	case 1:
 	default:
 		// One push is one index-pack, so more than one pack is a shape
@@ -396,6 +429,76 @@ func captureSegment(req *hookRequest) (*os.File, int64, error) {
 	}
 
 	return f, info.Size(), nil
+}
+
+// quarantineWithoutPack answers the one question captureSegment cannot
+// read out of pack/: a quarantine directory with no packfile in it either
+// received no objects at all, or received them as loose objects walden
+// has no segment to journal. The first is legitimate and journals a ref
+// transaction with no segments; the second is walden unable to keep its
+// one promise, so it is a one-line refusal and the push does not happen.
+// Returning nil for both -- which is what reading "no pack" as "no
+// objects" amounts to -- would acknowledge a push whose objects are in no
+// journal anywhere, and would do it silently.
+//
+// The two are told apart by what git leaves on disk: loose objects live in
+// the two-hex-character fan-out directories git creates under the object
+// directory as it writes them, so a quarantine that received objects
+// without packing them has at least one. This counts directory entries; it
+// does not open, decompress, or otherwise interpret an object, so wrapping
+// git rather than reimplementing it (mechanical rule 5) is intact.
+//
+// A quarantine directory that cannot be read at all -- including one that
+// is not there, although git creates it before running this hook -- is a
+// refusal too, for the same reason: walden cannot see what it received.
+func quarantineWithoutPack(quarantine string) error {
+	entries, err := os.ReadDir(quarantine)
+	if err != nil {
+		return refusal.RefuseWithCause(
+			"pre-receive refused",
+			fmt.Sprintf("cannot read the quarantine directory %s: %s", quarantine, err.Error()),
+			"",
+			err,
+		)
+	}
+
+	var fanout []string
+	for _, e := range entries {
+		if e.IsDir() && isFanoutDir(e.Name()) {
+			fanout = append(fanout, e.Name())
+		}
+	}
+	if len(fanout) == 0 {
+		return nil
+	}
+	return refusal.Refuse(
+		"pre-receive refused",
+		fmt.Sprintf("quarantine directory %s holds loose objects (%d fan-out directories, including %s) but no packfile, so this push carries objects walden cannot journal", quarantine, len(fanout), fanout[0]),
+		"run receive-pack with -c receive.unpackLimit=0 so git leaves every received push in a packfile",
+	)
+}
+
+// isFanoutDir reports whether name is one of the two-hex-character
+// directories git splits loose objects into -- "3c" holding the objects
+// whose id starts with those digits. Uppercase is accepted as well as the
+// lowercase git writes today: this check exists precisely to catch a git
+// that stopped behaving the way walden expects, so reading a spelling
+// nobody has seen as "no objects here" would reopen the hole it closes.
+func isFanoutDir(name string) bool {
+	if len(name) != 2 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // journalPush appends this push to the journal: the quarantined packfile

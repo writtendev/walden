@@ -400,11 +400,13 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 }
 
 // runPreReceive implements walden dispatched as git's pre-receive hook
-// (WALD-43): it parses the old/new/ref triples git writes to stdin, then
-// resolves the repository, data directory, and journal purely from the
-// environment internal/githttp/receivepack.go sets, and stops there.
-// args is unused -- the hook takes no flags, only stdin and environment,
-// the same shape git itself invokes it with.
+// (WALD-43, WALD-44): it parses the old/new/ref triples git writes to
+// stdin, resolves the repository, data directory, journal, and quarantine
+// directory purely from the environment
+// internal/githttp/receivepack.go sets, and then appends the push to the
+// journal -- the quarantined packfile as one segment, then the ref
+// transaction naming it. args is unused -- the hook takes no flags, only
+// stdin and environment, the same shape git itself invokes it with.
 //
 // Stdin at EOF with no lines parsed exits 0 without resolving anything
 // from the environment: there is nothing to look up a repository, data
@@ -413,10 +415,15 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 // WALDEN_REPO/WALDEN_DATA_DIR set, exactly the shape the argv-dispatch
 // tests use to prove the dispatch itself works.
 //
-// Deliberately not done here: appending anything to the journal. A green
-// WALD-43 exits 0 having parsed and resolved, and nothing more --
-// journaling the quarantined packfile is WALD-44, and making exit 0 depend
-// on that append landing is WALD-46.
+// A nil req.Journal is journal-less mode: the hook resolves, makes no
+// network call at all, and exits 0. That is the same guard WALD-43 left
+// behind, unchanged.
+//
+// Deliberately not done here: making exit 0 a durability guarantee. A
+// failed append is returned, and main() already turns a returned error
+// into a non-zero exit -- but proving that exit 0 happens strictly after
+// storage acknowledged both records, across every injected failure point,
+// is WALD-46.
 func runPreReceive(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	updates, err := parseRefUpdates(stdin)
 	if err != nil {
@@ -425,10 +432,14 @@ func runPreReceive(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	if len(updates) == 0 {
 		return nil
 	}
-	if _, err := resolveHook(ctx, os.LookupEnv, updates); err != nil {
+	req, err := resolveHook(ctx, os.LookupEnv, updates)
+	if err != nil {
 		return err
 	}
-	return nil
+	if req.Journal == nil {
+		return nil
+	}
+	return journalPush(ctx, req, time.Now)
 }
 
 // refuseAdminTokenAlreadyJournaled refuses to mint a first-boot admin

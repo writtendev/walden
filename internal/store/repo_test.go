@@ -1007,6 +1007,180 @@ func TestEnsureHookRefusesARepositoryThatRedirectsItsHooks(t *testing.T) {
 	}
 }
 
+// TestEnsureHookRefusesARepositoryWhoseGitDirectoryIsElsewhere pins what walden says about
+// the scenario this check exists for: an operator places a repository in the data directory
+// by hand. If what they placed is not bare — a working tree with a .git directory, or one
+// backed by a .git gitfile — git takes that repository's hooks from its git directory and
+// never looks at <repo>/hooks/ at all, which reaches EnsureHook looking exactly like a
+// core.hooksPath redirect: the path git reports is not the path walden owns.
+//
+// Refusing is right either way. walden owns <repo>/hooks/pre-receive and can promise
+// durability for no other path. What has to be right as well is the reason, and these
+// repositories set no core.hooksPath in any scope: a refusal naming that key sends the
+// operator hunting for something nothing wrote, in the one case where a hand-placed
+// repository is the likeliest thing they are holding.
+func TestEnsureHookRefusesARepositoryWhoseGitDirectoryIsElsewhere(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		// place creates the repository at repoPath, inside dataDir, some way other than bare.
+		place func(t *testing.T, dataDir, repoPath string)
+	}{
+		{
+			// The headline case: `git init` output copied into the data directory whole, so
+			// git's directory for it is <repo>/.git and its hooks are under that.
+			name: "non-bare-repository",
+			place: func(t *testing.T, dataDir, repoPath string) {
+				t.Helper()
+				mustGitInit(t, repoPath)
+			},
+		},
+		{
+			// The same shape one step further out: <repo>/.git is a gitfile naming a git
+			// directory somewhere else entirely, so no lexical guess at <repo>/.git/hooks
+			// would find the path git actually reports either.
+			name: "gitfile-backed-repository",
+			place: func(t *testing.T, dataDir, repoPath string) {
+				t.Helper()
+				mustGitInit(t, "--separate-git-dir="+filepath.Join(dataDir, "elsewhere.git"), repoPath)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+			repoPath := filepath.Join(dataDir, "dropped.git")
+			tt.place(t, dataDir, repoPath)
+
+			// walden's own correct hook, at the path walden owns, so the repository's shape
+			// is the only thing left that can refuse the push.
+			hook := filepath.Join(repoPath, "hooks", "pre-receive")
+			mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+			mustSymlink(t, exe, hook)
+
+			err := s.EnsureHook(ctx, repoPath)
+			if err == nil {
+				t.Fatalf("EnsureHook = nil, want a refusal: git's hooks for this repository are not the ones walden owns")
+			}
+			if !errors.Is(err, store.ErrHookUnavailable) {
+				t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+			}
+			if strings.Contains(err.Error(), "\n") {
+				t.Errorf("refusal is not one line: %q", err)
+			}
+			if strings.Contains(err.Error(), "core.hooksPath") {
+				t.Errorf("refusal %q blames core.hooksPath, which nothing set here: the cause is the repository's shape", err)
+			}
+			if !strings.Contains(err.Error(), repoPath) {
+				t.Errorf("refusal %q does not name %s, so an operator cannot tell which repository is wrong", err, repoPath)
+			}
+			if !strings.Contains(err.Error(), "bare repository") {
+				t.Errorf("refusal %q does not say to serve a bare repository, so its remedy is not actionable", err)
+			}
+
+			assertWaldenHook(t, hook, exe)
+		})
+	}
+}
+
+// TestEnsureHookHooksPathSpellings pins a refusal walden takes deliberately, so it cannot be
+// read later as an oversight and "fixed".
+//
+// core.hooksPath spelled hooks, ./hooks, or the repository's own absolute hooks directory all
+// name the directory walden owns, and all three accept. A core.hooksPath that is a symlink to
+// that same directory does not: git would run walden's hook through it, and EnsureHook refuses
+// anyway, because it compares the path git printed against the path walden owns and resolves
+// neither side.
+//
+// The trade is the point. A resolved comparison would accept this repository on the strength
+// of where the link pointed during the check, and a link can be repointed between the check
+// and the `git receive-pack` a moment later — an accept with a window in it. The lexical
+// comparison has no window; it costs this one spelling, and the refusal says so.
+func TestEnsureHookHooksPathSpellings(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		// hooksPath returns the value core.hooksPath is set to for the repository at repoPath.
+		hooksPath func(t *testing.T, repoPath string) string
+		refuses   bool
+	}{
+		{
+			name:      "relative",
+			hooksPath: func(t *testing.T, repoPath string) string { return "hooks" },
+		},
+		{
+			name:      "dot-relative",
+			hooksPath: func(t *testing.T, repoPath string) string { return "./hooks" },
+		},
+		{
+			name: "absolute",
+			hooksPath: func(t *testing.T, repoPath string) string {
+				return filepath.Join(repoPath, "hooks")
+			},
+		},
+		{
+			// The subtest's name reaches the message through t.TempDir's directory name, so
+			// it deliberately spells none of the words the assertions below look for.
+			name: "linked-spelling-of-the-same-directory",
+			hooksPath: func(t *testing.T, repoPath string) string {
+				t.Helper()
+				link := filepath.Join(repoPath, "hooks-link")
+				mustSymlink(t, filepath.Join(repoPath, "hooks"), link)
+				return link
+			},
+			refuses: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+			repoPath := filepath.Join(dataDir, "spelled.git")
+			mustBareRepo(t, repoPath)
+			hook := filepath.Join(repoPath, "hooks", "pre-receive")
+			mustSymlink(t, exe, hook)
+			mustGitConfig(t, repoPath, "core.hooksPath", tt.hooksPath(t, repoPath))
+
+			err := s.EnsureHook(ctx, repoPath)
+			if !tt.refuses {
+				if err != nil {
+					t.Fatalf("EnsureHook = %v, want nil: this spelling names the hooks directory walden owns", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("EnsureHook = nil, want a refusal: the comparison is lexical, and a symlink is a different path")
+			}
+			if !errors.Is(err, store.ErrHookUnavailable) {
+				t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+			}
+			if strings.Contains(err.Error(), "\n") {
+				t.Errorf("refusal is not one line: %q", err)
+			}
+			if !strings.Contains(err.Error(), "core.hooksPath") {
+				t.Errorf("refusal %q does not name core.hooksPath, so an operator cannot act on it", err)
+			}
+			if !strings.Contains(err.Error(), "symlinks to that directory") {
+				t.Errorf("refusal %q does not say that a core.hooksPath symlinked to the repository's own hooks still refuses, so this reads as a bug rather than the trade it is", err)
+			}
+			assertWaldenHook(t, hook, exe)
+		})
+	}
+}
+
 // TestEnsureHookRefusesWhenGitCannotReportTheHookPath is the fail-closed half of the same
 // question. The probe used to treat every exit it did not recognise as "no redirect here",
 // on the reasoning that anything git refuses to open, `git receive-pack` refuses a moment
@@ -1230,6 +1404,18 @@ func mustBareRepo(t *testing.T, path string) {
 	cmd.Env = []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "PATH=" + os.Getenv("PATH")}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init --bare %q: %v: %s", path, err, out)
+	}
+}
+
+// mustGitInit runs `git init` with the given arguments under the same pinned environment as
+// mustBareRepo, for the repository shapes that one does not make: a working tree, or one whose
+// git directory sits somewhere other than the path walden would serve.
+func mustGitInit(t *testing.T, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"init", "-q"}, args...)...)
+	cmd.Env = []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "PATH=" + os.Getenv("PATH")}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init %v: %v: %s", args, err, out)
 	}
 }
 

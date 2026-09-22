@@ -292,13 +292,22 @@ func (s *Store) EnsureHook(ctx context.Context, repoPath string) error {
 			ErrHookUnavailable,
 		)
 	}
+	// The comparison is lexical, deliberately: the path git printed against
+	// the path walden owns, neither side resolved. It costs one state. A
+	// core.hooksPath of hooks, ./hooks or the repository's absolute hooks
+	// directory all clean to hookPath and all accept; a core.hooksPath that
+	// is a symlink to that very directory names a different path, so it
+	// refuses although git would in fact have run walden's hook through it.
+	// Resolving both sides would accept it and would be a promise walden
+	// cannot keep: what a resolution returns is where the link pointed at
+	// the moment of the check, and the link can be repointed between here
+	// and the `git receive-pack` exec a moment later, so the accept it buys
+	// is an accept of whatever the link names by then. A lexical comparison
+	// has no such window — it accepts only spellings of the directory walden
+	// owns and repairs the hook inside it — and the refusal says which
+	// spelling to use instead.
 	if reported != hookPath {
-		return refusal.RefuseWithCause(
-			"repository hook unavailable",
-			fmt.Sprintf("git runs %s for this repository, not %s, so core.hooksPath sends the push past walden's hook", reported, hookPath),
-			"unset core.hooksPath for this repository so git runs hooks/pre-receive",
-			ErrHookUnavailable,
-		)
+		return hookPathMismatchRefusal(ctx, repoPath, hookPath, reported)
 	}
 
 	// The link target as it stands before any repair, empty when there is
@@ -352,6 +361,58 @@ func (s *Store) EnsureHook(ctx context.Context, repoPath string) error {
 		log.Printf("store: %s: repointed pre-receive hook from %s to walden's own binary", hookPath, displaced)
 	}
 	return nil
+}
+
+// hookPathMismatchRefusal states, in one line, that git will run a
+// pre-receive hook other than the one walden owns at <repo>/hooks/pre-receive
+// — and says which of two repositories it is looking at, because the two take
+// different remedies.
+//
+// One is a repository that redirects its hooks: core.hooksPath, in any scope
+// or spelling, sends git to a directory walden does not install into.
+//
+// The other is a repository whose shape puts its git directory somewhere
+// other than the path walden serves — a non-bare repository an operator
+// dropped into the data directory, or one backed by a .git gitfile. git
+// resolves <repo>/.git and reports hooks under that, and no core.hooksPath is
+// involved anywhere. Telling that operator to unset core.hooksPath sends them
+// looking for a key nothing set.
+//
+// Both refuse. walden owns <repo>/hooks/pre-receive and can promise
+// durability for no other path, and an operator-placed repository is exactly
+// the case this check exists for — so the refusal has to be the one an
+// operator can act on.
+//
+// `git rev-parse --git-dir` separates them and nothing else has to: it
+// answers "." exactly when the git directory is the directory git was pointed
+// at, so an answer resolving anywhere but repoPath is the second kind. When
+// that probe cannot answer, the refusal claims no cause at all: it names the
+// two paths, which are established, and a remedy true of either state.
+func hookPathMismatchRefusal(ctx context.Context, repoPath, hookPath, reported string) error {
+	gitDir, err := gitDirPath(ctx, repoPath)
+	switch {
+	case err != nil:
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			fmt.Sprintf("git runs %s for this repository, not %s, so a push would move refs past walden's hook", reported, hookPath),
+			fmt.Sprintf("serve %s as a bare repository with no core.hooksPath, so git runs its hooks/%s", repoPath, preReceiveHookName),
+			ErrHookUnavailable,
+		)
+	case gitDir != repoPath:
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			fmt.Sprintf("git's directory for %s is %s, so it runs %s and never looks in the hooks directory walden owns", repoPath, gitDir, reported),
+			fmt.Sprintf("replace %s with a bare repository — git clone --bare it — so walden's hook at %s is the one git runs", repoPath, hookPath),
+			ErrHookUnavailable,
+		)
+	default:
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			fmt.Sprintf("core.hooksPath sends this repository's hooks to %s, not %s, so a push would move refs past walden's hook", reported, hookPath),
+			fmt.Sprintf("unset core.hooksPath for this repository so git runs hooks/%s; a core.hooksPath that only symlinks to that directory is a different path and still refuses", preReceiveHookName),
+			ErrHookUnavailable,
+		)
+	}
 }
 
 // gitWaitDelay bounds how long cmd.Wait may block after a git child's own
@@ -435,6 +496,58 @@ func gitHookPath(ctx context.Context, repoPath string) (string, error) {
 		log.Printf("store: %s: git rev-parse --git-path %s printed nothing",
 			repoPath, filepath.Join("hooks", preReceiveHookName))
 		return "", fmt.Errorf("git reported no pre-receive hook path for %s", repoPath)
+	}
+	if !filepath.IsAbs(reported) {
+		reported = filepath.Join(repoPath, reported)
+	}
+	return filepath.Clean(reported), nil
+}
+
+// gitDirPath returns the git directory git resolves for the directory at
+// repoPath. It is what tells a repository that redirects its hooks apart from
+// one whose shape puts its hooks where walden does not own them, which is the
+// only thing hookPathMismatchRefusal needs it for.
+//
+// `git rev-parse --git-dir` answers that where comparing hook paths cannot:
+// it prints "." exactly when the git directory is the directory git was
+// pointed at — whatever symlinks that path was reached through, and whatever
+// core.hooksPath says — so an answer joining to anything but repoPath is a
+// repository whose git directory is elsewhere. A relative answer is joined
+// against repoPath, as gitHookPath joins its own and for the same reason: -C
+// makes repoPath the child's working directory.
+//
+// It runs only after EnsureHook has already decided to refuse, and only to
+// word that refusal. Nothing it returns can turn a refusal into an accept,
+// and a failure here costs precision in a message, never durability — which
+// is why it is a second function rather than a second argument to
+// gitHookPath. The probe that decides stays exactly the probe that was
+// verified, and a change to the wording cannot move the decision.
+func gitDirPath(ctx context.Context, repoPath string) (string, error) {
+	env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"}
+	if p := os.Getenv("PATH"); p != "" {
+		env = append(env, "PATH="+p)
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--git-dir")
+	cmd.Env = env
+	cmd.WaitDelay = gitWaitDelay
+	setupProcessGroup(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("store: %s: git rev-parse --git-dir failed: %v: %s", repoPath, err, strings.TrimSpace(stderr.String()))
+		cause := oneLine(stderr.String())
+		if cause == "" {
+			cause = err.Error()
+		}
+		return "", fmt.Errorf("git could not report the git directory of %s: %s", repoPath, cause)
+	}
+
+	reported := strings.TrimSpace(string(out))
+	if reported == "" {
+		return "", fmt.Errorf("git reported no git directory for %s", repoPath)
 	}
 	if !filepath.IsAbs(reported) {
 		reported = filepath.Join(repoPath, reported)

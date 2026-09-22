@@ -125,7 +125,12 @@ func (h *Handler) authorize(ctx context.Context, token string, required auth.Act
 // HTTP status code and writes the single-line refusal as the response body.
 // ErrRepoNotFound is mapped to 404 (checked before ErrForbidden), ErrForbidden to
 // 403 (no challenge), ErrInvalidRepo to 400, auth credential errors to 401 with
-// the fixed WWW-Authenticate challenge, ErrStoreUnavailable to a path-free 500
+// the fixed WWW-Authenticate challenge, ErrHookUnavailable to its own path-free 500
+// (its own sentinel and its own wording, because a repository whose pre-receive hook
+// is not walden's resolved its path perfectly well — saying otherwise would send an
+// operator looking at the wrong thing; the distinct sentinel is also why this needs
+// no marker type of the repoCreateError kind, which exists only to tell apart two
+// failures wearing the same one), ErrStoreUnavailable to a path-free 500
 // (checked before the default branch, which would otherwise forward store's
 // own cause — the absolute repository path — onto the wire), and any other
 // unexpected error to 500 with an operator log line.
@@ -157,6 +162,14 @@ func writeAuthRefusal(w http.ResponseWriter, route, repo string, err error) {
 		errors.Is(err, auth.ErrInvalidSignature):
 		w.Header().Set("WWW-Authenticate", authChallenge)
 		writeRefusal(w, http.StatusUnauthorized, err)
+	case errors.Is(err, store.ErrHookUnavailable):
+		log.Printf("githttp: %s: hook unavailable for %q: %v", route, repo, err)
+		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
+			"repository hook unavailable",
+			"the repository's pre-receive hook is not walden's and could not be repaired",
+			"contact the operator",
+			store.ErrHookUnavailable,
+		))
 	case errors.Is(err, store.ErrStoreUnavailable):
 		log.Printf("githttp: %s: repository unavailable for %q: %v", route, repo, err)
 		why := "the server could not resolve the repository path"

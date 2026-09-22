@@ -35,6 +35,13 @@ import (
 // proceeds against the winner's repository instead of being told to retry the exact push that
 // just failed. Any other CreateRepo error still refuses.
 //
+// Last, and only for a push, the repository's pre-receive hook is verified and repaired
+// where it safely can be (store.EnsureHook). A repository that reached disk some other way
+// than CreateRepo — placed there by an operator, restored from a backup — has no hook of
+// walden's, and a push through it would move refs that were never journaled. Reads are
+// untouched by this: see the call site below for why it sits here rather than in
+// store.ResolveRepo.
+//
 // ensureRepoForPush is called by POST /{repo}/git-receive-pack to authorize the push and,
 // if the repository does not yet exist, create it. It is fully exercised by its own
 // tests here.
@@ -78,7 +85,26 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 	// that case, and create_test.go's
 	// TestEnsureRepoForPushRefusesEscapingSymlinkSwappedDuringAuthorize drives exactly that
 	// swap against the exists == true branch, so removing this line fails the suite.
-	return h.store.RepoPath(repo)
+	path, err := h.store.RepoPath(repo)
+	if err != nil {
+		return "", err
+	}
+
+	// The hook is verified here — on the path the re-resolve above just returned, which is
+	// the directory `git receive-pack` is about to be pointed at, including one swapped in
+	// during the Authorize window — and nowhere else. Not inside store.ResolveRepo: all
+	// three routes share that call, and a repository that lost its hook must still serve
+	// clones (info/refs and upload-pack behave exactly as they did before this line
+	// existed). Not in the hook process either: by the time a hook runs, git has already
+	// taken the pack, and a hook that is running is by construction present.
+	//
+	// It is also the last thing this function does, so the repair it may perform only ever
+	// runs for a caller that has already cleared Authorize with write scope: nobody else
+	// can probe a repository's hook state or provoke a write to its hooks directory.
+	if err := h.store.EnsureHook(path); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // repoCreateError marks an error CreateRepo returned, as distinct from one

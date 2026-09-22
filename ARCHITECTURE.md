@@ -288,6 +288,7 @@ By construction there are few, and each is legible:
 | crash mid-push                               | refs never moved; journal may hold an unreferenced pack                          | harmless; compaction tidies                   |
 | journal-less mode                            | durability = the disk, as warned                                                 | enable `WALDEN_JOURNAL`                       |
 | bucket lacks compare-and-swap                | walden refuses to boot, one line                                                 | choose a provider per spec §11.2              |
+| repository on disk without walden's hook     | the next push installs it; a `pre-receive` walden did not write is never replaced, so that push refuses in one line — reads keep serving either way | move the foreign hook aside; the next push installs walden's |
 
 Losing an acknowledged push does not appear in this table. That is the
 entire product.

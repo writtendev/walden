@@ -74,17 +74,6 @@ func revParse(t *testing.T, barePath, ref string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// installHook writes an executable hooks/<name> script into barePath
-// containing script verbatim.
-func installHook(t *testing.T, barePath, name, script string) {
-	t.Helper()
-
-	path := filepath.Join(barePath, "hooks", name)
-	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatalf("write hook %q: %v", name, err)
-	}
-}
-
 // statusCapture records the HTTP status code a handler sent, then passes
 // every call straight through to the underlying ResponseWriter. Unwrap
 // lets http.ResponseController (used by handleReceivePack to flush after
@@ -179,10 +168,16 @@ func TestReceivePackRealClient(t *testing.T) {
 // for testing, pre-receive hook declined) matches what git-http-backend
 // itself produces for the identical hook, confirmed by hand against a real
 // git-http-backend CGI instance before writing this test.
+//
+// The rejecting hook is walden's own — the symlink store.EnsureHook installs
+// on the way through this push, running this test binary, told to decline by
+// the directive file (hookstandin_test.go). It used to be a shell script
+// written straight to hooks/pre-receive, which is now the one shape walden
+// refuses rather than runs.
 func TestReceivePackHookRejectionIsACompletedRPC(t *testing.T) {
 	s := store.New(t.TempDir())
 	barePath := newEmptyBareRepo(t, s, "repo")
-	installHook(t, barePath, "pre-receive", "#!/bin/sh\necho 'walden: declined for testing' >&2\nexit 1\n")
+	writeHookDirective(t, barePath, "decline walden: declined for testing")
 
 	var pushStatus int
 	h, tok := newTestHandler(t, s, "")
@@ -224,12 +219,17 @@ func TestReceivePackHookRejectionIsACompletedRPC(t *testing.T) {
 // pre-receive hook (WALD-43) depends on: an explicit, enumerable list built
 // by this handler, plus whatever git itself adds around a hook invocation —
 // never the server's ambient environment forwarded wholesale.
+//
+// The hook doing the reporting is walden's own symlink, running this test
+// binary under the "env" directive (hookstandin_test.go), since a hook
+// script of the test's own at hooks/pre-receive is what store.EnsureHook
+// now refuses.
 func TestReceivePackHookEnvironment(t *testing.T) {
 	runPush := func(t *testing.T, h http.Handler, token, barePath string) map[string]string {
 		t.Helper()
 
 		dumpPath := filepath.Join(t.TempDir(), "env.dump")
-		installHook(t, barePath, "pre-receive", "#!/bin/sh\nenv > "+dumpPath+"\nexit 1\n")
+		writeHookDirective(t, barePath, "env "+dumpPath)
 
 		server := httptest.NewServer(h)
 		defer server.Close()
@@ -238,7 +238,7 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 		cmd := exec.Command("git", "push", authURL(server.URL, token)+"/repo", "main")
 		cmd.Dir = work
 		cmd.Env = gitClientEnv()
-		_, _ = cmd.CombinedOutput() // the hook always exits 1; only its env dump matters
+		_, _ = cmd.CombinedOutput() // only the hook's env dump matters, not the push's outcome
 
 		raw, err := os.ReadFile(dumpPath)
 		if err != nil {

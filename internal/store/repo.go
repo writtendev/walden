@@ -170,55 +170,15 @@ func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 		)
 	}
 
-	// git only creates hooks/ because the default template ships one; an
-	// absent or stripped template (and now GIT_TEMPLATE_DIR is out of the
-	// allowlist above, so an operator-set one no longer reaches this exec
-	// either) leaves --bare with no hooks/ at all. walden depends on that
-	// directory, so it makes it, rather than depending on git's template.
-	hooksDir := filepath.Join(tmp, "hooks")
-	if err := os.MkdirAll(hooksDir, 0o700); err != nil {
+	// The same installer EnsureHook repairs an already-published
+	// repository with, so the two cannot disagree about what a correct
+	// hook is. It runs against the staging directory, before the
+	// publishing rename, so a repository is never observable without one.
+	if err := installPreReceiveHook(filepath.Join(tmp, "hooks")); err != nil {
 		return refusal.RefuseWithCause(
 			"repository creation failed",
 			err.Error(),
-			"verify the data directory is writable",
-			ErrStoreUnavailable,
-		)
-	}
-
-	// The symlink — rather than a shell shim — is the point of the argv[0]
-	// dispatch in cmd/walden/main.go (`if prog == "pre-receive"`): it needs
-	// no shell on the image, and it always points at whatever binary is
-	// actually running.
-	exe, err := os.Executable()
-	if err != nil {
-		return refusal.RefuseWithCause(
-			"repository creation failed",
-			err.Error(),
-			"verify the walden binary path is resolvable",
-			ErrStoreUnavailable,
-		)
-	}
-	hookPath := filepath.Join(hooksDir, "pre-receive")
-	if err := os.Symlink(exe, hookPath); err != nil {
-		return refusal.RefuseWithCause(
-			"repository creation failed",
-			err.Error(),
-			"verify the hooks directory is writable",
-			ErrStoreUnavailable,
-		)
-	}
-
-	// git accepts a push whose pre-receive is a dangling symlink silently:
-	// no error, no hook run, ref moved. A repository published in that state
-	// acknowledges pushes it never journals — PHILOSOPHY's first promise
-	// failing with no signal. Stat follows the symlink, so this also catches
-	// os.Executable's Linux "/path (deleted)" result after an in-place
-	// binary upgrade, with no need to special-case that string.
-	if err := hookIsRunnable(hookPath); err != nil {
-		return refusal.RefuseWithCause(
-			"repository creation failed",
-			fmt.Sprintf("hooks/pre-receive does not resolve to a runnable file: %v", err),
-			"verify the walden binary path is stable and executable",
+			"verify the data directory is writable and the walden binary path is stable",
 			ErrStoreUnavailable,
 		)
 	}
@@ -228,6 +188,183 @@ func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 	}
 	publish = true
 
+	return nil
+}
+
+// preReceiveHookName is the one hook walden owns. git looks for it under
+// a repository's hooks/ directory by exactly this name.
+const preReceiveHookName = "pre-receive"
+
+// EnsureHook verifies, and repairs where it safely can, the pre-receive
+// hook of the repository already resolved to repoPath.
+//
+// It takes a path rather than a repository identifier so nothing is
+// resolved a second time: its caller — githttp's ensureRepoForPush — has
+// just re-resolved the path it is about to hand to `git receive-pack`, and
+// this has to check that exact directory, not one resolved again after it.
+//
+// A repository whose pre-receive hook is not walden's is a repository
+// whose pushes are silently undurable: git takes the pack, moves the ref,
+// reports success, and nothing is ever journaled. So a push through one is
+// refused. A read through one is not — a clone off a hook-less repository
+// is harmless, and refusing it would turn a durability defect into an
+// availability outage — which is why this lives on the push path rather
+// than inside ResolveRepo, where all three routes would inherit it.
+//
+// Three outcomes and no fourth:
+//
+//   - hooks/pre-receive is a symlink to the running binary and resolves to
+//     a runnable file: nothing is written, three Stat-class syscalls.
+//   - it is absent, a dangling symlink, or a symlink pointing anywhere
+//     other than the running binary: walden replaces the symlink it owns.
+//     A symlink left over from a previous install still resolving to some
+//     executable is repaired too — it runs a different walden, which is
+//     not the same thing as running this one.
+//   - it is anything else — a regular file, a directory: one-line refusal
+//     wrapping ErrHookUnavailable. An operator's own pre-receive script at
+//     that path means walden's hook never runs, so the push cannot be
+//     accepted; and walden will not delete a file an operator deliberately
+//     placed, because it cannot know what it was for. It says which file
+//     is in the way and stops.
+func (s *Store) EnsureHook(repoPath string) error {
+	hooksDir := filepath.Join(repoPath, "hooks")
+	hookPath := filepath.Join(hooksDir, preReceiveHookName)
+
+	switch info, err := os.Lstat(hookPath); {
+	case err == nil && info.Mode()&fs.ModeSymlink != 0:
+		if hookPointsAtRunningBinary(hookPath) {
+			return nil
+		}
+		// walden's own symlink, pointing at a previous install or at
+		// nothing at all. Replacing it is replacing what walden wrote.
+	case err == nil:
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			fmt.Sprintf("%s exists and is not walden's pre-receive hook", hookPath),
+			"move it aside so walden can install its own pre-receive hook",
+			ErrHookUnavailable,
+		)
+	case errors.Is(err, fs.ErrNotExist):
+		// Nothing there — an operator-placed repository, or one whose hook
+		// was removed. Install below.
+	default:
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			err.Error(),
+			"verify the repository's hooks directory is accessible",
+			ErrHookUnavailable,
+		)
+	}
+
+	if err := installPreReceiveHook(hooksDir); err != nil {
+		// The staged link is verified before it replaces anything, so a
+		// hook that runs is never replaced by one that does not. When the
+		// repair could not be made but what is already there still runs
+		// this walden's own binary — os.Executable returning "/path
+		// (deleted)" on Linux after an in-place upgrade is that case, and
+		// the hook symlink still points at the new binary at the same
+		// path — the push proceeds rather than the server refusing over a
+		// hook that works.
+		if hookIsRunnable(hookPath) == nil {
+			return nil
+		}
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			err.Error(),
+			"verify the repository's hooks directory is writable and the walden binary path is stable",
+			ErrHookUnavailable,
+		)
+	}
+	return nil
+}
+
+// hookPointsAtRunningBinary reports whether hookPath is a symlink to the
+// binary this process is running, resolving to a runnable file. It is
+// EnsureHook's fast path, and answers a question hookIsRunnable
+// deliberately does not: hookIsRunnable follows the symlink, so a link left
+// pointing at a previous install that still holds an executable passes it.
+// That hook runs, but it runs a different walden.
+func hookPointsAtRunningBinary(hookPath string) bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	target, err := os.Readlink(hookPath)
+	if err != nil || target != exe {
+		return false
+	}
+	return hookIsRunnable(hookPath) == nil
+}
+
+// installPreReceiveHook installs hooksDir/pre-receive as a symlink to the
+// running binary, creating hooksDir if it is not already there. It is the
+// one place walden writes that hook: CreateRepo calls it against a staging
+// directory, EnsureHook against a published repository.
+//
+// The symlink — rather than a shell shim — is the point of the argv[0]
+// dispatch in cmd/walden/main.go (`if prog == "pre-receive"`): it needs
+// no shell on the image, and it always points at whatever binary is
+// actually running.
+//
+// The link is staged under a temporary name, checked runnable there, and
+// only then renamed into place, so a hook that runs is never replaced by
+// one that does not.
+//
+// It returns plain errors rather than refusals: creating a repository and
+// repairing a published one are different refusals for the same failure,
+// and each caller says which one happened.
+func installPreReceiveHook(hooksDir string) error {
+	// git only creates hooks/ because the default template ships one; an
+	// absent or stripped template (and GIT_TEMPLATE_DIR is out of
+	// CreateRepo's environment allowlist, so an operator-set one does not
+	// reach that exec either) leaves --bare with no hooks/ at all. walden
+	// depends on that directory, so it makes it, rather than depending on
+	// git's template.
+	if err := os.MkdirAll(hooksDir, 0o700); err != nil {
+		return err
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	// os.Symlink refuses to overwrite, so the staged link needs a name
+	// nothing holds: CreateTemp reserves one, and the empty file it made
+	// is removed to make room for the link itself.
+	staged, err := os.CreateTemp(hooksDir, ".pre-receive-*")
+	if err != nil {
+		return err
+	}
+	stagedPath := staged.Name()
+	staged.Close()
+	published := false
+	defer func() {
+		if !published {
+			os.Remove(stagedPath)
+		}
+	}()
+	if err := os.Remove(stagedPath); err != nil {
+		return err
+	}
+	if err := os.Symlink(exe, stagedPath); err != nil {
+		return err
+	}
+
+	// git accepts a push whose pre-receive is a dangling symlink silently:
+	// no error, no hook run, ref moved. A repository left in that state
+	// acknowledges pushes it never journals — PHILOSOPHY's first promise
+	// failing with no signal. Stat follows the symlink, so this also
+	// catches os.Executable's Linux "/path (deleted)" result after an
+	// in-place binary upgrade, with no need to special-case that string.
+	if err := hookIsRunnable(stagedPath); err != nil {
+		return fmt.Errorf("hooks/pre-receive would not resolve to a runnable file: %w", err)
+	}
+
+	if err := os.Rename(stagedPath, filepath.Join(hooksDir, preReceiveHookName)); err != nil {
+		return err
+	}
+	published = true
 	return nil
 }
 

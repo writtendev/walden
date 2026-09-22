@@ -581,3 +581,294 @@ func TestCreateRepoConcurrentCreatorsExactlyOneWins(t *testing.T) {
 		t.Errorf("RepoExists after concurrent creators = false, want true")
 	}
 }
+
+// TestEnsureHook is the repair-then-verify table for the hook of a repository that reached
+// disk some way other than CreateRepo — placed there by an operator, restored from a backup,
+// or created by a walden that has since been replaced. walden owns hooks/pre-receive, so it
+// repairs the symlink it writes; it does not own whatever else may be sitting there, so it
+// refuses the push rather than deleting it.
+func TestEnsureHook(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	// runnableFile writes an executable file a hook symlink can point at, standing in for a
+	// walden binary at some other path.
+	runnableFile := func(t *testing.T, path string) string {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+		return path
+	}
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, repoPath string)
+		// refuse is true when EnsureHook must refuse rather than repair: what is at the
+		// path is not walden's to replace.
+		refuse bool
+	}{
+		{
+			name: "walden-symlink-left-alone",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+				mustSymlink(t, exe, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			name: "missing-hook-installed",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+			},
+		},
+		{
+			name: "missing-hooks-directory-created",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustMkdirAll(t, repoPath)
+			},
+		},
+		{
+			name: "dangling-symlink-repaired",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+				mustSymlink(t, filepath.Join(repoPath, "gone"), filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			name: "non-executable-target-repaired",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+				target := filepath.Join(repoPath, "not-executable")
+				if err := os.WriteFile(target, []byte("not a binary"), 0o644); err != nil {
+					t.Fatalf("WriteFile(%q): %v", target, err)
+				}
+				mustSymlink(t, target, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			// The case hookIsRunnable cannot see, because it follows the symlink: a link
+			// left by a previous install that still resolves to an executable. That hook
+			// runs, but it runs a different walden.
+			name: "symlink-to-another-binary-repointed",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+				other := runnableFile(t, filepath.Join(repoPath, "previous-walden"))
+				mustSymlink(t, other, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			// An operator's own pre-receive script. It is runnable, so git would run it
+			// happily — and walden's hook would never run, making every push to this
+			// repository silently undurable. walden refuses that push, and does not delete
+			// a file an operator deliberately placed: it says what is in the way and stops.
+			name:   "operator-placed-regular-file-refused",
+			refuse: true,
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+				runnableFile(t, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			name:   "directory-refused",
+			refuse: true,
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustMkdirAll(t, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+			repoPath := filepath.Join(dataDir, "repo.git")
+			tt.setup(t, repoPath)
+			hook := filepath.Join(repoPath, "hooks", "pre-receive")
+
+			err := s.EnsureHook(repoPath)
+			if tt.refuse {
+				if err == nil {
+					t.Fatalf("EnsureHook = nil, want a refusal")
+				}
+				if !errors.Is(err, store.ErrHookUnavailable) {
+					t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+				}
+				if errors.Is(err, store.ErrStoreUnavailable) {
+					t.Errorf("EnsureHook error = %v, want it not to wear ErrStoreUnavailable: the path resolved, the hook is what failed", err)
+				}
+				if strings.Contains(err.Error(), "\n") {
+					t.Errorf("refusal is not one line: %q", err)
+				}
+				if _, statErr := os.Lstat(hook); statErr != nil {
+					t.Errorf("Lstat(%q) after a refusal: %v, want what was there left untouched", hook, statErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("EnsureHook: %v", err)
+			}
+			assertWaldenHook(t, hook, exe)
+
+			// Idempotent: a second call agrees with the first.
+			if err := s.EnsureHook(repoPath); err != nil {
+				t.Fatalf("EnsureHook (second call): %v", err)
+			}
+			assertWaldenHook(t, hook, exe)
+
+			// No staged .pre-receive-* link survives either call.
+			entries, err := os.ReadDir(filepath.Join(repoPath, "hooks"))
+			if err != nil {
+				t.Fatalf("ReadDir: %v", err)
+			}
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), ".pre-receive-") {
+					t.Errorf("hooks/ holds staging residue %q", e.Name())
+				}
+			}
+		})
+	}
+}
+
+// TestEnsureHookLeavesAWaldenSymlinkUntouched pins the fast path: a hook that is already
+// walden's is not rewritten, so an ordinary push does no filesystem write at all.
+func TestEnsureHookLeavesAWaldenSymlinkUntouched(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "repo.git")
+	hook := filepath.Join(repoPath, "hooks", "pre-receive")
+	mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+	mustSymlink(t, exe, hook)
+
+	before, err := os.Lstat(hook)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", hook, err)
+	}
+	if err := s.EnsureHook(repoPath); err != nil {
+		t.Fatalf("EnsureHook: %v", err)
+	}
+	after, err := os.Lstat(hook)
+	if err != nil {
+		t.Fatalf("Lstat(%q) after EnsureHook: %v", hook, err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Errorf("EnsureHook replaced a hook that was already correct (mtime %v -> %v)", before.ModTime(), after.ModTime())
+	}
+}
+
+// TestEnsureHookRefusesUnwritableHooksDirectory covers the one repair that cannot be made
+// and has no runnable hook to fall back on: the hook is missing and hooks/ cannot be written.
+// The push is refused in one line naming ErrHookUnavailable rather than proceeding into a
+// repository whose pushes would never be journaled.
+func TestEnsureHookRefusesUnwritableHooksDirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "repo.git")
+	hooksDir := filepath.Join(repoPath, "hooks")
+	mustMkdirAll(t, hooksDir)
+
+	if err := os.Chmod(hooksDir, 0o555); err != nil {
+		t.Fatalf("Chmod(%q, 0o555): %v", hooksDir, err)
+	}
+	t.Cleanup(func() {
+		// Restore write permission so t.TempDir's own cleanup can remove the tree.
+		_ = os.Chmod(hooksDir, 0o700)
+	})
+	probe := filepath.Join(hooksDir, ".write-probe")
+	if err := os.Mkdir(probe, 0o700); err == nil {
+		_ = os.Remove(probe)
+		t.Skipf("LOUD SKIP: %q is still writable at mode 0555, so this process cannot simulate an unwritable hooks directory — it is running as root, or on a filesystem that ignores mode bits. EnsureHook's refusal path is still covered by TestEnsureHook's operator-placed-regular-file case, which needs no permission games.", hooksDir)
+	}
+
+	err := s.EnsureHook(repoPath)
+	if err == nil {
+		t.Fatalf("EnsureHook = nil, want a refusal: the hook is missing and cannot be installed")
+	}
+	if !errors.Is(err, store.ErrHookUnavailable) {
+		t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("refusal is not one line: %q", err)
+	}
+}
+
+// TestEnsureHookAgreesWithCreateRepo is what fails if CreateRepo's installer and EnsureHook's
+// ever drift apart: a repository walden has just created must need no repair. They share one
+// installer today, and this notices if a later change gives them two.
+func TestEnsureHookAgreesWithCreateRepo(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+
+	if err := s.CreateRepo(ctx, "fresh"); err != nil {
+		t.Fatalf("CreateRepo: %v", err)
+	}
+	path, err := s.RepoPath("fresh")
+	if err != nil {
+		t.Fatalf("RepoPath: %v", err)
+	}
+
+	hook := filepath.Join(path, "hooks", "pre-receive")
+	before, err := os.Lstat(hook)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", hook, err)
+	}
+
+	if err := s.EnsureHook(path); err != nil {
+		t.Fatalf("EnsureHook on a freshly created repository: %v", err)
+	}
+
+	after, err := os.Lstat(hook)
+	if err != nil {
+		t.Fatalf("Lstat(%q) after EnsureHook: %v", hook, err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Errorf("EnsureHook rewrote the hook CreateRepo had just installed (mtime %v -> %v); the two installers have drifted apart", before.ModTime(), after.ModTime())
+	}
+}
+
+// mustMkdirAll creates dir, failing the test if it cannot.
+func mustMkdirAll(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", dir, err)
+	}
+}
+
+// mustSymlink creates the symlink name pointing at target, failing the test if it cannot.
+func mustSymlink(t *testing.T, target, name string) {
+	t.Helper()
+	if err := os.Symlink(target, name); err != nil {
+		t.Fatalf("Symlink(%q, %q): %v", target, name, err)
+	}
+}
+
+// assertWaldenHook asserts that hook is a symlink to exe resolving to a runnable file — the
+// one shape EnsureHook leaves behind.
+func assertWaldenHook(t *testing.T, hook, exe string) {
+	t.Helper()
+	target, err := os.Readlink(hook)
+	if err != nil {
+		t.Fatalf("Readlink(%q): %v", hook, err)
+	}
+	if target != exe {
+		t.Errorf("hooks/pre-receive -> %q, want %q", target, exe)
+	}
+	if err := store.HookIsRunnableForTest(hook); err != nil {
+		t.Errorf("hooks/pre-receive is not runnable: %v", err)
+	}
+}

@@ -325,7 +325,7 @@ func TestResolveHookRefusals(t *testing.T) {
 				"WALDEN_DATA_DIR":     dataDir,
 				"GIT_QUARANTINE_PATH": filepath.Join(dataDir, "elsewhere", "objects", "tmp_objdir-incoming-x"),
 			},
-			wantSub: "resolves outside the repository",
+			wantSub: "not inside the repository directory",
 		},
 		{
 			name: "quarantine escaping the repository with ..",
@@ -334,7 +334,7 @@ func TestResolveHookRefusals(t *testing.T) {
 				"WALDEN_DATA_DIR":     dataDir,
 				"GIT_QUARANTINE_PATH": filepath.Join(dataDir, "repo.git", "objects", "..", "..", "tmp_objdir-incoming-x"),
 			},
-			wantSub: "resolves outside the repository",
+			wantSub: "not inside the repository directory",
 		},
 	}
 	for _, tt := range tests {
@@ -410,6 +410,68 @@ func TestResolveHookQuarantine(t *testing.T) {
 		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
 			"WALDEN_REPO":         "link",
 			"WALDEN_DATA_DIR":     linkDir,
+			"GIT_QUARANTINE_PATH": quarantine,
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != quarantine {
+			t.Errorf("Quarantine = %q, want %q", req.Quarantine, quarantine)
+		}
+	})
+
+	t.Run("two-spellings-of-the-same-directory-resolve", func(t *testing.T) {
+		// The containment test is about identity, not spelling. This is
+		// the portable stand-in for the case-insensitive filesystem below:
+		// <dataDir>/alias.git is the same directory as <dataDir>/repo.git,
+		// written another way, and a lexical prefix test reads the two as
+		// unrelated and refuses the push (round 2 finding 1). git does not
+		// hand walden this particular spelling -- it builds
+		// GIT_QUARANTINE_PATH from getcwd() -- but a case-insensitive
+		// volume hands it the same disagreement, and Linux, where CI runs,
+		// has no way to produce that one.
+		aliasDir := t.TempDir()
+		real := initBareRepo(t, aliasDir, "repo")
+		if err := os.Symlink(real, filepath.Join(aliasDir, "alias.git")); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		quarantine := filepath.Join(aliasDir, "alias.git", "objects", "tmp_objdir-incoming-AbCdEf")
+
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":         "repo",
+			"WALDEN_DATA_DIR":     aliasDir,
+			"GIT_QUARANTINE_PATH": quarantine,
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != quarantine {
+			t.Errorf("Quarantine = %q, want %q", req.Quarantine, quarantine)
+		}
+	})
+
+	t.Run("data-dir-cased-differently-from-the-directory-on-disk", func(t *testing.T) {
+		// The reported shape: on APFS, NTFS, SMB or exFAT, a --data-dir
+		// spelled in another case than the directory it names still opens
+		// it, but filepath.EvalSymlinks hands back the operator's spelling
+		// while git reports the quarantine under the on-disk one. Every
+		// push to every repository was refused, journal-less mode included
+		// (round 2 finding 1). Skipped where case is significant, because
+		// there the mis-cased path names no directory at all.
+		root := t.TempDir()
+		onDisk := filepath.Join(root, "Data")
+		mkdirAll(t, onDisk)
+		misCased := filepath.Join(root, "data")
+		if _, err := os.Stat(misCased); err != nil {
+			t.Skipf("case-sensitive filesystem: %s names no directory", misCased)
+		}
+
+		repoPath := initBareRepo(t, onDisk, "repo")
+		quarantine := filepath.Join(repoPath, "objects", "tmp_objdir-incoming-AbCdEf")
+
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":         "repo",
+			"WALDEN_DATA_DIR":     misCased,
 			"GIT_QUARANTINE_PATH": quarantine,
 		}), updates)
 		if err != nil {
@@ -541,7 +603,26 @@ func TestCaptureSegment(t *testing.T) {
 			},
 		},
 		{
-			name: "pack directory holding only index-pack's siblings",
+			// An empty pack/ and an info/ beside it is the whole of what a
+			// quarantine that received nothing ever holds, so this is the
+			// permissive half of the allowlist: tightening it further would
+			// refuse legitimate pushes, and this says so out loud.
+			name: "pack and info directories, both empty",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkdirAll(t, filepath.Join(q, "pack"))
+				mkdirAll(t, filepath.Join(q, "info"))
+				return q
+			},
+		},
+		{
+			// index-pack's own footprint minus the one file that matters.
+			// Unreachable through git 2.50.1 -- receive-pack rejects every
+			// command before pre-receive when index-pack dies -- but this
+			// check exists to catch a git that changed under walden, so a
+			// shape of exactly that description must not read as "nothing
+			// received" (round 2 finding 2).
+			name: "pack directory holding only index-pack's siblings refuses",
 			setup: func(t *testing.T, root string) string {
 				q := mkQuarantine(t, root)
 				dir := filepath.Join(q, "pack")
@@ -551,6 +632,19 @@ func TestCaptureSegment(t *testing.T) {
 				}
 				return q
 			},
+			wantSub: "pack/pack-abc.idx with no packfile beside it",
+		},
+		{
+			// The allowlist's whole point: walden has never seen this
+			// entry, so it is evidence, not background noise.
+			name: "an entry walden does not recognize refuses",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkdirAll(t, filepath.Join(q, "pack"))
+				mkdirAll(t, filepath.Join(q, "incoming-loose"))
+				return q
+			},
+			wantSub: `"incoming-loose", which a quarantine that received nothing never holds`,
 		},
 		{
 			// The failure this whole change exists to prevent, and the

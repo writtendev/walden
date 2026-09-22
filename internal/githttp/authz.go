@@ -130,7 +130,13 @@ func (h *Handler) authorize(ctx context.Context, token string, required auth.Act
 // is not walden's resolved its path perfectly well — saying otherwise would send an
 // operator looking at the wrong thing; the distinct sentinel is also why this needs
 // no marker type of the repoCreateError kind, which exists only to tell apart two
-// failures wearing the same one), ErrStoreUnavailable to a path-free 500
+// failures wearing the same one). That wording is deliberately the one thing true of
+// every ErrHookUnavailable rather than the commonest: store.EnsureHook refuses a
+// foreign hook, a hook it could not install, a repository that redirects its hooks
+// with core.hooksPath, and a repository directory that went away, and "is not
+// walden's and could not be repaired" was false for the second of those. The
+// operator log line above carries store's own cause, which says which it was.
+// ErrStoreUnavailable maps to a path-free 500
 // (checked before the default branch, which would otherwise forward store's
 // own cause — the absolute repository path — onto the wire), and any other
 // unexpected error to 500 with an operator log line.
@@ -166,7 +172,7 @@ func writeAuthRefusal(w http.ResponseWriter, route, repo string, err error) {
 		log.Printf("githttp: %s: hook unavailable for %q: %v", route, repo, err)
 		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
 			"repository hook unavailable",
-			"the repository's pre-receive hook is not walden's and could not be repaired",
+			"walden could not confirm the repository's pre-receive hook is its own",
 			"contact the operator",
 			store.ErrHookUnavailable,
 		))

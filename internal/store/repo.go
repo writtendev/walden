@@ -217,10 +217,22 @@ const preReceiveHookName = "pre-receive"
 // symlink at hooks/pre-receive and repairs it; it owns nothing else at
 // that path and touches nothing else there.
 //
-// Three outcomes and no fourth:
+// The rule holds only where hooks/pre-receive is the path git will run, so
+// that is established first: a repository whose own config sets
+// core.hooksPath runs <core.hooksPath>/pre-receive and never looks at
+// hooks/ at all, and verifying a path git will ignore is worse than not
+// verifying at all — it reports a repository healthy while its pushes move
+// refs nothing journals. See repoHooksPathRedirect for how git is asked,
+// and why walden refuses such a repository rather than installing into the
+// directory it names.
+//
+// Asking git costs one exec on every push, which is what verifying the
+// right path is worth: `git receive-pack` is an exec a moment later anyway.
+//
+// Three further outcomes and no fourth:
 //
 //   - hooks/pre-receive is a symlink to the running binary and resolves to
-//     a runnable file: nothing is written, three Stat-class syscalls.
+//     a runnable file: nothing else is written, three Stat-class syscalls.
 //   - it is absent, a dangling symlink, or a symlink pointing anywhere
 //     other than the running binary: walden repoints the symlink. A link
 //     still resolving to some executable is repointed too — it runs a
@@ -236,13 +248,40 @@ const preReceiveHookName = "pre-receive"
 //     placed, because it cannot know what it was for. It says which file
 //     is in the way and stops.
 //
+// The second and third of those repair a repository that is there, so the
+// repair also refuses when repoPath is not a directory any more: the
+// installer's MkdirAll would otherwise build one, and walden does not
+// create storage on the repair path. See the comment at that check.
+//
 // A repair that cannot be made refuses. There is deliberately no
 // accept-what-is-already-there fallback: the one state such a fallback
 // was written for — an in-place binary upgrade, the new binary back at
 // the path the existing link names — is the first outcome above, which
 // returns before anything is written. See hookPointsAtRunningBinary for
 // why os.Executable needs no " (deleted)" special case to get there.
+//
+// That refusal is not free, and the trade is stated rather than implied.
+// One push shape it refuses was accepted before it existed: hooks/ not
+// writable and the link naming a walden binary at some other path. An
+// operator who locks hooks/ down and then upgrades to a versioned install
+// directory hits it — on Linux /proc/self/exe resolves to that directory,
+// so os.Executable moves every release, the fast path misses on the path
+// compare, and the repair cannot be written. Every push to that repository
+// then refuses until hooks/ is writable again (chmod u+w on the
+// repository's hooks directory), which is what the refusal's remedy says.
+// The trade is still the right one — the alternative is accepting a push
+// validated by a binary walden cannot tell from /bin/true — but it costs
+// that, and an operator reading this should know it does.
 func (s *Store) EnsureHook(repoPath string) error {
+	if redirect := repoHooksPathRedirect(repoPath); redirect != "" {
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			fmt.Sprintf("%s sets core.hooksPath to %q, so git runs that directory's pre-receive and never walden's", repoPath, redirect),
+			"unset core.hooksPath in the repository's config so git runs hooks/pre-receive",
+			ErrHookUnavailable,
+		)
+	}
+
 	hooksDir := filepath.Join(repoPath, "hooks")
 	hookPath := filepath.Join(hooksDir, preReceiveHookName)
 
@@ -280,6 +319,32 @@ func (s *Store) EnsureHook(repoPath string) error {
 		)
 	}
 
+	// The installer creates hooks/ when it is absent, and MkdirAll would
+	// create repoPath along with it. EnsureHook is handed a path, not a
+	// repository identifier, and never checks that a repository is there —
+	// so a directory that went away since ensureRepoForPush re-resolved it
+	// (an operator's rm -rf racing this push, the same window that
+	// re-resolve exists to cover) would be conjured back as an empty
+	// repository-shaped tree. statRepoPath calls any directory a
+	// repository, so that phantom would occupy the identifier from then on:
+	// pushes hand `git receive-pack` something that is not a repository,
+	// and creation refuses "repository already exists" for a repository
+	// that does not exist — recoverable only by an operator removing it by
+	// hand, and legible from neither refusal. walden repairs a repository
+	// that is there; the repair path does not create storage.
+	if info, err := os.Stat(repoPath); err != nil || !info.IsDir() {
+		cause := fmt.Sprintf("%s is not a directory", repoPath)
+		if err != nil {
+			cause = err.Error()
+		}
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			cause,
+			"verify the repository directory is still present before pushing again",
+			ErrHookUnavailable,
+		)
+	}
+
 	if err := installPreReceiveHook(hooksDir); err != nil {
 		// Whatever is already at hookPath stays there, and the push is
 		// refused. It cannot be accepted on the strength of what is there:
@@ -297,6 +362,60 @@ func (s *Store) EnsureHook(repoPath string) error {
 		log.Printf("store: %s: repointed pre-receive hook from %s to walden's own binary", hookPath, displaced)
 	}
 	return nil
+}
+
+// repoHooksPathRedirect returns the core.hooksPath the repository at
+// repoPath sets in its own config, or "" when it sets none.
+//
+// git consults hooks/pre-receive only while core.hooksPath is unset. Set, it
+// runs <core.hooksPath>/pre-receive and ignores hooks/ entirely — so a
+// repository that arrived some way other than CreateRepo (copied off another
+// server, restored from a backup taken on a host with a hook manager,
+// `git init --template`'d) can carry one, and EnsureHook would otherwise
+// verify a path git will never run and call the repository healthy.
+//
+// walden refuses such a repository rather than installing into the directory
+// core.hooksPath names. Honouring it would be walden guessing at an
+// operator's intent over a surface much larger than it looks — relative paths
+// resolved against the repository, ~ expansion, per-condition includes — and
+// the whole point of this function's caller is that it does not guess about
+// the hook.
+//
+// git is asked rather than the config file read, per AGENTS.md's "wrap git"
+// rule: --local is the repository's own config and nothing above it, and
+// --includes makes git resolve include.path the way it will when it runs the
+// hook (it defaults off once a scope is named). Hand-parsing would mean
+// reimplementing include resolution and value quoting to answer a question
+// git answers exactly.
+//
+// The child gets CreateRepo's allowlist environment, for the reason that one
+// has it: GIT_CONFIG_COUNT/KEY_n/VALUE_n bypass config-file neutralisation
+// entirely, and the answer to "what does this repository's own config say"
+// must not be movable from the server's environment. Only the repository's
+// own half is asked here. Whether /etc/gitconfig can set core.hooksPath for
+// every repository at once is a property of the environment the receive-pack
+// child is given, which lives in githttp and is tracked as WALD-127.
+//
+// git's exit codes carry the answer: 1 is "the key is not set", 0 is the
+// value. Anything else — repoPath is not a repository git will open, git is
+// not on PATH — means git read no local config here at all, and is a path
+// `git receive-pack` refuses outright a moment later for the same reason, so
+// there is no push through it for a redirected hook to slip under. It is
+// reported as no redirect rather than as a refusal naming a condition that
+// was never established.
+func repoHooksPathRedirect(repoPath string) string {
+	env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"}
+	if p := os.Getenv("PATH"); p != "" {
+		env = append(env, "PATH="+p)
+	}
+
+	cmd := exec.Command("git", "-C", repoPath, "config", "--local", "--includes", "--get", "core.hooksPath")
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // hookPointsAtRunningBinary reports whether hookPath is a symlink to the

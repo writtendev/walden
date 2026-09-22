@@ -781,18 +781,7 @@ func TestEnsureHookRefusesUnwritableHooksDirectory(t *testing.T) {
 	hooksDir := filepath.Join(repoPath, "hooks")
 	mustMkdirAll(t, hooksDir)
 
-	if err := os.Chmod(hooksDir, 0o555); err != nil {
-		t.Fatalf("Chmod(%q, 0o555): %v", hooksDir, err)
-	}
-	t.Cleanup(func() {
-		// Restore write permission so t.TempDir's own cleanup can remove the tree.
-		_ = os.Chmod(hooksDir, 0o700)
-	})
-	probe := filepath.Join(hooksDir, ".write-probe")
-	if err := os.Mkdir(probe, 0o700); err == nil {
-		_ = os.Remove(probe)
-		t.Skipf("LOUD SKIP: %q is still writable at mode 0555, so this process cannot simulate an unwritable hooks directory — it is running as root, or on a filesystem that ignores mode bits. EnsureHook's refusal path is still covered by TestEnsureHook's operator-placed-regular-file case, which needs no permission games.", hooksDir)
-	}
+	mustBeUnwritable(t, hooksDir)
 
 	err := s.EnsureHook(repoPath)
 	if err == nil {
@@ -803,6 +792,78 @@ func TestEnsureHookRefusesUnwritableHooksDirectory(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "\n") {
 		t.Errorf("refusal is not one line: %q", err)
+	}
+}
+
+// TestEnsureHookRefusesAForeignRunnableHookItCannotReplace is the case a fallback on "does
+// hooks/pre-receive resolve to some executable" silently re-admitted: a symlink to a runnable
+// binary that is not walden's, in a hooks/ directory the repair cannot be written to. git would
+// run that hook happily, journal nothing, move the ref, and acknowledge the push — the one
+// failure this ticket exists to stop. Runnable is not the question; walden's own is.
+func TestEnsureHookRefusesAForeignRunnableHookItCannotReplace(t *testing.T) {
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "repo.git")
+	hooksDir := filepath.Join(repoPath, "hooks")
+	mustMkdirAll(t, hooksDir)
+
+	// A previous install, /bin/true, an operator's compiled hook: anything runnable that is
+	// not this binary. It lives outside hooks/ so locking that directory down does not also
+	// make the target unreadable.
+	foreign := filepath.Join(dataDir, "not-walden")
+	if err := os.WriteFile(foreign, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q): %v", foreign, err)
+	}
+	hook := filepath.Join(hooksDir, "pre-receive")
+	mustSymlink(t, foreign, hook)
+
+	mustBeUnwritable(t, hooksDir)
+
+	err := s.EnsureHook(repoPath)
+	if err == nil {
+		t.Fatalf("EnsureHook = nil, want a refusal: hooks/pre-receive runs %q, which is not walden", foreign)
+	}
+	if !errors.Is(err, store.ErrHookUnavailable) {
+		t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+	}
+	if errors.Is(err, store.ErrStoreUnavailable) {
+		t.Errorf("EnsureHook error = %v, want it not to wear ErrStoreUnavailable: the path resolved, the hook is what failed", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("refusal is not one line: %q", err)
+	}
+
+	// Nothing is deleted on the way out: the refusal leaves the foreign link where it was.
+	target, readErr := os.Readlink(hook)
+	if readErr != nil {
+		t.Fatalf("Readlink(%q) after a refusal: %v", hook, readErr)
+	}
+	if target != foreign {
+		t.Errorf("hooks/pre-receive -> %q after a refusal, want %q left untouched", target, foreign)
+	}
+}
+
+// TestEnsureHookAcceptsItsOwnHookWhenRepairIsImpossible is the other half of the case above,
+// and the reason refusing a failed repair costs nothing: an in-place binary upgrade — the new
+// walden back at the path the existing link already names — never reaches the repair at all.
+// It matches on the fast path and returns before a single byte is written, so an unwritable
+// hooks/ directory is irrelevant to it.
+func TestEnsureHookAcceptsItsOwnHookWhenRepairIsImpossible(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "repo.git")
+	hooksDir := filepath.Join(repoPath, "hooks")
+	mustMkdirAll(t, hooksDir)
+	mustSymlink(t, exe, filepath.Join(hooksDir, "pre-receive"))
+
+	mustBeUnwritable(t, hooksDir)
+
+	if err := s.EnsureHook(repoPath); err != nil {
+		t.Fatalf("EnsureHook = %v, want nil: the hook already points at the running binary, so no repair is needed", err)
 	}
 }
 
@@ -846,6 +907,26 @@ func mustMkdirAll(t *testing.T, dir string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("MkdirAll(%q): %v", dir, err)
+	}
+}
+
+// mustBeUnwritable takes write permission off dir for the rest of the test, so the repair
+// EnsureHook would make cannot be made — the ENOSPC, EDQUOT and EPERM cases an operator hits,
+// reachable without a full filesystem. It restores the mode on cleanup so t.TempDir can remove
+// the tree, and skips loudly where mode bits do not bite: as root, or on a filesystem that
+// ignores them, the directory stays writable and the test would assert nothing.
+func mustBeUnwritable(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("Chmod(%q, 0o555): %v", dir, err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o700)
+	})
+	probe := filepath.Join(dir, ".write-probe")
+	if err := os.Mkdir(probe, 0o700); err == nil {
+		_ = os.Remove(probe)
+		t.Skipf("LOUD SKIP: %q is still writable at mode 0555, so this process cannot simulate an unwritable hooks directory — it is running as root, or on a filesystem that ignores mode bits. EnsureHook's refusal path is still covered by TestEnsureHook's operator-placed-regular-file case, which needs no permission games.", dir)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -211,32 +212,55 @@ const preReceiveHookName = "pre-receive"
 // availability outage — which is why this lives on the push path rather
 // than inside ResolveRepo, where all three routes would inherit it.
 //
+// The rule is one sentence: a hook is acceptable only if it is walden's
+// own, and being executable is not evidence of that. walden owns the
+// symlink at hooks/pre-receive and repairs it; it owns nothing else at
+// that path and touches nothing else there.
+//
 // Three outcomes and no fourth:
 //
 //   - hooks/pre-receive is a symlink to the running binary and resolves to
 //     a runnable file: nothing is written, three Stat-class syscalls.
 //   - it is absent, a dangling symlink, or a symlink pointing anywhere
-//     other than the running binary: walden replaces the symlink it owns.
-//     A symlink left over from a previous install still resolving to some
-//     executable is repaired too — it runs a different walden, which is
-//     not the same thing as running this one.
+//     other than the running binary: walden repoints the symlink. A link
+//     still resolving to some executable is repointed too — it runs a
+//     different walden, which is not the same thing as running this one —
+//     and a repointing that displaced a target walden did not write is
+//     logged, naming the old target, because walden cannot tell its own
+//     stale link from one an operator placed and the operator whose hook
+//     stopped running deserves to be able to find out why.
 //   - it is anything else — a regular file, a directory: one-line refusal
 //     wrapping ErrHookUnavailable. An operator's own pre-receive script at
 //     that path means walden's hook never runs, so the push cannot be
 //     accepted; and walden will not delete a file an operator deliberately
 //     placed, because it cannot know what it was for. It says which file
 //     is in the way and stops.
+//
+// A repair that cannot be made refuses. There is deliberately no
+// accept-what-is-already-there fallback: the one state such a fallback
+// was written for — an in-place binary upgrade, the new binary back at
+// the path the existing link names — is the first outcome above, which
+// returns before anything is written. See hookPointsAtRunningBinary for
+// why os.Executable needs no " (deleted)" special case to get there.
 func (s *Store) EnsureHook(repoPath string) error {
 	hooksDir := filepath.Join(repoPath, "hooks")
 	hookPath := filepath.Join(hooksDir, preReceiveHookName)
+
+	// The link target as it stands before any repair, empty when there is
+	// no symlink at hookPath. It is what the repair log line below names,
+	// so an operator can find the hook walden displaced.
+	displaced := ""
 
 	switch info, err := os.Lstat(hookPath); {
 	case err == nil && info.Mode()&fs.ModeSymlink != 0:
 		if hookPointsAtRunningBinary(hookPath) {
 			return nil
 		}
-		// walden's own symlink, pointing at a previous install or at
-		// nothing at all. Replacing it is replacing what walden wrote.
+		// A symlink at the path walden owns, pointing somewhere other than
+		// this binary: a previous install, nothing at all, or a hook an
+		// operator linked there. Repointing it is the repair — it is how a
+		// stale install heals itself — but it is not silent.
+		displaced, _ = os.Readlink(hookPath)
 	case err == nil:
 		return refusal.RefuseWithCause(
 			"repository hook unavailable",
@@ -257,23 +281,20 @@ func (s *Store) EnsureHook(repoPath string) error {
 	}
 
 	if err := installPreReceiveHook(hooksDir); err != nil {
-		// The staged link is verified before it replaces anything, so a
-		// hook that runs is never replaced by one that does not. When the
-		// repair could not be made but what is already there still runs
-		// this walden's own binary — os.Executable returning "/path
-		// (deleted)" on Linux after an in-place upgrade is that case, and
-		// the hook symlink still points at the new binary at the same
-		// path — the push proceeds rather than the server refusing over a
-		// hook that works.
-		if hookIsRunnable(hookPath) == nil {
-			return nil
-		}
+		// Whatever is already at hookPath stays there, and the push is
+		// refused. It cannot be accepted on the strength of what is there:
+		// the fast path above has already established that it is not this
+		// binary, and a hook that runs something else journals nothing
+		// while git moves the ref and reports success.
 		return refusal.RefuseWithCause(
 			"repository hook unavailable",
 			err.Error(),
 			"verify the repository's hooks directory is writable and the walden binary path is stable",
 			ErrHookUnavailable,
 		)
+	}
+	if displaced != "" {
+		log.Printf("store: %s: repointed pre-receive hook from %s to walden's own binary", hookPath, displaced)
 	}
 	return nil
 }
@@ -284,6 +305,15 @@ func (s *Store) EnsureHook(repoPath string) error {
 // deliberately does not: hookIsRunnable follows the symlink, so a link left
 // pointing at a previous install that still holds an executable passes it.
 // That hook runs, but it runs a different walden.
+//
+// It needs no " (deleted)" special case for the in-place binary upgrade.
+// On Linux os.Executable reads /proc/self/exe, which the kernel appends
+// that suffix to once the binary is unlinked — and os.Executable has
+// trimmed it back off since before the toolchain go.mod pins, so it
+// returns the plain install path. On darwin the path is captured at exec
+// and never carries a suffix at all. Either way exe is the install path,
+// which is what the existing link names and where the replacement binary
+// now sits, so the upgraded server matches here and writes nothing.
 func hookPointsAtRunningBinary(hookPath string) bool {
 	exe, err := os.Executable()
 	if err != nil {
@@ -355,8 +385,9 @@ func installPreReceiveHook(hooksDir string) error {
 	// no error, no hook run, ref moved. A repository left in that state
 	// acknowledges pushes it never journals — PHILOSOPHY's first promise
 	// failing with no signal. Stat follows the symlink, so this also
-	// catches os.Executable's Linux "/path (deleted)" result after an
-	// in-place binary upgrade, with no need to special-case that string.
+	// catches a running binary that has been unlinked and not replaced:
+	// os.Executable still reports the install path, and nothing is there
+	// any more for the new link to resolve to.
 	if err := hookIsRunnable(stagedPath); err != nil {
 		return fmt.Errorf("hooks/pre-receive would not resolve to a runnable file: %w", err)
 	}

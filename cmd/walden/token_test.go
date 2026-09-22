@@ -21,7 +21,7 @@ func TestTokenCreateSuccess(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--allow", "rw:blog-*", "--id", "test_tok_1"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create failed: %v", err)
 	}
 
@@ -94,7 +94,7 @@ func TestTokenCreateDefaultScope(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create without --allow failed: %v", err)
 	}
 
@@ -137,7 +137,7 @@ func TestTokenCreateMultipleAndCommaSeparatedScopes(t *testing.T) {
 		"--allow", "c:new-*",
 		"--id", "multi_scope",
 	}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create with multiple scopes failed: %v", err)
 	}
 
@@ -205,7 +205,7 @@ func TestTokenCreateInvalidScopesRefusal(t *testing.T) {
 			dataDir := t.TempDir()
 			var stdout, stderr bytes.Buffer
 			args := []string{"walden", "token", "create", "--data-dir", dataDir, "--allow", tt.allowArg}
-			err := run(context.Background(), args, &stdout, &stderr)
+			err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 			if err == nil {
 				t.Fatalf("expected error for invalid scope %q, got nil", tt.allowArg)
 			}
@@ -227,7 +227,7 @@ func TestTokenCreateDuplicateScopeRefusal(t *testing.T) {
 	dataDir := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--allow", "r:foo", "--allow", "r:foo"}
-	err := run(context.Background(), args, &stdout, &stderr)
+	err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected refusal for duplicate scope, got nil")
 	}
@@ -242,7 +242,7 @@ func TestTokenCreateInvalidTokenID(t *testing.T) {
 	// Spaces in ID
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "bad id"}
-	err := run(context.Background(), args, &stdout, &stderr)
+	err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for invalid token ID, got nil")
 	}
@@ -254,7 +254,7 @@ func TestTokenCreateInvalidTokenID(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "create", "--data-dir", dataDir, "--id", ""}
-	err = run(context.Background(), args, &stdout, &stderr)
+	err = run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for empty token ID, got nil")
 	}
@@ -268,13 +268,13 @@ func TestTokenCreateDuplicateIDRefusal(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_dup"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("first token create failed: %v", err)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	err := run(context.Background(), args, &stdout, &stderr)
+	err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for duplicate token ID, got nil")
 	}
@@ -292,7 +292,7 @@ func TestTokenDelegatedModeExclusivity(t *testing.T) {
 	// 1. Create a token in built-in mode first
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_pre"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create failed: %v", err)
 	}
 
@@ -303,7 +303,7 @@ func TestTokenDelegatedModeExclusivity(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "create", "--data-dir", dataDir}
-	err := run(context.Background(), args, &stdout, &stderr)
+	err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected token create to refuse when WALDEN_AUTH_TRUST is set, got nil")
 	}
@@ -316,7 +316,7 @@ func TestTokenDelegatedModeExclusivity(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "create", "--data-dir", dataDir, "--auth-trust", "some-trust-key"}
-	err = run(context.Background(), args, &stdout, &stderr)
+	err = run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected token create to refuse with --auth-trust flag, got nil")
 	}
@@ -330,7 +330,7 @@ func TestTokenDelegatedModeExclusivity(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "list", "--data-dir", dataDir}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("token list failed under delegated mode: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "tok_pre") {
@@ -340,7 +340,7 @@ func TestTokenDelegatedModeExclusivity(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "revoke", "--data-dir", dataDir, "tok_pre"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("token revoke failed under delegated mode: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "revoked token tok_pre") {
@@ -356,7 +356,7 @@ func TestTokenListNeverLeaksSecrets(t *testing.T) {
 	for _, id := range []string{"tok_a", "tok_b", "tok_c"} {
 		var stdout, stderr bytes.Buffer
 		args := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", id, "--allow", "r:*"}
-		if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+		if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 			t.Fatalf("create %s failed: %v", id, err)
 		}
 		raw := strings.TrimSpace(stdout.String())
@@ -366,7 +366,7 @@ func TestTokenListNeverLeaksSecrets(t *testing.T) {
 	// Run list
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "list", "--data-dir", dataDir}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("token list failed: %v", err)
 	}
 
@@ -401,7 +401,7 @@ func TestTokenRevocationImmediate(t *testing.T) {
 	// Create token
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_active", "--allow", "rw:*"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("token create failed: %v", err)
 	}
 	rawToken := strings.TrimSpace(stdout.String())
@@ -419,7 +419,7 @@ func TestTokenRevocationImmediate(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "revoke", "--data-dir", dataDir, "tok_active"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("token revoke failed: %v", err)
 	}
 	if strings.TrimSpace(stdout.String()) != "revoked token tok_active" {
@@ -439,7 +439,7 @@ func TestTokenRevocationImmediate(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "list", "--data-dir", dataDir}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("token list failed: %v", err)
 	}
 	out := stdout.String()
@@ -454,7 +454,7 @@ func TestTokenRevokeRefusals(t *testing.T) {
 	// 1. Missing token ID positional argument
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "revoke", "--data-dir", dataDir}
-	err := run(context.Background(), args, &stdout, &stderr)
+	err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for missing token ID, got nil")
 	}
@@ -467,7 +467,7 @@ func TestTokenRevokeRefusals(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "revoke", "--data-dir", dataDir, "tok_1", "tok_2"}
-	err = run(context.Background(), args, &stdout, &stderr)
+	err = run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for extra positional argument, got nil")
 	}
@@ -479,7 +479,7 @@ func TestTokenRevokeRefusals(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "revoke", "--data-dir", dataDir, "tok_nonexistent"}
-	err = run(context.Background(), args, &stdout, &stderr)
+	err = run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for unknown token ID, got nil")
 	}
@@ -494,21 +494,21 @@ func TestTokenRevokeRefusals(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_to_revoke"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("token create failed: %v", err)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "revoke", "--data-dir", dataDir, "tok_to_revoke"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("first revoke failed: %v", err)
 	}
 
 	// 4. Revoking already-revoked token ID
 	stdout.Reset()
 	stderr.Reset()
-	err = run(context.Background(), args, &stdout, &stderr)
+	err = run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for already-revoked token ID, got nil")
 	}
@@ -523,7 +523,7 @@ func TestTokenRevokeRefusals(t *testing.T) {
 func TestTokenInvalidDataDir(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", ""}
-	err := run(context.Background(), args, &stdout, &stderr)
+	err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for empty --data-dir, got nil")
 	}
@@ -537,7 +537,7 @@ func TestTokenUnexpectedArguments(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "extra-arg"}
-	err := run(context.Background(), args, &stdout, &stderr)
+	err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for unexpected argument on create, got nil")
 	}
@@ -548,7 +548,7 @@ func TestTokenUnexpectedArguments(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	args = []string{"walden", "token", "list", "--data-dir", dataDir, "extra-arg"}
-	err = run(context.Background(), args, &stdout, &stderr)
+	err = run(context.Background(), args, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected error for unexpected argument on list, got nil")
 	}
@@ -605,7 +605,7 @@ func TestTokenCreateWithJournalWritesMetaRecordAndDisk(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--allow", "rw:blog-*", "--id", "tok_journaled"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create failed: %v", err)
 	}
 	rawToken := strings.TrimSpace(stdout.String())
@@ -645,7 +645,7 @@ func TestTokenCreateWithJournalReusedIDRefusesBeforeAnyPut(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	first := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_dup"}
-	if err := run(context.Background(), first, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), first, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("first run token create failed: %v", err)
 	}
 
@@ -655,7 +655,7 @@ func TestTokenCreateWithJournalReusedIDRefusesBeforeAnyPut(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	second := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_dup"}
-	err := run(context.Background(), second, &stdout, &stderr)
+	err := run(context.Background(), second, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected the second create with a reused id to refuse")
 	}
@@ -700,14 +700,14 @@ func TestTokenRevokeWithJournalJournalsThenMutates(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_to_revoke"}
-	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), create, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create failed: %v", err)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	revoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_to_revoke"}
-	if err := run(context.Background(), revoke, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), revoke, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token revoke failed: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "revoked token tok_to_revoke") {
@@ -743,7 +743,7 @@ func TestTokenRevokeWithJournalUnknownOrAlreadyRevokedRefusesWithoutAppending(t 
 
 	var stdout, stderr bytes.Buffer
 	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_live"}
-	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), create, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create failed: %v", err)
 	}
 
@@ -752,7 +752,7 @@ func TestTokenRevokeWithJournalUnknownOrAlreadyRevokedRefusesWithoutAppending(t 
 
 		var out, errOut bytes.Buffer
 		args := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_ghost"}
-		err := run(context.Background(), args, &out, &errOut)
+		err := run(context.Background(), args, strings.NewReader(""), &out, &errOut)
 		if err == nil {
 			t.Fatal("expected revoking an unknown id to refuse")
 		}
@@ -772,7 +772,7 @@ func TestTokenRevokeWithJournalUnknownOrAlreadyRevokedRefusesWithoutAppending(t 
 	t.Run("already revoked", func(t *testing.T) {
 		var out, errOut bytes.Buffer
 		firstRevoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_live"}
-		if err := run(context.Background(), firstRevoke, &out, &errOut); err != nil {
+		if err := run(context.Background(), firstRevoke, strings.NewReader(""), &out, &errOut); err != nil {
 			t.Fatalf("first revoke failed: %v", err)
 		}
 
@@ -781,7 +781,7 @@ func TestTokenRevokeWithJournalUnknownOrAlreadyRevokedRefusesWithoutAppending(t 
 		out.Reset()
 		errOut.Reset()
 		secondRevoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_live"}
-		err := run(context.Background(), secondRevoke, &out, &errOut)
+		err := run(context.Background(), secondRevoke, strings.NewReader(""), &out, &errOut)
 		if err == nil {
 			t.Fatal("expected revoking an already-revoked id to refuse")
 		}
@@ -818,7 +818,7 @@ func TestTokenRevokeCompletesDiskAfterJournalSucceedsButDiskFails(t *testing.T) 
 
 	var stdout, stderr bytes.Buffer
 	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_probe"}
-	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), create, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create failed: %v", err)
 	}
 
@@ -831,7 +831,7 @@ func TestTokenRevokeCompletesDiskAfterJournalSucceedsButDiskFails(t *testing.T) 
 
 	stdout.Reset()
 	stderr.Reset()
-	err := run(context.Background(), revoke, &stdout, &stderr)
+	err := run(context.Background(), revoke, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected the first revoke attempt to fail: tokens.json.tmp cannot be written")
 	}
@@ -872,7 +872,7 @@ func TestTokenRevokeCompletesDiskAfterJournalSucceedsButDiskFails(t *testing.T) 
 
 	stdout.Reset()
 	stderr.Reset()
-	if err := run(context.Background(), revoke, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), revoke, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("retry after clearing the disk fault should succeed, got: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "revoked token tok_probe") {
@@ -897,7 +897,7 @@ func TestTokenRevokeCompletesDiskAfterJournalSucceedsButDiskFails(t *testing.T) 
 	// fix must not make this pre-check useless for the ordinary case.
 	stdout.Reset()
 	stderr.Reset()
-	err = run(context.Background(), revoke, &stdout, &stderr)
+	err = run(context.Background(), revoke, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected a third revoke attempt (already revoked on both sides) to refuse")
 	}
@@ -927,14 +927,14 @@ func TestTokenRevokeWithJournalRevokedButNoLocalRecordRefusesHonestly(t *testing
 
 	var stdout, stderr bytes.Buffer
 	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--journal", journalURL, "--id", "tok_ghost"}
-	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), create, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create failed: %v", err)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	revoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_ghost"}
-	if err := run(context.Background(), revoke, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), revoke, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token revoke failed: %v", err)
 	}
 
@@ -950,7 +950,7 @@ func TestTokenRevokeWithJournalRevokedButNoLocalRecordRefusesHonestly(t *testing
 
 	stdout.Reset()
 	stderr.Reset()
-	err := run(context.Background(), revoke, &stdout, &stderr)
+	err := run(context.Background(), revoke, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected revoking a token with no local record to refuse")
 	}
@@ -1008,7 +1008,7 @@ func TestTokenRevokeUnknownIDRefusalNamesRealNextStep(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	create := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_local"}
-	if err := run(context.Background(), create, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), create, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create (journal-less) failed: %v", err)
 	}
 
@@ -1017,7 +1017,7 @@ func TestTokenRevokeUnknownIDRefusalNamesRealNextStep(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	revoke := []string{"walden", "token", "revoke", "--data-dir", dataDir, "--journal", journalURL, "tok_local"}
-	err := run(context.Background(), revoke, &stdout, &stderr)
+	err := run(context.Background(), revoke, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected revoking a disk-only, never-journaled token to refuse")
 	}
@@ -1056,7 +1056,7 @@ func TestTokenRevokeUnknownIDRefusalNamesRealNextStep(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	revokeNoJournal := []string{"walden", "token", "revoke", "--data-dir", dataDir, "tok_local"}
-	if err := run(context.Background(), revokeNoJournal, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), revokeNoJournal, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("journal-less revoke (the refusal's own suggested next step) failed: %v", err)
 	}
 	rec, err = store.GetTokenByID(context.Background(), "tok_local")
@@ -1076,7 +1076,7 @@ func TestTokenCreateNoJournalBehavesAsBefore(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	args := []string{"walden", "token", "create", "--data-dir", dataDir, "--id", "tok_no_journal"}
-	if err := run(context.Background(), args, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), args, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run token create failed: %v", err)
 	}
 	rawToken := strings.TrimSpace(stdout.String())

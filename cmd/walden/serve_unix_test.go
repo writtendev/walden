@@ -107,12 +107,18 @@ func waitForServerBoot(t *testing.T, stdout io.Reader) (adminToken, addr string)
 
 // TestServeEndToEndCloneAndPush builds the real walden binary, starts it
 // as a subprocess bound to a real socket, and drives it with the real git
-// client: a push, then a clone, against a repository that already exists.
+// client: a create push, an update push, a branch creation and its own
+// deletion, then a clone, against a repository that already exists.
 // Driving githttp.Handler directly in-process (as every other handler
 // test in this codebase does) is exactly what let WALD-112's gap go
 // unnoticed -- runServe never actually called net.Listen or
-// (*http.Server).Serve -- so this test must go through a socket. It
-// deliberately does not exercise create-on-push; that gap is WALD-111's.
+// (*http.Server).Serve -- so this test must go through a socket. The three
+// push shapes are what exercise the real pre-receive hook (WALD-43,
+// dispatched by argv[0] via the hooks/pre-receive symlink below) against
+// git's actual stdin, rather than a line this suite constructs by hand --
+// a hook that mis-parses it fails here, not only in prereceive_test.go's
+// mocks. It deliberately does not exercise create-on-push; that gap is
+// WALD-111's.
 func TestServeEndToEndCloneAndPush(t *testing.T) {
 	tmpDir := t.TempDir()
 	binPath := filepath.Join(tmpDir, "walden")
@@ -180,12 +186,45 @@ func TestServeEndToEndCloneAndPush(t *testing.T) {
 		t.Fatalf("bare repo refs/heads/main = %q, want %q", gotRef, sha)
 	}
 
+	// A second push to the same branch exercises the pre-receive hook's
+	// other two triple shapes (WALD-43's parseRefUpdates/resolveHook are
+	// exercised by a mock everywhere else; this end-to-end test is what
+	// catches a hook that mis-parses git's own stdin). First an update:
+	// old_oid is now sha, not the all-zero creation OID.
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "second")
+	sha2 := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+	runLocalGit(t, work, "push", "-q", repoURL, "main")
+
+	gotRef2 := strings.TrimSpace(runLocalGit(t, tmpDir, "--git-dir="+repoPath, "rev-parse", "refs/heads/main"))
+	if gotRef2 != sha2 {
+		t.Fatalf("bare repo refs/heads/main after update = %q, want %q", gotRef2, sha2)
+	}
+
+	// Then a branch creation and its own deletion -- new_oid all-zero.
+	// "feature", not "main": git's own receive.denyDeleteCurrent refuses
+	// deleting the branch the bare repo's HEAD points to, which would
+	// fail this push before the hook is ever asked to parse it, and this
+	// test is about the hook, not that unrelated git default.
+	runLocalGit(t, work, "branch", "feature")
+	runLocalGit(t, work, "push", "-q", repoURL, "feature")
+	gotFeatureRef := strings.TrimSpace(runLocalGit(t, tmpDir, "--git-dir="+repoPath, "rev-parse", "refs/heads/feature"))
+	if gotFeatureRef != sha2 {
+		t.Fatalf("bare repo refs/heads/feature = %q, want %q", gotFeatureRef, sha2)
+	}
+
+	runLocalGit(t, work, "push", "-q", repoURL, "--delete", "feature")
+	verifyFeature := exec.Command("git", "--git-dir="+repoPath, "rev-parse", "--verify", "refs/heads/feature")
+	verifyFeature.Env = e2eGitEnv()
+	if out, err := verifyFeature.CombinedOutput(); err == nil {
+		t.Fatalf("refs/heads/feature still resolves after delete: %s", out)
+	}
+
 	// Clone it back over the same socket.
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 	runLocalGit(t, tmpDir, "clone", "-q", repoURL, cloneDir)
 	cloneHead := strings.TrimSpace(runLocalGit(t, cloneDir, "rev-parse", "HEAD"))
-	if cloneHead != sha {
-		t.Fatalf("clone HEAD = %q, want %q", cloneHead, sha)
+	if cloneHead != sha2 {
+		t.Fatalf("clone HEAD = %q, want %q", cloneHead, sha2)
 	}
 
 	// Send the shutdown signal and wait for a clean exit before

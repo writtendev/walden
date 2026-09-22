@@ -73,9 +73,11 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 
 	// Resolve the path last, not from the ResolveRepo call above: when exists was true,
 	// CreateRepo never ran, so nothing has re-checked containment since then. A symlink
-	// swapped in for the repository directory during the Authorize window (create_test.go's
-	// raceAuthorizer drives this exact window) would otherwise reach handleReceivePack
-	// unchecked. RepoPath's own containment check is what refuses that case.
+	// swapped in for the repository directory during the Authorize window would otherwise
+	// reach handleReceivePack unchecked. RepoPath's own containment check is what refuses
+	// that case, and create_test.go's
+	// TestEnsureRepoForPushRefusesEscapingSymlinkSwappedDuringAuthorize drives exactly that
+	// swap against the exists == true branch, so removing this line fails the suite.
 	return h.store.RepoPath(repo)
 }
 

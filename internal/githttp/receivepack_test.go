@@ -225,11 +225,22 @@ func TestReceivePackHookRejectionIsACompletedRPC(t *testing.T) {
 // by this handler, plus whatever git itself adds around a hook invocation —
 // never the server's ambient environment forwarded wholesale.
 func TestReceivePackHookEnvironment(t *testing.T) {
-	runPush := func(t *testing.T, h http.Handler, token, barePath string) map[string]string {
+	// runPush returns the hook's environment and the names git left in
+	// the quarantine directory's pack/. The second is what proves the
+	// receive.unpackLimit=0 knob (WALD-44) actually took: with git's
+	// default, a push this small is unpacked to loose objects and pack/
+	// is empty, so the pre-receive hook has no segment to journal.
+	// Deliberately asserted as behaviour rather than by grepping the
+	// argv -- a test that looks for "-c receive.unpackLimit=0" would go
+	// on passing if git stopped honouring it.
+	runPush := func(t *testing.T, h http.Handler, token, barePath string) (map[string]string, []string) {
 		t.Helper()
 
-		dumpPath := filepath.Join(t.TempDir(), "env.dump")
-		installHook(t, barePath, "pre-receive", "#!/bin/sh\nenv > "+dumpPath+"\nexit 1\n")
+		dumpDir := t.TempDir()
+		dumpPath := filepath.Join(dumpDir, "env.dump")
+		packPath := filepath.Join(dumpDir, "pack.dump")
+		installHook(t, barePath, "pre-receive",
+			"#!/bin/sh\nenv > "+dumpPath+"\nls \"$GIT_QUARANTINE_PATH/pack\" > "+packPath+" 2>/dev/null\nexit 1\n")
 
 		server := httptest.NewServer(h)
 		defer server.Close()
@@ -255,14 +266,23 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 			}
 			env[k] = v
 		}
-		return env
+
+		var packEntries []string
+		if raw, err := os.ReadFile(packPath); err == nil {
+			for _, name := range strings.Split(string(raw), "\n") {
+				if name != "" {
+					packEntries = append(packEntries, name)
+				}
+			}
+		}
+		return env, packEntries
 	}
 
 	t.Run("core-variables-and-git-owned-ones", func(t *testing.T) {
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
 		h, tok := newTestHandler(t, s, "https://example.com/bucket/prefix")
-		env := runPush(t, h, tok, barePath)
+		env, packEntries := runPush(t, h, tok, barePath)
 
 		if got := env["WALDEN_REPO"]; got != "repo" {
 			t.Errorf("WALDEN_REPO = %q, want %q", got, "repo")
@@ -282,13 +302,27 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 		if _, ok := env["GIT_COMMITTER_NAME"]; ok {
 			t.Errorf("GIT_COMMITTER_NAME is present; walden has no identity model and must not invent one")
 		}
+
+		// One commit is far below git's default receive.unpackLimit of
+		// 100, so without walden setting that knob to 0 this directory
+		// is empty and the objects are loose somewhere under the
+		// quarantine root instead.
+		packs := 0
+		for _, name := range packEntries {
+			if strings.HasSuffix(name, ".pack") {
+				packs++
+			}
+		}
+		if packs != 1 {
+			t.Errorf("GIT_QUARANTINE_PATH/pack holds %d packfiles (entries %v), want exactly one; the received objects must reach the hook as a packfile, not as loose objects", packs, packEntries)
+		}
 	})
 
 	t.Run("journal-less-mode-omits-the-variable-entirely", func(t *testing.T) {
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
 		h, tok := newTestHandler(t, s, "")
-		env := runPush(t, h, tok, barePath)
+		env, _ := runPush(t, h, tok, barePath)
 
 		if v, ok := env["WALDEN_JOURNAL"]; ok {
 			t.Errorf("WALDEN_JOURNAL = %q, want the variable absent entirely (journal-less mode), not empty", v)
@@ -302,7 +336,7 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
 		h, tok := newTestHandler(t, s, "")
-		env := runPush(t, h, tok, barePath)
+		env, _ := runPush(t, h, tok, barePath)
 
 		if got := env["AWS_ACCESS_KEY_ID"]; got != "test-access-key-id" {
 			t.Errorf("AWS_ACCESS_KEY_ID = %q, want %q", got, "test-access-key-id")

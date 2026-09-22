@@ -84,6 +84,27 @@ func ValidatePackfileHeader(data []byte) error {
 	return nil
 }
 
+// PackfileObjectCount returns the object count out of the packfile header
+// at the front of data, after validating that header with
+// ValidatePackfileHeader -- so data must be at least PackfileMinSize
+// bytes, the same leading slice every other check in this file takes. A
+// count of 0 is what git's index-pack writes when a push moves a ref to an
+// object the repository already holds: the resulting pack is the 32-byte
+// header-plus-checksum minimum and carries nothing worth journaling as a
+// segment (WALD-44).
+//
+// This reads three documented header fields and stops. It does not
+// decompress an entry, resolve a delta, or otherwise parse the pack --
+// spec/journal/v1 section 6.6 items 1-3 already name this header as
+// framing walden checks, and this reads the one field of it that
+// ValidatePackfileHeader did not already have a reason to look at.
+func PackfileObjectCount(data []byte) (uint32, error) {
+	if err := ValidatePackfileHeader(data); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(data[8:12]), nil
+}
+
 // ValidatePackfileHeaderSHA256 validates that data contains a valid Git packfile header for SHA-256 repositories (>= 44 bytes).
 func ValidatePackfileHeaderSHA256(data []byte) error {
 	if len(data) < PackfileMinSizeSHA256 {

@@ -136,12 +136,25 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	// rather than inheriting the server's environment, but it does not
 	// touch what git itself injects into the child once started; nothing
 	// here bypasses or relaxes the quarantine-until-pre-receive-exits-0
-	// mechanism the durability handshake will stand on.
+	// mechanism the durability handshake stands on.
+	//
+	// One git config knob is set on the invocation below rather than in
+	// the environment: receive.unpackLimit=0 (WALD-44). git's default
+	// (100) makes receive-pack unpack a small push into *loose objects*
+	// in the quarantine directory and leave its pack/ empty, so the
+	// pre-receive hook has no packfile to journal for exactly the pushes
+	// people make most often -- the core promise failing with no signal.
+	// Setting it to 0 makes git take its index-pack branch every time, so
+	// quarantine holds exactly one .pack or none. It is set here, on the
+	// exec, rather than written into a repository's config by
+	// store.CreateRepo's git init, so it also applies to every repository
+	// already on disk. git propagates a -c setting to its own children
+	// through GIT_CONFIG_PARAMETERS, so index-pack sees it too.
 
 	releaseBody := func() {
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 	}
-	proc, err := startGit(r.Context(), env, body, releaseBody, "receive-pack", "--stateless-rpc", path)
+	proc, err := startGit(r.Context(), env, body, releaseBody, "-c", "receive.unpackLimit=0", "receive-pack", "--stateless-rpc", path)
 	if err != nil {
 		writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 			"receive-pack failed",

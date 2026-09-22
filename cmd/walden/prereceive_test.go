@@ -148,6 +148,18 @@ func TestParseRefUpdatesRefusals(t *testing.T) {
 			wantSub: "no-op ref update",
 		},
 		{
+			// git receive-pack runs pre-receive before its own
+			// "funny refname" check, so this line reaches the hook
+			// verbatim. bufio.ScanLines would have dropped the '\r' and
+			// handed back "refs/heads/ev" -- a ref name the client never
+			// sent, which ValidateRefName then accepts. Keeping the byte
+			// lets ValidateRefName refuse it, which is spec §5.2's
+			// byte-preservation invariant doing its job.
+			name:    "trailing carriage return stays in the ref name and is refused",
+			in:      journal.ZeroOID40 + " " + testNewOID + " refs/heads/ev\r\n",
+			wantSub: "byte 0x0d",
+		},
+		{
 			name:    "a line past the scanner's buffer",
 			in:      journal.ZeroOID40 + " " + testNewOID + " refs/heads/" + strings.Repeat("x", bufio.MaxScanTokenSize) + "\n",
 			wantSub: "reading stdin",
@@ -166,6 +178,28 @@ func TestParseRefUpdatesRefusals(t *testing.T) {
 				t.Errorf("expected a single-line refusal, got: %q", err.Error())
 			}
 		})
+	}
+}
+
+// TestParseRefUpdatesDoesNotCollapseCarriageReturnOntoItsTwin pins the
+// second consequence of splitting with bufio.ScanLines: "refs/heads/x" and
+// "refs/heads/x\r" are different ref names, and dropping the '\r' made them
+// the same map key, so the push was refused for a duplicate ref it did not
+// contain. The refusal must name the real cause -- the control byte in the
+// second ref -- not a duplicate.
+func TestParseRefUpdatesDoesNotCollapseCarriageReturnOntoItsTwin(t *testing.T) {
+	in := journal.ZeroOID40 + " " + testNewOID + " refs/heads/x\n" +
+		testOldOID + " " + journal.ZeroOID40 + " refs/heads/x\r\n"
+
+	_, err := parseRefUpdates(strings.NewReader(in))
+	if err == nil {
+		t.Fatal("parseRefUpdates succeeded, want a refusal for the control byte")
+	}
+	if strings.Contains(err.Error(), "duplicate ref update") {
+		t.Errorf("refused as a duplicate ref, which mis-states the cause: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "byte 0x0d") {
+		t.Errorf("error = %q, want it to name the carriage return", err.Error())
 	}
 }
 

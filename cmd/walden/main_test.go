@@ -590,6 +590,25 @@ func TestBinaryArgvDispatch(t *testing.T) {
 	}
 }
 
+// hookTestEnv returns a curated environment for a walden process exec'd as
+// git's pre-receive hook by a test that asserts its output byte for byte:
+// PATH only, and no WALDEN_* name at all, so the test sets every variable
+// the hook reads. Inheriting os.Environ() instead let an ambient
+// WALDEN_JOURNAL on a developer's machine push the hook into resolveHook's
+// journal branch, failing the test with "pre-receive exited non-zero" --
+// a message pointing at the hook rather than at the leaked variable.
+//
+// serve_unix_test.go's e2eGitEnv does the same job for the end-to-end git
+// tests but is behind //go:build unix, and it also pins GIT_CONFIG_GLOBAL
+// and GIT_CONFIG_SYSTEM to /dev/null, which the hook -- which execs no git
+// -- has no use for.
+func hookTestEnv() []string {
+	if p := os.Getenv("PATH"); p != "" {
+		return []string{"PATH=" + p}
+	}
+	return nil
+}
+
 // TestBinaryPreReceiveRealTriplesExitsZero drives the actual walden binary
 // as git's pre-receive hook through the pre-receive symlink (WALD-43),
 // with WALDEN_REPO/WALDEN_DATA_DIR naming a repository that really exists
@@ -615,7 +634,7 @@ func TestBinaryPreReceiveRealTriplesExitsZero(t *testing.T) {
 	}
 
 	cmd := exec.Command(hookPath)
-	cmd.Env = append(os.Environ(), "WALDEN_REPO=hookrepo", "WALDEN_DATA_DIR="+dataDir)
+	cmd.Env = append(hookTestEnv(), "WALDEN_REPO=hookrepo", "WALDEN_DATA_DIR="+dataDir)
 	cmd.Stdin = strings.NewReader("0000000000000000000000000000000000000000 4b825dc642cb6eb9a060e54bf8d69288fbee4904 refs/heads/main\n")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

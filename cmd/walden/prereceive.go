@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -43,6 +44,7 @@ func parseRefUpdates(r io.Reader) ([]journal.RefUpdate, error) {
 	seenRefs := make(map[string]bool)
 
 	scanner := bufio.NewScanner(r)
+	scanner.Split(splitRawLines)
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -83,6 +85,37 @@ func parseRefUpdates(r io.Reader) ([]journal.RefUpdate, error) {
 		)
 	}
 	return updates, nil
+}
+
+// splitRawLines is a bufio.SplitFunc that splits stdin on '\n' and nothing
+// else. It exists because bufio.ScanLines, the Scanner default, drops a
+// trailing '\r' unconditionally, which would rewrite a ref name ending in
+// a carriage return into a different, shorter name. git receive-pack does
+// not check refname format before running pre-receive -- its "funny
+// refname" check runs afterwards -- so a hostile client can put
+// "refs/heads/x\r" on this reader, and ScanLines would normalize it into
+// "refs/heads/x": a ref name nobody pushed, which ValidateRefName would
+// then accept. Spec §5.2 requires ref names to be treated as exact,
+// opaque byte sequences, so the '\r' stays in the token and
+// journal.ValidateRefName -- which owns the question and refuses any byte
+// <= 0x20 -- refuses it.
+//
+// Apart from the missing dropCR this is bufio.ScanLines: a final line with
+// no newline is still a token, and an empty line is still an empty token
+// (refused below for carrying no spaces). Returning 0, nil, nil when no
+// newline is in the buffer leaves Scanner's own ErrTooLong intact for a
+// line longer than its buffer.
+func splitRawLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 // refusePreReceiveLine refuses a pre-receive stdin line that does not carry

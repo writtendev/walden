@@ -29,6 +29,14 @@ var (
 	// data directory is a server misconfiguration, not a bad repository
 	// name.
 	ErrStoreUnavailable = errors.New("repository storage unavailable")
+	// ErrHookUnavailable marks an operator-fault refusal: a repository's
+	// hooks/pre-receive is not walden's and could not be made so, so a
+	// push to it would move refs that were never journaled. It is
+	// deliberately not an alias of ErrStoreUnavailable — the repository's
+	// path resolved perfectly well, and githttp flattens every
+	// ErrStoreUnavailable into one sentence about failing to resolve that
+	// path, which would be a lie about this failure.
+	ErrHookUnavailable = errors.New("repository hook unavailable")
 )
 
 // Store manages bare git repositories under a base data directory.
@@ -153,6 +161,11 @@ type RepositoryManager interface {
 	// ResolveRepo resolves repo to its on-disk path and reports whether a
 	// bare git repository already exists there, in one call.
 	ResolveRepo(ctx context.Context, repo string) (path string, exists bool, err error)
+	// EnsureHook verifies — repairing where it safely can — the
+	// pre-receive hook of the repository already resolved to repoPath. It
+	// takes a context because it execs git to establish which hook that
+	// repository will run.
+	EnsureHook(ctx context.Context, repoPath string) error
 }
 
 // var _ RepositoryManager = (*Store)(nil) pins Store to the interface at

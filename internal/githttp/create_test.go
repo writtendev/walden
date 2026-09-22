@@ -3,7 +3,9 @@ package githttp
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -417,4 +419,102 @@ func TestEnsureRepoForPushConcurrentCreatorsAllSucceed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEnsureRepoForPushInstallsHookOnOperatorPlacedRepo is the case this ticket exists for:
+// a bare repository an operator made themselves and dropped into the data directory. walden
+// never created it, so nothing has ever installed its pre-receive hook, and a push through
+// it would move refs that were never journaled. The push proceeds — and the hook is walden's
+// afterwards.
+func TestEnsureRepoForPushInstallsHookOnOperatorPlacedRepo(t *testing.T) {
+	ctx := context.Background()
+	for name, p := range mountAuthorizers(t, "rw:*") {
+		t.Run(name, func(t *testing.T) {
+			s := store.New(t.TempDir())
+			wantPath := initBareRepoByHand(t, s, "byhand")
+
+			h := NewHandler(p.authorizer, s, "")
+			path, err := h.ensureRepoForPush(ctx, p.token, "byhand")
+			if err != nil {
+				t.Fatalf("ensureRepoForPush: %v", err)
+			}
+			if path != wantPath {
+				t.Errorf("ensureRepoForPush = %q, want %q", path, wantPath)
+			}
+
+			hook := filepath.Join(path, "hooks", "pre-receive")
+			target, err := os.Readlink(hook)
+			if err != nil {
+				t.Fatalf("Readlink(%q): %v, want walden's hook installed by the push", hook, err)
+			}
+			exe, err := os.Executable()
+			if err != nil {
+				t.Fatalf("os.Executable: %v", err)
+			}
+			if target != exe {
+				t.Errorf("hooks/pre-receive -> %q, want %q", target, exe)
+			}
+		})
+	}
+}
+
+// TestEnsureRepoForPushRefusesForeignHook is the other half of the same decision: an
+// operator's own pre-receive script at that path means walden's hook never runs, so the push
+// cannot be accepted — and the script is not walden's to delete, so it is not deleted. The
+// refusal carries store.ErrHookUnavailable and not store.ErrStoreUnavailable: the path
+// resolved perfectly well.
+func TestEnsureRepoForPushRefusesForeignHook(t *testing.T) {
+	ctx := context.Background()
+	for name, p := range mountAuthorizers(t, "rw:*") {
+		t.Run(name, func(t *testing.T) {
+			s := store.New(t.TempDir())
+			path := initBareRepoByHand(t, s, "byhand")
+
+			hook := filepath.Join(path, "hooks", "pre-receive")
+			const script = "#!/bin/sh\nexit 0\n"
+			if err := os.WriteFile(hook, []byte(script), 0o755); err != nil {
+				t.Fatalf("WriteFile(%q): %v", hook, err)
+			}
+
+			h := NewHandler(p.authorizer, s, "")
+			gotPath, err := h.ensureRepoForPush(ctx, p.token, "byhand")
+			if err == nil {
+				t.Fatalf("ensureRepoForPush = (%q, nil), want a refusal: walden's hook would never run", gotPath)
+			}
+			if !errors.Is(err, store.ErrHookUnavailable) {
+				t.Errorf("ensureRepoForPush error = %v, want errors.Is store.ErrHookUnavailable", err)
+			}
+			if errors.Is(err, store.ErrStoreUnavailable) {
+				t.Errorf("ensureRepoForPush error = %v, want it not to wear ErrStoreUnavailable: the repository path resolved", err)
+			}
+
+			got, err := os.ReadFile(hook)
+			if err != nil {
+				t.Fatalf("ReadFile(%q): %v, want the operator's own hook left where they put it", hook, err)
+			}
+			if string(got) != script {
+				t.Errorf("hooks/pre-receive = %q, want %q: walden must not rewrite a file it did not put there", got, script)
+			}
+		})
+	}
+}
+
+// initBareRepoByHand creates repo's bare repository with the real git binary and nothing
+// else — no walden, so no hook — exactly as an operator would by running `git init --bare`
+// inside the data directory. It returns the repository's path.
+func initBareRepoByHand(t *testing.T, s *store.Store, repo string) string {
+	t.Helper()
+
+	path, err := s.RepoPath(repo)
+	if err != nil {
+		t.Fatalf("RepoPath(%q): %v", repo, err)
+	}
+	cmd := exec.Command("git", "init", "-q", "--bare", "--initial-branch=main", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare %q: %v\n%s", path, err, out)
+	}
+	if _, err := os.Lstat(filepath.Join(path, "hooks", "pre-receive")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Lstat(hooks/pre-receive) = %v, want it absent: git's own template must not be installing one", err)
+	}
+	return path
 }

@@ -581,3 +581,864 @@ func TestCreateRepoConcurrentCreatorsExactlyOneWins(t *testing.T) {
 		t.Errorf("RepoExists after concurrent creators = false, want true")
 	}
 }
+
+// TestEnsureHook is the repair-then-verify table for the hook of a repository that reached
+// disk some way other than CreateRepo — placed there by an operator, restored from a backup,
+// or created by a walden that has since been replaced. walden owns hooks/pre-receive, so it
+// repairs the symlink it writes; it does not own whatever else may be sitting there, so it
+// refuses the push rather than deleting it.
+//
+// Every fixture is a real bare repository rather than a directory shaped like one, because
+// EnsureHook's first act is to ask git which pre-receive hook this repository will run, and
+// git only answers that inside a repository it can open. A bare directory is not the state
+// this table is about — it is a repository `git receive-pack` would refuse a moment later —
+// and EnsureHook now refuses it too, which
+// TestEnsureHookRefusesAVanishedRepositoryInsteadOfCreatingOne pins.
+func TestEnsureHook(t *testing.T) {
+	ctx := context.Background()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	// runnableFile writes an executable file a hook symlink can point at, standing in for a
+	// walden binary at some other path.
+	runnableFile := func(t *testing.T, path string) string {
+		t.Helper()
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+		return path
+	}
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, repoPath string)
+		// refuse is true when EnsureHook must refuse rather than repair: what is at the
+		// path is not walden's to replace.
+		refuse bool
+	}{
+		{
+			name: "walden-symlink-left-alone",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustBareRepo(t, repoPath)
+				mustSymlink(t, exe, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			name: "missing-hook-installed",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustBareRepo(t, repoPath)
+			},
+		},
+		{
+			name: "missing-hooks-directory-created",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustBareRepo(t, repoPath)
+				if err := os.RemoveAll(filepath.Join(repoPath, "hooks")); err != nil {
+					t.Fatalf("RemoveAll(hooks): %v", err)
+				}
+			},
+		},
+		{
+			name: "dangling-symlink-repaired",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustBareRepo(t, repoPath)
+				mustSymlink(t, filepath.Join(repoPath, "gone"), filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			name: "non-executable-target-repaired",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustBareRepo(t, repoPath)
+				target := filepath.Join(repoPath, "not-executable")
+				if err := os.WriteFile(target, []byte("not a binary"), 0o644); err != nil {
+					t.Fatalf("WriteFile(%q): %v", target, err)
+				}
+				mustSymlink(t, target, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			// The case hookIsRunnable cannot see, because it follows the symlink: a link
+			// left by a previous install that still resolves to an executable. That hook
+			// runs, but it runs a different walden.
+			name: "symlink-to-another-binary-repointed",
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustBareRepo(t, repoPath)
+				other := runnableFile(t, filepath.Join(repoPath, "previous-walden"))
+				mustSymlink(t, other, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			// An operator's own pre-receive script. It is runnable, so git would run it
+			// happily — and walden's hook would never run, making every push to this
+			// repository silently undurable. walden refuses that push, and does not delete
+			// a file an operator deliberately placed: it says what is in the way and stops.
+			name:   "operator-placed-regular-file-refused",
+			refuse: true,
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustBareRepo(t, repoPath)
+				runnableFile(t, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+		{
+			name:   "directory-refused",
+			refuse: true,
+			setup: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustBareRepo(t, repoPath)
+				mustMkdirAll(t, filepath.Join(repoPath, "hooks", "pre-receive"))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+			repoPath := filepath.Join(dataDir, "repo.git")
+			tt.setup(t, repoPath)
+			hook := filepath.Join(repoPath, "hooks", "pre-receive")
+
+			err := s.EnsureHook(ctx, repoPath)
+			if tt.refuse {
+				if err == nil {
+					t.Fatalf("EnsureHook = nil, want a refusal")
+				}
+				if !errors.Is(err, store.ErrHookUnavailable) {
+					t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+				}
+				if errors.Is(err, store.ErrStoreUnavailable) {
+					t.Errorf("EnsureHook error = %v, want it not to wear ErrStoreUnavailable: the path resolved, the hook is what failed", err)
+				}
+				if strings.Contains(err.Error(), "\n") {
+					t.Errorf("refusal is not one line: %q", err)
+				}
+				if _, statErr := os.Lstat(hook); statErr != nil {
+					t.Errorf("Lstat(%q) after a refusal: %v, want what was there left untouched", hook, statErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("EnsureHook: %v", err)
+			}
+			assertWaldenHook(t, hook, exe)
+
+			// Idempotent: a second call agrees with the first.
+			if err := s.EnsureHook(ctx, repoPath); err != nil {
+				t.Fatalf("EnsureHook (second call): %v", err)
+			}
+			assertWaldenHook(t, hook, exe)
+
+			// No staged .pre-receive-* link survives either call.
+			entries, err := os.ReadDir(filepath.Join(repoPath, "hooks"))
+			if err != nil {
+				t.Fatalf("ReadDir: %v", err)
+			}
+			for _, e := range entries {
+				if strings.HasPrefix(e.Name(), ".pre-receive-") {
+					t.Errorf("hooks/ holds staging residue %q", e.Name())
+				}
+			}
+		})
+	}
+}
+
+// TestEnsureHookLeavesAWaldenSymlinkUntouched pins the fast path: a hook that is already
+// walden's is not rewritten, so an ordinary push does no filesystem write at all.
+func TestEnsureHookLeavesAWaldenSymlinkUntouched(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "repo.git")
+	hook := filepath.Join(repoPath, "hooks", "pre-receive")
+	mustBareRepo(t, repoPath)
+	mustSymlink(t, exe, hook)
+
+	before, err := os.Lstat(hook)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", hook, err)
+	}
+	if err := s.EnsureHook(ctx, repoPath); err != nil {
+		t.Fatalf("EnsureHook: %v", err)
+	}
+	after, err := os.Lstat(hook)
+	if err != nil {
+		t.Fatalf("Lstat(%q) after EnsureHook: %v", hook, err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Errorf("EnsureHook replaced a hook that was already correct (mtime %v -> %v)", before.ModTime(), after.ModTime())
+	}
+}
+
+// TestEnsureHookRefusesUnwritableHooksDirectory covers the one repair that cannot be made
+// and has no runnable hook to fall back on: the hook is missing and hooks/ cannot be written.
+// The push is refused in one line naming ErrHookUnavailable rather than proceeding into a
+// repository whose pushes would never be journaled.
+func TestEnsureHookRefusesUnwritableHooksDirectory(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "repo.git")
+	hooksDir := filepath.Join(repoPath, "hooks")
+	mustBareRepo(t, repoPath)
+
+	mustBeUnwritable(t, hooksDir)
+
+	err := s.EnsureHook(ctx, repoPath)
+	if err == nil {
+		t.Fatalf("EnsureHook = nil, want a refusal: the hook is missing and cannot be installed")
+	}
+	if !errors.Is(err, store.ErrHookUnavailable) {
+		t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("refusal is not one line: %q", err)
+	}
+}
+
+// TestEnsureHookRefusesAForeignRunnableHookItCannotReplace is the case a fallback on "does
+// hooks/pre-receive resolve to some executable" silently re-admitted: a symlink to a runnable
+// binary that is not walden's, in a hooks/ directory the repair cannot be written to. git would
+// run that hook happily, journal nothing, move the ref, and acknowledge the push — the one
+// failure this ticket exists to stop. Runnable is not the question; walden's own is.
+func TestEnsureHookRefusesAForeignRunnableHookItCannotReplace(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "repo.git")
+	hooksDir := filepath.Join(repoPath, "hooks")
+	mustBareRepo(t, repoPath)
+
+	// A previous install, /bin/true, an operator's compiled hook: anything runnable that is
+	// not this binary. It lives outside hooks/ so locking that directory down does not also
+	// make the target unreadable.
+	foreign := filepath.Join(dataDir, "not-walden")
+	if err := os.WriteFile(foreign, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q): %v", foreign, err)
+	}
+	hook := filepath.Join(hooksDir, "pre-receive")
+	mustSymlink(t, foreign, hook)
+
+	mustBeUnwritable(t, hooksDir)
+
+	err := s.EnsureHook(ctx, repoPath)
+	if err == nil {
+		t.Fatalf("EnsureHook = nil, want a refusal: hooks/pre-receive runs %q, which is not walden", foreign)
+	}
+	if !errors.Is(err, store.ErrHookUnavailable) {
+		t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+	}
+	if errors.Is(err, store.ErrStoreUnavailable) {
+		t.Errorf("EnsureHook error = %v, want it not to wear ErrStoreUnavailable: the path resolved, the hook is what failed", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("refusal is not one line: %q", err)
+	}
+
+	// Nothing is deleted on the way out: the refusal leaves the foreign link where it was.
+	target, readErr := os.Readlink(hook)
+	if readErr != nil {
+		t.Fatalf("Readlink(%q) after a refusal: %v", hook, readErr)
+	}
+	if target != foreign {
+		t.Errorf("hooks/pre-receive -> %q after a refusal, want %q left untouched", target, foreign)
+	}
+}
+
+// TestEnsureHookAcceptsItsOwnHookWhenRepairIsImpossible is the other half of the case above,
+// and the reason refusing a failed repair costs nothing: an in-place binary upgrade — the new
+// walden back at the path the existing link already names — never reaches the repair at all.
+// It matches on the fast path and returns before a single byte is written, so an unwritable
+// hooks/ directory is irrelevant to it.
+func TestEnsureHookAcceptsItsOwnHookWhenRepairIsImpossible(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "repo.git")
+	hooksDir := filepath.Join(repoPath, "hooks")
+	mustBareRepo(t, repoPath)
+	mustSymlink(t, exe, filepath.Join(hooksDir, "pre-receive"))
+
+	mustBeUnwritable(t, hooksDir)
+
+	if err := s.EnsureHook(ctx, repoPath); err != nil {
+		t.Fatalf("EnsureHook = %v, want nil: the hook already points at the running binary, so no repair is needed", err)
+	}
+}
+
+// TestEnsureHookRefusesARepositoryThatRedirectsItsHooks covers the bypass that made every
+// other check in EnsureHook beside the point: git runs <repo>/hooks/pre-receive only while
+// core.hooksPath is unset. Set, it runs <core.hooksPath>/pre-receive and never looks at
+// hooks/ at all — so a repository copied off another server or restored from a backup taken
+// on a host with a hook manager could carry a perfect walden symlink at hooks/pre-receive,
+// pass EnsureHook, take the push, move the ref, and journal nothing.
+//
+// Every case installs walden's own correct hook first, so the refusal can only be about the
+// redirect. The four of them are four ways the same redirect arrives, and each one defeated
+// a narrower probe than the one this now uses:
+//
+//   - set-directly is the plain case.
+//   - arriving-through-an-include needed git's include resolution, which git turns off once
+//     a config scope is named.
+//   - set-to-the-empty-string reads back from `git config --get` byte-for-byte like a key
+//     that was never set, while git treats it as a redirect to /pre-receive.
+//   - set-in-the-worktree-config lives in $GIT_DIR/config.worktree, which --local never
+//     consults at all.
+//
+// The lesson of the list is that there is always one more scope and one more spelling, so
+// EnsureHook stopped asking about config and started asking `git rev-parse --git-path
+// hooks/pre-receive` — which git answers by resolving the hook path itself, and which
+// therefore covers all four without knowing any of them.
+func TestEnsureHookRefusesARepositoryThatRedirectsItsHooks(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		redirect func(t *testing.T, repoPath string)
+	}{
+		{
+			name: "set-directly",
+			redirect: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustGitConfig(t, repoPath, "core.hooksPath", "/etc/walden/elsewhere")
+			},
+		},
+		{
+			name: "arriving-through-an-include",
+			redirect: func(t *testing.T, repoPath string) {
+				t.Helper()
+				included := filepath.Join(repoPath, "hooks-config")
+				if err := os.WriteFile(included, []byte("[core]\n\thooksPath = /etc/walden/elsewhere\n"), 0o644); err != nil {
+					t.Fatalf("WriteFile(%q): %v", included, err)
+				}
+				mustGitConfig(t, repoPath, "include.path", included)
+			},
+		},
+		{
+			// core.hooksPath = "" is a redirect that reads as an absence. `git config --get`
+			// prints an empty line and exits 0, which is indistinguishable after TrimSpace
+			// from the exit-1 "not set" answer — while git itself joins the empty directory
+			// with the hook name and looks for /pre-receive, at the filesystem root. A
+			// repository in this state has no hook of walden's on any path git will consult.
+			name: "set-to-the-empty-string",
+			redirect: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustGitConfig(t, repoPath, "core.hooksPath", "")
+			},
+		},
+		{
+			// $GIT_DIR/config.worktree, which git reads whenever extensions.worktreeConfig is
+			// on and which --local does not consult at any setting. Both halves are set through
+			// the real git binary, so this is a repository state git produced rather than one
+			// the test guessed at the file format for.
+			name: "set-in-the-worktree-config",
+			redirect: func(t *testing.T, repoPath string) {
+				t.Helper()
+				mustGitConfig(t, repoPath, "extensions.worktreeConfig", "true")
+				mustGitConfigWorktree(t, repoPath, "core.hooksPath", "/etc/walden/elsewhere")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+
+			// A real repository, because this asks git what its config says and git will
+			// only answer --local inside one.
+			if err := s.CreateRepo(ctx, "redirected"); err != nil {
+				t.Fatalf("CreateRepo: %v", err)
+			}
+			repoPath, err := s.RepoPath("redirected")
+			if err != nil {
+				t.Fatalf("RepoPath: %v", err)
+			}
+			hook := filepath.Join(repoPath, "hooks", "pre-receive")
+			assertWaldenHook(t, hook, exe)
+
+			tt.redirect(t, repoPath)
+
+			err = s.EnsureHook(ctx, repoPath)
+			if err == nil {
+				t.Fatalf("EnsureHook = nil, want a refusal: core.hooksPath sends git somewhere walden's hook is not")
+			}
+			if !errors.Is(err, store.ErrHookUnavailable) {
+				t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+			}
+			if errors.Is(err, store.ErrStoreUnavailable) {
+				t.Errorf("EnsureHook error = %v, want it not to wear ErrStoreUnavailable: the path resolved, the hook is what failed", err)
+			}
+			if strings.Contains(err.Error(), "\n") {
+				t.Errorf("refusal is not one line: %q", err)
+			}
+			if !strings.Contains(err.Error(), "core.hooksPath") {
+				t.Errorf("refusal %q does not name core.hooksPath, so an operator cannot act on it", err)
+			}
+
+			// walden does not install into the directory core.hooksPath names, and does not
+			// edit the repository's config to get its own way: it says what is wrong and stops.
+			assertWaldenHook(t, hook, exe)
+			if _, statErr := os.Stat("/etc/walden/elsewhere"); statErr == nil {
+				t.Errorf("walden created the directory core.hooksPath named; it must not guess at an operator's intent")
+			}
+		})
+	}
+}
+
+// TestEnsureHookRefusesARepositoryWhoseGitDirectoryIsElsewhere pins what walden says about
+// the scenario this check exists for: an operator places a repository in the data directory
+// by hand. If what they placed is not bare — a working tree with a .git directory, or one
+// backed by a .git gitfile — git takes that repository's hooks from its git directory and
+// never looks at <repo>/hooks/ at all, which reaches EnsureHook looking exactly like a
+// core.hooksPath redirect: the path git reports is not the path walden owns.
+//
+// Refusing is right either way. walden owns <repo>/hooks/pre-receive and can promise
+// durability for no other path. What has to be right as well is the reason, and these
+// repositories set no core.hooksPath in any scope: a refusal naming that key sends the
+// operator hunting for something nothing wrote, in the one case where a hand-placed
+// repository is the likeliest thing they are holding.
+func TestEnsureHookRefusesARepositoryWhoseGitDirectoryIsElsewhere(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		// place creates the repository at repoPath, inside dataDir, some way other than bare.
+		place func(t *testing.T, dataDir, repoPath string)
+	}{
+		{
+			// The headline case: `git init` output copied into the data directory whole, so
+			// git's directory for it is <repo>/.git and its hooks are under that.
+			name: "non-bare-repository",
+			place: func(t *testing.T, dataDir, repoPath string) {
+				t.Helper()
+				mustGitInit(t, repoPath)
+			},
+		},
+		{
+			// The same shape one step further out: <repo>/.git is a gitfile naming a git
+			// directory somewhere else entirely, so no lexical guess at <repo>/.git/hooks
+			// would find the path git actually reports either.
+			name: "gitfile-backed-repository",
+			place: func(t *testing.T, dataDir, repoPath string) {
+				t.Helper()
+				mustGitInit(t, "--separate-git-dir="+filepath.Join(dataDir, "elsewhere.git"), repoPath)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+			repoPath := filepath.Join(dataDir, "dropped.git")
+			tt.place(t, dataDir, repoPath)
+
+			// walden's own correct hook, at the path walden owns, so the repository's shape
+			// is the only thing left that can refuse the push.
+			hook := filepath.Join(repoPath, "hooks", "pre-receive")
+			mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+			mustSymlink(t, exe, hook)
+
+			err := s.EnsureHook(ctx, repoPath)
+			if err == nil {
+				t.Fatalf("EnsureHook = nil, want a refusal: git's hooks for this repository are not the ones walden owns")
+			}
+			if !errors.Is(err, store.ErrHookUnavailable) {
+				t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+			}
+			if strings.Contains(err.Error(), "\n") {
+				t.Errorf("refusal is not one line: %q", err)
+			}
+			if strings.Contains(err.Error(), "core.hooksPath") {
+				t.Errorf("refusal %q blames core.hooksPath, which nothing set here: the cause is the repository's shape", err)
+			}
+			if !strings.Contains(err.Error(), repoPath) {
+				t.Errorf("refusal %q does not name %s, so an operator cannot tell which repository is wrong", err, repoPath)
+			}
+			if !strings.Contains(err.Error(), "bare repository") {
+				t.Errorf("refusal %q does not say to serve a bare repository, so its remedy is not actionable", err)
+			}
+
+			assertWaldenHook(t, hook, exe)
+		})
+	}
+}
+
+// TestEnsureHookHooksPathSpellings pins a refusal walden takes deliberately, so it cannot be
+// read later as an oversight and "fixed".
+//
+// core.hooksPath spelled hooks, ./hooks, or the repository's own absolute hooks directory all
+// name the directory walden owns, and all three accept. A core.hooksPath that is a symlink to
+// that same directory does not: git would run walden's hook through it, and EnsureHook refuses
+// anyway, because it compares the path git printed against the path walden owns and resolves
+// neither side.
+//
+// The trade is the point. A resolved comparison would accept this repository on the strength
+// of where the link pointed during the check, and a link can be repointed between the check
+// and the `git receive-pack` a moment later — an accept with a window in it. The lexical
+// comparison has no window; it costs this one spelling, and the refusal says so.
+func TestEnsureHookHooksPathSpellings(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		// hooksPath returns the value core.hooksPath is set to for the repository at repoPath.
+		hooksPath func(t *testing.T, repoPath string) string
+		refuses   bool
+	}{
+		{
+			name:      "relative",
+			hooksPath: func(t *testing.T, repoPath string) string { return "hooks" },
+		},
+		{
+			name:      "dot-relative",
+			hooksPath: func(t *testing.T, repoPath string) string { return "./hooks" },
+		},
+		{
+			name: "absolute",
+			hooksPath: func(t *testing.T, repoPath string) string {
+				return filepath.Join(repoPath, "hooks")
+			},
+		},
+		{
+			// The subtest's name reaches the message through t.TempDir's directory name, so
+			// it deliberately spells none of the words the assertions below look for.
+			name: "linked-spelling-of-the-same-directory",
+			hooksPath: func(t *testing.T, repoPath string) string {
+				t.Helper()
+				link := filepath.Join(repoPath, "hooks-link")
+				mustSymlink(t, filepath.Join(repoPath, "hooks"), link)
+				return link
+			},
+			refuses: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dataDir := t.TempDir()
+			s := store.New(dataDir)
+			repoPath := filepath.Join(dataDir, "spelled.git")
+			mustBareRepo(t, repoPath)
+			hook := filepath.Join(repoPath, "hooks", "pre-receive")
+			mustSymlink(t, exe, hook)
+			mustGitConfig(t, repoPath, "core.hooksPath", tt.hooksPath(t, repoPath))
+
+			err := s.EnsureHook(ctx, repoPath)
+			if !tt.refuses {
+				if err != nil {
+					t.Fatalf("EnsureHook = %v, want nil: this spelling names the hooks directory walden owns", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("EnsureHook = nil, want a refusal: the comparison is lexical, and a symlink is a different path")
+			}
+			if !errors.Is(err, store.ErrHookUnavailable) {
+				t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+			}
+			if strings.Contains(err.Error(), "\n") {
+				t.Errorf("refusal is not one line: %q", err)
+			}
+			if !strings.Contains(err.Error(), "core.hooksPath") {
+				t.Errorf("refusal %q does not name core.hooksPath, so an operator cannot act on it", err)
+			}
+			if !strings.Contains(err.Error(), "symlinks to that directory") {
+				t.Errorf("refusal %q does not say that a core.hooksPath symlinked to the repository's own hooks still refuses, so this reads as a bug rather than the trade it is", err)
+			}
+			assertWaldenHook(t, hook, exe)
+		})
+	}
+}
+
+// TestEnsureHookRefusesWhenGitCannotReportTheHookPath is the fail-closed half of the same
+// question. The probe used to treat every exit it did not recognise as "no redirect here",
+// on the reasoning that anything git refuses to open, `git receive-pack` refuses a moment
+// later too. That reasoning does not hold: the probe pins GIT_CONFIG_SYSTEM=/dev/null and
+// githttp's gitEnv does not, so a safe.directory in /etc/gitconfig opens a repository for
+// receive-pack and not for this — and a fork that failed with EAGAIN or EMFILE says nothing
+// about the repository at all. A probe that could not answer must refuse.
+//
+// The directory here holds walden's own correct hook, so nothing but the unanswered probe
+// can be the reason for the refusal: under the old branch this returned nil.
+func TestEnsureHookRefusesWhenGitCannotReportTheHookPath(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	newRepoShapedDirectory := func(t *testing.T) string {
+		t.Helper()
+		dataDir := t.TempDir()
+		repoPath := filepath.Join(dataDir, "repo.git")
+		mustMkdirAll(t, filepath.Join(repoPath, "hooks"))
+		mustSymlink(t, exe, filepath.Join(repoPath, "hooks", "pre-receive"))
+		return repoPath
+	}
+
+	tests := []struct {
+		name string
+		// ctx is the context EnsureHook is called with, and setup returns the path.
+		run func(t *testing.T) (context.Context, *store.Store, string)
+	}{
+		{
+			// git exits 128: this is a directory shaped like a repository, not one git will
+			// open. Nothing about the hook that is sitting there has been established.
+			name: "not-a-repository-git-will-open",
+			run: func(t *testing.T) (context.Context, *store.Store, string) {
+				t.Helper()
+				repoPath := newRepoShapedDirectory(t)
+				return context.Background(), store.New(filepath.Dir(repoPath)), repoPath
+			},
+		},
+		{
+			// A real repository with walden's own hook already correctly installed, so the
+			// cancelled context is the only thing that can refuse it — which is what pins
+			// that EnsureHook takes a context at all, and that the probe honours it rather
+			// than parking the handler goroutine past the client's disconnect.
+			name: "cancelled-context",
+			run: func(t *testing.T) (context.Context, *store.Store, string) {
+				t.Helper()
+				dataDir := t.TempDir()
+				repoPath := filepath.Join(dataDir, "repo.git")
+				mustBareRepo(t, repoPath)
+				mustSymlink(t, exe, filepath.Join(repoPath, "hooks", "pre-receive"))
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, store.New(dataDir), repoPath
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, s, repoPath := tt.run(t)
+
+			err := s.EnsureHook(ctx, repoPath)
+			if err == nil {
+				t.Fatalf("EnsureHook = nil, want a refusal: git never reported which hook %q runs", repoPath)
+			}
+			if !errors.Is(err, store.ErrHookUnavailable) {
+				t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+			}
+			if strings.Contains(err.Error(), "\n") {
+				t.Errorf("refusal is not one line: %q", err)
+			}
+		})
+	}
+}
+
+// TestEnsureHookRefusesAVanishedRepositoryInsteadOfCreatingOne pins that the repair path does
+// not create storage. EnsureHook is handed a path, not an identifier, and an installer built
+// on MkdirAll would happily build <repo>/hooks/ — and <repo> with it — for a repository an
+// operator removed between ensureRepoForPush's re-resolve and this call. statRepoPath calls
+// any directory a repository, so that phantom would occupy the identifier permanently: pushes
+// handing git receive-pack a non-repository, and CreateRepo refusing "repository already
+// exists" for a repository that does not exist.
+//
+// Two things stop it now, and neither is a check that could go stale between the looking and
+// the writing: git will not report a hook path for a directory that is not there, and the
+// installer makes hooks/ with a single os.Mkdir, which fails rather than building the parent.
+// The guard this replaced was an os.Stat of repoPath immediately before the MkdirAll — the
+// same rm -rf race, just narrowed to the width of two syscalls.
+func TestEnsureHookRefusesAVanishedRepositoryInsteadOfCreatingOne(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+	repoPath := filepath.Join(dataDir, "vanished.git")
+
+	err := s.EnsureHook(ctx, repoPath)
+	if err == nil {
+		t.Fatalf("EnsureHook = nil, want a refusal: there is no repository at %q to repair", repoPath)
+	}
+	if !errors.Is(err, store.ErrHookUnavailable) {
+		t.Errorf("EnsureHook error = %v, want it to wrap store.ErrHookUnavailable", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("refusal is not one line: %q", err)
+	}
+
+	if _, statErr := os.Lstat(repoPath); statErr == nil {
+		t.Fatalf("EnsureHook created %q; the repair path must not conjure a repository", repoPath)
+	}
+
+	// The identifier is still free, which is the whole point: the phantom would have made
+	// creation refuse "already exists" forever.
+	exists, err := s.RepoExists(ctx, "vanished")
+	if err != nil {
+		t.Fatalf("RepoExists: %v", err)
+	}
+	if exists {
+		t.Errorf("RepoExists(%q) = true after a refused repair, want false", "vanished")
+	}
+	if err := s.CreateRepo(ctx, "vanished"); err != nil {
+		t.Errorf("CreateRepo after a refused repair: %v, want it to still be creatable", err)
+	}
+}
+
+// TestEnsureHookAgreesWithCreateRepo is what fails if CreateRepo's installer and EnsureHook's
+// ever drift apart: a repository walden has just created must need no repair. They share one
+// installer today, and this notices if a later change gives them two.
+func TestEnsureHookAgreesWithCreateRepo(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s := store.New(dataDir)
+
+	if err := s.CreateRepo(ctx, "fresh"); err != nil {
+		t.Fatalf("CreateRepo: %v", err)
+	}
+	path, err := s.RepoPath("fresh")
+	if err != nil {
+		t.Fatalf("RepoPath: %v", err)
+	}
+
+	hook := filepath.Join(path, "hooks", "pre-receive")
+	before, err := os.Lstat(hook)
+	if err != nil {
+		t.Fatalf("Lstat(%q): %v", hook, err)
+	}
+
+	if err := s.EnsureHook(ctx, path); err != nil {
+		t.Fatalf("EnsureHook on a freshly created repository: %v", err)
+	}
+
+	after, err := os.Lstat(hook)
+	if err != nil {
+		t.Fatalf("Lstat(%q) after EnsureHook: %v", hook, err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Errorf("EnsureHook rewrote the hook CreateRepo had just installed (mtime %v -> %v); the two installers have drifted apart", before.ModTime(), after.ModTime())
+	}
+}
+
+// mustMkdirAll creates dir, failing the test if it cannot.
+func mustMkdirAll(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", dir, err)
+	}
+}
+
+// mustBeUnwritable takes write permission off dir for the rest of the test, so the repair
+// EnsureHook would make cannot be made — the ENOSPC, EDQUOT and EPERM cases an operator hits,
+// reachable without a full filesystem. It restores the mode on cleanup so t.TempDir can remove
+// the tree, and skips loudly where mode bits do not bite: as root, or on a filesystem that
+// ignores them, the directory stays writable and the test would assert nothing.
+func mustBeUnwritable(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("Chmod(%q, 0o555): %v", dir, err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o700)
+	})
+	probe := filepath.Join(dir, ".write-probe")
+	if err := os.Mkdir(probe, 0o700); err == nil {
+		_ = os.Remove(probe)
+		t.Skipf("LOUD SKIP: %q is still writable at mode 0555, so this process cannot simulate an unwritable hooks directory — it is running as root, or on a filesystem that ignores mode bits. EnsureHook's refusal path is still covered by TestEnsureHook's operator-placed-regular-file case, which needs no permission games.", dir)
+	}
+}
+
+// mustGitConfig sets key to value in the local config of the repository at repoPath, through
+// the real git binary rather than by writing the file, so the fixture is a config git itself
+// wrote and the test is not asserting against a format it guessed at.
+func mustGitConfig(t *testing.T, repoPath, key, value string) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repoPath, "config", "--local", key, value)
+	cmd.Env = []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "PATH=" + os.Getenv("PATH")}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git config %s %s in %q: %v: %s", key, value, repoPath, err, out)
+	}
+}
+
+// mustGitConfigWorktree sets key to value in $GIT_DIR/config.worktree for the repository at
+// repoPath — the scope `git config --local` never reads. It is the caller's business to have
+// turned extensions.worktreeConfig on first; git refuses the write otherwise, and the test
+// fails here rather than silently fixturing nothing.
+func mustGitConfigWorktree(t *testing.T, repoPath, key, value string) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repoPath, "config", "--worktree", key, value)
+	cmd.Env = []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "PATH=" + os.Getenv("PATH")}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git config --worktree %s %s in %q: %v: %s", key, value, repoPath, err, out)
+	}
+}
+
+// mustBareRepo initializes a real bare repository at path with the real git binary, so a
+// fixture EnsureHook will ask git about is a repository git will actually open. It is not
+// store.CreateRepo: these tests are about repositories that reached disk some way other than
+// walden, so they must not arrive with walden's hook already installed.
+func mustBareRepo(t *testing.T, path string) {
+	t.Helper()
+	cmd := exec.Command("git", "init", "-q", "--bare", "--initial-branch=main", path)
+	cmd.Env = []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "PATH=" + os.Getenv("PATH")}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare %q: %v: %s", path, err, out)
+	}
+}
+
+// mustGitInit runs `git init` with the given arguments under the same pinned environment as
+// mustBareRepo, for the repository shapes that one does not make: a working tree, or one whose
+// git directory sits somewhere other than the path walden would serve.
+func mustGitInit(t *testing.T, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"init", "-q"}, args...)...)
+	cmd.Env = []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "PATH=" + os.Getenv("PATH")}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init %v: %v: %s", args, err, out)
+	}
+}
+
+// mustSymlink creates the symlink name pointing at target, failing the test if it cannot.
+func mustSymlink(t *testing.T, target, name string) {
+	t.Helper()
+	if err := os.Symlink(target, name); err != nil {
+		t.Fatalf("Symlink(%q, %q): %v", target, name, err)
+	}
+}
+
+// assertWaldenHook asserts that hook is a symlink to exe resolving to a runnable file — the
+// one shape EnsureHook leaves behind.
+func assertWaldenHook(t *testing.T, hook, exe string) {
+	t.Helper()
+	target, err := os.Readlink(hook)
+	if err != nil {
+		t.Fatalf("Readlink(%q): %v", hook, err)
+	}
+	if target != exe {
+		t.Errorf("hooks/pre-receive -> %q, want %q", target, exe)
+	}
+	if err := store.HookIsRunnableForTest(hook); err != nil {
+		t.Errorf("hooks/pre-receive is not runnable: %v", err)
+	}
+}

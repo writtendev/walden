@@ -46,7 +46,7 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 			"contact the operator",
 		)
 	}
-	exists, err := h.store.RepoExists(ctx, repo)
+	_, exists, err := h.store.ResolveRepo(ctx, repo)
 	if err != nil {
 		return "", err
 	}
@@ -67,9 +67,32 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 
 	if !exists {
 		if err := h.store.CreateRepo(ctx, repo); err != nil && !errors.Is(err, store.ErrRepoExists) {
-			return "", err
+			return "", &repoCreateError{err}
 		}
 	}
 
+	// Resolve the path last, not from the ResolveRepo call above: when exists was true,
+	// CreateRepo never ran, so nothing has re-checked containment since then. A symlink
+	// swapped in for the repository directory during the Authorize window would otherwise
+	// reach handleReceivePack unchecked. RepoPath's own containment check is what refuses
+	// that case, and create_test.go's
+	// TestEnsureRepoForPushRefusesEscapingSymlinkSwappedDuringAuthorize drives exactly that
+	// swap against the exists == true branch, so removing this line fails the suite.
 	return h.store.RepoPath(repo)
 }
+
+// repoCreateError marks an error CreateRepo returned, as distinct from one
+// store.ResolveRepo (or a bare store.RepoPath) returned while merely resolving
+// or classifying a repository's path. Both can wrap store.ErrStoreUnavailable,
+// but they describe different failures — one happened while working out where
+// the repository is, the other while writing it to disk — and
+// writeAuthRefusal uses errors.As to tell them apart so the operator-facing
+// wording says which one actually happened. It changes nothing about
+// errors.Is(err, store.ErrStoreUnavailable): Unwrap delegates to the
+// underlying error, so that still holds.
+type repoCreateError struct {
+	err error
+}
+
+func (e *repoCreateError) Error() string { return e.err.Error() }
+func (e *repoCreateError) Unwrap() error { return e.err }

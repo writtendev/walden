@@ -150,6 +150,9 @@ type RepositoryManager interface {
 	CreateRepo(ctx context.Context, repo string) error
 	// RepoPath returns the on-disk path to the repository.
 	RepoPath(repo string) (string, error)
+	// ResolveRepo resolves repo to its on-disk path and reports whether a
+	// bare git repository already exists there, in one call.
+	ResolveRepo(ctx context.Context, repo string) (path string, exists bool, err error)
 }
 
 // var _ RepositoryManager = (*Store)(nil) pins Store to the interface at

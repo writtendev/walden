@@ -294,6 +294,63 @@ func TestEnsureRepoForPushRefusesLostRaceToNonDirectory(t *testing.T) {
 	}
 }
 
+// TestEnsureRepoForPushRefusesEscapingSymlinkSwappedDuringAuthorize is the other half of the
+// raceAuthorizer window, and the one the exists == true branch depends on: a repository that
+// exists when ResolveRepo answers is replaced, during Authorize, by a symlink pointing at a
+// directory outside the data root. CreateRepo never runs on this branch, so its own
+// statRepoPath is not the guard here — ensureRepoForPush's trailing RepoPath is the only
+// thing between the swapped-in symlink and handleReceivePack exec'ing git against it. Drop
+// that re-resolution and return the path captured before Authorize, and this test is what
+// goes red.
+func TestEnsureRepoForPushRefusesEscapingSymlinkSwappedDuringAuthorize(t *testing.T) {
+	ctx := context.Background()
+	// rw:* is the whole point: the repository already exists, so Create is not required and
+	// the push takes the exists == true path.
+	for name, p := range mountAuthorizers(t, "rw:*") {
+		t.Run(name, func(t *testing.T) {
+			s := store.New(t.TempDir())
+			if err := s.CreateRepo(ctx, "racer"); err != nil {
+				t.Fatalf("CreateRepo (setup): %v", err)
+			}
+
+			path, err := s.RepoPath("racer")
+			if err != nil {
+				t.Fatalf("RepoPath: %v", err)
+			}
+
+			// A sibling of the data directory, so it is outside the resolved root.
+			outside := t.TempDir()
+
+			wrapped := &raceAuthorizer{
+				Authorizer: p.authorizer,
+				before: func() {
+					if err := os.RemoveAll(path); err != nil {
+						t.Fatalf("RemoveAll(%q): %v", path, err)
+					}
+					if err := os.Symlink(outside, path); err != nil {
+						t.Fatalf("Symlink(%q, %q): %v", outside, path, err)
+					}
+				},
+			}
+			h := NewHandler(wrapped, s, "")
+
+			gotPath, err := h.ensureRepoForPush(ctx, p.token, "racer")
+			if err == nil {
+				t.Fatalf("ensureRepoForPush = (%q, nil), want a refusal: the repository path now escapes the data directory via a symlink", gotPath)
+			}
+			if !errors.Is(err, store.ErrInvalidRepo) {
+				t.Errorf("ensureRepoForPush error = %v, want errors.Is store.ErrInvalidRepo", err)
+			}
+			if gotPath != "" {
+				t.Errorf("ensureRepoForPush path = %q, want %q: a refused push must not hand any path to git", gotPath, "")
+			}
+			if strings.ContainsAny(err.Error(), "\n\r") {
+				t.Errorf("refusal is not a single line: %q", err.Error())
+			}
+		})
+	}
+}
+
 // TestEnsureRepoForPushConcurrentCreatorsAllSucceed drives the race PR #35's round-2 review
 // found rather than reasoning about it: several rwc:* pushes reaching the same missing
 // repository at once. Before the fix, store.CreateRepo's ErrRepoExists passed straight

@@ -9,9 +9,11 @@
 package journal
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"sync"
@@ -30,6 +32,20 @@ type TxLister interface {
 	List(ctx context.Context, prefix, startAfter string, fn func(key string) error) error
 }
 
+// TxStore is TxLister's sibling, widened to also write: the whole storage
+// surface a Lease needs both to discover a stream's head sequence and to
+// issue its one conditional PUT. It is declared here for the same reason
+// TxLister is - this package must not import store, and *store.Client
+// satisfies this interface structurally, with no import needed on either
+// side. WALD-118 added the PutIfAbsent half so Append (below) can own that
+// PUT itself rather than take it on faith from a caller's closure: the
+// lease is the only thing that can say honestly whether a write was ever
+// issued, so the lease has to be the thing that issues it.
+type TxStore interface {
+	List(ctx context.Context, prefix, startAfter string, fn func(key string) error) error
+	PutIfAbsent(ctx context.Context, key string, body io.ReaderAt, size int64) error
+}
+
 // Leases is the per-instance registry of per-stream sequence leases: one
 // shared Fencer, and at most one *Lease per stream for the life of the
 // process. Two leases for one stream inside one process would be
@@ -37,7 +53,7 @@ type TxLister interface {
 // exists to prevent - so Open hands out the same *Lease to every caller
 // that asks for a given stream, ever.
 type Leases struct {
-	lister TxLister
+	store  TxStore
 	fencer *Fencer
 
 	// mu guards leases and serializes Open end to end, including the LIST
@@ -50,12 +66,12 @@ type Leases struct {
 	leases map[StreamID]*Lease
 }
 
-// NewLeases builds an empty registry backed by lister. It owns its own
+// NewLeases builds an empty registry backed by store. It owns its own
 // Fencer: fencing state is per-registry (in practice, per walden process),
 // never shared across instances.
-func NewLeases(lister TxLister) *Leases {
+func NewLeases(store TxStore) *Leases {
 	return &Leases{
-		lister: lister,
+		store:  store,
 		fencer: NewFencer(),
 		leases: make(map[StreamID]*Lease),
 	}
@@ -117,7 +133,7 @@ func (l *Leases) Open(ctx context.Context, stream StreamID) (*Lease, error) {
 	// placeholder object) is exactly as suspect as one that sorts above it
 	// - the doc comment above promises a one-line refusal, not a skipped
 	// key, and that promise held only for the head before this fix.
-	if err := l.lister.List(ctx, prefix, "", func(key string) error {
+	if err := l.store.List(ctx, prefix, "", func(key string) error {
 		seq, err := parseTxSeq(prefix, key)
 		if err != nil {
 			// A stray object under tx/ - a console-created placeholder, a
@@ -162,7 +178,7 @@ func (l *Leases) Open(ctx context.Context, stream StreamID) (*Lease, error) {
 		}
 	}
 
-	lease := &Lease{stream: stream, fencer: l.fencer, next: next, exhausted: exhausted}
+	lease := &Lease{stream: stream, fencer: l.fencer, store: l.store, next: next, exhausted: exhausted}
 	l.leases[stream] = lease
 	return lease, nil
 }
@@ -209,6 +225,7 @@ func parseTxSeq(prefix, key string) (Seq, error) {
 type Lease struct {
 	stream StreamID
 	fencer *Fencer
+	store  TxStore
 
 	// mu guards next, exhausted, and busy. It is held only for the two short
 	// windows inside Append that read or write this state - acquiring the
@@ -218,7 +235,7 @@ type Lease struct {
 	mu        sync.Mutex
 	next      Seq
 	exhausted bool
-	busy      bool // true only while an Append's fn is running on this Lease
+	busy      bool // true only while an Append's prepare is running on this Lease
 }
 
 // Stream returns the stream this lease was opened for.
@@ -229,53 +246,98 @@ func (l *Lease) Stream() StreamID { return l.stream }
 // stream's Leases registry has ever opened.
 func (l *Lease) Fencer() *Fencer { return l.fencer }
 
-// Append acquires the next sequence for this stream, calls fn with it, and
-// resolves the checkout before returning - the only way a sequence ever
-// leaves this type. It refuses with RefusePermanentlyFenced, making zero
-// network calls, if the stream is already fenced (checked both before and
-// after acquiring mu, since a concurrent Append can fence the stream in the
-// instant between the two). It refuses in one line, rather than wait, if
-// another Append is already running on this Lease. It refuses in one line,
-// rather than silently wrap onto sequence 0 - already written - once the
-// stream has exhausted the full 64-bit sequence space.
+// Append acquires the next sequence for this stream, calls prepare with it
+// to build the record's bytes, issues the one conditional PUT those bytes
+// get written with, and resolves the checkout before returning - the only
+// way a sequence ever leaves this type, and, as of WALD-118, the only
+// place that ever calls PutIfAbsent on l.store: prepare returns a payload,
+// not an error from a write it performed itself. It refuses with
+// RefusePermanentlyFenced, making zero network calls, if the stream is
+// already fenced (checked both before and after acquiring mu, since a
+// concurrent Append can fence the stream in the instant between the two).
+// It refuses in one line, before busy is ever set and with zero network
+// calls, if ctx is nil - ctx is handed to l.store.PutIfAbsent below, whose
+// first move (store.(*Client).do) calls ctx.Err(), which panics on a nil
+// interface value exactly where this refuses instead. It refuses in one
+// line, rather than wait, if another Append is already running on this
+// Lease. It refuses in one line, rather than silently wrap onto sequence 0
+// - already written - once the stream has exhausted the full 64-bit
+// sequence space.
 //
-// fn's outcome is classified exactly as an earlier version of this file's
-// Failed method classified it:
+// prepare's only job is to build the record's bytes: construct it, sign
+// it, marshal it, and return the result. It must not write to storage or
+// call anything that does - there is nothing left for it to write, since
+// Append performs the one conditional PUT itself, at TxKey(l.stream, seq),
+// once prepare has returned a non-empty payload with no error. This is
+// WALD-118's whole point: fencing a stream is the price of a write whose
+// outcome cannot be proven, and only Append can prove whether that write
+// was ever issued, because only Append issues it. A caller's own bug -
+// a nil parameter, a broken clock, anything prepare does that panics -
+// now crashes the process with its own stack trace, exactly as any other
+// unrecovered panic would, and leaves the stream untouched: unfenced, with
+// the sequence still unconsumed, so a healthy retry after a restart is
+// offered the same seq again. Only a panic at or after the PUT has been
+// issued still fences the stream permanently, because only then is the
+// write's outcome genuinely unprovable (spec/journal/v1 section 11.4 item
+// 6) - see the panic and Goexit cases below.
 //
-//   - fn returns nil: the append landed. The lease advances to seq+1 (or,
-//     at the maximum 64-bit sequence, marks itself exhausted instead of
+// The outcome is classified exactly as an earlier version of this file's
+// Failed method classified it, now keyed on whether the PUT was ever
+// issued rather than on what fn itself attempted:
+//
+//   - prepare returns a non-empty payload and no error, and the PUT
+//     returns nil: the append landed. The lease advances to seq+1 (or, at
+//     the maximum 64-bit sequence, marks itself exhausted instead of
 //     wrapping to 0).
-//   - fn returns an error matching ErrPreconditionFailed: a proven 412.
-//     The stream fences permanently through Fencer.HandleConflict (spec
-//     section 11.4 items 2-3), and that refusal is returned.
-//   - fn returns an error matching ErrOutcomeUnknown: the append's outcome
-//     could not be proven either way. The stream fences permanently
-//     through Fencer.HandleOutcomeUnknown (spec section 11.4 item 6), and
-//     that refusal is returned.
-//   - fn returns any other error: returned unchanged. The stream stays
-//     unfenced and the sequence is not consumed, so the next Append offers
-//     the same seq again. Conflating this retryable case with fencing is
-//     the split-brain bug WALD-22 typed ErrPrecondition and
-//     ErrOutcomeUnknown to prevent.
-//   - fn panics: the process cannot prove whether the write it was in the
-//     middle of landed - exactly the epistemic position ErrOutcomeUnknown
-//     exists for - so Append recovers the panic, fences the stream through
-//     Fencer.HandleOutcomeUnknown, and re-panics so the panic still
-//     propagates to fn's own caller rather than being swallowed here.
-//   - fn calls runtime.Goexit, terminating its goroutine without returning
-//     and without panicking: the same epistemic position as a panic, so
-//     the deferred resolution fences through Fencer.HandleOutcomeUnknown
-//     rather than leave busy set for the life of the process. There is no
-//     value to return to - the goroutine is gone - but the stream is left
-//     fenced rather than wedged, so a later Append from a healthy
-//     goroutine gets a real refusal instead of "in progress" forever.
+//   - prepare returns a nil or empty payload with no error: refused in one
+//     line, before any PUT is issued. A tx/ record is never zero bytes,
+//     so this is prepare's own bug, not a write that was ever attempted;
+//     the stream stays unfenced and the sequence unconsumed.
+//   - prepare returns an error, or the PUT itself returns one: both are
+//     classified the same way, by matching the error itself rather than
+//     asking which of the two produced it:
+//   - matching ErrPreconditionFailed: a proven 412. The stream fences
+//     permanently through Fencer.HandleConflict (spec section 11.4
+//     items 2-3), and that refusal is returned.
+//   - matching ErrOutcomeUnknown: the outcome could not be proven either
+//     way. The stream fences permanently through
+//     Fencer.HandleOutcomeUnknown (spec section 11.4 item 6), and that
+//     refusal is returned.
+//   - anything else: returned unchanged. The stream stays unfenced and
+//     the sequence is not consumed, so the next Append offers the same
+//     seq again. Conflating this retryable case with fencing is the
+//     split-brain bug WALD-22 typed ErrPrecondition and ErrOutcomeUnknown
+//     to prevent. In the ordinary case only the PUT itself ever produces
+//     the first two - prepare's job is building bytes, not classifying
+//     storage outcomes - but the switch does not depend on that; it
+//     sorts the error it is given, not its source.
+//   - prepare or the PUT panics: if the PUT had already been issued when
+//     the panic happened, the process cannot prove whether it landed -
+//     exactly the epistemic position ErrOutcomeUnknown exists for - so
+//     Append fences the stream through Fencer.HandleOutcomeUnknown before
+//     re-panicking. If the PUT had not yet been issued, nothing was ever
+//     attempted: Append re-panics without fencing, and the stream is left
+//     exactly as healthy as it was before the call. Either way the panic
+//     itself still propagates to Append's own caller rather than being
+//     swallowed here.
+//   - prepare or the PUT calls runtime.Goexit, terminating its goroutine
+//     without returning and without panicking: the same epistemic
+//     position as a panic, split the same way on whether the PUT had been
+//     issued. Issued, the deferred resolution fences through
+//     Fencer.HandleOutcomeUnknown rather than leave busy set for the life
+//     of the process. Not issued, busy is simply cleared - there is no
+//     goroutine left to return an error to, and nothing was attempted.
 //
-// mu is not held while fn runs: Append takes it only to read the seq to
-// hand fn and mark this Lease busy, releases it, calls fn unlocked, then
-// reacquires it to finalize the outcome. A slow fn therefore blocks no
-// other stream and no other operation on this process - only a second,
-// concurrent Append on this same Lease, which refuses rather than waits.
-func (l *Lease) Append(fn func(seq Seq) error) (err error) {
+// mu is not held while prepare or the PUT run: Append takes it only to
+// read the seq to hand prepare and mark this Lease busy, releases it, does
+// the work unlocked, then reacquires it to finalize the outcome. A slow
+// prepare therefore blocks no other stream and no other operation on this
+// process - only a second, concurrent Append on this same Lease, which
+// refuses rather than waits.
+func (l *Lease) Append(ctx context.Context, prepare func(seq Seq) ([]byte, error)) (err error) {
+	if ctx == nil {
+		return refuseNilContext(l.stream)
+	}
 	if l.fencer.IsFenced(l.stream) {
 		return RefusePermanentlyFenced(l.stream)
 	}
@@ -301,34 +363,40 @@ func (l *Lease) Append(fn func(seq Seq) error) (err error) {
 		callErr   error
 		panicked  any
 		completed bool
+		issued    bool // true once Append has issued the one conditional PUT
 	)
 	// The resolution below runs in a defer, not straight-line code after
-	// the call to fn, because a panic is not the only way fn can fail to
-	// return: fn calling runtime.Goexit (in practice, t.Fatal/FailNow
-	// inside fn, in this package's own tests) also unwinds past any
-	// straight-line resolution, and a defer is the only thing a Goexit
-	// unwind still runs. completed is set as the last statement of the
-	// normal path, once fn has returned and callErr holds its result; the
-	// deferred resolution checks it before trusting callErr, so a Goexit
-	// unwind - which leaves panicked nil, the same as a normal return -
-	// cannot fall through and advance the sequence as though the append
-	// had landed. Not completed and not panicking is its own outcome: the
-	// process cannot prove whether fn's write landed, the same epistemic
-	// position a panic leaves it in, so it is routed through
-	// Fencer.HandleOutcomeUnknown exactly as the panic case below is,
-	// rather than left to leave busy set for the life of the process.
+	// the call to prepare and the PUT, because a panic is not the only way
+	// that work can fail to return: calling runtime.Goexit (in practice,
+	// t.Fatal/FailNow inside prepare, in this package's own tests) also
+	// unwinds past any straight-line resolution, and a defer is the only
+	// thing a Goexit unwind still runs. completed is set as the last
+	// statement of the normal path, once the inner func has returned and
+	// callErr holds its result; the deferred resolution checks it before
+	// trusting callErr, so a Goexit unwind - which leaves panicked nil, the
+	// same as a normal return - cannot fall through and advance the
+	// sequence as though the append had landed. issued is the fencing
+	// gate: it is set by Append itself, one statement before the PUT is
+	// issued, so neither a panic nor a Goexit can leave it in a state no
+	// caller could have produced - see the doc comment above for the four
+	// cases this produces (panicked && issued, panicked && !issued,
+	// !completed && issued, !completed && !issued).
 	defer func() {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		l.busy = false
 
 		if panicked != nil {
-			l.fencer.HandleOutcomeUnknown(l.stream, seq)
+			if issued {
+				l.fencer.HandleOutcomeUnknown(l.stream, seq)
+			}
 			panic(panicked)
 		}
 
 		if !completed {
-			err = l.fencer.HandleOutcomeUnknown(l.stream, seq)
+			if issued {
+				err = l.fencer.HandleOutcomeUnknown(l.stream, seq)
+			}
 			return
 		}
 
@@ -350,11 +418,62 @@ func (l *Lease) Append(fn func(seq Seq) error) (err error) {
 
 	func() {
 		defer func() { panicked = recover() }()
-		callErr = fn(seq)
+		payload, prepErr := prepare(seq)
+		if prepErr != nil {
+			callErr = prepErr
+			completed = true
+			return
+		}
+		if len(payload) == 0 {
+			callErr = refuseEmptyPayload(l.stream, seq)
+			completed = true
+			return
+		}
+		issued = true
+		callErr = l.store.PutIfAbsent(ctx, TxKey(l.stream, seq), bytes.NewReader(payload), int64(len(payload)))
 		completed = true
 	}()
 
 	return nil
+}
+
+// refuseNilContext is Append's one-line refusal for a nil ctx, checked
+// before busy is ever set and before prepare is ever called. ctx is handed
+// to l.store.PutIfAbsent once prepare has returned a payload, and
+// store.(*Client).do's first statement calls ctx.Err() - a method call on
+// a nil interface value that panics exactly where this refuses instead.
+// Catching it here, once, closes the incident WALD-27 round 2 found once
+// per caller (a nil ctx dereferenced inside PutIfAbsent) for every caller
+// present and future, rather than leaving each one to rediscover the same
+// guard.
+func refuseNilContext(stream StreamID) error {
+	what := "refusal: push failed"
+	if stream == MetaStreamID {
+		what = "refusal: meta operation failed"
+	}
+	return refusal.Refuse(
+		what,
+		fmt.Sprintf("stream %s: Append called with a nil context", stream),
+		"pass a non-nil context.Context",
+	)
+}
+
+// refuseEmptyPayload is Append's one-line refusal when prepare returns a
+// nil or empty payload with no error: a tx/ record is never zero bytes, so
+// a bare "return nil, nil" from prepare must not become a conditional PUT
+// of an empty body. Nothing was ever issued - this is prepare's own bug,
+// not a write - so the stream stays unfenced and the sequence unconsumed,
+// exactly as any other error prepare returns.
+func refuseEmptyPayload(stream StreamID, seq Seq) error {
+	what := "refusal: push failed"
+	if stream == MetaStreamID {
+		what = "refusal: meta operation failed"
+	}
+	return refusal.Refuse(
+		what,
+		fmt.Sprintf("stream %s: prepare returned an empty payload for seq %d", stream, seq),
+		"",
+	)
 }
 
 // refuseSeqExhausted is Append's one-line refusal for a stream that has

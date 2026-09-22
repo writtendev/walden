@@ -91,20 +91,27 @@ func RefusePermanentlyFenced(stream StreamID) error {
 // WALD-22). The instance treats the stream as fenced exactly as it does for a 412
 // (spec/journal/v1 section 11.4 item 6): a resend risks a 412 caused by this writer's own
 // earlier, unacknowledged attempt, so it never resends, never re-reads the key, and stops.
+// The cause is errors.Join(ErrFenced, ErrOutcomeUnknown), not ErrFenced alone (WALD-118):
+// RotateKey used to tell a proven 412 from an unprovable outcome by capturing putErr from
+// inside its own closure, a trick that no longer works once Lease.Append owns the PUT, so
+// this refusal itself must let errors.Is(err, ErrOutcomeUnknown) hold for a caller that
+// needs the distinction. Refusal.Error() never prints the cause, so every section 11.5
+// string below is unchanged; only the set of errors.Is matches grows.
 func RefuseAppendOutcomeUnknown(stream StreamID, seq Seq) error {
+	cause := errors.Join(ErrFenced, ErrOutcomeUnknown)
 	if stream == MetaStreamID {
 		return refusal.RefuseWithCause(
 			"refusal: meta operation failed",
 			fmt.Sprintf("stream %s append at seq %d has unknown outcome", stream, seq),
 			"instance is fenced for this stream; restart walden process to re-materialize from journal",
-			ErrFenced,
+			cause,
 		)
 	}
 	return refusal.RefuseWithCause(
 		"refusal: push failed",
 		fmt.Sprintf("stream %s append at seq %d has unknown outcome", stream, seq),
 		"instance is fenced for this stream; restart walden process to re-materialize from journal",
-		ErrFenced,
+		cause,
 	)
 }
 

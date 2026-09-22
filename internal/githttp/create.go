@@ -46,7 +46,7 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 			"contact the operator",
 		)
 	}
-	exists, err := h.store.RepoExists(ctx, repo)
+	path, exists, err := h.store.ResolveRepo(ctx, repo)
 	if err != nil {
 		return "", err
 	}
@@ -71,5 +71,5 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 		}
 	}
 
-	return h.store.RepoPath(repo)
+	return path, nil
 }

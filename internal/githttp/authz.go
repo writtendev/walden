@@ -125,8 +125,11 @@ func (h *Handler) authorize(ctx context.Context, token string, required auth.Act
 // HTTP status code and writes the single-line refusal as the response body.
 // ErrRepoNotFound is mapped to 404 (checked before ErrForbidden), ErrForbidden to
 // 403 (no challenge), ErrInvalidRepo to 400, auth credential errors to 401 with
-// the fixed WWW-Authenticate challenge, and unexpected errors or store unavailabilities
-// to 500 with an operator log line.
+// the fixed WWW-Authenticate challenge, ErrStoreUnavailable to the same
+// path-free 500 resolveRepoDir writes (checked before the default branch,
+// which would otherwise forward store's own cause — the absolute repository
+// path — onto the wire), and any other unexpected error to 500 with an
+// operator log line.
 func writeAuthRefusal(w http.ResponseWriter, route, repo string, err error) {
 	switch {
 	case errors.Is(err, store.ErrRepoNotFound):
@@ -142,6 +145,14 @@ func writeAuthRefusal(w http.ResponseWriter, route, repo string, err error) {
 		errors.Is(err, auth.ErrInvalidSignature):
 		w.Header().Set("WWW-Authenticate", authChallenge)
 		writeRefusal(w, http.StatusUnauthorized, err)
+	case errors.Is(err, store.ErrStoreUnavailable):
+		log.Printf("githttp: %s: repository unavailable for %q: %v", route, repo, err)
+		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
+			"repository unavailable",
+			"the server could not resolve the repository path",
+			"contact the operator",
+			store.ErrStoreUnavailable,
+		))
 	default:
 		log.Printf("githttp: %s: auth failure for %q: %v", route, repo, err)
 		writeRefusal(w, http.StatusInternalServerError, err)

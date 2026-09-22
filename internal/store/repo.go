@@ -15,19 +15,37 @@ import (
 	"github.com/writtendev/walden/internal/refusal"
 )
 
-// RepoExists reports whether repo has a bare git repository on disk.
+// ResolveRepo resolves repo to its on-disk path and reports whether a bare
+// git repository already exists there, in one call. Callers that need both
+// — githttp's handlers, chief among them — used to call RepoPath and
+// RepoExists separately and re-derive the classification between them; this
+// is the one place that does it, so a fourth site cannot drift from the
+// other two.
 //
 // RepoPath resolves the identifier first, so the identifier and containment
 // refusals from WALD-37 are returned unchanged and never reach the
 // filesystem check below. The rest of the classification is statRepoPath's:
 // see it for what a directory, a missing path, and anything else (including
 // a non-directory sitting at the path) each mean.
-func (s *Store) RepoExists(ctx context.Context, repo string) (bool, error) {
-	path, err := s.RepoPath(repo)
+func (s *Store) ResolveRepo(ctx context.Context, repo string) (path string, exists bool, err error) {
+	path, err = s.RepoPath(repo)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return statRepoPath(path)
+	exists, err = statRepoPath(path)
+	if err != nil {
+		return "", false, err
+	}
+	return path, exists, nil
+}
+
+// RepoExists reports whether repo has a bare git repository on disk. It is
+// a one-line delegation to ResolveRepo, kept for callers that only need the
+// answer, so there remains a single classifier of what a resolved path
+// means.
+func (s *Store) RepoExists(ctx context.Context, repo string) (bool, error) {
+	_, exists, err := s.ResolveRepo(ctx, repo)
+	return exists, err
 }
 
 // statRepoPath classifies what is at path in the one place both RepoExists

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -212,20 +211,21 @@ func gitEnv(wantV2 bool) []string {
 	return env
 }
 
-// resolveRepoDir resolves repo to its bare repository directory on disk.
-// route names the calling endpoint (e.g. "info/refs" or "upload-pack")
-// for the operator log only: these refusals are deliberately path-free
-// on the wire, so the log line is the only place an operator can tell
-// which endpoint produced a given 500. On success it returns the path
-// and true. On failure it writes a one-line refusal to w — mapping
-// store.ErrStoreUnavailable to 500, every other RepoPath refusal to
-// 400, a missing repository to 404, and any other stat error to 500 —
-// and returns false, telling the caller to stop.
-func (h *Handler) resolveRepoDir(w http.ResponseWriter, route, repo string) (string, bool) {
-	path, err := h.store.RepoPath(repo)
+// resolveRepoDir resolves repo to its bare repository directory on disk,
+// asking store for both the path and the existence answer in one call
+// rather than stat'ing the filesystem itself. route names the calling
+// endpoint (e.g. "info/refs" or "upload-pack") for the operator log only:
+// these refusals are deliberately path-free on the wire, so the log line
+// is the only place an operator can tell which endpoint produced a given
+// 500. On success it returns the path and true. On failure it writes a
+// one-line refusal to w — mapping store.ErrStoreUnavailable to 500, every
+// other RepoPath refusal to 400, and a missing repository to 404 — and
+// returns false, telling the caller to stop.
+func (h *Handler) resolveRepoDir(ctx context.Context, w http.ResponseWriter, route, repo string) (string, bool) {
+	path, exists, err := h.store.ResolveRepo(ctx, repo)
 	if err != nil {
 		if errors.Is(err, store.ErrStoreUnavailable) {
-			log.Printf("githttp: %s: repo path for %q: %v", route, repo, err)
+			log.Printf("githttp: %s: resolve repo for %q: %v", route, repo, err)
 			writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
 				"repository unavailable",
 				"the server could not resolve the repository path",
@@ -238,22 +238,12 @@ func (h *Handler) resolveRepoDir(w http.ResponseWriter, route, repo string) (str
 		return "", false
 	}
 
-	if _, err := os.Stat(path); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			writeRefusal(w, http.StatusNotFound, refusal.RefuseWithCause(
-				"repository not found",
-				fmt.Sprintf("no repository named %q", repo),
-				"check the repository identifier or create it with a push",
-				store.ErrRepoNotFound,
-			))
-			return "", false
-		}
-		log.Printf("githttp: %s: stat repository path for %q: %v", route, repo, err)
-		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
-			"repository unavailable",
-			"the server could not access the repository",
-			"contact the operator",
-			store.ErrStoreUnavailable,
+	if !exists {
+		writeRefusal(w, http.StatusNotFound, refusal.RefuseWithCause(
+			"repository not found",
+			fmt.Sprintf("no repository named %q", repo),
+			"check the repository identifier or create it with a push",
+			store.ErrRepoNotFound,
 		))
 		return "", false
 	}

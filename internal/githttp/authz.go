@@ -125,11 +125,23 @@ func (h *Handler) authorize(ctx context.Context, token string, required auth.Act
 // HTTP status code and writes the single-line refusal as the response body.
 // ErrRepoNotFound is mapped to 404 (checked before ErrForbidden), ErrForbidden to
 // 403 (no challenge), ErrInvalidRepo to 400, auth credential errors to 401 with
-// the fixed WWW-Authenticate challenge, ErrStoreUnavailable to the same
-// path-free 500 resolveRepoDir writes (checked before the default branch,
-// which would otherwise forward store's own cause — the absolute repository
-// path — onto the wire), and any other unexpected error to 500 with an
-// operator log line.
+// the fixed WWW-Authenticate challenge, ErrStoreUnavailable to a path-free 500
+// (checked before the default branch, which would otherwise forward store's
+// own cause — the absolute repository path — onto the wire), and any other
+// unexpected error to 500 with an operator log line.
+//
+// writeAuthRefusal's caller is ensureRepoForPush, whose ErrStoreUnavailable can
+// come from either resolving the path (store.ResolveRepo, before Authorize is
+// even asked) or, for a repository that did not yet exist, creating it
+// (store.CreateRepo, after Authorize succeeds: an unwritable data directory, a
+// failed git init, a failed publish rename). Those are different failures and
+// get different wording: a path-resolution ErrStoreUnavailable must still read
+// exactly like resolveRepoDir's — info/refs, upload-pack, and receive-pack
+// agree byte-for-byte on a regular file, dangling symlink, or FIFO occupying a
+// repository's path (repoexistence_test.go pins this) — while a repoCreateError
+// says the server failed to create the repository instead, which is what
+// actually happened and is never true of the other two routes (only
+// receive-pack ever creates a repository).
 func writeAuthRefusal(w http.ResponseWriter, route, repo string, err error) {
 	switch {
 	case errors.Is(err, store.ErrRepoNotFound):
@@ -147,9 +159,14 @@ func writeAuthRefusal(w http.ResponseWriter, route, repo string, err error) {
 		writeRefusal(w, http.StatusUnauthorized, err)
 	case errors.Is(err, store.ErrStoreUnavailable):
 		log.Printf("githttp: %s: repository unavailable for %q: %v", route, repo, err)
+		why := "the server could not resolve the repository path"
+		var creationErr *repoCreateError
+		if errors.As(err, &creationErr) {
+			why = "the server could not create the repository"
+		}
 		writeRefusal(w, http.StatusInternalServerError, refusal.RefuseWithCause(
 			"repository unavailable",
-			"the server could not resolve the repository path",
+			why,
 			"contact the operator",
 			store.ErrStoreUnavailable,
 		))

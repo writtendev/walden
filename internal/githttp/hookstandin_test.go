@@ -43,8 +43,11 @@ func TestMain(m *testing.M) {
 //
 // One directive per line:
 //
-//	decline <message>   write message to stderr and exit non-zero
-//	env <path>          write the hook's environment to path, KEY=VALUE per line
+//	decline <message>     write message to stderr and exit non-zero
+//	env <path>            write the hook's environment to path, KEY=VALUE per line
+//	pack-listing <path>   write the names under $GIT_QUARANTINE_PATH/pack to
+//	                      path, one per line (empty, not absent, if the
+//	                      directory has nothing in it or doesn't exist)
 //
 // With no directive file it drains stdin and exits 0, accepting the push.
 func runStandInHook() int {
@@ -68,6 +71,17 @@ func runStandInHook() int {
 			code = 1
 		case "env":
 			if err := os.WriteFile(arg, []byte(strings.Join(os.Environ(), "\n")+"\n"), 0o600); err != nil {
+				fmt.Fprintf(os.Stderr, "stand-in hook: %v\n", err)
+				code = 1
+			}
+		case "pack-listing":
+			var names []string
+			if entries, err := os.ReadDir(filepath.Join(os.Getenv("GIT_QUARANTINE_PATH"), "pack")); err == nil {
+				for _, e := range entries {
+					names = append(names, e.Name())
+				}
+			}
+			if err := os.WriteFile(arg, []byte(strings.Join(names, "\n")+"\n"), 0o600); err != nil {
 				fmt.Fprintf(os.Stderr, "stand-in hook: %v\n", err)
 				code = 1
 			}

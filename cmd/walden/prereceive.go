@@ -4,9 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/refusal"
@@ -14,16 +19,21 @@ import (
 )
 
 // hookRequest is the parsed shape of one pre-receive invocation: the
-// environment resolveHook read (WALD-43) plus the ref updates
-// parseRefUpdates read off stdin. WALD-44 adds the quarantine path and the
-// captured pack segment; WALD-46 makes the exit code depend on whether the
-// journal append landed. Nothing else needs to grow.
+// environment resolveHook read (WALD-43, plus WALD-44's quarantine
+// directory) and the ref updates parseRefUpdates read off stdin. WALD-46
+// makes the exit code depend on whether the journal append landed.
+// Nothing else needs to grow.
 type hookRequest struct {
 	Repo     string         // WALDEN_REPO
 	DataDir  string         // WALDEN_DATA_DIR
 	RepoPath string         // resolved bare repo path
 	Journal  *store.Journal // nil in journal-less mode
-	Updates  []journal.RefUpdate
+	// Quarantine is GIT_QUARANTINE_PATH, cleaned and absolute. Empty
+	// means git created no quarantine directory for this push, which is
+	// what a delete-only push looks like: no objects were received, so
+	// there is nothing to capture. It is not a refusal.
+	Quarantine string
+	Updates    []journal.RefUpdate
 }
 
 // parseRefUpdates reads git's pre-receive stdin protocol: one
@@ -181,13 +191,282 @@ func resolveHook(ctx context.Context, lookupEnv func(string) (string, bool), upd
 		}
 	}
 
+	quarantine, err := resolveQuarantine(lookupEnv, repoPath)
+	if err != nil {
+		return nil, err
+	}
+
 	return &hookRequest{
-		Repo:     repo,
-		DataDir:  dataDir,
-		RepoPath: repoPath,
-		Journal:  jrnl,
-		Updates:  updates,
+		Repo:       repo,
+		DataDir:    dataDir,
+		RepoPath:   repoPath,
+		Journal:    jrnl,
+		Quarantine: quarantine,
+		Updates:    updates,
 	}, nil
+}
+
+// resolveQuarantine locates the directory git received this push's objects
+// into (WALD-44). There are three cases and deliberately no fourth:
+//
+//   - GIT_QUARANTINE_PATH set: cleaned, made absolute, and required to sit
+//     inside repoPath. git spells it "<repo.git>/./objects/tmp_objdir-
+//     incoming-XXXXXX" -- the "/./" comes from GIT_DIR being "." -- so the
+//     clean is load-bearing, not cosmetic. A path resolving outside the
+//     repository is a one-line refusal.
+//   - Neither variable set: the empty string. This is a delete-only push;
+//     git creates no quarantine directory when no objects are received, so
+//     there is genuinely nothing to capture.
+//   - GIT_QUARANTINE_PATH unset but GIT_OBJECT_DIRECTORY set: a one-line
+//     refusal. Objects landed somewhere walden is not looking, and
+//     journaling nothing for them would be a guess. internal/githttp/
+//     receivepack.go builds an explicit allowlist environment, so no
+//     inherited GIT_OBJECT_DIRECTORY can reach the hook and produce this
+//     state innocently.
+//
+// The two variables are deliberately not required to be byte-equal even
+// though git sets them to the same value today: githooks(5) documents
+// GIT_QUARANTINE_PATH as the variable a pre-receive hook reads, so it is
+// the single authority here, and an equality check would turn a future
+// git's harmless divergence into a refused push.
+func resolveQuarantine(lookupEnv func(string) (string, bool), repoPath string) (string, error) {
+	quarantine, _ := lookupEnv("GIT_QUARANTINE_PATH")
+	if quarantine == "" {
+		if objectDir, _ := lookupEnv("GIT_OBJECT_DIRECTORY"); objectDir != "" {
+			return "", refusal.Refuse(
+				"pre-receive refused",
+				fmt.Sprintf("GIT_QUARANTINE_PATH is not set but GIT_OBJECT_DIRECTORY is (%s), so the received objects are somewhere walden cannot journal them from", objectDir),
+				"push through walden's own receive-pack handler, which leaves git's quarantine mechanism alone",
+			)
+		}
+		return "", nil
+	}
+
+	abs, err := filepath.Abs(quarantine)
+	if err != nil {
+		return "", refusal.RefuseWithCause(
+			"pre-receive refused",
+			fmt.Sprintf("cannot resolve GIT_QUARANTINE_PATH %q: %s", quarantine, err.Error()),
+			"",
+			err,
+		)
+	}
+	abs = filepath.Clean(abs)
+	if !dirWithin(abs, repoPath) {
+		return "", refusal.Refuse(
+			"pre-receive refused",
+			fmt.Sprintf("GIT_QUARANTINE_PATH %s resolves outside the repository at %s", abs, repoPath),
+			"",
+		)
+	}
+	return abs, nil
+}
+
+// dirWithin reports whether path is root itself or a descendant of it.
+// Both arguments must already be absolute and cleaned. This is the same
+// separator-terminated prefix test internal/store/store.go's
+// pathWithinRoot makes; that one is unexported, and widening store's
+// surface for this single caller would buy nothing.
+func dirWithin(path, root string) bool {
+	prefix := strings.TrimSuffix(root, string(os.PathSeparator)) + string(os.PathSeparator)
+	return path == root || strings.HasPrefix(path, prefix)
+}
+
+// captureSegment opens the packfile git's index-pack left in this push's
+// quarantine directory, ready to be appended as one segment. It returns a
+// nil file when this push has no segment to journal, which is not an
+// error: a delete-only push has no quarantine directory at all, and a push
+// that only moves a ref to an object the repository already holds leaves a
+// 32-byte pack whose header declares zero objects. Both journal a ref
+// transaction with no segments, which spec/journal/v1 section 5.1 permits
+// explicitly.
+//
+// Only the pack's leading header bytes are read here, through
+// journal.PackfileObjectCount; the returned *os.File is handed to
+// (*store.Client).AppendSegment as the io.ReaderAt it wants, so the pack's
+// bytes are streamed from disk and never buffered in memory. walden does
+// not decompress an entry or resolve a delta -- git already did all of
+// that, and this opens the file git wrote and PUTs it verbatim.
+//
+// The caller closes a non-nil file.
+func captureSegment(req *hookRequest) (*os.File, int64, error) {
+	if req.Quarantine == "" {
+		return nil, 0, nil
+	}
+
+	packDir := filepath.Join(req.Quarantine, "pack")
+	entries, err := os.ReadDir(packDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// git creates pack/ lazily; no directory means index-pack
+			// wrote no pack, the same "nothing to capture" as no
+			// quarantine at all.
+			return nil, 0, nil
+		}
+		return nil, 0, refusal.RefuseWithCause(
+			"pre-receive refused",
+			fmt.Sprintf("cannot read the quarantine pack directory %s: %s", packDir, err.Error()),
+			"",
+			err,
+		)
+	}
+
+	// index-pack writes a .idx, a .keep, and a .rev beside the .pack;
+	// only the .pack is the segment.
+	var packs []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".pack") {
+			packs = append(packs, e.Name())
+		}
+	}
+
+	switch len(packs) {
+	case 0:
+		return nil, 0, nil
+	case 1:
+	default:
+		// One push is one index-pack, so more than one pack is a shape
+		// walden does not understand. Picking one would be a guess.
+		return nil, 0, refusal.Refuse(
+			"pre-receive refused",
+			fmt.Sprintf("quarantine directory %s holds %d packfiles, expected exactly one", packDir, len(packs)),
+			"",
+		)
+	}
+
+	packPath := filepath.Join(packDir, packs[0])
+	f, err := os.Open(packPath)
+	if err != nil {
+		return nil, 0, refusal.RefuseWithCause(
+			"pre-receive refused",
+			fmt.Sprintf("cannot open the quarantined packfile %s: %s", packPath, err.Error()),
+			"",
+			err,
+		)
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, refusal.RefuseWithCause(
+			"pre-receive refused",
+			fmt.Sprintf("cannot size the quarantined packfile %s: %s", packPath, err.Error()),
+			"",
+			err,
+		)
+	}
+
+	// ReadAt, not Read: it leaves the file offset at 0, so the *os.File
+	// handed to AppendSegment below is positioned exactly as that method
+	// expects to find it. PackfileMinSize bytes rather than
+	// PackfileHeaderSize, because ValidatePackfileHeader -- which
+	// PackfileObjectCount calls for the validation half -- refuses
+	// anything shorter than a whole minimal packfile, and a pack too
+	// short to hold its own trailing checksum is a refusal here rather
+	// than a segment walden uploads and a reader later chokes on.
+	var hdr [journal.PackfileMinSize]byte
+	if n, err := f.ReadAt(hdr[:], 0); n < len(hdr) {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		f.Close()
+		return nil, 0, refusal.RefuseWithCause(
+			"pre-receive refused",
+			fmt.Sprintf("cannot read the header of the quarantined packfile %s: %s", packPath, err.Error()),
+			"",
+			err,
+		)
+	}
+	count, err := journal.PackfileObjectCount(hdr[:])
+	if err != nil {
+		f.Close()
+		return nil, 0, refusal.RefuseWithCause(
+			"pre-receive refused",
+			fmt.Sprintf("quarantined packfile %s: %s", packPath, err.Error()),
+			"",
+			err,
+		)
+	}
+	if count == 0 {
+		// A ref moved to an object the repository already holds: git
+		// still writes a pack, but it is the empty one. Journal the ref
+		// transaction and no segment.
+		f.Close()
+		return nil, 0, nil
+	}
+
+	return f, info.Size(), nil
+}
+
+// journalPush appends this push to the journal: the quarantined packfile
+// as one segment, then the ref transaction naming it (WALD-44).
+//
+// The order of the four steps is deliberate and is the whole of this
+// function's design:
+//
+//  1. captureSegment is local-only and cheapest, so a malformed quarantine
+//     refuses having made no network call at all.
+//  2. LoadSigner and Leases.Open run before AppendSegment, so a journal
+//     with no genesis record, a local signing key that is not the chain's
+//     active one, or an already-fenced stream refuses without first
+//     leaving an orphan segment in the bucket.
+//  3. AppendSegment runs before AppendRefTx, because spec/journal/v1
+//     section 5 requires a segment to be acknowledged before the record
+//     that names it -- AppendRefTx's own doc comment says it neither
+//     writes segments nor checks that they exist. An orphan segment left
+//     by a crash between the two is explicitly harmless (section 6.4 and
+//     ARCHITECTURE.md's failure table): the client retries, and
+//     AppendSegment's unconditional PUT of identical bytes is a no-op
+//     success.
+//
+// Nothing here hands a closure to (*journal.Lease).Append: the journal is
+// reached through (*store.Client).AppendSegment, which is an unconditional
+// PUT that never touches a lease, and (*store.Client).AppendRefTx, whose
+// own prepare closure only builds, signs, and marshals bytes. WALD-118's
+// contract -- that a caller panic inside prepare must not permanently
+// fence a healthy stream -- is therefore inherited unchanged and needs no
+// code here.
+//
+// now is a parameter so a test can hold the clock still; runPreReceive
+// passes time.Now.
+//
+// What this does not own: making exit 0 mean "storage acknowledged both
+// records". A failure here is returned as an ordinary one-line refusal
+// and main() already turns that into a non-zero exit, but proving that is
+// always enough -- across every injected failure point -- is WALD-46.
+func journalPush(ctx context.Context, req *hookRequest, now func() time.Time) error {
+	stream := journal.StreamID(req.Repo)
+	client := store.NewClient(req.Journal)
+
+	seg, size, err := captureSegment(req)
+	if err != nil {
+		return err
+	}
+	if seg != nil {
+		defer seg.Close()
+	}
+
+	signer, err := client.LoadSigner(ctx, req.DataDir)
+	if err != nil {
+		return err
+	}
+
+	lease, err := journal.NewLeases(client).Open(ctx, stream)
+	if err != nil {
+		return err
+	}
+
+	var segments []string
+	if seg != nil {
+		hash, err := client.AppendSegment(ctx, stream, seg, size)
+		if err != nil {
+			return err
+		}
+		segments = []string{hash}
+	}
+
+	_, err = client.AppendRefTx(ctx, lease, signer, segments, req.Updates, now)
+	return err
 }
 
 // refusePreReceiveEnv refuses a pre-receive invocation missing one of the

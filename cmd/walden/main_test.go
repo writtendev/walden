@@ -197,7 +197,7 @@ func TestRunUsageAndVersion(t *testing.T) {
 				t.Setenv("WALDEN_LISTEN_ADDR", "127.0.0.1:0")
 			}
 			var stdout, stderr bytes.Buffer
-			err := run(cancelledContext(), tt.args, &stdout, &stderr)
+			err := run(cancelledContext(), tt.args, strings.NewReader(""), &stdout, &stderr)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("run(%v) error = %v, wantErr %v", tt.args, err, tt.wantErr)
 			}
@@ -590,6 +590,86 @@ func TestBinaryArgvDispatch(t *testing.T) {
 	}
 }
 
+// TestBinaryPreReceiveRealTriplesExitsZero drives the actual walden binary
+// as git's pre-receive hook through the pre-receive symlink (WALD-43),
+// with WALDEN_REPO/WALDEN_DATA_DIR naming a repository that really exists
+// on disk and a well-formed ref update triple on stdin. It must exit 0
+// with no output at all: a green pre-receive is silent, and WALD-43 stops
+// deliberately short of journaling anything.
+func TestBinaryPreReceiveRealTriplesExitsZero(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "walden")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	hookPath := filepath.Join(tmpDir, "pre-receive")
+	if err := os.Symlink(binPath, hookPath); err != nil {
+		t.Fatalf("symlink pre-receive hook: %v", err)
+	}
+
+	dataDir := t.TempDir()
+	repoPath := filepath.Join(dataDir, "hookrepo.git")
+	if out, err := exec.Command("git", "init", "-q", "--bare", "--initial-branch=main", repoPath).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(hookPath)
+	cmd.Env = append(os.Environ(), "WALDEN_REPO=hookrepo", "WALDEN_DATA_DIR="+dataDir)
+	cmd.Stdin = strings.NewReader("0000000000000000000000000000000000000000 4b825dc642cb6eb9a060e54bf8d69288fbee4904 refs/heads/main\n")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("pre-receive exited non-zero: %v\nstderr: %s", err, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("expected no stdout, got %q", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+// TestBinaryPreReceiveMalformedLineRefuses drives the actual walden binary
+// as the pre-receive hook with a stdin line that cannot be split into
+// old_oid/new_oid/ref: it must exit 1 and print exactly one line on
+// stderr, per AGENTS.md's "every operator-facing refusal is one line".
+func TestBinaryPreReceiveMalformedLineRefuses(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "walden")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+	hookPath := filepath.Join(tmpDir, "pre-receive")
+	if err := os.Symlink(binPath, hookPath); err != nil {
+		t.Fatalf("symlink pre-receive hook: %v", err)
+	}
+
+	cmd := exec.Command(hookPath)
+	cmd.Stdin = strings.NewReader("not-a-valid-pre-receive-line\n")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err == nil {
+		t.Fatalf("expected pre-receive to exit non-zero for a malformed line")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("expected no stdout, got %q", stdout.String())
+	}
+	errOut := strings.TrimRight(stderr.String(), "\n")
+	const wantPrefix = "walden: pre-receive refused:"
+	if !strings.HasPrefix(errOut, wantPrefix) {
+		t.Errorf("stderr = %q, want prefix %q", errOut, wantPrefix)
+	}
+	if strings.Contains(errOut, "\n") {
+		t.Errorf("expected a single-line refusal, got: %q", stderr.String())
+	}
+}
+
 // TestDockerfilePinsAndEntrypoint parses Dockerfile and asserts pinning and configuration rules.
 func TestDockerfilePinsAndEntrypoint(t *testing.T) {
 	dockerfilePath := filepath.Join("..", "..", "Dockerfile")
@@ -815,7 +895,7 @@ func TestNoStackTraceOrWrappedChainToOperator(t *testing.T) {
 // TestRefusalConventionFormat asserts that all refusals produced by walden
 // follow the standard format: "<what>: <why> (<fix>)".
 func TestRefusalConventionFormat(t *testing.T) {
-	errUnknown := run(context.Background(), []string{"walden", "invalid"}, &bytes.Buffer{}, &bytes.Buffer{})
+	errUnknown := run(context.Background(), []string{"walden", "invalid"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if errUnknown == nil {
 		t.Fatal("expected error")
 	}
@@ -824,7 +904,7 @@ func TestRefusalConventionFormat(t *testing.T) {
 		t.Errorf("refusal format mismatch: %q (expected '<what>: <why> (<fix>)')", errStr)
 	}
 
-	errToken := run(context.Background(), []string{"walden", "token"}, &bytes.Buffer{}, &bytes.Buffer{})
+	errToken := run(context.Background(), []string{"walden", "token"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if errToken == nil {
 		t.Fatal("expected error")
 	}

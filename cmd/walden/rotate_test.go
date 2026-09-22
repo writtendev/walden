@@ -191,7 +191,7 @@ func TestRunRotateKeyIgnoresUnrelatedConfigValidation(t *testing.T) {
 // clause: `walden help` lists rotate-key.
 func TestRunUsageListsRotateKey(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if err := run(context.Background(), []string{"walden", "help"}, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), []string{"walden", "help"}, strings.NewReader(""), &stdout, &stderr); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "rotate-key") {
@@ -206,7 +206,7 @@ func TestRunDispatchesRotateKey(t *testing.T) {
 	dataDir := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	err := run(context.Background(), []string{"walden", "rotate-key", "--data-dir", dataDir}, &stdout, &stderr)
+	err := run(context.Background(), []string{"walden", "rotate-key", "--data-dir", dataDir}, strings.NewReader(""), &stdout, &stderr)
 	if err == nil {
 		t.Fatal("expected a refusal (no journal configured), got nil")
 	}

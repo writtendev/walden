@@ -41,13 +41,13 @@ var Version = "dev"
 const probeTimeout = 2 * time.Minute
 
 func main() {
-	if err := run(context.Background(), os.Args, os.Stdout, os.Stderr); err != nil {
+	if err := run(context.Background(), os.Args, os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "walden: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return dispatchServe(ctx, nil, stdout, stderr)
 	}
@@ -56,7 +56,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 	// Dispatched by argv[0] when executed directly as git hook
 	if prog == "pre-receive" {
-		return runPreReceive(args[1:], stdout, stderr)
+		return runPreReceive(ctx, args[1:], stdin, stdout, stderr)
 	}
 
 	if len(args) < 2 {
@@ -71,7 +71,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	case "rotate-key":
 		return runRotateKey(args[2:], stdout, stderr)
 	case "pre-receive":
-		return runPreReceive(args[2:], stdout, stderr)
+		return runPreReceive(ctx, args[2:], stdin, stdout, stderr)
 	case "version", "--version", "-v":
 		fmt.Fprintf(stdout, "walden %s\n", Version)
 		return nil
@@ -399,8 +399,35 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	return nil
 }
 
-func runPreReceive(args []string, stdout, stderr io.Writer) error {
-	// Journal hook dispatched during git receive-pack push
+// runPreReceive implements walden dispatched as git's pre-receive hook
+// (WALD-43): it parses the old/new/ref triples git writes to stdin, then
+// resolves the repository, data directory, and journal purely from the
+// environment internal/githttp/receivepack.go sets, and stops there.
+// args is unused -- the hook takes no flags, only stdin and environment,
+// the same shape git itself invokes it with.
+//
+// Stdin at EOF with no lines parsed exits 0 without resolving anything
+// from the environment: there is nothing to look up a repository, data
+// directory, or journal for. This is what keeps `walden pre-receive` (or
+// the pre-receive symlink) harmless to invoke by hand with no
+// WALDEN_REPO/WALDEN_DATA_DIR set, exactly the shape the argv-dispatch
+// tests use to prove the dispatch itself works.
+//
+// Deliberately not done here: appending anything to the journal. A green
+// WALD-43 exits 0 having parsed and resolved, and nothing more --
+// journaling the quarantined packfile is WALD-44, and making exit 0 depend
+// on that append landing is WALD-46.
+func runPreReceive(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	updates, err := parseRefUpdates(stdin)
+	if err != nil {
+		return err
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	if _, err := resolveHook(ctx, os.LookupEnv, updates); err != nil {
+		return err
+	}
 	return nil
 }
 

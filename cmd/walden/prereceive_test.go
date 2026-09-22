@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -304,6 +307,35 @@ func TestResolveHookRefusals(t *testing.T) {
 			},
 			wantSub: "invalid journal",
 		},
+		{
+			// Objects landed somewhere walden is not looking. Journaling
+			// nothing for them would be a guess, so this refuses.
+			name: "GIT_OBJECT_DIRECTORY without GIT_QUARANTINE_PATH",
+			env: map[string]string{
+				"WALDEN_REPO":          repo,
+				"WALDEN_DATA_DIR":      dataDir,
+				"GIT_OBJECT_DIRECTORY": "/somewhere/else/objects",
+			},
+			wantSub: "GIT_OBJECT_DIRECTORY",
+		},
+		{
+			name: "quarantine outside the repository",
+			env: map[string]string{
+				"WALDEN_REPO":         repo,
+				"WALDEN_DATA_DIR":     dataDir,
+				"GIT_QUARANTINE_PATH": filepath.Join(dataDir, "elsewhere", "objects", "tmp_objdir-incoming-x"),
+			},
+			wantSub: "not inside the repository directory",
+		},
+		{
+			name: "quarantine escaping the repository with ..",
+			env: map[string]string{
+				"WALDEN_REPO":         repo,
+				"WALDEN_DATA_DIR":     dataDir,
+				"GIT_QUARANTINE_PATH": filepath.Join(dataDir, "repo.git", "objects", "..", "..", "tmp_objdir-incoming-x"),
+			},
+			wantSub: "not inside the repository directory",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -321,5 +353,480 @@ func TestResolveHookRefusals(t *testing.T) {
 				t.Errorf("expected a single-line refusal, got: %q", err.Error())
 			}
 		})
+	}
+}
+
+// TestResolveHookQuarantine covers the three cases resolveQuarantine
+// recognizes and no fourth (WALD-44). The two refusals -- an object
+// directory with no quarantine path, and a quarantine resolving outside
+// the repository -- are cases in TestResolveHookRefusals above.
+func TestResolveHookQuarantine(t *testing.T) {
+	dataDir := t.TempDir()
+	const repo = "repo"
+	repoPath := initBareRepo(t, dataDir, repo)
+
+	updates := []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: testNewOID}}
+
+	t.Run("cleaned-and-absolute", func(t *testing.T) {
+		// git's own spelling: GIT_DIR is ".", so the path it exports has
+		// a "/./" in the middle of it. Cleaning is what removes it.
+		sep := string(os.PathSeparator)
+		gitSpelling := repoPath + sep + "." + sep + filepath.Join("objects", "tmp_objdir-incoming-AbCdEf")
+		want := filepath.Join(repoPath, "objects", "tmp_objdir-incoming-AbCdEf")
+
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":          repo,
+			"WALDEN_DATA_DIR":      dataDir,
+			"GIT_QUARANTINE_PATH":  gitSpelling,
+			"GIT_OBJECT_DIRECTORY": gitSpelling,
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != want {
+			t.Errorf("Quarantine = %q, want %q", req.Quarantine, want)
+		}
+		if strings.Contains(req.Quarantine, sep+"."+sep) {
+			t.Errorf("Quarantine %q still carries git's \"/./\" spelling", req.Quarantine)
+		}
+	})
+
+	t.Run("repository-that-is-itself-a-symlink", func(t *testing.T) {
+		// store.RepoPath resolves the data directory but leaves the
+		// "<repo>.git" leaf as written, so <dataDir>/link.git pointing at
+		// a sibling inside the data directory is a shape it deliberately
+		// permits. git reports the quarantine directory under the
+		// resolved path -- it derives GIT_QUARANTINE_PATH from getcwd()
+		// after chdir -- so a lexical containment test against the
+		// unresolved leaf would refuse every push to that repository
+		// (round 1 finding 2).
+		linkDir := t.TempDir()
+		target := initBareRepo(t, linkDir, "real")
+		if err := os.Symlink(target, filepath.Join(linkDir, "link.git")); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		quarantine := filepath.Join(target, "objects", "tmp_objdir-incoming-AbCdEf")
+
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":         "link",
+			"WALDEN_DATA_DIR":     linkDir,
+			"GIT_QUARANTINE_PATH": quarantine,
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != quarantine {
+			t.Errorf("Quarantine = %q, want %q", req.Quarantine, quarantine)
+		}
+	})
+
+	t.Run("two-spellings-of-the-same-directory-resolve", func(t *testing.T) {
+		// The containment test is about identity, not spelling. This is
+		// the portable stand-in for the case-insensitive filesystem below:
+		// <dataDir>/alias.git is the same directory as <dataDir>/repo.git,
+		// written another way, and a lexical prefix test reads the two as
+		// unrelated and refuses the push (round 2 finding 1). git does not
+		// hand walden this particular spelling -- it builds
+		// GIT_QUARANTINE_PATH from getcwd() -- but a case-insensitive
+		// volume hands it the same disagreement, and Linux, where CI runs,
+		// has no way to produce that one.
+		aliasDir := t.TempDir()
+		real := initBareRepo(t, aliasDir, "repo")
+		if err := os.Symlink(real, filepath.Join(aliasDir, "alias.git")); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		quarantine := filepath.Join(aliasDir, "alias.git", "objects", "tmp_objdir-incoming-AbCdEf")
+
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":         "repo",
+			"WALDEN_DATA_DIR":     aliasDir,
+			"GIT_QUARANTINE_PATH": quarantine,
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != quarantine {
+			t.Errorf("Quarantine = %q, want %q", req.Quarantine, quarantine)
+		}
+	})
+
+	t.Run("data-dir-cased-differently-from-the-directory-on-disk", func(t *testing.T) {
+		// The reported shape: on APFS, NTFS, SMB or exFAT, a --data-dir
+		// spelled in another case than the directory it names still opens
+		// it, but filepath.EvalSymlinks hands back the operator's spelling
+		// while git reports the quarantine under the on-disk one. Every
+		// push to every repository was refused, journal-less mode included
+		// (round 2 finding 1). Skipped where case is significant, because
+		// there the mis-cased path names no directory at all.
+		root := t.TempDir()
+		onDisk := filepath.Join(root, "Data")
+		mkdirAll(t, onDisk)
+		misCased := filepath.Join(root, "data")
+		if _, err := os.Stat(misCased); err != nil {
+			t.Skipf("case-sensitive filesystem: %s names no directory", misCased)
+		}
+
+		repoPath := initBareRepo(t, onDisk, "repo")
+		quarantine := filepath.Join(repoPath, "objects", "tmp_objdir-incoming-AbCdEf")
+
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":         "repo",
+			"WALDEN_DATA_DIR":     misCased,
+			"GIT_QUARANTINE_PATH": quarantine,
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != quarantine {
+			t.Errorf("Quarantine = %q, want %q", req.Quarantine, quarantine)
+		}
+	})
+
+	t.Run("neither-variable-set-is-a-delete-only-push", func(t *testing.T) {
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":     repo,
+			"WALDEN_DATA_DIR": dataDir,
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != "" {
+			t.Errorf("Quarantine = %q, want empty: a delete-only push gets no quarantine directory at all", req.Quarantine)
+		}
+	})
+
+	t.Run("divergent-object-directory-is-not-an-equality-check", func(t *testing.T) {
+		// githooks(5) names GIT_QUARANTINE_PATH as the variable a
+		// pre-receive hook reads, so it is the single authority here. A
+		// future git spelling GIT_OBJECT_DIRECTORY differently must not
+		// turn into a refused push.
+		quarantine := filepath.Join(repoPath, "objects", "tmp_objdir-incoming-x")
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":          repo,
+			"WALDEN_DATA_DIR":      dataDir,
+			"GIT_QUARANTINE_PATH":  quarantine,
+			"GIT_OBJECT_DIRECTORY": filepath.Join(repoPath, "objects"),
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != quarantine {
+			t.Errorf("Quarantine = %q, want %q", req.Quarantine, quarantine)
+		}
+	})
+}
+
+// zeroObjectPack is the 32-byte packfile git's index-pack writes when a
+// push moves a ref to an object the repository already holds: "PACK",
+// version 2, object count 0, then the 20-byte trailing checksum.
+// Confirmed against git 2.50.1 by pushing a ref to an existing object
+// with receive.unpackLimit=0.
+func zeroObjectPack() []byte {
+	return append([]byte{'P', 'A', 'C', 'K', 0, 0, 0, 2, 0, 0, 0, 0}, make([]byte, 20)...)
+}
+
+// realPackfile builds an actual git packfile holding more than one object
+// -- a commit and its tree -- by driving the real git binary, so
+// captureSegment and the hook tests below run against bytes git wrote
+// rather than bytes this suite invented.
+func realPackfile(t *testing.T) []byte {
+	t.Helper()
+	work := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "Test"},
+		{"commit", "-q", "--allow-empty", "-m", "packed"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = work
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+
+	list := exec.Command("git", "rev-list", "--objects", "--all")
+	list.Dir = work
+	objects, err := list.Output()
+	if err != nil {
+		t.Fatalf("git rev-list --objects --all: %v", err)
+	}
+
+	packObjects := exec.Command("git", "pack-objects", "--stdout", "-q")
+	packObjects.Dir = work
+	packObjects.Stdin = bytes.NewReader(objects)
+	pack, err := packObjects.Output()
+	if err != nil {
+		t.Fatalf("git pack-objects --stdout: %v", err)
+	}
+	count, err := journal.PackfileObjectCount(pack)
+	if err != nil {
+		t.Fatalf("git pack-objects produced something that is not a packfile: %v", err)
+	}
+	if count < 2 {
+		t.Fatalf("git pack-objects produced object count %d, want at least 2", count)
+	}
+	return pack
+}
+
+// TestCaptureSegment covers every shape a quarantine directory reaches the
+// hook in. A nil file means "this push has no segment to journal", which
+// is three distinct situations and an error in none of them.
+func TestCaptureSegment(t *testing.T) {
+	pack := realPackfile(t)
+
+	// setup writes one case's quarantine tree under root and returns the
+	// GIT_QUARANTINE_PATH value for it; an empty return means the push
+	// had no quarantine directory at all.
+	tests := []struct {
+		name     string
+		setup    func(t *testing.T, root string) string
+		wantSize int64
+		wantSub  string // non-empty: expect a refusal naming this
+	}{
+		{
+			name:  "no quarantine directory at all",
+			setup: func(t *testing.T, root string) string { return "" },
+		},
+		{
+			name: "quarantine with no pack directory",
+			setup: func(t *testing.T, root string) string {
+				return mkQuarantine(t, root)
+			},
+		},
+		{
+			name: "pack directory holding nothing",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkdirAll(t, filepath.Join(q, "pack"))
+				return q
+			},
+		},
+		{
+			// An empty pack/ and an info/ beside it is the whole of what a
+			// quarantine that received nothing ever holds, so this is the
+			// permissive half of the allowlist: tightening it further would
+			// refuse legitimate pushes, and this says so out loud.
+			name: "pack and info directories, both empty",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkdirAll(t, filepath.Join(q, "pack"))
+				mkdirAll(t, filepath.Join(q, "info"))
+				return q
+			},
+		},
+		{
+			// index-pack's own footprint minus the one file that matters.
+			// Unreachable through git 2.50.1 -- receive-pack rejects every
+			// command before pre-receive when index-pack dies -- but this
+			// check exists to catch a git that changed under walden, so a
+			// shape of exactly that description must not read as "nothing
+			// received" (round 2 finding 2).
+			name: "pack directory holding only index-pack's siblings refuses",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				dir := filepath.Join(q, "pack")
+				mkdirAll(t, dir)
+				for _, name := range []string{"pack-abc.idx", "pack-abc.keep", "pack-abc.rev"} {
+					writeFile(t, filepath.Join(dir, name), []byte("not a pack"))
+				}
+				return q
+			},
+			wantSub: "pack/pack-abc.idx with no packfile beside it",
+		},
+		{
+			// The allowlist's whole point: walden has never seen this
+			// entry, so it is evidence, not background noise.
+			name: "an entry walden does not recognize refuses",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkdirAll(t, filepath.Join(q, "pack"))
+				mkdirAll(t, filepath.Join(q, "incoming-loose"))
+				return q
+			},
+			wantSub: `"incoming-loose", which a quarantine that received nothing never holds`,
+		},
+		{
+			// The failure this whole change exists to prevent, and the
+			// only runtime detection behind the receive.unpackLimit=0
+			// knob: git's default unpackLimit writes a small push into
+			// loose objects and leaves pack/ empty, which must refuse
+			// rather than journal "this push introduced no objects"
+			// (round 1 finding 1). Deleting this case deletes the
+			// detection with it.
+			name: "loose objects beside an empty pack directory refuse",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkdirAll(t, filepath.Join(q, "pack"))
+				mkLooseObject(t, q)
+				return q
+			},
+			wantSub: "loose objects",
+		},
+		{
+			// Same shape, reached through the other branch: git creates
+			// pack/ lazily, so an unpacked push may leave no pack/ at all.
+			name: "loose objects with no pack directory refuse",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkLooseObject(t, q)
+				return q
+			},
+			wantSub: "loose objects",
+		},
+		{
+			// GIT_QUARANTINE_PATH naming a directory that is not there:
+			// git creates it before running the hook, so walden cannot
+			// see what this push received and does not guess that it
+			// received nothing.
+			name: "an unreadable quarantine directory refuses",
+			setup: func(t *testing.T, root string) string {
+				return filepath.Join(root, "objects", "tmp_objdir-incoming-gone")
+			},
+			wantSub: "cannot read the quarantine directory",
+		},
+		{
+			name: "zero-object pack is no segment",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				dir := filepath.Join(q, "pack")
+				mkdirAll(t, dir)
+				writeFile(t, filepath.Join(dir, "pack-abc.pack"), zeroObjectPack())
+				return q
+			},
+		},
+		{
+			name: "a real pack is captured whole",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				dir := filepath.Join(q, "pack")
+				mkdirAll(t, dir)
+				writeFile(t, filepath.Join(dir, "pack-abc.pack"), pack)
+				writeFile(t, filepath.Join(dir, "pack-abc.idx"), []byte("ignored"))
+				writeFile(t, filepath.Join(dir, "pack-abc.keep"), nil)
+				return q
+			},
+			wantSize: int64(len(pack)),
+		},
+		{
+			name: "two packs are a refusal naming the count",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				dir := filepath.Join(q, "pack")
+				mkdirAll(t, dir)
+				writeFile(t, filepath.Join(dir, "pack-abc.pack"), pack)
+				writeFile(t, filepath.Join(dir, "pack-def.pack"), pack)
+				return q
+			},
+			wantSub: "2 packfiles",
+		},
+		{
+			name: "a pack too short to be one is a refusal",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				dir := filepath.Join(q, "pack")
+				mkdirAll(t, dir)
+				writeFile(t, filepath.Join(dir, "pack-abc.pack"), []byte("PACK\x00\x00\x00\x02"))
+				return q
+			},
+			wantSub: "header",
+		},
+		{
+			name: "a pack with the wrong magic is a refusal",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				dir := filepath.Join(q, "pack")
+				mkdirAll(t, dir)
+				bad := zeroObjectPack()
+				copy(bad, "KCAP")
+				writeFile(t, filepath.Join(dir, "pack-abc.pack"), bad)
+				return q
+			},
+			wantSub: "invalid header magic",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &hookRequest{Quarantine: tt.setup(t, t.TempDir())}
+
+			f, size, err := captureSegment(req)
+			if f != nil {
+				defer f.Close()
+			}
+
+			if tt.wantSub != "" {
+				if err == nil {
+					t.Fatalf("captureSegment succeeded, want a refusal containing %q", tt.wantSub)
+				}
+				if !strings.Contains(err.Error(), tt.wantSub) {
+					t.Errorf("error = %q, want substring %q", err.Error(), tt.wantSub)
+				}
+				if strings.ContainsAny(err.Error(), "\n\r") {
+					t.Errorf("expected a single-line refusal, got: %q", err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("captureSegment: %v", err)
+			}
+			if tt.wantSize == 0 {
+				if f != nil {
+					t.Fatalf("captureSegment returned a file, want nil: there is nothing to journal")
+				}
+				return
+			}
+			if f == nil {
+				t.Fatal("captureSegment returned no file, want the captured pack")
+			}
+			if size != tt.wantSize {
+				t.Errorf("size = %d, want %d", size, tt.wantSize)
+			}
+			// Readable from offset 0 through ReadAt: that is the
+			// io.ReaderAt contract AppendSegment relies on, and the bytes
+			// must be the pack's, verbatim.
+			got := make([]byte, size)
+			if _, err := f.ReadAt(got, 0); err != nil {
+				t.Fatalf("ReadAt: %v", err)
+			}
+			if !bytes.Equal(got, pack) {
+				t.Errorf("captured bytes differ from the packfile on disk")
+			}
+		})
+	}
+}
+
+// mkQuarantine creates a directory shaped like the one git exports as
+// GIT_QUARANTINE_PATH and returns its path.
+func mkQuarantine(t *testing.T, root string) string {
+	t.Helper()
+	dir := filepath.Join(root, "objects", "tmp_objdir-incoming-AbCdEf")
+	mkdirAll(t, dir)
+	return dir
+}
+
+// mkLooseObject writes one loose object into a quarantine directory the
+// way git does when it unpacks a push instead of packing it: a file under
+// the two-hex-character fan-out directory named for the first byte of its
+// object id. The bytes are irrelevant -- walden counts what git left, it
+// never opens an object -- but the layout is not.
+func mkLooseObject(t *testing.T, quarantine string) {
+	t.Helper()
+	dir := filepath.Join(quarantine, "3c")
+	mkdirAll(t, dir)
+	writeFile(t, filepath.Join(dir, "79adf14db2a78562dba199b1b044f986a48a9c"), []byte("zlib-compressed object"))
+}
+
+func mkdirAll(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", dir, err)
+	}
+}
+
+func writeFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile(%s): %v", path, err)
 	}
 }

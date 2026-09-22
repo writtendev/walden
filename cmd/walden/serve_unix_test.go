@@ -12,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/writtendev/walden/internal/journal"
+	"github.com/writtendev/walden/internal/store/storetest"
 )
 
 // e2eGitEnv returns a minimal, isolated environment for a git process
@@ -248,5 +251,176 @@ func TestServeEndToEndCloneAndPush(t *testing.T) {
 	const warning = "walden: WARNING: journal-less mode: WALDEN_JOURNAL is unset, so durability is this disk alone"
 	if got := strings.Count(stderrBuf.String(), warning); got != 1 {
 		t.Errorf("expected the journal-less warning exactly once on stderr, got %d:\n%s", got, stderrBuf.String())
+	}
+}
+
+// TestServeEndToEndJournalsEveryPush is the only test that proves the
+// whole write path on the real binaries: `walden serve` as a subprocess
+// with a journal configured, the real git client pushing over a real
+// socket, the real pre-receive hook dispatched by argv[0], and a real
+// object storage endpoint underneath. Every other WALD-44 test builds its
+// quarantine directory by hand and would go on passing if git stopped
+// leaving a packfile there at all -- which is exactly what git's default
+// receive.unpackLimit makes it do.
+//
+// It walks the same four push shapes as TestServeEndToEndCloneAndPush,
+// and each one lands a ref transaction in sequence:
+//
+//  0. create        -- new objects, so a segment
+//  1. fast-forward  -- new objects, so a segment
+//  2. branch create -- points at an object the repo already holds, so
+//     git writes the 32-byte zero-object pack and there
+//     is no segment
+//  3. branch delete -- no quarantine directory at all, so no segment
+func TestServeEndToEndJournalsEveryPush(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "walden")
+
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+
+	dataDir := t.TempDir()
+	repoPath := filepath.Join(dataDir, "repo.git")
+	runLocalGit(t, tmpDir, "init", "-q", "--bare", "--initial-branch=main", repoPath)
+	hooksDir := filepath.Join(repoPath, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir hooks dir: %v", err)
+	}
+	if err := os.Symlink(binPath, filepath.Join(hooksDir, "pre-receive")); err != nil {
+		t.Fatalf("symlink pre-receive hook: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "serve",
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	)
+	// The hook is a separate process, so it needs credentials of its
+	// own: handleReceivePack forwards exactly these names from the
+	// server's environment into the hook's.
+	cmd.Env = append(e2eGitEnv(),
+		"AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+		"AWS_SECRET_ACCESS_KEY=topsecret",
+		"AWS_REGION=us-east-1",
+	)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start walden serve: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	})
+
+	adminToken, addr := waitForServerBoot(t, stdoutPipe)
+
+	work := t.TempDir()
+	runLocalGit(t, work, "init", "-q", "-b", "main")
+	runLocalGit(t, work, "config", "user.email", "test@example.com")
+	runLocalGit(t, work, "config", "user.name", "Test")
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "initial")
+	sha := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+
+	repoURL := fmt.Sprintf("http://walden:%s@%s/repo", adminToken, addr)
+	runLocalGit(t, work, "push", "-q", repoURL, "main")
+
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "second")
+	sha2 := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+	runLocalGit(t, work, "push", "-q", repoURL, "main")
+
+	runLocalGit(t, work, "branch", "feature")
+	runLocalGit(t, work, "push", "-q", repoURL, "feature")
+	runLocalGit(t, work, "push", "-q", repoURL, "--delete", "feature")
+
+	const stream = journal.StreamID("repo")
+	want := []struct {
+		name        string
+		wantSegment bool
+		updates     []journal.RefUpdate
+	}{
+		{
+			name:        "create",
+			wantSegment: true,
+			updates:     []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: sha}},
+		},
+		{
+			name:        "fast-forward",
+			wantSegment: true,
+			updates:     []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: sha, NewOID: sha2}},
+		},
+		{
+			name:        "branch create pointing at an object already present",
+			wantSegment: false,
+			updates:     []journal.RefUpdate{{Ref: "refs/heads/feature", OldOID: journal.ZeroOID40, NewOID: sha2}},
+		},
+		{
+			name:        "branch delete",
+			wantSegment: false,
+			updates:     []journal.RefUpdate{{Ref: "refs/heads/feature", OldOID: sha2, NewOID: journal.ZeroOID40}},
+		},
+	}
+
+	for seq, tt := range want {
+		rec := journalRefTx(t, fake, stream, journal.Seq(seq))
+		if tt.wantSegment {
+			if len(rec.Segments) != 1 {
+				t.Errorf("tx %d (%s): segments = %v, want exactly one", seq, tt.name, rec.Segments)
+			} else if _, ok := fake.Object("prefix/" + journal.SegmentKey(stream, rec.Segments[0])); !ok {
+				t.Errorf("tx %d (%s): names segment %s, which is not in the bucket", seq, tt.name, rec.Segments[0])
+			}
+		} else if len(rec.Segments) != 0 {
+			t.Errorf("tx %d (%s): segments = %v, want an empty array: this push introduced no objects", seq, tt.name, rec.Segments)
+		}
+		if len(rec.Updates) != len(tt.updates) {
+			t.Errorf("tx %d (%s): updates = %+v, want %+v", seq, tt.name, rec.Updates, tt.updates)
+			continue
+		}
+		for i := range tt.updates {
+			if rec.Updates[i] != tt.updates[i] {
+				t.Errorf("tx %d (%s): update[%d] = %+v, want %+v", seq, tt.name, i, rec.Updates[i], tt.updates[i])
+			}
+		}
+	}
+
+	// Exactly four ref transactions: a fifth would mean a push was
+	// journaled twice, and a missing one would mean a push slipped by
+	// unjournaled.
+	txPrefix := "prefix/" + journal.TxPrefix(stream)
+	got := 0
+	for _, k := range fake.Keys() {
+		if strings.HasPrefix(k, txPrefix) {
+			got++
+		}
+	}
+	if got != len(want) {
+		t.Errorf("stream %q holds %d ref transactions, want %d", stream, got, len(want))
+	}
+
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("signal SIGINT: %v", err)
+	}
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- cmd.Wait() }()
+	select {
+	case err := <-waitErr:
+		if err != nil {
+			t.Errorf("expected walden serve to exit 0 after SIGINT, got: %v\n%s", err, stderrBuf.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("walden serve did not exit within 10s of SIGINT")
 	}
 }

@@ -101,7 +101,11 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 	// It is also the last thing this function does, so the repair it may perform only ever
 	// runs for a caller that has already cleared Authorize with write scope: nobody else
 	// can probe a repository's hook state or provoke a write to its hooks directory.
-	if err := h.store.EnsureHook(path); err != nil {
+	//
+	// It gets the request's context: establishing which hook git will run is itself an
+	// exec, and a data directory that has stopped answering must not park this goroutine
+	// past the client's disconnect.
+	if err := h.store.EnsureHook(ctx, path); err != nil {
 		return "", err
 	}
 	return path, nil

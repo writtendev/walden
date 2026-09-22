@@ -288,7 +288,7 @@ By construction there are few, and each is legible:
 | crash mid-push                               | refs never moved; journal may hold an unreferenced pack                          | harmless; compaction tidies                   |
 | journal-less mode                            | durability = the disk, as warned                                                 | enable `WALDEN_JOURNAL`                       |
 | bucket lacks compare-and-swap                | walden refuses to boot, one line                                                 | choose a provider per spec §11.2              |
-| repository on disk without walden's hook     | the next push repairs the symlink at `hooks/pre-receive` and logs it if it displaced another target; anything else there — a regular file, a directory — is left untouched and that push refuses in one line, as does a repair that cannot be written and a repository whose own config redirects hooks with `core.hooksPath` — reads keep serving either way | move the foreign hook aside, make `hooks/` writable, or unset `core.hooksPath`; the next push installs walden's |
+| repository on disk without walden's hook     | the next push repairs the symlink at `hooks/pre-receive` and logs it if it displaced another target; anything else there — a regular file, a directory — is left untouched and that push refuses in one line, as does a repair that cannot be written, a repository that `core.hooksPath` redirects in any scope, and a repository whose hook path git will not report at all — reads keep serving either way | move the foreign hook aside, make `hooks/` writable, or unset `core.hooksPath`; the next push installs walden's |
 
 Losing an acknowledged push does not appear in this table. That is the
 entire product.

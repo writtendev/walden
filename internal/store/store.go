@@ -162,8 +162,10 @@ type RepositoryManager interface {
 	// bare git repository already exists there, in one call.
 	ResolveRepo(ctx context.Context, repo string) (path string, exists bool, err error)
 	// EnsureHook verifies — repairing where it safely can — the
-	// pre-receive hook of the repository already resolved to repoPath.
-	EnsureHook(repoPath string) error
+	// pre-receive hook of the repository already resolved to repoPath. It
+	// takes a context because it execs git to establish which hook that
+	// repository will run.
+	EnsureHook(ctx context.Context, repoPath string) error
 }
 
 // var _ RepositoryManager = (*Store)(nil) pins Store to the interface at

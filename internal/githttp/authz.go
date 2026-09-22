@@ -131,11 +131,14 @@ func (h *Handler) authorize(ctx context.Context, token string, required auth.Act
 // operator looking at the wrong thing; the distinct sentinel is also why this needs
 // no marker type of the repoCreateError kind, which exists only to tell apart two
 // failures wearing the same one). That wording is deliberately the one thing true of
-// every ErrHookUnavailable rather than the commonest: store.EnsureHook refuses a
-// foreign hook, a hook it could not install, a repository that redirects its hooks
-// with core.hooksPath, and a repository directory that went away, and "is not
-// walden's and could not be repaired" was false for the second of those. The
-// operator log line above carries store's own cause, which says which it was.
+// every ErrHookUnavailable rather than the commonest. store.EnsureHook refuses on
+// five counts: git would not report which hook the repository runs (which is also
+// how a repository that went away between the re-resolve and the check arrives
+// here), the hook git reported is not the one walden owns, hooks/pre-receive could
+// not be stat'ed at all, something that is not walden's symlink is sitting at that
+// path, and the repair could not be written. "Is not walden's and could not be
+// repaired" was false for more than one of those. The operator log line above
+// carries store's own cause, which says which it was.
 // ErrStoreUnavailable maps to a path-free 500
 // (checked before the default branch, which would otherwise forward store's
 // own cause — the absolute repository path — onto the wire), and any other

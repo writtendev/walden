@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
@@ -218,13 +219,14 @@ const preReceiveHookName = "pre-receive"
 // that path and touches nothing else there.
 //
 // The rule holds only where hooks/pre-receive is the path git will run, so
-// that is established first: a repository whose own config sets
-// core.hooksPath runs <core.hooksPath>/pre-receive and never looks at
-// hooks/ at all, and verifying a path git will ignore is worse than not
-// verifying at all — it reports a repository healthy while its pushes move
-// refs nothing journals. See repoHooksPathRedirect for how git is asked,
-// and why walden refuses such a repository rather than installing into the
-// directory it names.
+// that is established first, and established by asking git rather than by
+// reconstructing its answer: a repository whose config sets core.hooksPath
+// runs <core.hooksPath>/pre-receive and never looks at hooks/ at all, and
+// verifying a path git will ignore is worse than not verifying at all — it
+// reports a repository healthy while its pushes move refs nothing journals.
+// See gitHookPath for the question that has an answer, and why walden
+// refuses a redirected repository rather than installing into the directory
+// it names.
 //
 // Asking git costs one exec on every push, which is what verifying the
 // right path is worth: `git receive-pack` is an exec a moment later anyway.
@@ -248,10 +250,11 @@ const preReceiveHookName = "pre-receive"
 //     placed, because it cannot know what it was for. It says which file
 //     is in the way and stops.
 //
-// The second and third of those repair a repository that is there, so the
-// repair also refuses when repoPath is not a directory any more: the
-// installer's MkdirAll would otherwise build one, and walden does not
-// create storage on the repair path. See the comment at that check.
+// The second and third of those repair a repository that is there, and the
+// repair never creates storage: installPreReceiveHook makes hooks/ with a
+// single os.Mkdir, which fails rather than building repoPath under it. See
+// the comment there for the phantom repository that structural choice
+// closes.
 //
 // A repair that cannot be made refuses. There is deliberately no
 // accept-what-is-already-there fallback: the one state such a fallback
@@ -272,18 +275,31 @@ const preReceiveHookName = "pre-receive"
 // The trade is still the right one — the alternative is accepting a push
 // validated by a binary walden cannot tell from /bin/true — but it costs
 // that, and an operator reading this should know it does.
-func (s *Store) EnsureHook(repoPath string) error {
-	if redirect := repoHooksPathRedirect(repoPath); redirect != "" {
+func (s *Store) EnsureHook(ctx context.Context, repoPath string) error {
+	hooksDir := filepath.Join(repoPath, "hooks")
+	hookPath := filepath.Join(hooksDir, preReceiveHookName)
+
+	// Everything below verifies and repairs hookPath, so hookPath has to be
+	// the path git will run. git is asked, and its answer is not negotiated
+	// with: a probe that could not answer refuses, and an answer naming any
+	// other path refuses.
+	reported, err := gitHookPath(ctx, repoPath)
+	if err != nil {
 		return refusal.RefuseWithCause(
 			"repository hook unavailable",
-			fmt.Sprintf("%s sets core.hooksPath to %q, so git runs that directory's pre-receive and never walden's", repoPath, redirect),
-			"unset core.hooksPath in the repository's config so git runs hooks/pre-receive",
+			err.Error(),
+			"verify git is installed and that it can open the repository directory",
 			ErrHookUnavailable,
 		)
 	}
-
-	hooksDir := filepath.Join(repoPath, "hooks")
-	hookPath := filepath.Join(hooksDir, preReceiveHookName)
+	if reported != hookPath {
+		return refusal.RefuseWithCause(
+			"repository hook unavailable",
+			fmt.Sprintf("git runs %s for this repository, not %s, so core.hooksPath sends the push past walden's hook", reported, hookPath),
+			"unset core.hooksPath for this repository so git runs hooks/pre-receive",
+			ErrHookUnavailable,
+		)
+	}
 
 	// The link target as it stands before any repair, empty when there is
 	// no symlink at hookPath. It is what the repair log line below names,
@@ -319,32 +335,6 @@ func (s *Store) EnsureHook(repoPath string) error {
 		)
 	}
 
-	// The installer creates hooks/ when it is absent, and MkdirAll would
-	// create repoPath along with it. EnsureHook is handed a path, not a
-	// repository identifier, and never checks that a repository is there —
-	// so a directory that went away since ensureRepoForPush re-resolved it
-	// (an operator's rm -rf racing this push, the same window that
-	// re-resolve exists to cover) would be conjured back as an empty
-	// repository-shaped tree. statRepoPath calls any directory a
-	// repository, so that phantom would occupy the identifier from then on:
-	// pushes hand `git receive-pack` something that is not a repository,
-	// and creation refuses "repository already exists" for a repository
-	// that does not exist — recoverable only by an operator removing it by
-	// hand, and legible from neither refusal. walden repairs a repository
-	// that is there; the repair path does not create storage.
-	if info, err := os.Stat(repoPath); err != nil || !info.IsDir() {
-		cause := fmt.Sprintf("%s is not a directory", repoPath)
-		if err != nil {
-			cause = err.Error()
-		}
-		return refusal.RefuseWithCause(
-			"repository hook unavailable",
-			cause,
-			"verify the repository directory is still present before pushing again",
-			ErrHookUnavailable,
-		)
-	}
-
 	if err := installPreReceiveHook(hooksDir); err != nil {
 		// Whatever is already at hookPath stays there, and the push is
 		// refused. It cannot be accepted on the strength of what is there:
@@ -364,58 +354,104 @@ func (s *Store) EnsureHook(repoPath string) error {
 	return nil
 }
 
-// repoHooksPathRedirect returns the core.hooksPath the repository at
-// repoPath sets in its own config, or "" when it sets none.
+// gitWaitDelay bounds how long cmd.Wait may block after a git child's own
+// exit and pipe closures have otherwise settled. Cancelling the context kills
+// the child and its process group, but killing is not reaping: os/exec's
+// output-copy goroutines can still be parked on a dead child's pipe. It is
+// githttp's gitWaitDelay, for the same reason and with the same value; the
+// two packages cannot share a constant without store importing githttp,
+// which is the wrong direction.
+const gitWaitDelay = 5 * time.Second
+
+// gitHookPath returns the absolute path of the pre-receive hook git will run
+// for the repository at repoPath.
 //
-// git consults hooks/pre-receive only while core.hooksPath is unset. Set, it
-// runs <core.hooksPath>/pre-receive and ignores hooks/ entirely — so a
-// repository that arrived some way other than CreateRepo (copied off another
-// server, restored from a backup taken on a host with a hook manager,
-// `git init --template`'d) can carry one, and EnsureHook would otherwise
-// verify a path git will never run and call the repository healthy.
+// This is the question EnsureHook actually has, and `git rev-parse
+// --git-path hooks/pre-receive` is the only thing that answers it. Reading
+// config cannot: core.hooksPath is settable from the repository's own config,
+// from an include.path that config pulls in, from $GIT_DIR/config.worktree
+// when extensions.worktreeConfig is on, and from every scope above those —
+// and it is not even a single spelling, since the empty string reads back
+// from `git config --get` exactly like a key that was never set while git
+// treats it as a redirect to /pre-receive. Every narrower probe leaves one
+// more scope or spelling, which is how this check acquired three rounds of
+// them. git resolves the path itself, so asking git costs one exec and ends
+// the enumeration.
 //
-// walden refuses such a repository rather than installing into the directory
-// core.hooksPath names. Honouring it would be walden guessing at an
-// operator's intent over a surface much larger than it looks — relative paths
-// resolved against the repository, ~ expansion, per-condition includes — and
-// the whole point of this function's caller is that it does not guess about
-// the hook.
-//
-// git is asked rather than the config file read, per AGENTS.md's "wrap git"
-// rule: --local is the repository's own config and nothing above it, and
-// --includes makes git resolve include.path the way it will when it runs the
-// hook (it defaults off once a scope is named). Hand-parsing would mean
-// reimplementing include resolution and value quoting to answer a question
-// git answers exactly.
+// The answer is relative to the git directory (plain "hooks/pre-receive" for
+// a repository with no redirect), which is the child's working directory
+// because of -C, so a relative answer is joined against repoPath and an
+// absolute one is taken as it stands.
 //
 // The child gets CreateRepo's allowlist environment, for the reason that one
 // has it: GIT_CONFIG_COUNT/KEY_n/VALUE_n bypass config-file neutralisation
-// entirely, and the answer to "what does this repository's own config say"
-// must not be movable from the server's environment. Only the repository's
-// own half is asked here. Whether /etc/gitconfig can set core.hooksPath for
-// every repository at once is a property of the environment the receive-pack
-// child is given, which lives in githttp and is tracked as WALD-127.
+// entirely, and the answer to "where will this repository's hook come from"
+// must not be movable from the server's environment. Whether /etc/gitconfig
+// can point every repository's hooks somewhere at once is a property of the
+// environment the receive-pack child is given, which lives in githttp and is
+// tracked as WALD-127.
 //
-// git's exit codes carry the answer: 1 is "the key is not set", 0 is the
-// value. Anything else — repoPath is not a repository git will open, git is
-// not on PATH — means git read no local config here at all, and is a path
-// `git receive-pack` refuses outright a moment later for the same reason, so
-// there is no push through it for a redirected hook to slip under. It is
-// reported as no redirect rather than as a refusal naming a condition that
-// was never established.
-func repoHooksPathRedirect(repoPath string) string {
+// A probe that cannot answer returns an error, and EnsureHook refuses on it.
+// There is no "git said nothing, so assume no redirect" branch: the reasons
+// git exits non-zero here include ones receive-pack does not share — this
+// child pins GIT_CONFIG_SYSTEM=/dev/null and githttp's gitEnv does not, so a
+// safe.directory in /etc/gitconfig opens the repository for receive-pack and
+// not for this — and ones that are nothing to do with the repository at all,
+// such as a fork that failed with EAGAIN. Treating any of those as "no
+// redirect" is the fail-open this check exists to prevent. git's stderr is
+// logged whole and carried, flattened, into the refusal's cause, because it
+// is the only thing that says which it was.
+//
+// The exec gets the context, a WaitDelay and its own process group, like
+// every other git walden runs: it sits on the push path after Authorize, and
+// without them a stalled data directory would park the handler goroutine past
+// the client's disconnect and the request's cancellation.
+func gitHookPath(ctx context.Context, repoPath string) (string, error) {
 	env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"}
 	if p := os.Getenv("PATH"); p != "" {
 		env = append(env, "PATH="+p)
 	}
 
-	cmd := exec.Command("git", "-C", repoPath, "config", "--local", "--includes", "--get", "core.hooksPath")
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "rev-parse", "--git-path", filepath.Join("hooks", preReceiveHookName))
 	cmd.Env = env
+	cmd.WaitDelay = gitWaitDelay
+	setupProcessGroup(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
 	out, err := cmd.Output()
 	if err != nil {
-		return ""
+		log.Printf("store: %s: git rev-parse --git-path %s failed: %v: %s",
+			repoPath, filepath.Join("hooks", preReceiveHookName), err, strings.TrimSpace(stderr.String()))
+		cause := oneLine(stderr.String())
+		if cause == "" {
+			cause = err.Error()
+		}
+		return "", fmt.Errorf("git could not report which pre-receive hook %s runs: %s", repoPath, cause)
 	}
-	return strings.TrimSpace(string(out))
+
+	reported := strings.TrimSpace(string(out))
+	if reported == "" {
+		log.Printf("store: %s: git rev-parse --git-path %s printed nothing",
+			repoPath, filepath.Join("hooks", preReceiveHookName))
+		return "", fmt.Errorf("git reported no pre-receive hook path for %s", repoPath)
+	}
+	if !filepath.IsAbs(reported) {
+		reported = filepath.Join(repoPath, reported)
+	}
+	return filepath.Clean(reported), nil
+}
+
+// oneLine collapses s into a single line, so git's multi-line stderr can be
+// carried in a refusal without breaking AGENTS.md's one-line rule.
+func oneLine(s string) string {
+	fields := strings.FieldsFunc(strings.TrimSpace(s), func(r rune) bool {
+		return r == '\n' || r == '\r'
+	})
+	for i, f := range fields {
+		fields[i] = strings.TrimSpace(f)
+	}
+	return strings.Join(fields, "; ")
 }
 
 // hookPointsAtRunningBinary reports whether hookPath is a symlink to the
@@ -469,7 +505,20 @@ func installPreReceiveHook(hooksDir string) error {
 	// reach that exec either) leaves --bare with no hooks/ at all. walden
 	// depends on that directory, so it makes it, rather than depending on
 	// git's template.
-	if err := os.MkdirAll(hooksDir, 0o700); err != nil {
+	//
+	// One os.Mkdir, not MkdirAll, and the difference is the whole point.
+	// MkdirAll would build the parent too, so a repository an operator
+	// removed between ensureRepoForPush's re-resolve and this call — the
+	// rm -rf racing a push that the re-resolve exists to cover — would be
+	// conjured back as an empty repository-shaped tree. statRepoPath calls
+	// any directory a repository, so that phantom would hold the identifier
+	// from then on: pushes handing `git receive-pack` a non-repository, and
+	// creation refusing "repository already exists" for a repository that
+	// does not exist. Mkdir fails with ENOENT instead, and it closes the
+	// window structurally rather than by checking the parent first and
+	// hoping it is still there a syscall later. CreateRepo's staging
+	// directory always exists by the time this runs, so nothing is lost.
+	if err := os.Mkdir(hooksDir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return err
 	}
 

@@ -391,6 +391,35 @@ func TestResolveHookQuarantine(t *testing.T) {
 		}
 	})
 
+	t.Run("repository-that-is-itself-a-symlink", func(t *testing.T) {
+		// store.RepoPath resolves the data directory but leaves the
+		// "<repo>.git" leaf as written, so <dataDir>/link.git pointing at
+		// a sibling inside the data directory is a shape it deliberately
+		// permits. git reports the quarantine directory under the
+		// resolved path -- it derives GIT_QUARANTINE_PATH from getcwd()
+		// after chdir -- so a lexical containment test against the
+		// unresolved leaf would refuse every push to that repository
+		// (round 1 finding 2).
+		linkDir := t.TempDir()
+		target := initBareRepo(t, linkDir, "real")
+		if err := os.Symlink(target, filepath.Join(linkDir, "link.git")); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		quarantine := filepath.Join(target, "objects", "tmp_objdir-incoming-AbCdEf")
+
+		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
+			"WALDEN_REPO":         "link",
+			"WALDEN_DATA_DIR":     linkDir,
+			"GIT_QUARANTINE_PATH": quarantine,
+		}), updates)
+		if err != nil {
+			t.Fatalf("resolveHook: %v", err)
+		}
+		if req.Quarantine != quarantine {
+			t.Errorf("Quarantine = %q, want %q", req.Quarantine, quarantine)
+		}
+	})
+
 	t.Run("neither-variable-set-is-a-delete-only-push", func(t *testing.T) {
 		req, err := resolveHook(context.Background(), lookupEnvFrom(map[string]string{
 			"WALDEN_REPO":     repo,
@@ -524,6 +553,45 @@ func TestCaptureSegment(t *testing.T) {
 			},
 		},
 		{
+			// The failure this whole change exists to prevent, and the
+			// only runtime detection behind the receive.unpackLimit=0
+			// knob: git's default unpackLimit writes a small push into
+			// loose objects and leaves pack/ empty, which must refuse
+			// rather than journal "this push introduced no objects"
+			// (round 1 finding 1). Deleting this case deletes the
+			// detection with it.
+			name: "loose objects beside an empty pack directory refuse",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkdirAll(t, filepath.Join(q, "pack"))
+				mkLooseObject(t, q)
+				return q
+			},
+			wantSub: "loose objects",
+		},
+		{
+			// Same shape, reached through the other branch: git creates
+			// pack/ lazily, so an unpacked push may leave no pack/ at all.
+			name: "loose objects with no pack directory refuse",
+			setup: func(t *testing.T, root string) string {
+				q := mkQuarantine(t, root)
+				mkLooseObject(t, q)
+				return q
+			},
+			wantSub: "loose objects",
+		},
+		{
+			// GIT_QUARANTINE_PATH naming a directory that is not there:
+			// git creates it before running the hook, so walden cannot
+			// see what this push received and does not guess that it
+			// received nothing.
+			name: "an unreadable quarantine directory refuses",
+			setup: func(t *testing.T, root string) string {
+				return filepath.Join(root, "objects", "tmp_objdir-incoming-gone")
+			},
+			wantSub: "cannot read the quarantine directory",
+		},
+		{
 			name: "zero-object pack is no segment",
 			setup: func(t *testing.T, root string) string {
 				q := mkQuarantine(t, root)
@@ -641,6 +709,18 @@ func mkQuarantine(t *testing.T, root string) string {
 	dir := filepath.Join(root, "objects", "tmp_objdir-incoming-AbCdEf")
 	mkdirAll(t, dir)
 	return dir
+}
+
+// mkLooseObject writes one loose object into a quarantine directory the
+// way git does when it unpacks a push instead of packing it: a file under
+// the two-hex-character fan-out directory named for the first byte of its
+// object id. The bytes are irrelevant -- walden counts what git left, it
+// never opens an object -- but the layout is not.
+func mkLooseObject(t *testing.T, quarantine string) {
+	t.Helper()
+	dir := filepath.Join(quarantine, "3c")
+	mkdirAll(t, dir)
+	writeFile(t, filepath.Join(dir, "79adf14db2a78562dba199b1b044f986a48a9c"), []byte("zlib-compressed object"))
 }
 
 func mkdirAll(t *testing.T, dir string) {

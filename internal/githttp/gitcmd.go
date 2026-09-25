@@ -194,14 +194,26 @@ func (f *flushingWriter) Write(p []byte) (int, error) {
 }
 
 // gitEnv returns the explicit, minimal environment for a git subprocess
-// this package execs: just PATH, so git can find anything it execs
-// internally, plus GIT_PROTOCOL when the caller has negotiated protocol
-// v2. The value forwarded is always this package's own literal
-// "GIT_PROTOCOL=version=2" — never a client's raw header value — so a
-// client cannot use this to inject an arbitrary environment variable
-// into the git child.
+// this package execs: GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM pinned to
+// /dev/null, so the child gets no system or global config at all, plus
+// PATH, so git can find anything it execs internally, plus GIT_PROTOCOL
+// when the caller has negotiated protocol v2. The value forwarded is
+// always this package's own literal "GIT_PROTOCOL=version=2" — never a
+// client's raw header value — so a client cannot use this to inject an
+// arbitrary environment variable into the git child.
+//
+// The pin matters on every route this builds an environment for, not just
+// receive-pack: a core.hooksPath in /etc/gitconfig or the server user's
+// ~/.gitconfig redirects every repository's pre-receive hook at once, and
+// uploadpack.packObjectsHook and core.alternateRefsCommand are arbitrary
+// commands git will run on a fetch — and git honors both only in
+// system/global scope, never per-repository, so this is the one place
+// that scope can be reached from. The spelling is byte-identical to the
+// one internal/store/repo.go already uses on CreateRepo's git init and on
+// its own hook-path and git-dir probes, so the whole codebase is
+// greppable for one string.
 func gitEnv(wantV2 bool) []string {
-	env := []string{}
+	env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"}
 	if p := os.Getenv("PATH"); p != "" {
 		env = append(env, "PATH="+p)
 	}

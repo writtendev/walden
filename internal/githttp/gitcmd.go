@@ -205,13 +205,20 @@ func (f *flushingWriter) Write(p []byte) (int, error) {
 // The pin matters on every route this builds an environment for, not just
 // receive-pack: a core.hooksPath in /etc/gitconfig or the server user's
 // ~/.gitconfig redirects every repository's pre-receive hook at once, and
-// uploadpack.packObjectsHook and core.alternateRefsCommand are arbitrary
-// commands git will run on a fetch — and git honors both only in
-// system/global scope, never per-repository, so this is the one place
-// that scope can be reached from. The spelling is byte-identical to the
-// one internal/store/repo.go already uses on CreateRepo's git init and on
-// its own hook-path and git-dir probes, so the whole codebase is
-// greppable for one string.
+// uploadpack.packObjectsHook is an arbitrary command git will run on a
+// fetch — git honors it only from protected configuration (system,
+// global, or -c), never from a repository's own config, so this pin
+// closes every scope it can be reached from. core.alternateRefsCommand is
+// the same kind of arbitrary-command hazard on the same fetch path, but
+// carries no such restriction: git runs it from a repository's own config
+// too, including on this package's own advertisement path. The pin still
+// closes the system/global route for it; the repository-local route stays
+// shut for a different reason — nothing today can write a walden
+// repository's local config (git init writes it once, no route edits it
+// afterward). The spelling is byte-identical to the one
+// internal/store/repo.go already uses on CreateRepo's git init and on its
+// own hook-path and git-dir probes, so the whole codebase is greppable
+// for one string.
 func gitEnv(wantV2 bool) []string {
 	env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null"}
 	if p := os.Getenv("PATH"); p != "" {

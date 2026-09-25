@@ -20,18 +20,21 @@ import (
 	"github.com/writtendev/walden/internal/store"
 )
 
-// gitClientEnv returns a minimal environment for a git client exec'd by
-// this test suite: just PATH, so git can be found, and nothing else — no
-// HOME, no GIT_CONFIG_*, none of the ambient environment's git
-// configuration. This mirrors what handleInfoRefs does for its own git
-// child (see inforefs.go's "explicit, minimal environment" comment), so
-// these tests exercise walden's client behavior rather than whatever git
-// config happens to be set on the machine running the suite — a global
-// http.proxy in ~/.gitconfig, for instance, would otherwise silently
-// change what git ls-remote does here.
+// gitClientEnv returns a minimal, isolated environment for a git client
+// exec'd by this test suite: PATH, so git can be found, GIT_TERMINAL_PROMPT
+// so a bad credential never blocks on a prompt, and GIT_CONFIG_GLOBAL /
+// GIT_CONFIG_SYSTEM pinned to /dev/null (the spelling cmd/walden's
+// e2eGitEnv already uses) so the client doesn't depend on whatever git
+// config happens to be installed on the machine running the suite — a
+// global http.proxy or protocol.version in /etc/gitconfig, for instance,
+// would otherwise silently change what git ls-remote or git push does
+// here. This is the client side only: it says nothing about what
+// handleInfoRefs forwards to its own git child (see gitEnv in gitcmd.go).
 func gitClientEnv() []string {
 	env := []string{
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
 	}
 	if p := os.Getenv("PATH"); p != "" {
 		env = append(env, "PATH="+p)

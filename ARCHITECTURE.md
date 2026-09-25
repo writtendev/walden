@@ -319,3 +319,13 @@ implementation and may change (though, per the philosophy, it mostly won't).
 
 The dependency graph is intended to be legible in one sitting and stable for
 ten years.
+
+Every git child walden execs to serve a request or touch a repository —
+`upload-pack`, `receive-pack`, the ref advertisement, `git init` — runs with
+system and global git config pinned off
+(`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_GLOBAL=/dev/null`), so its behavior comes
+from the pinned invocation and the repository's own config only, never from
+`/etc/gitconfig` or the server user's `~/.gitconfig`. The one exception is the
+boot-time `git version` probe: it asks git about itself rather than about a
+repository, runs once before walden serves anything, and any failure is a
+loud, one-line boot refusal rather than silent wrong behavior.

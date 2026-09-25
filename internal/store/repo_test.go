@@ -1184,10 +1184,8 @@ func TestEnsureHookHooksPathSpellings(t *testing.T) {
 // TestEnsureHookRefusesWhenGitCannotReportTheHookPath is the fail-closed half of the same
 // question. The probe used to treat every exit it did not recognise as "no redirect here",
 // on the reasoning that anything git refuses to open, `git receive-pack` refuses a moment
-// later too. That reasoning does not hold: the probe pins GIT_CONFIG_SYSTEM=/dev/null and
-// githttp's gitEnv does not, so a safe.directory in /etc/gitconfig opens a repository for
-// receive-pack and not for this — and a fork that failed with EAGAIN or EMFILE says nothing
-// about the repository at all. A probe that could not answer must refuse.
+// later too. That reasoning does not hold: a fork that failed with EAGAIN or EMFILE says
+// nothing about the repository at all. A probe that could not answer must refuse.
 //
 // The directory here holds walden's own correct hook, so nothing but the unanswered probe
 // can be the reason for the refusal: under the old branch this returned nil.

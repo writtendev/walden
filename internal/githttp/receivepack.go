@@ -89,7 +89,7 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	// pre-receive hook (WALD-43, dispatched by argv from the same
 	// binary) uses to find its repository and its journal with no
 	// config file of its own.
-	// gitEnv (gitcmd.go) is the same PATH-only environment WALD-38 already
+	// gitEnv (gitcmd.go) is the same pinned environment WALD-38 already
 	// builds for the sibling routes; called with wantV2 always false
 	// because, deliberately, receive-pack never forwards the request's
 	// Git-Protocol header. WALD-38's probe found receive-pack's

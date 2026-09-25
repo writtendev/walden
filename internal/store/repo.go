@@ -449,16 +449,14 @@ const gitWaitDelay = 5 * time.Second
 // entirely, and the answer to "where will this repository's hook come from"
 // must not be movable from the server's environment. Whether /etc/gitconfig
 // can point every repository's hooks somewhere at once is a property of the
-// environment the receive-pack child is given, which lives in githttp and is
-// tracked as WALD-127.
+// environment the receive-pack child is given; githttp's gitEnv pins the
+// same GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM=/dev/null this child does, so
+// neither child can be redirected without the other.
 //
 // A probe that cannot answer returns an error, and EnsureHook refuses on it.
 // There is no "git said nothing, so assume no redirect" branch: the reasons
-// git exits non-zero here include ones receive-pack does not share — this
-// child pins GIT_CONFIG_SYSTEM=/dev/null and githttp's gitEnv does not, so a
-// safe.directory in /etc/gitconfig opens the repository for receive-pack and
-// not for this — and ones that are nothing to do with the repository at all,
-// such as a fork that failed with EAGAIN. Treating any of those as "no
+// git exits non-zero here are nothing to do with the repository at all, such
+// as a fork that failed with EAGAIN or EMFILE. Treating that as "no
 // redirect" is the fail-open this check exists to prevent. git's stderr is
 // logged whole and carried, flattened, into the refusal's cause, because it
 // is the only thing that says which it was.

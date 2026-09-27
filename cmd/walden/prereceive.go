@@ -586,25 +586,58 @@ func isFanoutDir(name string) bool {
 }
 
 // journalPush appends this push to the journal: the quarantined packfile
-// as one segment, then the ref transaction naming it (WALD-44).
+// as one segment, then the ref transaction naming it (WALD-44) -- but only
+// for the subset of req.Updates that git will actually apply (WALD-128).
 //
-// The order of the four steps is deliberate and is the whole of this
+// The order of the five steps is deliberate and is the whole of this
 // function's design:
 //
 //  1. captureSegment is local-only and cheapest, so a malformed quarantine
 //     refuses having made no network call at all.
-//  2. LoadSigner and Leases.Open run before AppendSegment, so a journal
+//  2. prepareRefUpdates (refprepare.go, WALD-128) is also local-only: it
+//     asks git, via `git update-ref --stdin` prepare, which of req.Updates
+//     it will accept, and refuses the whole push in one line if git could
+//     not answer. Second, not first, because captureSegment is strictly
+//     cheaper and can itself refuse the push -- forking git ahead of a
+//     refusal that needed no fork would invert the "cheapest first" rule
+//     this ordering already follows. Before LoadSigner and Leases.Open,
+//     and therefore complete -- every ref lock released, the child
+//     reaped -- before the first network call this function makes: that is
+//     simultaneously WALD-128 Done-when 1's "before any journal write" and
+//     Done-when 4's "never holding a ref lock across the journal round
+//     trip".
+//  3. LoadSigner and Leases.Open run before AppendSegment, so a journal
 //     with no genesis record, a local signing key that is not the chain's
 //     active one, or an already-fenced stream refuses without first
 //     leaving an orphan segment in the bucket.
-//  3. AppendSegment runs before AppendRefTx, because spec/journal/v1
+//  4. AppendSegment runs before AppendRefTx, because spec/journal/v1
 //     section 5 requires a segment to be acknowledged before the record
 //     that names it -- AppendRefTx's own doc comment says it neither
 //     writes segments nor checks that they exist. An orphan segment left
 //     by a crash between the two is explicitly harmless (section 6.4 and
 //     ARCHITECTURE.md's failure table): the client retries, and
 //     AppendSegment's unconditional PUT of identical bytes is a no-op
-//     success.
+//     success. This step runs even when step 2 accepted no ref at all --
+//     git migrates the quarantine into the object store before writing
+//     any ref, and confirmed that those objects stay even when the only
+//     ref in the push was refused, so the segment always describes
+//     objects that really exist.
+//  5. AppendRefTx runs last, and is skipped entirely -- not called with an
+//     empty slice -- when step 2 accepted no ref: (*store.Client).
+//     AppendRefTx already refuses len(updates)==0 itself (spec section
+//     5.1 requires at least one triple), and calling it with none would
+//     turn "git will refuse every ref in this push" into walden refusing
+//     the push, which is exactly the refusal WALD-128's sub-decision
+//     forbids walden from manufacturing on git's behalf. In that case git
+//     refuses every ref with its own per-ref message and this function
+//     still returns nil.
+//
+// The accepted subset travels as its own local variable, never written
+// back into req.Updates: req.Updates is what the client asked for and
+// stays exactly what parseRefUpdates produced; accepted is what git will
+// actually apply, and is what gets journaled. Keeping them as two
+// differently-named values is what keeps a reader from having to
+// disentangle one fact from the other out of a single mutated slice.
 //
 // Nothing here hands a closure to (*journal.Lease).Append: the journal is
 // reached through (*store.Client).AppendSegment, which is an unconditional
@@ -633,6 +666,11 @@ func journalPush(ctx context.Context, req *hookRequest, now func() time.Time) er
 		defer seg.Close()
 	}
 
+	accepted, err := prepareRefUpdates(ctx, req.RepoPath, req.Quarantine, req.Updates)
+	if err != nil {
+		return err
+	}
+
 	signer, err := client.LoadSigner(ctx, req.DataDir)
 	if err != nil {
 		return err
@@ -652,7 +690,11 @@ func journalPush(ctx context.Context, req *hookRequest, now func() time.Time) er
 		segments = []string{hash}
 	}
 
-	_, err = client.AppendRefTx(ctx, lease, signer, segments, req.Updates, now)
+	if len(accepted) == 0 {
+		return nil
+	}
+
+	_, err = client.AppendRefTx(ctx, lease, signer, segments, accepted, now)
 	return err
 }
 

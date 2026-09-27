@@ -97,10 +97,56 @@ argv) performs the journal append and exits 0 only once object storage has
 acknowledged both records. Only then does git move the refs and does the
 client see success.
 
-Consequence, and the core promise: **an acknowledged push is already in
-object storage.** The cost is one object-storage round trip of added latency
-on pushes (~50–150 ms). Pushes are rare, human-initiated, and
-latency-tolerant; lost commits are none of those things.
+Consequence, and the core promise, stated in both directions:
+
+- **An acknowledged push is already in object storage.** If the client sees
+  success, the journal already knows about every ref move that produced it.
+- **The journal knows about no ref move that did not happen.** If `pre-receive`
+  cannot determine that git will actually apply a ref update, it refuses
+  rather than journal a guess.
+
+The second direction is the harder one, and it is not a corollary of the
+first: git's own per-ref checks — a directory/file conflict between two ref
+names, a stale `old_oid` losing a race, `receive.deny*` policy — run only
+*after* `pre-receive` returns, when git actually moves the refs. A hook that
+journaled every update the client asked for, then exited 0, could describe a
+move git went on to refuse — a signed record of something that never
+happened, and one a replay can never complete against. So before it appends
+anything, `pre-receive` asks git itself, via `git update-ref --stdin`'s
+`start`/`prepare`/`abort` transaction protocol run against the repository in
+the same environment as the incoming quarantine, which of the push's ref
+updates will actually apply — journaling exactly that subset (matching git's
+own behavior for a non-atomic push: a client that did not request
+`--atomic` gets the refs that apply and a per-ref refusal, in git's own
+words, for the ones that don't) and letting git refuse the rest itself. A
+`prepare` that cannot answer at all — the lock it needs is already held,
+its own fork failed, anything short of a definitive per-ref yes or no —
+refuses the whole push in one line rather than risk under-claiming, which is
+the worse direction of the two: a client retrying a refused push loses
+nothing, but a journal that has under-claimed a ref move is not one a replay
+can trust.
+
+`prepare` is blind to the four `receive.deny*` policy knobs
+(`denyDeletes`, `denyNonFastForwards`, `denyCurrentBranch`,
+`denyDeleteCurrent`) — `update-ref` is not `receive-pack` and does not
+consult them. walden pins all four off on its own `receive-pack` invocation
+(alongside the pre-existing `receive.unpackLimit=0`, `-c` flags on the
+command line, which outrank a repository's own config file), so the one
+class `prepare` cannot see is made unable to fire rather than left as a gap
+between what got checked and what receive-pack would actually have refused.
+This is a product statement as much as an implementation detail: **walden
+will never refuse a force-push or a branch deletion.** Anyone holding a
+write-scoped token for a repository can rewrite its history; that policy
+belongs above walden, not in it — walden's token vocabulary is read, write,
+and create, not "may rewrite history."
+
+The cost is one object-storage round trip of added latency on pushes
+(~50–150 ms), plus one local `git update-ref` exec (~15 ms, dominated by
+fork/exec) on the common path where every ref in a push applies — more,
+proportional to the size of the push, only on the rarer push that contains
+a conflict and is about to be partly refused anyway. Pushes are rare,
+human-initiated, and latency-tolerant; lost commits — and journaled ones
+that never happened — are none of those things.
 
 ### Fencing (single-writer safety)
 

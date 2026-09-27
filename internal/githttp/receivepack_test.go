@@ -855,3 +855,69 @@ func TestReceivePackPreservesKeepAliveConnection(t *testing.T) {
 		t.Fatalf("second request status = %d, want %d; body: %s", infoResp.StatusCode, http.StatusOK, infoBody)
 	}
 }
+
+// TestReceivePackDenyKnobsPinnedOff is WALD-128 Done-when 2, asserted
+// behaviourally rather than by grepping the argv passed to startGit --
+// the same deliberate choice TestReceivePackHookEnvironment documents for
+// the pre-existing receive.unpackLimit=0 knob, and for the identical
+// reason: a test that looked for "-c receive.denyDeletes=false" in the
+// command line would go on passing even if a future git version stopped
+// honouring the flag.
+//
+// All four receive.deny* knobs are set true in the repository's own
+// config -- the value an operator, or a client repository's own history,
+// might otherwise carry -- to prove walden's own -c pins
+// (internal/githttp/receivepack.go, beside the existing
+// receive.unpackLimit=0) override them: confirmed separately, against a
+// scratch repository, that a -c flag on the command line outranks a
+// repository's config file for this same knob. A force-push
+// (receive.denyNonFastForwards) and a deletion of the branch HEAD points
+// at (receive.denyDeleteCurrent, receive.denyCurrentBranch) both have to
+// succeed for the product statement WALD-128 makes deliberately: walden
+// never refuses a force-push or a branch deletion.
+func TestReceivePackDenyKnobsPinnedOff(t *testing.T) {
+	s := store.New(t.TempDir())
+	barePath := newEmptyBareRepo(t, s, "repo")
+
+	for _, kv := range [][2]string{
+		{"receive.denyDeletes", "true"},
+		{"receive.denyNonFastForwards", "true"},
+		{"receive.denyCurrentBranch", "true"},
+		{"receive.denyDeleteCurrent", "true"},
+	} {
+		runGit(t, barePath, "config", kv[0], kv[1])
+	}
+
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
+	defer server.Close()
+	repoURL := authURL(server.URL, tok) + "/repo"
+
+	work, sha1 := newWorkTreeWithCommit(t)
+	runGit(t, work, "push", "-q", repoURL, "main")
+	if got := revParse(t, barePath, "refs/heads/main"); got != sha1 {
+		t.Fatalf("refs/heads/main = %q after the initial push, want %q", got, sha1)
+	}
+
+	// A force-push: rewrite main's history so the new tip does not
+	// contain the old one, then push --force. receive.denyNonFastForwards
+	// pinned true in config would refuse this; walden's own -c pin must
+	// win.
+	runGit(t, work, "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+	sha2 := strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD"))
+	// runGit itself fails the test if this push is refused, which is
+	// exactly the failure mode receive.denyNonFastForwards pinned true
+	// would produce.
+	runGit(t, work, "push", "-q", "--force", repoURL, "main")
+	if got := revParse(t, barePath, "refs/heads/main"); got != sha2 {
+		t.Errorf("refs/heads/main = %q after the force-push, want %q", got, sha2)
+	}
+
+	// Deleting the branch HEAD points at: receive.denyDeleteCurrent (and,
+	// on some git versions, receive.denyCurrentBranch) pinned true in
+	// config would refuse this too.
+	runGit(t, work, "push", "-q", repoURL, "--delete", "main")
+	if got := revParse(t, barePath, "refs/heads/main"); got != "" {
+		t.Errorf("refs/heads/main still resolves to %q after delete", got)
+	}
+}

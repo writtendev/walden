@@ -13,6 +13,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -84,6 +85,28 @@ func (f *hookJournalFixture) noQuarantine(t *testing.T) {
 	t.Helper()
 	t.Setenv("GIT_QUARANTINE_PATH", "")
 	t.Setenv("GIT_OBJECT_DIRECTORY", "")
+}
+
+// quarantineIndexed is quarantine, but also runs `git index-pack` on pack
+// in place, so it gets the matching .idx a real git quarantine always
+// carries beside its .pack. WALD-128's probe (cmd/walden/refprepare.go)
+// reads this directory through GIT_ALTERNATE_OBJECT_DIRECTORIES, and an
+// object store git can search always means pack+idx pairs -- a .pack with
+// no .idx is not searchable, so a fixture that needs the probe to resolve
+// one of pack's own objects (a create's new_oid) needs this, not plain
+// quarantine. Plain quarantine stays as it is for a fixture whose push
+// never needs a lookup into pack's own objects (a delete, or the
+// zero-object pack) -- zeroObjectPack's all-zero trailer would fail
+// index-pack's checksum verification if this ran over it unconditionally.
+func (f *hookJournalFixture) quarantineIndexed(t *testing.T, name string, pack []byte) {
+	t.Helper()
+	f.quarantine(t, name, pack)
+	packPath := filepath.Join(f.repoPath, "objects", "tmp_objdir-incoming-"+name, "pack", "pack-"+name+".pack")
+	cmd := exec.Command("git", "index-pack", packPath)
+	cmd.Env = append(os.Environ(), "GIT_DIR="+f.repoPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git index-pack %s: %v\n%s", packPath, err, out)
+	}
 }
 
 // object returns the fake's bytes for a journal key, under the same
@@ -159,10 +182,13 @@ func assertUpdates(t *testing.T, got, want []journal.RefUpdate) {
 // one hash and carrying the updates git wrote to stdin.
 func TestRunPreReceiveJournalsAPackAndItsRefTransaction(t *testing.T) {
 	f := newHookJournalFixture(t, "repo")
-	pack := realPackfile(t)
-	f.quarantine(t, "create", pack)
+	pack, sha := realCommit(t)
+	f.quarantineIndexed(t, "create", pack)
 
-	updates := []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: testNewOID}}
+	// WALD-128's probe validates new_oid against a real object -- visible
+	// here through the quarantine's alternates -- so this uses the
+	// packfile's own commit SHA rather than an invented one.
+	updates := []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: sha}}
 	if err := runHook(t, updates); err != nil {
 		t.Fatalf("runPreReceive: %v", err)
 	}
@@ -219,9 +245,21 @@ func TestRunPreReceiveJournalsNoSegmentWhenNoObjectsArrive(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newHookJournalFixture(t, "repo")
+
+			// This push deletes refs/heads/feature (new_oid all-zero).
+			// WALD-128's probe checks a delete's old_oid against the
+			// repository's real current ref value, so the ref has to
+			// genuinely be at a real object there first -- seeded
+			// directly through the real git binary, never through
+			// walden, exactly the state a prior accepted push would
+			// have left behind.
+			pack, sha := realCommit(t)
+			realizeObjects(t, f.repoPath, pack)
+			setRef(t, f.repoPath, "refs/heads/feature", sha)
+
 			tt.setup(t, f)
 
-			updates := []journal.RefUpdate{{Ref: "refs/heads/feature", OldOID: testOldOID, NewOID: journal.ZeroOID40}}
+			updates := []journal.RefUpdate{{Ref: "refs/heads/feature", OldOID: sha, NewOID: journal.ZeroOID40}}
 			if err := runHook(t, updates); err != nil {
 				t.Fatalf("runPreReceive: %v", err)
 			}
@@ -244,16 +282,24 @@ func TestRunPreReceiveJournalsNoSegmentWhenNoObjectsArrive(t *testing.T) {
 // by LIST every time.
 func TestRunPreReceiveAppendsInSequenceAcrossPushes(t *testing.T) {
 	f := newHookJournalFixture(t, "repo")
-	pack := realPackfile(t)
-	f.quarantine(t, "create", pack)
+	pack, sha := realCommit(t)
+	f.quarantineIndexed(t, "create", pack)
 
-	first := []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: testNewOID}}
+	first := []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: sha}}
 	if err := runHook(t, first); err != nil {
 		t.Fatalf("runPreReceive (first): %v", err)
 	}
 
+	// The second push below carries no quarantine of its own, so
+	// WALD-128's probe has only the repository's real object store to
+	// check its old_oid against. Migrate the first push's objects into
+	// the repository for real, and set main to match -- the state a real
+	// git receive-pack would have left after accepting the first push.
+	realizeObjects(t, f.repoPath, pack)
+	setRef(t, f.repoPath, "refs/heads/main", sha)
+
 	f.noQuarantine(t)
-	second := []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: testNewOID, NewOID: testOldOID}}
+	second := []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: sha, NewOID: journal.ZeroOID40}}
 	if err := runHook(t, second); err != nil {
 		t.Fatalf("runPreReceive (second): %v", err)
 	}
@@ -311,13 +357,18 @@ func TestRunPreReceiveRefusesWithoutAGenesisRecord(t *testing.T) {
 	t.Setenv("WALDEN_DATA_DIR", dataDir)
 	t.Setenv("WALDEN_JOURNAL", journalTestJournalURL(fake))
 
+	// WALD-128's probe runs before LoadSigner (see journalPush's doc
+	// comment), so this push's new_oid has to be a real, resolvable
+	// object -- otherwise the probe itself would refuse the push and
+	// this test would stop proving what its name says.
+	pack, sha := realCommit(t)
 	dir := filepath.Join(repoPath, "objects", "tmp_objdir-incoming-x")
 	mkdirAll(t, filepath.Join(dir, "pack"))
-	writeFile(t, filepath.Join(dir, "pack", "pack-x.pack"), realPackfile(t))
+	writeFile(t, filepath.Join(dir, "pack", "pack-x.pack"), pack)
 	t.Setenv("GIT_QUARANTINE_PATH", dir)
 	t.Setenv("GIT_OBJECT_DIRECTORY", dir)
 
-	err := runHook(t, []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: testNewOID}})
+	err := runHook(t, []journal.RefUpdate{{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: sha}})
 	if err == nil {
 		t.Fatal("runPreReceive succeeded against a journal with no genesis record, want a refusal")
 	}
@@ -336,10 +387,16 @@ func TestRunPreReceiveRefusesWithoutAGenesisRecord(t *testing.T) {
 // reading whatever the wall clock said.
 func TestJournalPushHoldsTheClockStill(t *testing.T) {
 	f := newHookJournalFixture(t, "repo")
+
+	// This push carries no quarantine of its own, so WALD-128's probe
+	// needs new_oid to already be a real, resolvable object in the
+	// repository -- realized directly through the real git binary first.
+	pack, sha := realCommit(t)
+	realizeObjects(t, f.repoPath, pack)
 	f.noQuarantine(t)
 
 	req, err := resolveHook(context.Background(), os.LookupEnv, []journal.RefUpdate{
-		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: testNewOID},
+		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: sha},
 	})
 	if err != nil {
 		t.Fatalf("resolveHook: %v", err)

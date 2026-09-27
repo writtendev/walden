@@ -528,8 +528,24 @@ func zeroObjectPack() []byte {
 // realPackfile builds an actual git packfile holding more than one object
 // -- a commit and its tree -- by driving the real git binary, so
 // captureSegment and the hook tests below run against bytes git wrote
-// rather than bytes this suite invented.
+// rather than bytes this suite invented. It is realCommit with the SHA
+// discarded, for the tests that only need bytes git actually wrote and
+// don't care what they resolve to.
 func realPackfile(t *testing.T) []byte {
+	t.Helper()
+	pack, _ := realCommit(t)
+	return pack
+}
+
+// realCommit builds a real git commit (and its tree) by driving the real
+// git binary inside a scratch work tree, and returns both its packfile and
+// its own SHA. WALD-128's pre-receive probe validates every new_oid
+// against a real object (via `git update-ref --stdin prepare`), so a hook
+// test that constructs its own ref update triple needs one consistent,
+// resolvable value rather than an invented one -- realPackfile alone,
+// still used by tests that predate the probe and never construct a ref
+// update from its contents, is not enough on its own anymore.
+func realCommit(t *testing.T) (pack []byte, sha string) {
 	t.Helper()
 	work := t.TempDir()
 	for _, args := range [][]string{
@@ -545,6 +561,14 @@ func realPackfile(t *testing.T) []byte {
 		}
 	}
 
+	rev := exec.Command("git", "rev-parse", "HEAD")
+	rev.Dir = work
+	shaOut, err := rev.Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	sha = strings.TrimSpace(string(shaOut))
+
 	list := exec.Command("git", "rev-list", "--objects", "--all")
 	list.Dir = work
 	objects, err := list.Output()
@@ -555,7 +579,7 @@ func realPackfile(t *testing.T) []byte {
 	packObjects := exec.Command("git", "pack-objects", "--stdout", "-q")
 	packObjects.Dir = work
 	packObjects.Stdin = bytes.NewReader(objects)
-	pack, err := packObjects.Output()
+	pack, err = packObjects.Output()
 	if err != nil {
 		t.Fatalf("git pack-objects --stdout: %v", err)
 	}
@@ -566,7 +590,66 @@ func realPackfile(t *testing.T) []byte {
 	if count < 2 {
 		t.Fatalf("git pack-objects produced object count %d, want at least 2", count)
 	}
-	return pack
+	return pack, sha
+}
+
+// cleanGitEnv returns the current process environment with
+// GIT_QUARANTINE_PATH, GIT_OBJECT_DIRECTORY, and
+// GIT_ALTERNATE_OBJECT_DIRECTORIES stripped out, for a test helper that
+// drives a plain `git` command of its own against a real repository.
+// Several hookJournalFixture tests leave one or more of these set via
+// t.Setenv for the whole of a subtest (to build the hook's own
+// environment for runHook), and a plain git update-ref or index-pack
+// inheriting them by accident refuses outright ("ref updates forbidden
+// inside quarantine environment") -- a walden test helper is not the hook
+// probe those variables exist for.
+func cleanGitEnv() []string {
+	base := os.Environ()
+	out := make([]string, 0, len(base))
+	for _, kv := range base {
+		switch {
+		case strings.HasPrefix(kv, "GIT_QUARANTINE_PATH="),
+			strings.HasPrefix(kv, "GIT_OBJECT_DIRECTORY="),
+			strings.HasPrefix(kv, "GIT_ALTERNATE_OBJECT_DIRECTORIES="):
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// realizeObjects makes pack's objects genuinely resolvable inside the real
+// bare repository at repoPath, via `git index-pack --stdin`, which writes
+// the resulting pack and its idx straight into repoPath/objects/pack --
+// the same terminal state a real git receive-pack leaves once it migrates
+// a push's quarantine out on success. A hook test that drives a second,
+// separate push with no quarantine of its own (WALD-128's probe then has
+// nothing but the repository's real object store, plus whatever that
+// second push's own quarantine holds, to check a new_oid against) needs
+// this so an earlier push's object is still there to be pointed at.
+func realizeObjects(t *testing.T, repoPath string, pack []byte) {
+	t.Helper()
+	cmd := exec.Command("git", "index-pack", "--stdin")
+	cmd.Dir = repoPath
+	cmd.Env = append(cleanGitEnv(), "GIT_DIR=.")
+	cmd.Stdin = bytes.NewReader(pack)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git index-pack --stdin (dir %s): %v\n%s", repoPath, err, out)
+	}
+}
+
+// setRef sets ref to sha directly in the real bare repository at
+// repoPath, entirely through the real git binary and never through
+// walden's own hook. sha's object must already be resolvable in repoPath
+// (e.g. via realizeObjects) for this to succeed.
+func setRef(t *testing.T, repoPath, ref, sha string) {
+	t.Helper()
+	cmd := exec.Command("git", "update-ref", ref, sha)
+	cmd.Dir = repoPath
+	cmd.Env = append(cleanGitEnv(), "GIT_DIR=.")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git update-ref %s %s (dir %s): %v\n%s", ref, sha, repoPath, err, out)
+	}
 }
 
 // TestCaptureSegment covers every shape a quarantine directory reaches the

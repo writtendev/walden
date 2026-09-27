@@ -204,10 +204,16 @@ func TestServeEndToEndCloneAndPush(t *testing.T) {
 	}
 
 	// Then a branch creation and its own deletion -- new_oid all-zero.
-	// "feature", not "main": git's own receive.denyDeleteCurrent refuses
-	// deleting the branch the bare repo's HEAD points to, which would
-	// fail this push before the hook is ever asked to parse it, and this
-	// test is about the hook, not that unrelated git default.
+	// "feature", not "main": before WALD-128, git's own
+	// receive.denyDeleteCurrent would have refused deleting the branch
+	// the bare repo's HEAD points to, before the hook was ever asked to
+	// parse it, and this test is about the hook, not that git default.
+	// WALD-128 pins denyDeleteCurrent off on walden's own receive-pack
+	// invocation (internal/githttp/receivepack.go) -- deleting "main"
+	// itself would work today -- but "feature" stays: this test is still
+	// about the hook parsing an ordinary create/update/delete sequence.
+	// internal/githttp/receivepack_test.go's TestReceivePackDenyKnobsPinnedOff
+	// is where deleting the current branch and force-pushing are the point.
 	runLocalGit(t, work, "branch", "feature")
 	runLocalGit(t, work, "push", "-q", repoURL, "feature")
 	gotFeatureRef := strings.TrimSpace(runLocalGit(t, tmpDir, "--git-dir="+repoPath, "rev-parse", "refs/heads/feature"))
@@ -422,5 +428,510 @@ func TestServeEndToEndJournalsEveryPush(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatalf("walden serve did not exit within 10s of SIGINT")
+	}
+}
+
+// e2eServer is one booted `walden serve` subprocess for a WALD-128
+// end-to-end test: a fake object storage endpoint underneath, a real bare
+// repository with the real pre-receive hook symlinked in
+// (hooks/pre-receive, dispatched by argv[0] the same way store.CreateRepo
+// leaves it), and the address and admin token a real git client needs to
+// push to it.
+type e2eServer struct {
+	fake     *storetest.Fake
+	repoPath string
+	repoURL  string
+	cmd      *exec.Cmd
+	stderr   *strings.Builder
+}
+
+// bootE2EServer builds the real walden binary, starts it as a subprocess
+// bound to a real socket with a journal configured against a fresh fake
+// object store, and creates one bare repository (named repo) with the
+// real pre-receive hook already installed -- the shared setup every
+// WALD-128 end-to-end test in this file starts from. t.Cleanup stops the
+// server; the caller drives it with runLocalGit against repoURL exactly
+// as the pre-existing TestServeEndToEnd* tests above do.
+func bootE2EServer(t *testing.T) *e2eServer {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "walden")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+
+	dataDir := t.TempDir()
+	repoPath := filepath.Join(dataDir, "repo.git")
+	runLocalGit(t, tmpDir, "init", "-q", "--bare", "--initial-branch=main", repoPath)
+	hooksDir := filepath.Join(repoPath, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir hooks dir: %v", err)
+	}
+	if err := os.Symlink(binPath, filepath.Join(hooksDir, "pre-receive")); err != nil {
+		t.Fatalf("symlink pre-receive hook: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "serve",
+		"--data-dir", dataDir,
+		"--listen", "127.0.0.1:0",
+		"--journal", journalURL,
+	)
+	cmd.Env = append(e2eGitEnv(),
+		"AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+		"AWS_SECRET_ACCESS_KEY=topsecret",
+		"AWS_REGION=us-east-1",
+	)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start walden serve: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	})
+
+	adminToken, addr := waitForServerBoot(t, stdoutPipe)
+	repoURL := fmt.Sprintf("http://walden:%s@%s/repo", adminToken, addr)
+
+	return &e2eServer{fake: fake, repoPath: repoPath, repoURL: repoURL, cmd: cmd, stderr: &stderrBuf}
+}
+
+// txCount returns how many ref-transaction records this server's stream
+// "repo" currently holds in the bucket.
+func (s *e2eServer) txCount() int {
+	prefix := "prefix/" + journal.TxPrefix(journal.StreamID("repo"))
+	n := 0
+	for _, k := range s.fake.Keys() {
+		if strings.HasPrefix(k, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// segmentCount returns how many segments this server's stream "repo"
+// currently holds in the bucket.
+func (s *e2eServer) segmentCount() int {
+	prefix := "prefix/" + journal.SegmentPrefix(journal.StreamID("repo"))
+	n := 0
+	for _, k := range s.fake.Keys() {
+		if strings.HasPrefix(k, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestServeEndToEndSingleRefDFConflictRefusesUnjournaled is WALD-128
+// Done-when 5: a single-ref push whose only ref collides as a directory
+// and a file against an existing ref (refs/heads/feature already exists;
+// this push creates refs/heads/feature/x) is refused before it is ever
+// journaled: after it, the bucket's tx/ prefix must hold exactly the one
+// record the setup push left behind, no more.
+func TestServeEndToEndSingleRefDFConflictRefusesUnjournaled(t *testing.T) {
+	s := bootE2EServer(t)
+
+	work := t.TempDir()
+	runLocalGit(t, work, "init", "-q", "-b", "main")
+	runLocalGit(t, work, "config", "user.email", "test@example.com")
+	runLocalGit(t, work, "config", "user.name", "Test")
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "initial")
+	runLocalGit(t, work, "branch", "feature")
+	runLocalGit(t, work, "push", "-q", s.repoURL, "feature")
+
+	if got, want := s.txCount(), 1; got != want {
+		t.Fatalf("tx count after setup push = %d, want %d", got, want)
+	}
+
+	pushCmd := exec.Command("git", "push", s.repoURL, "feature:refs/heads/feature/x")
+	pushCmd.Dir = work
+	pushCmd.Env = e2eGitEnv()
+	out, err := pushCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("push of refs/heads/feature/x succeeded despite refs/heads/feature already existing:\n%s", out)
+	}
+
+	if got, want := s.txCount(), 1; got != want {
+		t.Errorf("tx count after the refused D/F push = %d, want %d (nothing journaled)", got, want)
+	}
+}
+
+// TestServeEndToEndNoRefAppliesJournalsSegmentOnly is WALD-128 Done-when
+// 9: a push whose pack carries a genuinely new object, but whose single
+// ref cannot apply (the same D/F conflict as above, with a fresh commit
+// as the new ref's target so index-pack leaves a real, non-empty pack in
+// quarantine) journals that segment -- the objects are really in the
+// store regardless of what happens to the ref, confirmed independently
+// against git 2.50.1 -- and no ref transaction, leaving git to refuse the
+// ref with its own message. Segment and tx counts are both taken before
+// and after the test push, not asserted as absolute totals: the setup
+// push above carries the initial commit's own objects and so already
+// leaves one segment of its own.
+func TestServeEndToEndNoRefAppliesJournalsSegmentOnly(t *testing.T) {
+	s := bootE2EServer(t)
+
+	work := t.TempDir()
+	runLocalGit(t, work, "init", "-q", "-b", "main")
+	runLocalGit(t, work, "config", "user.email", "test@example.com")
+	runLocalGit(t, work, "config", "user.name", "Test")
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "initial")
+	runLocalGit(t, work, "branch", "feature")
+	runLocalGit(t, work, "push", "-q", s.repoURL, "feature")
+
+	baseTx, baseSeg := s.txCount(), s.segmentCount()
+
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "new object for feature/x")
+	pushCmd := exec.Command("git", "push", s.repoURL, "HEAD:refs/heads/feature/x")
+	pushCmd.Dir = work
+	pushCmd.Env = e2eGitEnv()
+	out, err := pushCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("push of refs/heads/feature/x succeeded despite refs/heads/feature already existing:\n%s", out)
+	}
+
+	if got, want := s.txCount(), baseTx; got != want {
+		t.Errorf("tx count after the refused D/F push = %d, want %d (no ref transaction)", got, want)
+	}
+	if got, want := s.segmentCount(), baseSeg+1; got != want {
+		t.Errorf("segment count after the refused D/F push = %d, want %d (the new commit's objects are real regardless)", got, want)
+	}
+}
+
+// TestServeEndToEndDFConflictJournalsExactlyAppliedRefBothOrders is
+// WALD-128 Done-when 8: a push naming two refs that collide as a
+// directory and a file applies exactly one of them, and which one depends
+// on which came first on the wire -- so this drives the real git client
+// both ways, in one push each, and asserts the ref transaction names
+// exactly the ref git actually applied, never both and never neither.
+func TestServeEndToEndDFConflictJournalsExactlyAppliedRefBothOrders(t *testing.T) {
+	tests := []struct {
+		name       string
+		refspecs   []string
+		wantRef    string
+		wantOthRef string
+	}{
+		{
+			name:       "parent first",
+			refspecs:   []string{"HEAD:refs/heads/feature", "HEAD:refs/heads/feature/x"},
+			wantRef:    "refs/heads/feature",
+			wantOthRef: "refs/heads/feature/x",
+		},
+		{
+			name:       "child first",
+			refspecs:   []string{"HEAD:refs/heads/feature/x", "HEAD:refs/heads/feature"},
+			wantRef:    "refs/heads/feature/x",
+			wantOthRef: "refs/heads/feature",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := bootE2EServer(t)
+
+			work := t.TempDir()
+			runLocalGit(t, work, "init", "-q", "-b", "main")
+			runLocalGit(t, work, "config", "user.email", "test@example.com")
+			runLocalGit(t, work, "config", "user.name", "Test")
+			runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "initial")
+			sha := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+
+			args := append([]string{"push", s.repoURL}, tt.refspecs...)
+			pushCmd := exec.Command("git", args...)
+			pushCmd.Dir = work
+			pushCmd.Env = e2eGitEnv()
+			out, err := pushCmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("push %v succeeded, want a partial failure (the D/F conflict refuses one side):\n%s", tt.refspecs, out)
+			}
+
+			gotRef := strings.TrimSpace(runLocalGit(t, work, "--git-dir="+s.repoPath, "rev-parse", "--verify", "--quiet", tt.wantRef))
+			if gotRef != sha {
+				t.Errorf("%s = %q after the push, want %q (the ref git should have applied)", tt.wantRef, gotRef, sha)
+			}
+			verifyOther := exec.Command("git", "--git-dir="+s.repoPath, "rev-parse", "--verify", "--quiet", tt.wantOthRef)
+			verifyOther.Env = e2eGitEnv()
+			if out, err := verifyOther.CombinedOutput(); err == nil {
+				t.Errorf("%s resolves to %s after the push, want it refused (git should have refused this side)", tt.wantOthRef, strings.TrimSpace(string(out)))
+			}
+
+			if got, want := s.txCount(), 1; got != want {
+				t.Fatalf("tx count after the push = %d, want %d", got, want)
+			}
+			rec := journalRefTx(t, s.fake, journal.StreamID("repo"), 0)
+			wantUpdates := []journal.RefUpdate{{Ref: tt.wantRef, OldOID: journal.ZeroOID40, NewOID: sha}}
+			assertUpdates(t, rec.Updates, wantUpdates)
+		})
+	}
+}
+
+// helperMoveRefHook installs a wrapper pre-receive hook at repoPath that,
+// before delegating to the real walden binary, moves ref to sha directly
+// -- entirely outside of git's own quarantine restriction on ref updates,
+// and entirely before walden's own pre-receive (and its probe) ever runs.
+// This is what "moving the ref behind receive-pack's back" (WALD-128's
+// plan) means in practice: an ordinary, non-forced git push computes each
+// refspec's old_oid from the ref advertisement it received moments
+// earlier in the same `git push` invocation, so the only way to make that
+// old_oid stale by the time the server's own pre-receive probe checks it
+// is to move the ref in the gap between that advertisement and the
+// server processing the push proper -- a gap `--force-with-lease` cannot
+// reach either, since its lease is checked client-side and the ref never
+// reaches the hook at all (verified: a lease built from a stale value
+// still reports success against a repository whose real state has moved,
+// because the client never asked the server again).
+func helperMoveRefHook(t *testing.T, repoPath, binPath, ref, sha string) {
+	t.Helper()
+	script := "#!/bin/sh\n" +
+		"env -u GIT_QUARANTINE_PATH -u GIT_OBJECT_DIRECTORY git update-ref " + ref + " " + sha + " || exit 1\n" +
+		"exec " + binPath + " pre-receive\n"
+	hookPath := filepath.Join(repoPath, "hooks", "pre-receive")
+	if err := os.Remove(hookPath); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("remove existing pre-receive hook: %v", err)
+	}
+	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write wrapper pre-receive hook: %v", err)
+	}
+}
+
+// TestServeEndToEndMidPushStaleRefJournalsAcceptedSubset is WALD-128
+// Done-when 8's mid-push case: a three-ref push where the middle ref (b)
+// is stale by the time the server actually processes it -- moved behind
+// the push's back between the ref advertisement and pre-receive running,
+// via helperMoveRefHook -- while the other two (a, c) are ordinary,
+// independent, and unaffected. The accepted set must be exactly {a, c},
+// in that order, proving the incremental loop keeps walking past a
+// rejected candidate instead of stopping at the first one.
+func TestServeEndToEndMidPushStaleRefJournalsAcceptedSubset(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "walden")
+	buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, out)
+	}
+
+	fake := storetest.New(t)
+	journalURL := journalTestJournalURL(fake)
+
+	dataDir := t.TempDir()
+	repoPath := filepath.Join(dataDir, "repo.git")
+	runLocalGit(t, tmpDir, "init", "-q", "--bare", "--initial-branch=main", repoPath)
+	if err := os.MkdirAll(filepath.Join(repoPath, "hooks"), 0o755); err != nil {
+		t.Fatalf("mkdir hooks dir: %v", err)
+	}
+	if err := os.Symlink(binPath, filepath.Join(repoPath, "hooks", "pre-receive")); err != nil {
+		t.Fatalf("symlink pre-receive hook: %v", err)
+	}
+
+	cmd := exec.Command(binPath, "serve", "--data-dir", dataDir, "--listen", "127.0.0.1:0", "--journal", journalURL)
+	cmd.Env = append(e2eGitEnv(),
+		"AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+		"AWS_SECRET_ACCESS_KEY=topsecret",
+		"AWS_REGION=us-east-1",
+	)
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start walden serve: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	})
+	adminToken, addr := waitForServerBoot(t, stdoutPipe)
+	repoURL := fmt.Sprintf("http://walden:%s@%s/repo", adminToken, addr)
+
+	work := t.TempDir()
+	runLocalGit(t, work, "init", "-q", "-b", "main")
+	runLocalGit(t, work, "config", "user.email", "test@example.com")
+	runLocalGit(t, work, "config", "user.name", "Test")
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "seed")
+	seedSHA := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+	// Seed a, b, c at the same initial commit, and a second, real, already-
+	// accepted commit for the hijack to move b onto -- both objects are
+	// genuinely present in the repository's own object store by the time
+	// the wrapper hook runs, so its plain `git update-ref` needs nothing
+	// beyond that.
+	runLocalGit(t, work, "push", "-q", repoURL, "HEAD:refs/heads/a", "HEAD:refs/heads/b", "HEAD:refs/heads/c")
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "hijack target for b")
+	hijackSHA := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+	runLocalGit(t, work, "push", "-q", repoURL, "HEAD:refs/heads/scratch")
+	runLocalGit(t, work, "push", "-q", repoURL, "--delete", "scratch")
+
+	baseTx := 0
+	for _, k := range fake.Keys() {
+		if strings.HasPrefix(k, "prefix/"+journal.TxPrefix("repo")) {
+			baseTx++
+		}
+	}
+
+	// Advance a, b, c locally by one commit each, from the seeded state.
+	runLocalGit(t, work, "reset", "-q", "--hard", seedSHA)
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "advance a")
+	shaA := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+	runLocalGit(t, work, "reset", "-q", "--hard", seedSHA)
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "advance b (will be refused: stale)")
+	shaB := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+	runLocalGit(t, work, "reset", "-q", "--hard", seedSHA)
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "advance c")
+	shaC := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+
+	// Install the wrapper hook now, right before the real push: it moves
+	// b to hijackSHA the instant this push's receive-pack invokes
+	// pre-receive, which is after the client already computed old_oid
+	// for b from the advertisement it received moments earlier.
+	helperMoveRefHook(t, repoPath, binPath, "refs/heads/b", hijackSHA)
+
+	pushCmd := exec.Command("git", "push", repoURL,
+		shaA+":refs/heads/a", shaB+":refs/heads/b", shaC+":refs/heads/c")
+	pushCmd.Dir = work
+	pushCmd.Env = e2eGitEnv()
+	out, err := pushCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("push succeeded, want b's stale old_oid to cause a partial failure:\n%s", out)
+	}
+
+	gotA := strings.TrimSpace(runLocalGit(t, work, "--git-dir="+repoPath, "rev-parse", "refs/heads/a"))
+	if gotA != shaA {
+		t.Errorf("refs/heads/a = %q after the push, want %q (applied)", gotA, shaA)
+	}
+	gotB := strings.TrimSpace(runLocalGit(t, work, "--git-dir="+repoPath, "rev-parse", "refs/heads/b"))
+	if gotB != hijackSHA {
+		t.Errorf("refs/heads/b = %q after the push, want %q (the hijack, left untouched by the refused push)", gotB, hijackSHA)
+	}
+	gotC := strings.TrimSpace(runLocalGit(t, work, "--git-dir="+repoPath, "rev-parse", "refs/heads/c"))
+	if gotC != shaC {
+		t.Errorf("refs/heads/c = %q after the push, want %q (applied)", gotC, shaC)
+	}
+
+	newTx := 0
+	for _, k := range fake.Keys() {
+		if strings.HasPrefix(k, "prefix/"+journal.TxPrefix("repo")) {
+			newTx++
+		}
+	}
+	if newTx != baseTx+1 {
+		t.Fatalf("tx count went from %d to %d, want exactly one more", baseTx, newTx)
+	}
+	rec := journalRefTx(t, fake, journal.StreamID("repo"), journal.Seq(newTx-1))
+	assertUpdates(t, rec.Updates, []journal.RefUpdate{
+		{Ref: "refs/heads/a", OldOID: seedSHA, NewOID: shaA},
+		{Ref: "refs/heads/c", OldOID: seedSHA, NewOID: shaC},
+	})
+}
+
+// TestServeEndToEndLockCollisionRefusesWholePush drives WALD-128's
+// decided reclassification against the real binary with a real lock
+// actually held: a separate `git update-ref --stdin` process, started
+// directly against the bare repository (never through walden), holds
+// refs/heads/main prepared -- exactly the state probePrepare's own
+// isLockAcquisitionFailure exists to recognize -- while a real client
+// push to that same ref goes through walden's HTTP server. The whole
+// push must be refused, in one line, and nothing journaled for it: a
+// lock collision must never be read as git saying no.
+func TestServeEndToEndLockCollisionRefusesWholePush(t *testing.T) {
+	s := bootE2EServer(t)
+
+	work := t.TempDir()
+	runLocalGit(t, work, "init", "-q", "-b", "main")
+	runLocalGit(t, work, "config", "user.email", "test@example.com")
+	runLocalGit(t, work, "config", "user.name", "Test")
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "initial")
+	sha1 := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+	runLocalGit(t, work, "push", "-q", s.repoURL, "main")
+
+	if got, want := s.txCount(), 1; got != want {
+		t.Fatalf("tx count after setup push = %d, want %d", got, want)
+	}
+
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "second")
+	sha2 := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
+
+	holder := exec.Command("git", "update-ref", "--stdin")
+	holder.Dir = s.repoPath
+	holder.Env = append(e2eGitEnv(), "GIT_DIR=.")
+	stdin, err := holder.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe: %v", err)
+	}
+	if err := holder.Start(); err != nil {
+		t.Fatalf("start lock holder: %v", err)
+	}
+	t.Cleanup(func() {
+		stdin.Write([]byte("abort\n"))
+		stdin.Close()
+		holder.Wait()
+	})
+	if _, err := stdin.Write([]byte("start\nupdate refs/heads/main " + sha1 + " " + sha1 + "\nprepare\n")); err != nil {
+		t.Fatalf("write to lock holder: %v", err)
+	}
+	lockPath := filepath.Join(s.repoPath, "refs", "heads", "main.lock")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(lockPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("lock holder never appears to have taken refs/heads/main.lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	pushCmd := exec.Command("git", "push", s.repoURL, "main")
+	pushCmd.Dir = work
+	pushCmd.Env = e2eGitEnv()
+	out, err := pushCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("push succeeded while refs/heads/main.lock was held, want a refusal:\n%s", out)
+	}
+	if !strings.Contains(string(out), "could not determine whether git will accept this push") {
+		t.Errorf("push output does not mention the lock-collision refusal:\n%s", out)
+	}
+
+	if got, want := s.txCount(), 1; got != want {
+		t.Errorf("tx count after the lock-collision push = %d, want %d (nothing journaled)", got, want)
+	}
+
+	stdin.Write([]byte("abort\n"))
+	stdin.Close()
+	if err := holder.Wait(); err != nil {
+		t.Logf("lock holder exit: %v", err)
+	}
+
+	// With the lock released, an ordinary retry of the same push must now
+	// succeed and journal normally -- proving the refusal above was
+	// genuinely about the transient lock, not a real problem with the
+	// update itself.
+	retry := exec.Command("git", "push", s.repoURL, "main")
+	retry.Dir = work
+	retry.Env = e2eGitEnv()
+	if out, err := retry.CombinedOutput(); err != nil {
+		t.Fatalf("retry after the lock was released failed: %v\n%s", err, out)
+	}
+	gotRef := strings.TrimSpace(runLocalGit(t, work, "--git-dir="+s.repoPath, "rev-parse", "refs/heads/main"))
+	if gotRef != sha2 {
+		t.Errorf("refs/heads/main after the retry = %q, want %q", gotRef, sha2)
+	}
+	if got, want := s.txCount(), 2; got != want {
+		t.Errorf("tx count after the retry = %d, want %d", got, want)
 	}
 }

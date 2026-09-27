@@ -150,11 +150,43 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	// store.CreateRepo's git init, so it also applies to every repository
 	// already on disk. git propagates a -c setting to its own children
 	// through GIT_CONFIG_PARAMETERS, so index-pack sees it too.
+	//
+	// Four more -c pairs, added by WALD-128: receive.denyDeletes=false,
+	// receive.denyNonFastForwards=false, receive.denyCurrentBranch=false,
+	// receive.denyDeleteCurrent=false. The pre-receive hook's own probe
+	// (cmd/walden/refprepare.go) asks git's `update-ref --stdin prepare`
+	// whether a push will apply before journaling it -- but update-ref is
+	// not receive-pack and ignores all four of these policy knobs
+	// entirely (confirmed against git 2.50.1: with all four set true,
+	// prepare still answered "ok" for a delete and a rewind that
+	// receive-pack itself would refuse). Pinning them off here is what
+	// makes the probe's coverage complete rather than partial: the one
+	// class prepare cannot see is made unable to fire, rather than left as
+	// a silent gap between what the probe checked and what receive-pack
+	// would actually have refused. Pinned on the command line, which
+	// confirmed outranks a repository's own config file, the same way the
+	// existing receive.unpackLimit=0 above does; composes with WALD-127's
+	// GIT_CONFIG_GLOBAL/SYSTEM=/dev/null, which closes the file-scope
+	// route these four -c pins do not reach.
+	//
+	// The product statement this pinning makes, deliberately: walden will
+	// never refuse a force-push or a branch deletion. Anyone holding a
+	// write-scoped token for a repository can rewrite its history. That
+	// is a decision about what walden is, not only a side effect of this
+	// fix -- mechanical rule 3 keeps that kind of policy above walden
+	// rather than in it, and walden's token vocabulary is read/write/
+	// create, not "may rewrite history".
 
 	releaseBody := func() {
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 	}
-	proc, err := startGit(r.Context(), env, body, releaseBody, "-c", "receive.unpackLimit=0", "receive-pack", "--stateless-rpc", path)
+	proc, err := startGit(r.Context(), env, body, releaseBody,
+		"-c", "receive.unpackLimit=0",
+		"-c", "receive.denyDeletes=false",
+		"-c", "receive.denyNonFastForwards=false",
+		"-c", "receive.denyCurrentBranch=false",
+		"-c", "receive.denyDeleteCurrent=false",
+		"receive-pack", "--stateless-rpc", path)
 	if err != nil {
 		writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 			"receive-pack failed",

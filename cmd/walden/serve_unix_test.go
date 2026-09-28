@@ -678,32 +678,38 @@ func TestServeEndToEndDFConflictJournalsExactlyAppliedRefBothOrders(t *testing.T
 	}
 }
 
-// helperMoveRefHook installs a wrapper pre-receive hook at repoPath that,
-// before delegating to the real walden binary, moves ref to sha directly
-// -- entirely outside of git's own quarantine restriction on ref updates,
-// and entirely before walden's own pre-receive (and its probe) ever runs.
-// This is what "moving the ref behind receive-pack's back" (WALD-128's
-// plan) means in practice: an ordinary, non-forced git push computes each
-// refspec's old_oid from the ref advertisement it received moments
-// earlier in the same `git push` invocation, so the only way to make that
-// old_oid stale by the time the server's own pre-receive probe checks it
-// is to move the ref in the gap between that advertisement and the
-// server processing the push proper -- a gap `--force-with-lease` cannot
-// reach either, since its lease is checked client-side and the ref never
-// reaches the hook at all (verified: a lease built from a stale value
-// still reports success against a repository whose real state has moved,
-// because the client never asked the server again).
-func helperMoveRefHook(t *testing.T, repoPath, binPath, ref, sha string) {
+// helperStaleRefPrePush installs a pre-push hook in the *client* repository
+// at workDir that moves ref in the server's repository at repoPath to sha,
+// making that one refspec's old_oid stale for the push it is about to send.
+//
+// An ordinary, non-forced git push computes each refspec's old_oid from the
+// ref advertisement it received moments earlier in the same `git push`
+// invocation, so a ref has to move in the gap between that advertisement and
+// the server processing the push proper. The client's own pre-push hook sits
+// in exactly that gap: verified against git 2.50.1 by capturing the hook's
+// stdin during a three-ref push while the hook moved one of the three --
+// every line still carried the pre-move value as its old_oid, and git went
+// on to apply the other two refs and report "! [remote rejected] ... (failed
+// to update ref)" for the moved one, with receive-pack printing "cannot lock
+// ref 'refs/heads/b': is at <moved> but expected <advertised>".
+//
+// `--force-with-lease` cannot reach that gap: its lease is checked
+// client-side, so the stale value never reaches the server at all.
+//
+// The move is made straight against repoPath with `git --git-dir`, never
+// through a push to walden, so it moves the ref without adding a journal
+// record of its own -- the test counts transactions, and a hijack that
+// journaled would be counting itself. sha must already be an object in
+// repoPath for that to work; the caller gets it there first.
+func helperStaleRefPrePush(t *testing.T, workDir, repoPath, ref, sha string) {
 	t.Helper()
-	script := "#!/bin/sh\n" +
-		"env -u GIT_QUARANTINE_PATH -u GIT_OBJECT_DIRECTORY git update-ref " + ref + " " + sha + " || exit 1\n" +
-		"exec " + binPath + " pre-receive\n"
-	hookPath := filepath.Join(repoPath, "hooks", "pre-receive")
-	if err := os.Remove(hookPath); err != nil && !os.IsNotExist(err) {
-		t.Fatalf("remove existing pre-receive hook: %v", err)
+	hooksDir := filepath.Join(workDir, ".git", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatalf("mkdir client hooks dir: %v", err)
 	}
-	if err := os.WriteFile(hookPath, []byte(script), 0o755); err != nil {
-		t.Fatalf("write wrapper pre-receive hook: %v", err)
+	script := "#!/bin/sh\nexec git --git-dir=" + repoPath + " update-ref " + ref + " " + sha + "\n"
+	if err := os.WriteFile(filepath.Join(hooksDir, "pre-push"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write client pre-push hook: %v", err)
 	}
 }
 
@@ -711,7 +717,7 @@ func helperMoveRefHook(t *testing.T, repoPath, binPath, ref, sha string) {
 // Done-when 8's mid-push case: a three-ref push where the middle ref (b)
 // is stale by the time the server actually processes it -- moved behind
 // the push's back between the ref advertisement and pre-receive running,
-// via helperMoveRefHook -- while the other two (a, c) are ordinary,
+// via helperStaleRefPrePush -- while the other two (a, c) are ordinary,
 // independent, and unaffected. The accepted set must be exactly {a, c},
 // in that order, proving the incremental loop keeps walking past a
 // rejected candidate instead of stopping at the first one.
@@ -795,11 +801,11 @@ func TestServeEndToEndMidPushStaleRefJournalsAcceptedSubset(t *testing.T) {
 	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "advance c")
 	shaC := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
 
-	// Install the wrapper hook now, right before the real push: it moves
-	// b to hijackSHA the instant this push's receive-pack invokes
-	// pre-receive, which is after the client already computed old_oid
-	// for b from the advertisement it received moments earlier.
-	helperMoveRefHook(t, repoPath, binPath, "refs/heads/b", hijackSHA)
+	// Install the client's pre-push hook now, right before the real push:
+	// it moves b to hijackSHA after this push's ref advertisement has
+	// already given the client b's old value, and before the client sends
+	// the commands built from it.
+	helperStaleRefPrePush(t, work, repoPath, "refs/heads/b", hijackSHA)
 
 	pushCmd := exec.Command("git", "push", repoURL,
 		shaA+":refs/heads/a", shaB+":refs/heads/b", shaC+":refs/heads/c")

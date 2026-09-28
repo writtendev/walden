@@ -597,15 +597,16 @@ func isFanoutDir(name string) bool {
 //  2. prepareRefUpdates (refprepare.go, WALD-128) is also local-only: it
 //     asks git, via `git update-ref --stdin` prepare, which of req.Updates
 //     it will accept, and refuses the whole push in one line if git could
-//     not answer. Second, not first, because captureSegment is strictly
-//     cheaper and can itself refuse the push -- forking git ahead of a
-//     refusal that needed no fork would invert the "cheapest first" rule
-//     this ordering already follows. Before LoadSigner and Leases.Open,
-//     and therefore complete -- every ref lock released, the child
-//     reaped -- before the first network call this function makes: that is
-//     simultaneously WALD-128 Done-when 1's "before any journal write" and
-//     Done-when 4's "never holding a ref lock across the journal round
-//     trip".
+//     not answer -- or, for a push whose own refs collide as a directory
+//     and a file, without asking git at all. Second, not first, because
+//     captureSegment is strictly cheaper and can itself refuse the
+//     push -- forking git ahead of a refusal that needed no fork would
+//     invert the "cheapest first" rule this ordering already follows.
+//     Before LoadSigner and Leases.Open, and therefore complete -- every
+//     ref lock released, the child reaped -- before the first network
+//     call this function makes: that is simultaneously WALD-128
+//     Done-when 1's "before any journal write" and Done-when 4's "never
+//     holding a ref lock across the journal round trip".
 //  3. LoadSigner and Leases.Open run before AppendSegment, so a journal
 //     with no genesis record, a local signing key that is not the chain's
 //     active one, or an already-fenced stream refuses without first

@@ -118,7 +118,8 @@ the same environment as the incoming quarantine, which of the push's ref
 updates will actually apply — journaling exactly that subset (matching git's
 own behavior for a non-atomic push: a client that did not request
 `--atomic` gets the refs that apply and a per-ref refusal, in git's own
-words, for the ones that don't) and letting git refuse the rest itself. A
+words, for the ones that don't) and letting git refuse the rest itself —
+with one exception, the directory/file conflict described below. A
 `prepare` that cannot answer at all — the lock it needs is already held,
 its own fork failed, anything short of a definitive per-ref yes or no —
 refuses the whole push in one line rather than risk under-claiming, which is
@@ -139,6 +140,21 @@ will never refuse a force-push or a branch deletion.** Anyone holding a
 write-scoped token for a repository can rewrite its history; that policy
 belongs above walden, not in it — walden's token vocabulary is read, write,
 and create, not "may rewrite history."
+
+The one push walden refuses outright, and the one place it is deliberately
+stricter than git: **a push whose own refs conflict as a directory and a
+file** — `refs/heads/feature` and `refs/heads/feature/x` in the same
+push — **is refused whole, in one line, with nothing journaled for it,
+rather than partly applied.** git applies one of the two and refuses the
+other, but which one survives has changed between git versions, so there is
+no stable answer for walden to match and predicting one would be modelling
+git's conflict resolution rather than asking it. The conflict is found in
+the push's own ref names — a name that is a path prefix of another, counting
+only the refs the push leaves in place, so deleting one of the two in the
+same push is unaffected — never in git's wording for it. This is the same
+answer walden gives everywhere it cannot get a definitive one: refuse in one
+line rather than guess, because a client retrying a refused push still holds
+everything it was pushing and loses nothing.
 
 The cost is one object-storage round trip of added latency on pushes
 (~50–150 ms), plus one local `git update-ref` exec (~15 ms, dominated by

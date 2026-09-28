@@ -75,21 +75,19 @@ func TestPrepareRefUpdatesAcceptsACleanSet(t *testing.T) {
 	assertNoLocks(t, repoPath)
 }
 
-// TestPrepareRefUpdatesDFConflictBothOrders is WALD-128's headline case:
-// a directory/file conflict between two refs in the same push (creating
-// refs/heads/feature and refs/heads/feature/x cannot both exist), which
-// git applies in whichever order the push named them and refuses the
-// other -- and the two orders name different losers. The sub-decision's
-// incremental algorithm is what tells them apart; a version that read the
-// full-set failure's error message would not, since that message names
-// both refs and identifies neither as the loser.
-func TestPrepareRefUpdatesDFConflictBothOrders(t *testing.T) {
+// TestPrepareRefUpdatesDFConflictRefusedBothOrders is WALD-128's headline
+// case as its 2026-09-28 amendment settled it: two refs of one push in a
+// directory/file conflict (refs/heads/feature and refs/heads/feature/x
+// cannot both exist) are refused whole, in one line, whichever order the
+// push named them in. Both orders are covered because which side git keeps
+// is exactly what stopped being predictable -- so the refusal must not
+// depend on the order either.
+func TestPrepareRefUpdatesDFConflictRefusedBothOrders(t *testing.T) {
 	pack, sha := realCommit(t)
 
 	tests := []struct {
 		name    string
 		updates []journal.RefUpdate
-		want    int // index into updates of the one accepted
 	}{
 		{
 			name: "parent first",
@@ -97,7 +95,6 @@ func TestPrepareRefUpdatesDFConflictBothOrders(t *testing.T) {
 				{Ref: "refs/heads/feature", OldOID: journal.ZeroOID40, NewOID: sha},
 				{Ref: "refs/heads/feature/x", OldOID: journal.ZeroOID40, NewOID: sha},
 			},
-			want: 0,
 		},
 		{
 			name: "child first",
@@ -105,7 +102,6 @@ func TestPrepareRefUpdatesDFConflictBothOrders(t *testing.T) {
 				{Ref: "refs/heads/feature/x", OldOID: journal.ZeroOID40, NewOID: sha},
 				{Ref: "refs/heads/feature", OldOID: journal.ZeroOID40, NewOID: sha},
 			},
-			want: 0,
 		},
 	}
 
@@ -115,10 +111,55 @@ func TestPrepareRefUpdatesDFConflictBothOrders(t *testing.T) {
 			realizeObjects(t, repoPath, pack)
 
 			accepted, err := prepareRefUpdates(context.Background(), repoPath, "", tt.updates)
-			if err != nil {
-				t.Fatalf("prepareRefUpdates: %v", err)
+			if err == nil {
+				t.Fatalf("prepareRefUpdates accepted %+v, want the whole push refused", accepted)
 			}
-			assertUpdates(t, accepted, []journal.RefUpdate{tt.updates[tt.want]})
+			if accepted != nil {
+				t.Errorf("accepted = %+v alongside a refusal, want nil", accepted)
+			}
+			if strings.ContainsAny(err.Error(), "\n\r") {
+				t.Errorf("expected a single-line refusal, got: %q", err.Error())
+			}
+			for _, ref := range []string{"refs/heads/feature", "refs/heads/feature/x"} {
+				if !strings.Contains(err.Error(), ref) {
+					t.Errorf("refusal %q does not name %s", err.Error(), ref)
+				}
+			}
+			assertNoLocks(t, repoPath)
+		})
+	}
+}
+
+// TestPrepareRefUpdatesDFConflictOnlyAgainstSurvivingRefs pins the carve-out
+// the refusal above must not swallow: a push that deletes refs/heads/feature
+// and creates refs/heads/feature/x leaves only one of the two names in
+// place, so it is not a conflict and must reach git like any other push.
+// Both wire orders, because a delete is not always sorted where the client
+// typed it. What git then makes of the set is git's business and not this
+// test's; all this asserts is that walden did not refuse it out of hand.
+func TestPrepareRefUpdatesDFConflictOnlyAgainstSurvivingRefs(t *testing.T) {
+	pack, sha := realCommit(t)
+
+	deleteParent := journal.RefUpdate{Ref: "refs/heads/feature", OldOID: sha, NewOID: journal.ZeroOID40}
+	createChild := journal.RefUpdate{Ref: "refs/heads/feature/x", OldOID: journal.ZeroOID40, NewOID: sha}
+
+	tests := []struct {
+		name    string
+		updates []journal.RefUpdate
+	}{
+		{name: "delete first", updates: []journal.RefUpdate{deleteParent, createChild}},
+		{name: "create first", updates: []journal.RefUpdate{createChild, deleteParent}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repoPath := newBareRepo(t)
+			realizeObjects(t, repoPath, pack)
+			setRef(t, repoPath, "refs/heads/feature", sha)
+
+			if _, err := prepareRefUpdates(context.Background(), repoPath, "", tt.updates); err != nil {
+				t.Fatalf("prepareRefUpdates refused a delete-and-create push: %v", err)
+			}
 			assertNoLocks(t, repoPath)
 		})
 	}

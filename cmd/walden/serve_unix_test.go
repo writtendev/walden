@@ -52,6 +52,33 @@ func runLocalGit(t *testing.T, dir string, args ...string) string {
 	return string(out)
 }
 
+// initServerRepo creates the bare repository an end-to-end test's walden
+// server will serve, and turns off the one piece of git's own housekeeping
+// that outlives the test.
+//
+// receive.autogc=false is not about what is under test; it is about being
+// able to delete the directory afterwards. With it left at git's default,
+// receive-pack starts `git maintenance run --auto --quiet --detach` once a
+// push is reported, and that process detaches (observed with PPID 1) and
+// keeps running after the client's `git push` has exited and after the
+// walden server the test started has been killed. On git 2.55.0 it ran
+// `git repack --cruft --write-midx`, whose pack-objects writes
+// objects/pack/.tmp-<pid>-pack*, tmp_pack_*, and multi-pack-index.lock --
+// so t.TempDir's RemoveAll raced it and failed with "unlinkat
+// .../repo.git/objects/pack: directory not empty", failing a test whose
+// own assertions had all passed. (Observed on git 2.55.0; git 2.47.3 on
+// the same code started no such process, which is why this only ever
+// failed on CI.) A test cannot wait for a process it did not start and
+// cannot see, so the fix is not to let it start. Nothing is lost by
+// turning it off: these tests assert what walden journals and which refs
+// git moved, and repacking the server's own object store is cache
+// maintenance none of them depend on.
+func initServerRepo(t *testing.T, runDir, repoPath string) {
+	t.Helper()
+	runLocalGit(t, runDir, "init", "-q", "--bare", "--initial-branch=main", repoPath)
+	runLocalGit(t, runDir, "--git-dir="+repoPath, "config", "receive.autogc", "false")
+}
+
 // waitForServerBoot scans a walden serve subprocess's stdout for the
 // admin-token line and the start line, and returns the minted token and
 // the bound address parsed out of the start line ("walden server starting
@@ -138,7 +165,7 @@ func TestServeEndToEndCloneAndPush(t *testing.T) {
 	// bare repo whose hooks/pre-receive is a symlink to the walden
 	// binary, dispatched by argv[0] (main.go's "if prog == pre-receive"
 	// branch), not a shell shim.
-	runLocalGit(t, tmpDir, "init", "-q", "--bare", "--initial-branch=main", repoPath)
+	initServerRepo(t, tmpDir, repoPath)
 	hooksDir := filepath.Join(repoPath, "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		t.Fatalf("mkdir hooks dir: %v", err)
@@ -292,7 +319,7 @@ func TestServeEndToEndJournalsEveryPush(t *testing.T) {
 
 	dataDir := t.TempDir()
 	repoPath := filepath.Join(dataDir, "repo.git")
-	runLocalGit(t, tmpDir, "init", "-q", "--bare", "--initial-branch=main", repoPath)
+	initServerRepo(t, tmpDir, repoPath)
 	hooksDir := filepath.Join(repoPath, "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		t.Fatalf("mkdir hooks dir: %v", err)
@@ -467,7 +494,7 @@ func bootE2EServer(t *testing.T) *e2eServer {
 
 	dataDir := t.TempDir()
 	repoPath := filepath.Join(dataDir, "repo.git")
-	runLocalGit(t, tmpDir, "init", "-q", "--bare", "--initial-branch=main", repoPath)
+	initServerRepo(t, tmpDir, repoPath)
 	hooksDir := filepath.Join(repoPath, "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		t.Fatalf("mkdir hooks dir: %v", err)
@@ -734,7 +761,7 @@ func TestServeEndToEndMidPushStaleRefJournalsAcceptedSubset(t *testing.T) {
 
 	dataDir := t.TempDir()
 	repoPath := filepath.Join(dataDir, "repo.git")
-	runLocalGit(t, tmpDir, "init", "-q", "--bare", "--initial-branch=main", repoPath)
+	initServerRepo(t, tmpDir, repoPath)
 	if err := os.MkdirAll(filepath.Join(repoPath, "hooks"), 0o755); err != nil {
 		t.Fatalf("mkdir hooks dir: %v", err)
 	}

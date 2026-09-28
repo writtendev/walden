@@ -611,30 +611,30 @@ func TestServeEndToEndNoRefAppliesJournalsSegmentOnly(t *testing.T) {
 	}
 }
 
-// TestServeEndToEndDFConflictJournalsExactlyAppliedRefBothOrders is
-// WALD-128 Done-when 8: a push naming two refs that collide as a
-// directory and a file applies exactly one of them, and which one depends
-// on which came first on the wire -- so this drives the real git client
-// both ways, in one push each, and asserts the ref transaction names
-// exactly the ref git actually applied, never both and never neither.
-func TestServeEndToEndDFConflictJournalsExactlyAppliedRefBothOrders(t *testing.T) {
+// TestServeEndToEndDFConflictRefusedWholeBothOrders is WALD-128 Done-when 8
+// as its 2026-09-28 amendment rewrote it: a push naming two refs that
+// collide as a directory and a file is refused whole, in one line, with
+// nothing journaled for it, in either wire order.
+//
+// This test used to assert the other thing -- that walden journaled
+// exactly the one ref git applied -- and it is the test that caught the
+// problem with that: git 2.50.1 applies whichever of the two came first on
+// the wire, and git 2.55.0 applies refs/heads/feature/x in both orders, so
+// there is no stable answer for walden to match. It keeps both orders for
+// that reason: the expectation now has to be the same one either way, and
+// a version that guessed a winner would still pass one of these two cases.
+func TestServeEndToEndDFConflictRefusedWholeBothOrders(t *testing.T) {
 	tests := []struct {
-		name       string
-		refspecs   []string
-		wantRef    string
-		wantOthRef string
+		name     string
+		refspecs []string
 	}{
 		{
-			name:       "parent first",
-			refspecs:   []string{"HEAD:refs/heads/feature", "HEAD:refs/heads/feature/x"},
-			wantRef:    "refs/heads/feature",
-			wantOthRef: "refs/heads/feature/x",
+			name:     "parent first",
+			refspecs: []string{"HEAD:refs/heads/feature", "HEAD:refs/heads/feature/x"},
 		},
 		{
-			name:       "child first",
-			refspecs:   []string{"HEAD:refs/heads/feature/x", "HEAD:refs/heads/feature"},
-			wantRef:    "refs/heads/feature/x",
-			wantOthRef: "refs/heads/feature",
+			name:     "child first",
+			refspecs: []string{"HEAD:refs/heads/feature/x", "HEAD:refs/heads/feature"},
 		},
 	}
 
@@ -647,7 +647,6 @@ func TestServeEndToEndDFConflictJournalsExactlyAppliedRefBothOrders(t *testing.T
 			runLocalGit(t, work, "config", "user.email", "test@example.com")
 			runLocalGit(t, work, "config", "user.name", "Test")
 			runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "initial")
-			sha := strings.TrimSpace(runLocalGit(t, work, "rev-parse", "HEAD"))
 
 			args := append([]string{"push", s.repoURL}, tt.refspecs...)
 			pushCmd := exec.Command("git", args...)
@@ -655,25 +654,26 @@ func TestServeEndToEndDFConflictJournalsExactlyAppliedRefBothOrders(t *testing.T
 			pushCmd.Env = e2eGitEnv()
 			out, err := pushCmd.CombinedOutput()
 			if err == nil {
-				t.Fatalf("push %v succeeded, want a partial failure (the D/F conflict refuses one side):\n%s", tt.refspecs, out)
+				t.Fatalf("push %v succeeded, want the whole push refused:\n%s", tt.refspecs, out)
+			}
+			if !strings.Contains(string(out), "one ref name is a directory prefix of the other") {
+				t.Errorf("push output does not carry walden's D/F refusal:\n%s", out)
 			}
 
-			gotRef := strings.TrimSpace(runLocalGit(t, work, "--git-dir="+s.repoPath, "rev-parse", "--verify", "--quiet", tt.wantRef))
-			if gotRef != sha {
-				t.Errorf("%s = %q after the push, want %q (the ref git should have applied)", tt.wantRef, gotRef, sha)
-			}
-			verifyOther := exec.Command("git", "--git-dir="+s.repoPath, "rev-parse", "--verify", "--quiet", tt.wantOthRef)
-			verifyOther.Env = e2eGitEnv()
-			if out, err := verifyOther.CombinedOutput(); err == nil {
-				t.Errorf("%s resolves to %s after the push, want it refused (git should have refused this side)", tt.wantOthRef, strings.TrimSpace(string(out)))
+			for _, ref := range []string{"refs/heads/feature", "refs/heads/feature/x"} {
+				verify := exec.Command("git", "--git-dir="+s.repoPath, "rev-parse", "--verify", "--quiet", ref)
+				verify.Env = e2eGitEnv()
+				if out, err := verify.CombinedOutput(); err == nil {
+					t.Errorf("%s resolves to %s after the push, want neither ref applied", ref, strings.TrimSpace(string(out)))
+				}
 			}
 
-			if got, want := s.txCount(), 1; got != want {
-				t.Fatalf("tx count after the push = %d, want %d", got, want)
+			if got := s.txCount(); got != 0 {
+				t.Errorf("tx count after the refused push = %d, want 0 (nothing journaled)", got)
 			}
-			rec := journalRefTx(t, s.fake, journal.StreamID("repo"), 0)
-			wantUpdates := []journal.RefUpdate{{Ref: tt.wantRef, OldOID: journal.ZeroOID40, NewOID: sha}}
-			assertUpdates(t, rec.Updates, wantUpdates)
+			if got := s.segmentCount(); got != 0 {
+				t.Errorf("segment count after the refused push = %d, want 0 (nothing journaled)", got)
+			}
 		})
 	}
 }

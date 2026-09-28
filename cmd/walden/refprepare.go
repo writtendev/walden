@@ -3,6 +3,12 @@
 // journal only that subset -- leaving git to refuse the rest, in its own
 // words, exactly as it would if walden asked nothing at all.
 //
+// One shape of push is refused outright instead, before git is asked
+// anything: one whose own ref set puts two surviving refs in a
+// directory/file conflict (refuseDirFileConflict below). That is WALD-128's
+// 2026-09-28 amendment, and it is the only case where walden is
+// deliberately stricter than git.
+//
 // The instrument is `git update-ref --stdin`'s start/prepare/abort
 // sub-protocol: `prepare` validates a whole batch of ref updates --
 // directory/file conflicts, stale old_oid, a nonexistent new_oid -- without
@@ -76,13 +82,20 @@ const refPrepareWaitDelay = 5 * time.Second
 // The returned slice may be empty -- git will refuse every update -- which
 // is not an error: the caller journals no ref transaction in that case and
 // lets git refuse everything with its own per-ref messages (WALD-128
-// Done-when 9). An error return means git could not answer at all, for
-// any of the candidate sets asked about, and the caller must refuse the
-// whole push (Done-when 3): a probe that cannot answer must never be read
-// as "no problem found".
+// Done-when 9).
+//
+// There are two error returns, and the caller treats them identically by
+// refusing the whole push. The first is refuseDirFileConflict's: this
+// push's own ref set is one walden will not journal any part of, decided
+// without asking git at all. The second is git could not answer at all,
+// for any of the candidate sets asked about (Done-when 3): a probe that
+// cannot answer must never be read as "no problem found".
 func prepareRefUpdates(ctx context.Context, repoPath, quarantine string, updates []journal.RefUpdate) ([]journal.RefUpdate, error) {
 	if len(updates) == 0 {
 		return nil, nil
+	}
+	if err := refuseDirFileConflict(updates); err != nil {
+		return nil, err
 	}
 
 	ok, err := probePrepare(ctx, repoPath, quarantine, updates)
@@ -108,6 +121,77 @@ func prepareRefUpdates(ctx context.Context, repoPath, quarantine string, updates
 		}
 	}
 	return accepted, nil
+}
+
+// refuseDirFileConflict refuses a push whose own ref set carries a
+// directory/file conflict: two refs the push would leave in place where
+// one name is a path prefix of the other, as "refs/heads/feature" is of
+// "refs/heads/feature/x". It returns nil for every other push, including
+// the single-ref case where the conflict is against a ref already on disk
+// rather than against another ref in the same push -- that one is not this
+// function's to find, and probePrepare already refuses it as an ordinary
+// per-ref no.
+//
+// This is the one place walden is deliberately stricter than git, and the
+// one place it declines a push git would partly apply (WALD-128's
+// 2026-09-28 amendment). git applies one side of such a push and refuses
+// the other, but which side survives is not stable across git versions:
+// against git 2.50.1 the ref named first on the wire survived, and against
+// git 2.55.0 "refs/heads/feature/x" survived in both orders, the loser
+// reported as "refname conflict". Journaling a guess at the winner is how
+// this ticket's own reproduction ended up with the journal holding
+// refs/heads/feature while the disk held only refs/heads/feature/x: a
+// signed record of a move that never happened, and a missing record of one
+// that did. Refusing the whole push in one line is what walden does
+// everywhere else it cannot get a definitive answer, and it is the cheap
+// direction to be wrong in: the client still holds everything it was
+// pushing and loses nothing by retrying with one of the two names
+// changed.
+//
+// The conflict is found in the push's ref names, never in git's error
+// text: the two versions above spell the refusal differently, and matching
+// a message is what made the behaviour version-dependent in the first
+// place. A path-prefix relationship between two names is a property of
+// this function's input alone, so it reads the same on every git.
+//
+// Deletions are excluded because only refs that exist after the push can
+// collide: a push that deletes refs/heads/feature and creates
+// refs/heads/feature/x is an ordinary, legitimate push, and both git
+// 2.50.1 and git 2.55.0 applied both of its updates, in both wire orders.
+func refuseDirFileConflict(updates []journal.RefUpdate) error {
+	remaining := make(map[string]bool, len(updates))
+	for _, u := range updates {
+		if !isRefDeletion(u) {
+			remaining[u.Ref] = true
+		}
+	}
+	// updates in order, and each name's prefixes shortest-first, so a push
+	// carrying more than one conflict always names the same pair.
+	for _, u := range updates {
+		if isRefDeletion(u) {
+			continue
+		}
+		for i := 0; i < len(u.Ref); i++ {
+			if u.Ref[i] != '/' || !remaining[u.Ref[:i]] {
+				continue
+			}
+			return refusal.Refuse(
+				"pre-receive refused",
+				fmt.Sprintf("this push would leave both %q and %q in place, and git will apply only one of them: one ref name is a directory prefix of the other", u.Ref[:i], u.Ref),
+				"rename one of the two so that neither ref name is a path prefix of the other, and push again",
+			)
+		}
+	}
+	return nil
+}
+
+// isRefDeletion reports whether u removes its ref rather than leaving one
+// behind, which git spells as an all-zero new_oid.
+// journal.ValidateRefUpdate -- already run over every update on this path
+// before journalPush is reached -- refuses an OID that is neither 40 nor
+// 64 hex characters, so these two constants are the whole of the shape.
+func isRefDeletion(u journal.RefUpdate) bool {
+	return u.NewOID == journal.ZeroOID40 || u.NewOID == journal.ZeroOID64
 }
 
 // probePrepare runs exactly one `git update-ref --stdin` start/prepare/

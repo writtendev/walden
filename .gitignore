@@ -32,9 +32,9 @@ go.work.sum
 # .idea/
 # .vscode/
 
-# Symlinks into a sibling `plugins/` checkout, for Codex and Antigravity,
-# which have no plugin mechanism. Intentionally untracked; see AGENTS.md
-# §Dispatch for the one-time setup.
+# Symlinks into a local mattwalters/skills checkout, for Codex and
+# Antigravity, which have no plugin mechanism. Intentionally untracked; see
+# AGENTS.md §Orchestrate for the one-time setup.
 .agents/skills/
 .claude/worktrees/
 .claude/settings.local.json

@@ -96,51 +96,49 @@ go build ./...
 go test ./...
 ```
 
-## Dispatch
+## Orchestrate
 
-The `studio` pipeline — `dispatch`, `implement-ticket`,
-`adversarial-review`, `merge-queue` — reads this section and nothing
-else for its repo-specific configuration. A field left out is a field
-those skills refuse to guess: they say which one is missing and stop.
+The `factory` pipeline — `orchestrate`, `implement-ticket`,
+`adversarial-review`, `merge-queue`, `decision-queue` — reads this
+section and nothing else for its repo-specific configuration. A field
+left out is a field those skills refuse to guess: they say which one
+is missing and stop.
 
-| Field        | Value                                 |
-| ------------ | ------------------------------------- |
-| Linear team  | `WALD`                                |
-| Base branch  | `main`                                |
-| Worktrees    | `.claude/worktrees/`                  |
-| Run manifest | `.claude/worktrees/run-manifest.json` |
+| Field        | Value                                     |
+| ------------ | ----------------------------------------- |
+| Linear team  | `WALD`                                    |
+| Base branch  | `main`                                    |
+| Worktrees    | `$HOME/ops/worktrees/writtendev/walden/`  |
+| Write window | `none`                                    |
 
-Both paths are already in `.gitignore`. Per-run state is local to the
-machine that ran it and is not committed.
+Per-ticket worktrees live outside the repo, so no ancestor
+`AGENTS.md`/`CLAUDE.md` loads into a ticket's run and there is nothing
+to gitignore. Expand `$HOME` to an absolute path before using it.
+Per-run state is local to the machine that ran it and is not
+committed.
 
-**Getting the pipeline onto a fresh clone.** Claude Code needs one
-step, not zero: `.claude/settings.json` is tracked and declares the
-`writtendev` marketplace and the `studio` plugin, so the marketplace
-registers with no edits — but Claude Code does not fetch and enable an
-externally-sourced plugin just because a project settings file names
-it. On a fresh clone, run:
+**Getting the pipeline.** `factory` is installed once per machine at
+user scope, not pinned by this repo. `.claude/settings.json` only
+declares the `mattwalters` marketplace (github `mattwalters/skills`).
+On a machine that does not have it installed yet, run:
 
 ```
-claude plugin install studio@writtendev --scope project
+claude plugin install factory@mattwalters --scope user
 ```
 
-Verified against Claude Code 2.1.263: a plugin named in a project's
-`enabledPlugins` that isn't already installed surfaces as a refusal
-("Plugin \"studio\" is enabled in project settings but isn't
-installed") rather than installing itself, and the refusal names the
-same command above as the fix. Codex and Antigravity have no plugin
-mechanism and read skills from `.agents/skills/<name>` instead; those
-are symlinks into the sibling `plugins/` checkout, ignored deliberately
-because they'd dangle both outside the studio layout and inside every
-`.claude/worktrees/` checkout. One-time setup, from the repo root on a
-machine with the studio layout:
+Do not install it at project scope or add it to `enabledPlugins` here.
+
+Codex and Antigravity have no plugin mechanism and read skills from
+`.agents/skills/<name>` instead; those are symlinks into a local
+checkout of `mattwalters/skills`, ignored deliberately because the
+checkout's location is per machine. One-time setup, from the repo root,
+with that checkout at `~/src/mattwalters/skills`:
 
 ```
 mkdir -p .agents/skills
-ln -sfn ../../../plugins/studio/skills/adversarial-review .agents/skills/adversarial-review
-ln -sfn ../../../plugins/studio/skills/dispatch .agents/skills/dispatch
-ln -sfn ../../../plugins/studio/skills/implement-ticket .agents/skills/implement-ticket
-ln -sfn ../../../plugins/studio/skills/merge-queue .agents/skills/merge-queue
+for s in orchestrate implement-ticket adversarial-review merge-queue decision-queue; do
+  ln -sfn "$HOME/src/mattwalters/skills/plugins/factory/skills/$s" ".agents/skills/$s"
+done
 ```
 
 `ln -sfn` so re-running this is a no-op instead of following an

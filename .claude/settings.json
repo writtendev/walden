@@ -1,12 +1,9 @@
 {
-  "enabledPlugins": {
-    "studio@writtendev": true
-  },
   "extraKnownMarketplaces": {
-    "writtendev": {
+    "mattwalters": {
       "source": {
         "source": "github",
-        "repo": "writtendev/meta"
+        "repo": "mattwalters/skills"
       }
     }
   }

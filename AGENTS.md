@@ -104,12 +104,15 @@ section and nothing else for its repo-specific configuration. A field
 left out is a field those skills refuse to guess: they say which one
 is missing and stop.
 
-| Field        | Value                                     |
-| ------------ | ----------------------------------------- |
-| Linear team  | `WALD`                                    |
-| Base branch  | `main`                                    |
-| Worktrees    | `$HOME/ops/worktrees/writtendev/walden/`  |
-| Write window | `none`                                    |
+| Field             | Value                                    |
+| ----------------- | ---------------------------------------- |
+| Linear team key   | `WALD`                                   |
+| Check command     | `./scripts/check.sh`                     |
+| Base branch       | `main`                                   |
+| Worktrees         | `$HOME/ops/worktrees/writtendev/walden/` |
+| Review invariants | `## Mechanical review rules` above       |
+| Stop-list         | `### Stop-list` below                    |
+| Write window      | `none`                                   |
 
 Per-ticket worktrees live outside the repo, so no ancestor
 `AGENTS.md`/`CLAUDE.md` loads into a ticket's run and there is nothing
@@ -150,16 +153,14 @@ existing link and writing a stray symlink inside the target.
 before pushing:
 
 ```
-go build ./... && go vet ./... && test -z "$(gofmt -l .)" && go test -race ./...
+./scripts/check.sh
 ```
 
-Wider than `## Build and test` above, deliberately. That one is what a
+It builds, vets, checks formatting, and runs `go test -race ./...` —
+wider than `## Build and test` above, deliberately. That one is what a
 person runs while working; this is what CI gates on, so that a local
-pass and a green pull request mean the same thing. The formatting
-check is spelled `test -z` rather than a bare `gofmt -l .` because
-`gofmt -l` lists the offending files and still exits zero — chained
-with `&&` it would never fail, and unformatted code would reach CI
-with the check reporting success.
+pass and a green pull request mean the same thing. What the check runs
+lives in the script, not here.
 
 **Review invariants.** `## Mechanical review rules` above is the
 review contract. A reviewer works against those six rules and reports
@@ -170,3 +171,17 @@ source — `## This file` says as much, and CLAUDE.md and GEMINI.md are
 one-line imports for that reason. A second copy of the rules under a
 second heading is the same drift in miniature, and the copy that goes
 stale is the one a reviewer would be reading.
+
+### Stop-list
+
+A change touching any of these waits for a human to merge it, whatever
+mode the run is in:
+
+- CI config: `.github/workflows/`.
+- Authentication and token handling: `internal/auth/`, the token CLI,
+  and anything that reads, stores, or compares a token or the trust
+  key.
+- Deploy and image: `Dockerfile`, `.dockerignore`.
+- The published formats and their golden fixtures: `spec/`.
+- The pipeline's own configuration: this `## Orchestrate` section,
+  `## Mechanical review rules`, and `scripts/check.sh`.

@@ -1,0 +1,10 @@
+{
+  "extraKnownMarketplaces": {
+    "mattwalters": {
+      "source": {
+        "source": "github",
+        "repo": "mattwalters/skills"
+      }
+    }
+  }
+}

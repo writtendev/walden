@@ -121,17 +121,18 @@ Per-run state is local to the machine that ran it and is not
 committed.
 
 **Getting the pipeline.** `factory` is installed once per machine at
-user scope. This repo declares no plugins and no marketplaces: there is
-no `.claude/settings.json`. On a machine that does not have it installed
-yet, run:
+user scope. On a machine that does not have it installed yet, run:
 
 ```
 claude plugin marketplace add mattwalters/skills
 claude plugin install factory@mattwalters --scope user
 ```
 
-Do not install it at project scope, and do not add `enabledPlugins` or
-`extraKnownMarketplaces` to this repo's settings.
+`.claude/settings.json` declares the `mattwalters` marketplace so Claude
+Code knows where it lives, and deliberately does not enable the plugin:
+a project pin registers a separate install per checkout and worktree,
+and those drift from the user-scope version. Do not install it at
+project scope or add `enabledPlugins`.
 
 Codex and Antigravity have no plugin mechanism and read skills from
 `.agents/skills/<name>` instead; those are symlinks into a local
@@ -184,4 +185,5 @@ mode the run is in:
 - Deploy and image: `Dockerfile`, `.dockerignore`.
 - The published formats and their golden fixtures: `spec/`.
 - The pipeline's own configuration: this `## Orchestrate` section,
-  `## Mechanical review rules`, and `scripts/check.sh`.
+  `## Mechanical review rules`, `scripts/check.sh`, and
+  `.claude/settings.json`.

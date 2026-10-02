@@ -97,10 +97,100 @@ argv) performs the journal append and exits 0 only once object storage has
 acknowledged both records. Only then does git move the refs and does the
 client see success.
 
-Consequence, and the core promise: **an acknowledged push is already in
-object storage.** The cost is one object-storage round trip of added latency
-on pushes (~50–150 ms). Pushes are rare, human-initiated, and
-latency-tolerant; lost commits are none of those things.
+Consequence, and the core promise, stated in both directions:
+
+- **An acknowledged push is already in object storage.** If the client sees
+  success, the journal already knows about every ref move that produced it.
+- **The journal knows about no ref move that did not happen.** If `pre-receive`
+  cannot determine that git will actually apply a ref update, it refuses
+  rather than journal a guess.
+
+The second direction is the harder one, and it is not a corollary of the
+first: git's own per-ref checks — a directory/file conflict between two ref
+names, a stale `old_oid` losing a race, `receive.deny*` policy — run only
+*after* `pre-receive` returns, when git actually moves the refs. A hook that
+journaled every update the client asked for, then exited 0, could describe a
+move git went on to refuse — a signed record of something that never
+happened, and one a replay can never complete against. So before it appends
+anything, `pre-receive` asks git itself, via `git update-ref --stdin`'s
+`start`/`prepare`/`abort` transaction protocol run against the repository in
+the same environment as the incoming quarantine, which of the push's ref
+updates will actually apply — journaling exactly that subset (matching git's
+own behavior for a non-atomic push: a client that did not request
+`--atomic` gets the refs that apply and a per-ref refusal, in git's own
+words, for the ones that don't) and letting git refuse the rest itself —
+with one exception, the directory/file conflict described below. A
+`prepare` that cannot answer at all — the lock it needs is already held,
+its own fork failed, anything short of a definitive per-ref yes or no —
+refuses the whole push in one line rather than risk under-claiming, which is
+the worse direction of the two: a client retrying a refused push loses
+nothing, but a journal that has under-claimed a ref move is not one a replay
+can trust.
+
+`prepare` is blind to the four `receive.deny*` policy knobs
+(`denyDeletes`, `denyNonFastForwards`, `denyCurrentBranch`,
+`denyDeleteCurrent`) — `update-ref` is not `receive-pack` and does not
+consult them. walden pins all four off on its own `receive-pack` invocation
+(alongside the pre-existing `receive.unpackLimit=0`, `-c` flags on the
+command line, which outrank a repository's own config file), so the one
+class `prepare` cannot see is made unable to fire rather than left as a gap
+between what got checked and what receive-pack would actually have refused.
+This is a product statement as much as an implementation detail: **walden
+will never refuse a force-push or a branch deletion.** Anyone holding a
+write-scoped token for a repository can rewrite its history; that policy
+belongs above walden, not in it — walden's token vocabulary is read, write,
+and create, not "may rewrite history."
+
+One class remains that `prepare` cannot see and no server-side policy knob
+describes: the client electing atomicity. `git push --atomic` asks
+`receive-pack` to apply every ref of the push or none, and the hook's input
+is byte-identical whether the client asked for it or not — so on a push
+where one ref cannot apply, walden's probe would accept the rest and
+journal them while git applied nothing at all. It is closed the same way
+the four above are, by making it unable to fire: walden drops the `atomic`
+capability from its ref advertisement
+(`receive.advertiseAtomic=false`, on the `receive-pack` invocation that
+produces the advertisement), so a client asking for an atomic push is
+refused by its own git before it sends anything. That too is a product
+statement: **walden does not support `git push --atomic`.** The same push
+without `--atomic` is served normally, and gets the refs that apply plus
+git's own per-ref refusal for the ones that don't.
+
+The one push walden refuses outright, and the one place it is deliberately
+stricter than git: **a push naming two refs that conflict as a directory
+and a file** — `refs/heads/feature` and `refs/heads/feature/x` in the same
+push — **is refused whole, in one line, with nothing journaled for it,
+rather than partly applied.** Where both refs survive the push, git applies
+one of the two and refuses the other, but which one survives has changed
+between git versions, so there is no stable answer for walden to match and
+predicting one would be modelling git's conflict resolution rather than
+asking it. The conflict is found in the push's own ref names — a name that
+is a path prefix of another — never in git's wording for it.
+
+Every ref the push names counts, including one it deletes. A push that
+deletes `refs/heads/feature` and creates `refs/heads/feature/x` is a push
+git applies in full, so this is walden refusing something git would have
+accepted — stated plainly, and accepted deliberately. The reason is that
+walden has nothing it can ask about that push: `update-ref --stdin`
+evaluates its batch as one transaction against the refs on disk, with no
+notion of applying the delete first, so the create fails in every candidate
+set the probe can build and the accepted set comes back holding the delete
+alone. Journaling that is the worse direction of the two — a ref left on
+disk that no record names. The rule is therefore purely structural, with no
+second clause whose answer depends on something walden would have to go and
+ask. Either shape goes through as two pushes.
+
+This is the same answer walden gives everywhere it cannot get a definitive
+one: refuse in one line rather than guess, because a client retrying a
+refused push still holds everything it was pushing and loses nothing.
+
+The cost is one object-storage round trip of added latency on pushes
+(~50–150 ms), plus one local `git update-ref` exec (~15 ms, dominated by
+fork/exec) on the common path where every ref in a push applies — more,
+proportional to the size of the push, only on the rarer push that contains
+a conflict and is about to be partly refused anyway. Pushes are rare,
+human-initiated, and latency-tolerant; lost commits — and journaled ones
+that never happened — are none of those things.
 
 ### Fencing (single-writer safety)
 

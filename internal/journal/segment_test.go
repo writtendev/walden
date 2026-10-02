@@ -121,6 +121,38 @@ func TestValidatePackfileHeader(t *testing.T) {
 	}
 }
 
+// TestPackfileObjectCount covers WALD-44's one new read of the packfile
+// header: the object count that tells a zero-object pack -- what git's
+// index-pack writes when a push moves a ref to an object the repository
+// already holds -- apart from a pack worth journaling as a segment.
+func TestPackfileObjectCount(t *testing.T) {
+	if count, err := journal.PackfileObjectCount(validEmptyPackfile()); err != nil || count != 0 {
+		t.Errorf("PackfileObjectCount(empty pack) = %d, %v; want 0, nil", count, err)
+	}
+
+	threeObjects := validEmptyPackfile()
+	threeObjects[11] = 3
+	if count, err := journal.PackfileObjectCount(threeObjects); err != nil || count != 3 {
+		t.Errorf("PackfileObjectCount(3-object pack) = %d, %v; want 3, nil", count, err)
+	}
+
+	// The validation half is ValidatePackfileHeader's, unchanged: a short
+	// slice, a bad magic, and an unsupported version are all refused here
+	// too rather than silently yielding a count.
+	for _, tt := range []struct {
+		name string
+		data []byte
+	}{
+		{"too short", []byte("PACK\x00\x00\x00\x02\x00\x00\x00\x00")},
+		{"bad magic", append([]byte("KCAP\x00\x00\x00\x02\x00\x00\x00\x00"), make([]byte, 20)...)},
+		{"unsupported version", append([]byte("PACK\x00\x00\x00\x09\x00\x00\x00\x00"), make([]byte, 20)...)},
+	} {
+		if _, err := journal.PackfileObjectCount(tt.data); !errors.Is(err, journal.ErrInvalidPackfile) {
+			t.Errorf("PackfileObjectCount(%s) error = %v, want ErrInvalidPackfile", tt.name, err)
+		}
+	}
+}
+
 func TestValidatePackfileHeaderSHA256(t *testing.T) {
 	validSHA256 := validEmptyPackfileSHA256()
 	if len(validSHA256) != 44 {

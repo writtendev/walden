@@ -225,11 +225,21 @@ func TestReceivePackHookRejectionIsACompletedRPC(t *testing.T) {
 // script of the test's own at hooks/pre-receive is what store.EnsureHook
 // now refuses.
 func TestReceivePackHookEnvironment(t *testing.T) {
-	runPush := func(t *testing.T, h http.Handler, token, barePath string) map[string]string {
+	// runPush returns the hook's environment and the names git left in
+	// the quarantine directory's pack/. The second is what proves the
+	// receive.unpackLimit=0 knob (WALD-44) actually took: with git's
+	// default, a push this small is unpacked to loose objects and pack/
+	// is empty, so the pre-receive hook has no segment to journal.
+	// Deliberately asserted as behaviour rather than by grepping the
+	// argv -- a test that looks for "-c receive.unpackLimit=0" would go
+	// on passing if git stopped honouring it.
+	runPush := func(t *testing.T, h http.Handler, token, barePath string) (map[string]string, []string) {
 		t.Helper()
 
-		dumpPath := filepath.Join(t.TempDir(), "env.dump")
-		writeHookDirective(t, barePath, "env "+dumpPath)
+		dumpDir := t.TempDir()
+		dumpPath := filepath.Join(dumpDir, "env.dump")
+		packPath := filepath.Join(dumpDir, "pack.dump")
+		writeHookDirective(t, barePath, "env "+dumpPath, "pack-listing "+packPath)
 
 		server := httptest.NewServer(h)
 		defer server.Close()
@@ -255,14 +265,23 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 			}
 			env[k] = v
 		}
-		return env
+
+		var packEntries []string
+		if raw, err := os.ReadFile(packPath); err == nil {
+			for _, name := range strings.Split(string(raw), "\n") {
+				if name != "" {
+					packEntries = append(packEntries, name)
+				}
+			}
+		}
+		return env, packEntries
 	}
 
 	t.Run("core-variables-and-git-owned-ones", func(t *testing.T) {
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
 		h, tok := newTestHandler(t, s, "https://example.com/bucket/prefix")
-		env := runPush(t, h, tok, barePath)
+		env, packEntries := runPush(t, h, tok, barePath)
 
 		if got := env["WALDEN_REPO"]; got != "repo" {
 			t.Errorf("WALDEN_REPO = %q, want %q", got, "repo")
@@ -282,13 +301,27 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 		if _, ok := env["GIT_COMMITTER_NAME"]; ok {
 			t.Errorf("GIT_COMMITTER_NAME is present; walden has no identity model and must not invent one")
 		}
+
+		// One commit is far below git's default receive.unpackLimit of
+		// 100, so without walden setting that knob to 0 this directory
+		// is empty and the objects are loose somewhere under the
+		// quarantine root instead.
+		packs := 0
+		for _, name := range packEntries {
+			if strings.HasSuffix(name, ".pack") {
+				packs++
+			}
+		}
+		if packs != 1 {
+			t.Errorf("GIT_QUARANTINE_PATH/pack holds %d packfiles (entries %v), want exactly one; the received objects must reach the hook as a packfile, not as loose objects", packs, packEntries)
+		}
 	})
 
 	t.Run("journal-less-mode-omits-the-variable-entirely", func(t *testing.T) {
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
 		h, tok := newTestHandler(t, s, "")
-		env := runPush(t, h, tok, barePath)
+		env, _ := runPush(t, h, tok, barePath)
 
 		if v, ok := env["WALDEN_JOURNAL"]; ok {
 			t.Errorf("WALDEN_JOURNAL = %q, want the variable absent entirely (journal-less mode), not empty", v)
@@ -302,7 +335,7 @@ func TestReceivePackHookEnvironment(t *testing.T) {
 		s := store.New(t.TempDir())
 		barePath := newEmptyBareRepo(t, s, "repo")
 		h, tok := newTestHandler(t, s, "")
-		env := runPush(t, h, tok, barePath)
+		env, _ := runPush(t, h, tok, barePath)
 
 		if got := env["AWS_ACCESS_KEY_ID"]; got != "test-access-key-id" {
 			t.Errorf("AWS_ACCESS_KEY_ID = %q, want %q", got, "test-access-key-id")
@@ -820,5 +853,122 @@ func TestReceivePackPreservesKeepAliveConnection(t *testing.T) {
 	}
 	if infoResp.StatusCode != http.StatusOK {
 		t.Fatalf("second request status = %d, want %d; body: %s", infoResp.StatusCode, http.StatusOK, infoBody)
+	}
+}
+
+// TestReceivePackDenyKnobsPinnedOff is WALD-128 Done-when 2, asserted
+// behaviourally rather than by grepping the argv passed to startGit --
+// the same deliberate choice TestReceivePackHookEnvironment documents for
+// the pre-existing receive.unpackLimit=0 knob, and for the identical
+// reason: a test that looked for "-c receive.denyDeletes=false" in the
+// command line would go on passing even if a future git version stopped
+// honouring the flag.
+//
+// All four receive.deny* knobs are set true in the repository's own
+// config -- the value an operator, or a client repository's own history,
+// might otherwise carry -- to prove walden's own -c pins
+// (internal/githttp/receivepack.go, beside the existing
+// receive.unpackLimit=0) override them: confirmed separately, against a
+// scratch repository, that a -c flag on the command line outranks a
+// repository's config file for this same knob. A force-push
+// (receive.denyNonFastForwards) and a deletion of the branch HEAD points
+// at (receive.denyDeleteCurrent, receive.denyCurrentBranch) both have to
+// succeed for the product statement WALD-128 makes deliberately: walden
+// never refuses a force-push or a branch deletion.
+func TestReceivePackDenyKnobsPinnedOff(t *testing.T) {
+	s := store.New(t.TempDir())
+	barePath := newEmptyBareRepo(t, s, "repo")
+
+	for _, kv := range [][2]string{
+		{"receive.denyDeletes", "true"},
+		{"receive.denyNonFastForwards", "true"},
+		{"receive.denyCurrentBranch", "true"},
+		{"receive.denyDeleteCurrent", "true"},
+	} {
+		runGit(t, barePath, "config", kv[0], kv[1])
+	}
+
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
+	defer server.Close()
+	repoURL := authURL(server.URL, tok) + "/repo"
+
+	work, sha1 := newWorkTreeWithCommit(t)
+	runGit(t, work, "push", "-q", repoURL, "main")
+	if got := revParse(t, barePath, "refs/heads/main"); got != sha1 {
+		t.Fatalf("refs/heads/main = %q after the initial push, want %q", got, sha1)
+	}
+
+	// A force-push: rewrite main's history so the new tip does not
+	// contain the old one, then push --force. receive.denyNonFastForwards
+	// pinned true in config would refuse this; walden's own -c pin must
+	// win.
+	runGit(t, work, "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+	sha2 := strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD"))
+	// runGit itself fails the test if this push is refused, which is
+	// exactly the failure mode receive.denyNonFastForwards pinned true
+	// would produce.
+	runGit(t, work, "push", "-q", "--force", repoURL, "main")
+	if got := revParse(t, barePath, "refs/heads/main"); got != sha2 {
+		t.Errorf("refs/heads/main = %q after the force-push, want %q", got, sha2)
+	}
+
+	// Deleting the branch HEAD points at: receive.denyDeleteCurrent (and,
+	// on some git versions, receive.denyCurrentBranch) pinned true in
+	// config would refuse this too.
+	runGit(t, work, "push", "-q", repoURL, "--delete", "main")
+	if got := revParse(t, barePath, "refs/heads/main"); got != "" {
+		t.Errorf("refs/heads/main still resolves to %q after delete", got)
+	}
+}
+
+// TestReceivePackAtomicNotAdvertised pins WALD-128's other product
+// statement: walden does not support `git push --atomic`.
+//
+// Under --atomic receive-pack applies every ref of a push or none, and the
+// pre-receive hook's input is byte-identical whether the client asked for
+// it or not -- so walden's probe would accept the appliable subset and
+// journal it while git applied nothing. walden drops the "atomic"
+// capability from its advertisement instead
+// (receive.advertiseAtomic=false, inforefs.go), which turns that into a
+// refusal the client's own git makes before sending anything.
+//
+// Asserted behaviourally, like TestReceivePackDenyKnobsPinnedOff above and
+// for the same reason: this looks for the outcome, not for a -c pair in an
+// argv. The second half is what keeps the pin honest -- an ordinary push
+// of the same two refs must still work, so this cannot pass by refusing
+// pushes in general.
+func TestReceivePackAtomicNotAdvertised(t *testing.T) {
+	s := store.New(t.TempDir())
+	barePath := newEmptyBareRepo(t, s, "repo")
+
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
+	defer server.Close()
+	repoURL := authURL(server.URL, tok) + "/repo"
+
+	work, sha := newWorkTreeWithCommit(t)
+
+	atomicPush := exec.Command("git", "push", "--atomic", repoURL, "HEAD:refs/heads/a", "HEAD:refs/heads/b")
+	atomicPush.Dir = work
+	atomicPush.Env = gitClientEnv()
+	out, err := atomicPush.CombinedOutput()
+	if err == nil {
+		t.Fatalf("git push --atomic succeeded, want the client to refuse it:\n%s", out)
+	}
+	if !strings.Contains(string(out), "does not support --atomic push") {
+		t.Errorf("push output does not show the client refusing for lack of the capability:\n%s", out)
+	}
+	for _, ref := range []string{"refs/heads/a", "refs/heads/b"} {
+		if got := revParse(t, barePath, ref); got != "" {
+			t.Errorf("%s = %q after the refused atomic push, want it never created", ref, got)
+		}
+	}
+
+	runGit(t, work, "push", "-q", repoURL, "HEAD:refs/heads/a", "HEAD:refs/heads/b")
+	for _, ref := range []string{"refs/heads/a", "refs/heads/b"} {
+		if got := revParse(t, barePath, ref); got != sha {
+			t.Errorf("%s = %q after an ordinary push of the same two refs, want %q", ref, got, sha)
+		}
 	}
 }

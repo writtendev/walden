@@ -117,9 +117,16 @@ var vouchedScopes = map[string]struct{}{
 }
 
 // maxVouchedKeyReport bounds how much of a key name reaches the refusal.
-// Section and variable names are short and git-defined, but what sits between
-// them is arbitrary text out of the repository's own config file, and the
-// refusal has to stay printable on one line.
+//
+// It bounds the whole rendered key, not one shape of it, because git's config
+// parser bounds none of a key's three components. A section, a subsection and
+// a variable are each as long as the repository's own config file made them,
+// and the refusal has to stay printable on one line. Measured on 2.50.1
+// (Apple Git-155), a repository whose config carried a 4096-byte dot-free
+// section — and separately one whose config carried a 4096-byte variable
+// under a short section — was listed by vouchProbeArgs with that run intact
+// in the key name, so a renderer that bounds only some shapes puts the file's
+// own length on the wire.
 const maxVouchedKeyReport = 120
 
 // redactedSubsection stands in for a subsection name in the refusal a
@@ -287,20 +294,27 @@ func (s *Store) VouchRepoConfig(ctx context.Context, repoPath string) error {
 // variable, and anything between the two is subsection — redacted, for the
 // reason redactedSubsection gives.
 //
-// A key with no subsection is the repository's own name for a git-defined
-// setting and goes out whole, bounded by maxVouchedKeyReport in case some git
-// prints one longer than that. The bound cuts on a rune boundary: slicing
-// bytes would put a partial rune on the wire, which is how an elided key
-// stops being valid UTF-8.
+// The two things this does compose, in this order, rather than sitting on
+// separate paths: redaction first, so a subsection never reaches the wire
+// whole or in part, then maxVouchedKeyReport over whatever redaction left.
+// Both are needed on the same key. Redaction alone leaves the section and
+// variable, which git does not bound either; the bound alone would put a
+// subsection on the wire. A key with no subsection and inside the bound comes
+// back untouched and whole, which is what lets the remedy name an unset
+// command that works.
+//
+// The bound cuts on a rune boundary: slicing bytes would put a partial rune on
+// the wire, which is how an elided key stops being valid UTF-8.
 func reportableKey(key string) (shown string, whole bool) {
+	shown, whole = key, true
 	first := strings.Index(key, ".")
 	if last := strings.LastIndex(key, "."); first >= 0 && first != last {
-		return key[:first+1] + redactedSubsection + key[last:], false
+		shown, whole = key[:first+1]+redactedSubsection+key[last:], false
 	}
-	if len(key) > maxVouchedKeyReport {
-		return truncateAtRune(key, maxVouchedKeyReport) + "...", false
+	if len(shown) > maxVouchedKeyReport {
+		shown, whole = truncateAtRune(shown, maxVouchedKeyReport)+"...", false
 	}
-	return key, true
+	return shown, whole
 }
 
 // truncateAtRune returns the longest prefix of s that is at most max bytes and

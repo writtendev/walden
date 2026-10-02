@@ -482,33 +482,73 @@ func TestFirstUnvouchedKeyFraming(t *testing.T) {
 	}
 }
 
-// TestVouchRepoConfigBoundsTheReportedKey pins that a subsection name out of a
-// repository's own config file cannot grow the one-line refusal without bound.
-// Section and variable names are git's own and short; what sits between them is
-// arbitrary text the repository supplied.
+// TestVouchRepoConfigBoundsTheReportedKey pins that no part of a key name out
+// of a repository's own config file can grow the one-line refusal without
+// bound. git's config parser bounds none of a key's three components, so each
+// of them is as long as the file made it, and each shape has to be pinned —
+// one of them being handled is how the bound came to be skipped on the branch
+// that redacts.
+//
+// Every run below was observed through the real probe on 2.50.1 (Apple
+// Git-155): git listed all four keys with the 4096-byte run intact, and before
+// the bound and the redaction were composed the first of them put a 4273-byte
+// refusal on the wire while the other three stayed at 285 bytes or less.
 //
 // It also pins the remedy: a key the refusal does not report whole cannot be
 // handed to `git config --unset`, so the refusal must not print that command
 // for one.
 func TestVouchRepoConfigBoundsTheReportedKey(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "repo.git")
-	gitInitBare(t, path)
 	long := strings.Repeat("a", 4096)
-	appendToFile(t, filepath.Join(path, "config"), "[walden \""+long+"\"]\n\tkey = x\n")
 
-	err := store.New(filepath.Dir(path)).VouchRepoConfig(context.Background(), path)
-	if err == nil {
-		t.Fatal("VouchRepoConfig accepted a repository carrying an absurdly long key")
-	}
-	msg := err.Error()
-	if len(msg) > 512 {
-		t.Errorf("refusal is %d bytes; the reported key was not bounded", len(msg))
-	}
-	if strings.Contains(msg, "git config --unset") {
-		t.Errorf("refusal prints an unset command for a key it did not report whole: %v", err)
-	}
-	if !strings.Contains(msg, "walden.") {
-		t.Errorf("refusal lost the key's leading section: %v", err)
+	for _, tt := range []struct {
+		name string
+		// config is appended to a freshly initialized bare repository.
+		config string
+		// wantPrefix is what must survive at the front of the reported key:
+		// whatever the operator can still recognize it by.
+		wantPrefix string
+	}{
+		{
+			name:       "a long section carrying a subsection",
+			config:     "[" + long + " \"sub\"]\n\tkey = x\n",
+			wantPrefix: "aaaa",
+		},
+		{
+			name:       "a long section with no subsection",
+			config:     "[" + long + "]\n\tkey = x\n",
+			wantPrefix: "aaaa",
+		},
+		{
+			name:       "a long variable",
+			config:     "[walden]\n\t" + long + " = x\n",
+			wantPrefix: "walden.",
+		},
+		{
+			name:       "a long subsection",
+			config:     "[walden \"" + long + "\"]\n\tkey = x\n",
+			wantPrefix: "walden.",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "repo.git")
+			gitInitBare(t, path)
+			appendToFile(t, filepath.Join(path, "config"), tt.config)
+
+			err := store.New(filepath.Dir(path)).VouchRepoConfig(context.Background(), path)
+			if err == nil {
+				t.Fatal("VouchRepoConfig accepted a repository carrying an absurdly long key")
+			}
+			msg := err.Error()
+			if len(msg) > 512 {
+				t.Errorf("refusal is %d bytes; the reported key was not bounded", len(msg))
+			}
+			if strings.Contains(msg, "git config --unset") {
+				t.Errorf("refusal prints an unset command for a key it did not report whole: %v", err)
+			}
+			if !strings.Contains(msg, tt.wantPrefix) {
+				t.Errorf("refusal lost the front of the key, %q: %v", tt.wantPrefix, err)
+			}
+		})
 	}
 }
 
@@ -607,23 +647,52 @@ func TestVouchRepoConfigQuotesAKeyItReportsWhole(t *testing.T) {
 }
 
 // TestReportableKeyBoundsOnARuneBoundary drives the renderer directly, for the
-// two cases a real git and a real config file make awkward to reach: a key
-// with no subsection long enough to need eliding, and one whose elision would
-// land inside a rune. Slicing bytes there is how an elided key stops being
-// valid UTF-8 on the wire.
+// cases a real git and a real config file make awkward to reach: a key long
+// enough to need eliding whose elision would land inside a rune, with and
+// without a subsection, so the bound is exercised on both the branch that
+// redacts and the branch that does not. Slicing bytes there is how an elided
+// key stops being valid UTF-8 on the wire.
 func TestReportableKeyBoundsOnARuneBoundary(t *testing.T) {
 	const max = store.MaxVouchedKeyReportForTest
 
 	for _, tt := range []struct {
 		name string
 		key  string
+		// wantPrefix is what must survive at the front of the elided key.
+		wantPrefix string
+		// validUTF8 says whether the key's own bytes are valid UTF-8, and so
+		// whether the elided key can be expected to be.
+		validUTF8 bool
 	}{
-		{name: "ascii", key: "walden." + strings.Repeat("a", max)},
-		{name: "multi-byte", key: "walden." + strings.Repeat("é", max)},
+		{name: "ascii", key: "walden." + strings.Repeat("a", max), wantPrefix: "walden.", validUTF8: true},
+		{name: "multi-byte", key: "walden." + strings.Repeat("é", max), wantPrefix: "walden.", validUTF8: true},
 		// A key whose bytes are not valid UTF-8 at all: %q escapes those, so
 		// the refusal stays printable either way, but the bound must not make
 		// it worse.
-		{name: "invalid utf-8", key: "walden." + strings.Repeat("\x80", max)},
+		{name: "invalid utf-8", key: "walden." + strings.Repeat("\x80", max), wantPrefix: "walden.", validUTF8: false},
+		// The same three again with a subsection, so the bound is driven on
+		// the branch that redacts as well. Here it is the *section* carrying
+		// the awkward bytes, which no real git would print — a section name
+		// takes only alphanumerics, `-` and `.` — but which is the shape that
+		// reaches truncateAtRune once redaction has run first.
+		{
+			name:       "multi-byte before a subsection",
+			key:        strings.Repeat("é", max) + ".sub.key",
+			wantPrefix: "éé",
+			validUTF8:  true,
+		},
+		{
+			name:       "invalid utf-8 before a subsection",
+			key:        strings.Repeat("\x80", max) + ".sub.key",
+			wantPrefix: "\x80\x80",
+			validUTF8:  false,
+		},
+		{
+			name:       "ascii before a subsection",
+			key:        strings.Repeat("a", max) + ".sub.key",
+			wantPrefix: "aa",
+			validUTF8:  true,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			shown, whole := store.ReportableKeyForTest(tt.key)
@@ -634,11 +703,14 @@ func TestReportableKeyBoundsOnARuneBoundary(t *testing.T) {
 				t.Errorf("shown key is %d bytes, want at most %d", len(shown), max+len("..."))
 			}
 			trimmed := strings.TrimSuffix(shown, "...")
-			if tt.name != "invalid utf-8" && !utf8.ValidString(trimmed) {
+			if tt.validUTF8 && !utf8.ValidString(trimmed) {
 				t.Errorf("elided key is not valid UTF-8: %q", trimmed)
 			}
-			if !strings.HasPrefix(shown, "walden.") {
-				t.Errorf("elided key lost its section: %q", shown)
+			if !strings.HasPrefix(shown, tt.wantPrefix) {
+				t.Errorf("elided key lost its front, %q: %q", tt.wantPrefix, shown)
+			}
+			if strings.Contains(shown, "sub") {
+				t.Errorf("elided key carries the subsection: %q", shown)
 			}
 		})
 	}

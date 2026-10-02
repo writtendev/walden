@@ -207,7 +207,11 @@ func (f *flushingWriter) Write(p []byte) (int, error) {
 // set, the child sees none of it. It says nothing about what a
 // repository's own local config can do, which a pin on two other scopes
 // cannot reach: store.VouchRepoConfig is what covers that, and
-// resolveRepoDir below calls it before any path reaches this function.
+// resolveRepoDir below and ensureRepoForPush (create.go) call it between
+// them before any path reaches a git child given this environment —
+// resolveRepoDir for info/refs and the upload-pack POST,
+// ensureRepoForPush for the receive-pack POST, which is the one route
+// resolveRepoDir does not carry.
 // The spelling is byte-identical to the one
 // internal/store/repo.go already uses on CreateRepo's git init and on its
 // own hook-path and git-dir probes, so the whole codebase is greppable

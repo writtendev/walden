@@ -288,7 +288,7 @@ func seedLargeBlob(t *testing.T, s *store.Store, repo string, size int) {
 	if err != nil {
 		t.Fatalf("RepoPath(%q): %v", repo, err)
 	}
-	runGit(t, t.TempDir(), "clone", "-q", "--bare", work, barePath)
+	initBareAndPush(t, work, barePath)
 }
 
 // captureRawUploadPackRequest runs a real `git clone` against a recording

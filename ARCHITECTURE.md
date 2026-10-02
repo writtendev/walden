@@ -288,6 +288,7 @@ By construction there are few, and each is legible:
 | crash mid-push                               | refs never moved; journal may hold an unreferenced pack                          | harmless; compaction tidies                   |
 | journal-less mode                            | durability = the disk, as warned                                                 | enable `WALDEN_JOURNAL`                       |
 | bucket lacks compare-and-swap                | walden refuses to boot, one line                                                 | choose a provider per spec §11.2              |
+| repository on disk whose config walden did not write | nothing is served from it, on any route: walden asks git for the repository's own config key names before handing the directory to a git child, and refuses in one line naming the first key outside the set `git init --bare` writes — a config file travels with a repository, and some keys name a command for git to run, so serving such a repository is what runs it. This refuses a `git clone --mirror` output and an out-of-band backup, which legitimately carry `remote.*`, `gc.*` and `core.logallrefupdates`; the rule is an allowlist rather than a list of dangerous keys precisely so it fails that way round rather than silently admitting the key that matters | `git config --unset` the key the refusal names, or materialize the repository from the journal, which is walden's own restore path and produces repositories walden created |
 | repository on disk without walden's hook     | the next push repairs the symlink at `hooks/pre-receive` and logs it if it displaced another target; anything else there — a regular file, a directory — is left untouched and that push refuses in one line, as does a repair that cannot be written, a repository that `core.hooksPath` redirects in any scope, a repository whose git directory is not the path walden serves — a non-bare or gitfile-backed repository placed in the data directory, whose hooks git takes from `<repo>/.git/hooks/` with no `core.hooksPath` involved — and a repository whose hook path git will not report at all; each of those refusals names its own cause — reads keep serving either way | move the foreign hook aside, make `hooks/` writable, unset `core.hooksPath`, or replace a non-bare repository with a bare one; the next push installs walden's |
 
 Losing an acknowledged push does not appear in this table. That is the
@@ -325,7 +326,24 @@ Every git child walden execs to serve a request or touch a repository —
 system and global git config pinned off
 (`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_GLOBAL=/dev/null`), so its behavior comes
 from the pinned invocation and the repository's own config only, never from
-`/etc/gitconfig` or the server user's `~/.gitconfig`. The one exception is the
-boot-time `git version` probe: it asks git about itself rather than about a
-repository, runs once before walden serves anything, and any failure is a
-loud, one-line boot refusal rather than silent wrong behavior.
+`/etc/gitconfig` or the server user's `~/.gitconfig`. `git init` additionally
+names an explicitly empty `--template=`, so the template directory compiled
+into the host's git contributes nothing to the config of a repository walden
+creates — the same host-independence, one scope further down. The one
+exception is the boot-time `git version` probe: it asks git about itself
+rather than about a repository, runs once before walden serves anything, and
+any failure is a loud, one-line boot refusal rather than silent wrong
+behavior.
+
+That pin says nothing about what a repository's *own* config can do: a
+repository-scope key is honoured whatever the system and global scopes say,
+and a `config` file travels with a repository directory that reached the data
+volume by a route walden had no part in. So the repository scope is not
+trusted either. Before a resolved path becomes an argument to a git child —
+on every route, after authorization — walden asks git for that repository's
+config key names and refuses to serve one carrying any key it did not itself
+write, as the failure table above records. The question goes to git rather
+than to a config parser of walden's own, because include directives,
+`config.worktree` and case folding are git's to resolve; and it asks for
+names only, so a repository's config *values* are never read, parsed or
+logged.

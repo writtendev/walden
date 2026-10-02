@@ -373,9 +373,13 @@ func TestCreateRepoMakesHooksDirWithoutRelyingOnGit(t *testing.T) {
 	// template ships no hooks/: a minimal bare layout, deliberately missing
 	// hooks/, exactly what git init itself would leave with an empty or
 	// absent template directory.
+	// The destination is read as the last argument rather than a fixed
+	// position, so adding a flag to the real invocation's argv (as
+	// --template= was) cannot silently turn this into a test of mkdir's
+	// error messages.
 	script := `#!/bin/sh
 set -e
-dir="$4"
+for dir; do :; done
 mkdir -p "$dir/objects" "$dir/refs/heads" "$dir/refs/tags"
 echo "ref: refs/heads/main" > "$dir/HEAD"
 cat > "$dir/config" <<'EOF'

@@ -11,10 +11,10 @@ import (
 	"github.com/writtendev/walden/internal/store"
 )
 
-// repoExistenceRoute describes one of the three git-HTTP entry points that
+// repoExistenceRoute describes one of the four git-HTTP entry points that
 // resolve a repository's existence, for this file's cross-product tables:
-// every state is driven through all three routes with the same loop rather
-// than three copied cases, so a fourth entry point cannot drift in later
+// every state is driven through all four routes with the same loop rather
+// than four copied cases, so a fifth entry point cannot drift in later
 // without this file growing to cover it.
 type repoExistenceRoute struct {
 	name        string
@@ -29,6 +29,18 @@ var repoExistenceRoutes = []repoExistenceRoute{
 		name:   "info/refs",
 		method: http.MethodGet,
 		path:   "/info/refs?service=git-upload-pack",
+	},
+	{
+		// The ref advertisement for the other service, which this table was
+		// missing. It is a distinct entry point, not a spelling of the one
+		// above: inforefs.go authorizes it as auth.ActionWrite and execs a
+		// different git subcommand, so it is a different pairing of
+		// authorization and child process, and every cross-product test in
+		// this file was blind to it. WALD-131 is the ticket that found that
+		// out the hard way.
+		name:   "info/refs (receive-pack)",
+		method: http.MethodGet,
+		path:   "/info/refs?service=git-receive-pack",
 	},
 	{
 		name:        "upload-pack",
@@ -180,9 +192,10 @@ func TestRepoExistenceEscapingSymlinkKnownDisagreement(t *testing.T) {
 	h, tok := newTestHandler(t, s, "")
 
 	wantStatus := map[string]int{
-		"info/refs":    http.StatusBadRequest,
-		"upload-pack":  http.StatusBadRequest,
-		"receive-pack": http.StatusInternalServerError,
+		"info/refs":                http.StatusBadRequest,
+		"info/refs (receive-pack)": http.StatusBadRequest,
+		"upload-pack":              http.StatusBadRequest,
+		"receive-pack":             http.StatusInternalServerError,
 	}
 
 	for _, route := range repoExistenceRoutes {

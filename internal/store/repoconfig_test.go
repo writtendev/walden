@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/writtendev/walden/internal/store"
 )
@@ -82,6 +83,30 @@ func probeKeys(t *testing.T, repoPath string) [][2]string {
 // flags walden does not pass. Requiring equality would make the test fail on
 // whichever platform it was not written on, which is the failure mode that
 // gets a test deleted rather than fixed.
+//
+// The reach of that, stated here rather than left to be discovered: it inits
+// into t.TempDir(), so the filesystem it measures is whichever one TMPDIR
+// names, and three of the allowlist's keys are written by `git init` on the
+// strength of what the git directory's filesystem supports — core.ignorecase,
+// core.precomposeunicode and core.symlinks. That makes this test sensitive to
+// host drift as well as version drift, but only along the axis the host it
+// runs on happens to exercise: a Mac shows two of those three, a Linux CI
+// runner shows none.
+//
+// core.symlinks is the one worth being explicit about, because it is the one
+// no machine in regular use here exercises. Pointed at a volume with no real
+// symlink support, this test does see it: measured on git 2.49.1 with TMPDIR
+// on such a volume, where `git init --bare --template=` wrote
+// repositoryformatversion, filemode, symlinks and ignorecase under [core],
+// all at scope local — and with core.symlinks taken back out of the
+// allowlist, this test failed there with "git init --bare wrote core.symlinks
+// at scope local, which is not in initBareConfigKeys". So the gap is the
+// hosts available, not the test: CI runners and dev machines give t.TempDir()
+// a filesystem with symlinks, and arranging one without needs privileges a
+// test process does not have (the portable stand-ins do not work either —
+// macOS msdosfs emulates symlink(2), so even a FAT image inits clean there).
+// TestVouchRepoConfigAcceptsConditionalInitKeys is what holds that key on
+// every host.
 func TestInitBareKeysAreAllowlisted(t *testing.T) {
 	allowed := store.InitBareConfigKeysForTest()
 	scopes := store.VouchedScopesForTest()
@@ -150,6 +175,78 @@ func TestVouchRepoConfigAcceptsWhatCreateRepoWrote(t *testing.T) {
 	}
 	if err := s.VouchRepoConfig(context.Background(), path); err != nil {
 		t.Fatalf("VouchRepoConfig on a repository walden just created: %v", err)
+	}
+}
+
+// conditionalInitKeys are the allowlist entries `git init --bare` writes on
+// the strength of what the git directory's filesystem supports, rather than on
+// every host.
+var conditionalInitKeys = []struct{ key, value string }{
+	{"core.ignorecase", "true"},
+	{"core.precomposeunicode", "true"},
+	{"core.symlinks", "false"},
+}
+
+// TestVouchRepoConfigAcceptsConditionalInitKeys asserts that a bare
+// repository carrying each of those keys is one walden serves.
+//
+// It exists because TestInitBareKeysAreAllowlisted only observes whichever of
+// them the filesystem under t.TempDir() provokes, and no host in regular use
+// here provokes all three — see that test's own comment for what was measured
+// where. A key in the allowlist that the suite never observes on any machine
+// anyone runs it on is a key nothing is protecting. core.symlinks is that
+// key: `git init --bare` writes it whenever the git directory's filesystem
+// has no real symlink support (measured on git 2.47.2, the image's pin, and
+// on 2.49.1), which is a condition a data volume can have and a CI runner
+// does not.
+//
+// What this test substitutes for such a volume is git's own config writer.
+// `git config core.symlinks false` is the same git_config_set call `git init`
+// makes from create_default_files, against the same file, so the repository
+// here is the repository that init produces on one — the trigger is
+// simulated, the resulting config is not.
+//
+// Say plainly what that leaves uncovered: this pins the keys by name, so it
+// catches an allowlist entry being removed and not a future git writing a
+// differently named key under the same conditions. The second axis is
+// TestInitBareKeysAreAllowlisted's, and it reaches core.symlinks only on a
+// host whose TMPDIR has no symlinks.
+func TestVouchRepoConfigAcceptsConditionalInitKeys(t *testing.T) {
+	for _, tt := range conditionalInitKeys {
+		t.Run(tt.key, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "repo.git")
+			gitInitBare(t, path)
+			gitConfigSet(t, path, tt.key, tt.value)
+
+			// The key must actually be in the config this git reports, or
+			// the test would pass without having placed anything.
+			found := false
+			for _, pair := range probeKeys(t, path) {
+				if pair[1] == tt.key {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("git did not report %s after setting it (%s)", tt.key, gitVersionForTest(t))
+			}
+
+			if err := store.New(filepath.Dir(path)).VouchRepoConfig(context.Background(), path); err != nil {
+				t.Errorf("VouchRepoConfig refused a repository carrying %s, which `git init --bare` writes "+
+					"on a filesystem without the support it probes for — walden would refuse a repository "+
+					"it created itself: %v", tt.key, err)
+			}
+		})
+	}
+}
+
+// gitConfigSet writes one key into a repository's own config through git, so
+// the file ends up as git would have written it rather than as a test guessed.
+func gitConfigSet(t *testing.T, repoPath, key, value string) {
+	t.Helper()
+	cmd := exec.Command("git", "-C", repoPath, "config", key, value)
+	cmd.Env = gitProbeEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git -C %s config %s %s: %v: %s", repoPath, key, value, err, out)
 	}
 }
 
@@ -390,8 +487,9 @@ func TestFirstUnvouchedKeyFraming(t *testing.T) {
 // Section and variable names are git's own and short; what sits between them is
 // arbitrary text the repository supplied.
 //
-// It also pins the remedy: an elided key cannot be handed to `git config
-// --unset`, so the refusal that elides one must not print that command.
+// It also pins the remedy: a key the refusal does not report whole cannot be
+// handed to `git config --unset`, so the refusal must not print that command
+// for one.
 func TestVouchRepoConfigBoundsTheReportedKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "repo.git")
 	gitInitBare(t, path)
@@ -407,10 +505,148 @@ func TestVouchRepoConfigBoundsTheReportedKey(t *testing.T) {
 		t.Errorf("refusal is %d bytes; the reported key was not bounded", len(msg))
 	}
 	if strings.Contains(msg, "git config --unset") {
-		t.Errorf("refusal prints an unset command for an elided key, which would not work: %v", err)
+		t.Errorf("refusal prints an unset command for a key it did not report whole: %v", err)
 	}
 	if !strings.Contains(msg, "walden.") {
 		t.Errorf("refusal lost the key's leading section: %v", err)
+	}
+}
+
+// TestVouchRepoConfigRefusalWithholdsTheSubsection drives the two things a
+// repository's own config can put in a key *name* through the real probe: a
+// subsection that is a secret, and a subsection that is not printable text.
+//
+// A subsection is arbitrary bytes git preserves verbatim, and the refusal body
+// goes to whoever made the request — any holder of a token for the repository,
+// on routes that need only `r`. So the wire gets the section and the variable,
+// with the subsection redacted and the whole thing quoted; store's own log
+// line, which this test cannot see, carries the key whole for the operator.
+func TestVouchRepoConfigRefusalWithholdsTheSubsection(t *testing.T) {
+	tests := []struct {
+		name    string
+		section string
+		// withheld is the subsection text, which must not reach the refusal.
+		withheld string
+		variable string
+		// wantShape is what the refusal says instead.
+		wantShape string
+	}{
+		{
+			name:      "a subsection carrying a credential",
+			section:   "walden",
+			withheld:  "https://user:s3cr3t-tokenvalue@example.invalid/",
+			variable:  "key",
+			wantShape: `walden.<redacted>.key`,
+		},
+		{
+			name:      "a subsection carrying a control byte",
+			section:   "walden",
+			withheld:  "a\x1b[31mred",
+			variable:  "key",
+			wantShape: `walden.<redacted>.key`,
+		},
+		{
+			name:      "a subsection carrying multi-byte runes",
+			section:   "walden",
+			withheld:  strings.Repeat("é", 300),
+			variable:  "key",
+			wantShape: `walden.<redacted>.key`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "repo.git")
+			gitInitBare(t, path)
+			appendToFile(t, filepath.Join(path, "config"),
+				"["+tt.section+" \""+tt.withheld+"\"]\n\t"+tt.variable+" = x\n")
+
+			err := store.New(filepath.Dir(path)).VouchRepoConfig(context.Background(), path)
+			if err == nil {
+				t.Fatal("VouchRepoConfig accepted a repository whose config sets an unvouched key")
+			}
+			msg := err.Error()
+			if strings.Contains(msg, tt.withheld) {
+				t.Errorf("refusal carries the subsection onto the wire: %q", msg)
+			}
+			if !strings.Contains(msg, tt.wantShape) {
+				t.Errorf("refusal does not report the key as %s: %q", tt.wantShape, msg)
+			}
+			if strings.Contains(msg, "git config --unset") {
+				t.Errorf("refusal prints an unset command for a redacted key, which would not work: %q", msg)
+			}
+			if !utf8.ValidString(msg) {
+				t.Errorf("refusal is not valid UTF-8: %q", msg)
+			}
+			if strings.ContainsAny(msg, "\n\x1b") {
+				t.Errorf("refusal carries a newline or an escape byte: %q", msg)
+			}
+		})
+	}
+}
+
+// TestVouchRepoConfigQuotesAKeyItReportsWhole pins the other half: a key with
+// no subsection is the repository's own name for a git-defined setting, so it
+// goes out whole — quoted, and with an unset command that works.
+func TestVouchRepoConfigQuotesAKeyItReportsWhole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repo.git")
+	gitInitBare(t, path)
+	appendToFile(t, filepath.Join(path, "config"), "[walden]\n\tunvouchedTestKey = x\n")
+
+	err := store.New(filepath.Dir(path)).VouchRepoConfig(context.Background(), path)
+	if err == nil {
+		t.Fatal("VouchRepoConfig accepted a repository whose config sets an unvouched key")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `"`+unvouchedTestKey+`"`) {
+		t.Errorf("refusal does not report the key quoted: %q", msg)
+	}
+	if !strings.Contains(msg, `git config --unset "`+unvouchedTestKey+`"`) {
+		t.Errorf("refusal does not offer a quoted, copy-pasteable unset command: %q", msg)
+	}
+}
+
+// TestReportableKeyBoundsOnARuneBoundary drives the renderer directly, for the
+// two cases a real git and a real config file make awkward to reach: a key
+// with no subsection long enough to need eliding, and one whose elision would
+// land inside a rune. Slicing bytes there is how an elided key stops being
+// valid UTF-8 on the wire.
+func TestReportableKeyBoundsOnARuneBoundary(t *testing.T) {
+	const max = store.MaxVouchedKeyReportForTest
+
+	for _, tt := range []struct {
+		name string
+		key  string
+	}{
+		{name: "ascii", key: "walden." + strings.Repeat("a", max)},
+		{name: "multi-byte", key: "walden." + strings.Repeat("é", max)},
+		// A key whose bytes are not valid UTF-8 at all: %q escapes those, so
+		// the refusal stays printable either way, but the bound must not make
+		// it worse.
+		{name: "invalid utf-8", key: "walden." + strings.Repeat("\x80", max)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			shown, whole := store.ReportableKeyForTest(tt.key)
+			if whole {
+				t.Fatalf("reportableKey reported a %d-byte key whole", len(tt.key))
+			}
+			if len(shown) > max+len("...") {
+				t.Errorf("shown key is %d bytes, want at most %d", len(shown), max+len("..."))
+			}
+			trimmed := strings.TrimSuffix(shown, "...")
+			if tt.name != "invalid utf-8" && !utf8.ValidString(trimmed) {
+				t.Errorf("elided key is not valid UTF-8: %q", trimmed)
+			}
+			if !strings.HasPrefix(shown, "walden.") {
+				t.Errorf("elided key lost its section: %q", shown)
+			}
+		})
+	}
+
+	// A key with no subsection and inside the bound is reported whole, which
+	// is what lets the remedy name an unset command.
+	if shown, whole := store.ReportableKeyForTest("walden.short"); !whole || shown != "walden.short" {
+		t.Errorf("reportableKey(%q) = %q, %v; want the key whole", "walden.short", shown, whole)
 	}
 }
 

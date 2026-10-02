@@ -84,7 +84,8 @@ func newBareRepoWithCommit(t *testing.T, s *store.Store, repo string) string {
 //
 // The distinction is not cosmetic, and it is the reason this helper exists
 // instead of the one-liner it replaced. A bare clone writes remote.origin.url
-// and remote.origin.fetch into the repository it creates, and walden refuses
+// into the repository it creates — a remote-tracking refspec is what --mirror
+// adds and --bare deliberately sets up none of — and walden refuses
 // to serve a repository carrying repository-scope config it did not write —
 // so a clone-seeded fixture tests a repository shape walden deliberately does
 // not serve. init-and-push produces the shape walden itself produces, which

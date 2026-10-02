@@ -98,6 +98,28 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 		return "", err
 	}
 
+	// The repository's own config is vouched for first, on the path the re-resolve above
+	// just returned. This is the one route resolveRepoDir does not cover: the receive-pack
+	// POST comes through here instead. walden will not hand a git child a repository
+	// carrying a repository-scope config key it did not write.
+	//
+	// It sits here rather than in store.ResolveRepo for the reason the EnsureHook block
+	// below gives about itself — ResolveRepo is called before Authorize, and a check there
+	// would exec git for an unauthenticated caller — but it is not the same check and does
+	// not refuse the same repositories. A repository without walden's hook still serves
+	// reads; a repository whose config names a command for git to run does not, because
+	// serving it is what runs the command. resolveRepoDir carries that half.
+	//
+	// Before EnsureHook rather than after it, and the order is deliberate. EnsureHook
+	// execs git against this directory and may write a symlink into it, and neither
+	// belongs to a repository walden has already decided it will not serve. Asking the
+	// narrower question first also means the operator of a repository that is both
+	// unvouched and redirected hears about the config, which is the condition that has to
+	// be fixed before the hook refusal could even be reached.
+	if err := h.store.VouchRepoConfig(ctx, path); err != nil {
+		return "", err
+	}
+
 	// The hook is verified here — on the path the re-resolve above just returned, which is
 	// the directory `git receive-pack` is about to be pointed at, including one swapped in
 	// during the Authorize window — and nowhere else. Not inside store.ResolveRepo: all
@@ -113,31 +135,6 @@ func (h *Handler) ensureRepoForPush(ctx context.Context, token, repo string) (st
 	// It gets the request's context: establishing which hook git will run is itself an
 	// exec, and a data directory that has stopped answering must not park this goroutine
 	// past the client's disconnect.
-	// The repository's own config is vouched for first, on that same
-	// re-resolved path. This is the one route resolveRepoDir does not cover:
-	// the receive-pack POST comes through here instead. walden will not hand
-	// a git child a repository carrying a repository-scope config key it did
-	// not write.
-	//
-	// It sits here rather than in store.ResolveRepo for the reason given
-	// above about the hook — ResolveRepo is called before Authorize, and a
-	// check there would exec git for an unauthenticated caller — but it is
-	// not the same check and does not refuse the same repositories. A
-	// repository without walden's hook still serves reads; a repository whose
-	// config names a command for git to run does not, because serving it is
-	// what runs the command. resolveRepoDir carries that half.
-	//
-	// Before EnsureHook rather than after it, and the order is deliberate.
-	// EnsureHook execs git against this directory and may write a symlink
-	// into it, and neither belongs to a repository walden has already decided
-	// it will not serve. Asking the narrower question first also means the
-	// operator of a repository that is both unvouched and redirected hears
-	// about the config, which is the condition that has to be fixed before
-	// the hook refusal could even be reached.
-	if err := h.store.VouchRepoConfig(ctx, path); err != nil {
-		return "", err
-	}
-
 	if err := h.store.EnsureHook(ctx, path); err != nil {
 		return "", err
 	}

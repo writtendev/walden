@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/writtendev/walden/internal/refusal"
 )
@@ -31,23 +32,49 @@ import (
 //
 //   - core.repositoryformatversion, core.filemode and core.bare on all three.
 //   - core.ignorecase and core.precomposeunicode additionally on macOS.
+//   - core.symlinks when the git directory's own filesystem has no real
+//     symlink support. Measured on 2.47.2 against a FAT32 volume, where the
+//     same `git init --bare --template=` wrote repositoryformatversion,
+//     filemode, symlinks and ignorecase under [core], all at scope local.
+//     git writes it from create_default_files, in the block that probes the
+//     git directory for symlink support — which sits outside the
+//     is_bare_repository() branch that gates core.logallrefupdates, so a
+//     bare init reaches it like any other. It is the third of three
+//     filesystem-conditional keys here, alongside core.ignorecase and
+//     core.precomposeunicode, and it is as plainly inert as those two.
 //   - extensions.objectformat and extensions.refstorage on all three, from
 //     `--object-format=sha256` and `--ref-format=reftable` respectively.
 //     walden passes neither flag, so these appear only if a future git
 //     changes which format `git init` defaults to. They are admitted ahead
 //     of that so the upgrade does not make walden refuse every repository it
-//     created itself; TestInitBareKeysAreAllowlisted is what notices if the
-//     relationship ever stops holding.
+//     created itself.
+//
+// TestInitBareKeysAreAllowlisted is what notices if the relationship stops
+// holding, and what it covers is narrower than it looks: it runs a real `git
+// init --bare` on the filesystem the test host gives it, so it catches
+// version drift and only such host drift as that filesystem exhibits. No
+// single host shows all three filesystem-conditional keys — a Linux CI
+// runner shows none of them, a Mac shows two, and a volume without symlink
+// support shows core.symlinks, which that test does observe when pointed at
+// one but no machine in regular use here can arrange.
+// TestVouchRepoConfigAcceptsConditionalInitKeys holds that key on every host
+// instead; both tests state in their own words what they do and do not see.
 //
 // Keys that `git init --bare` does not write are deliberately absent, even
 // where they are plainly inert. core.logallrefupdates is the instructive one:
 // a non-bare `git init` writes it (verified on all three), a bare one never
-// does, so it is not walden's to vouch for. The same goes for the remote.*,
-// gc.* and pack.* keys an ordinary `git clone --mirror` leaves behind. This
-// is the accepted cost of the allowlist, not an oversight: a repository that
-// reached the data directory by mirror or by out-of-band backup is refused
-// until the key is unset. walden's own restore path is materialization from
-// the journal, which produces repositories walden created.
+// does, so it is not walden's to vouch for. A `git clone --bare` or `git
+// clone --mirror` output is outside the allowlist for the same reason, on the
+// remote.origin.* keys clone writes: measured on 2.47.2, a bare clone adds
+// remote.origin.url and a mirror adds remote.origin.url, remote.origin.fetch
+// and remote.origin.mirror (2.50.1 adds remote.origin.tagopt to the mirror as
+// well), and neither adds anything beyond those — in particular not
+// core.logallrefupdates, which a clone can only get from the non-bare branch
+// above, and a mirror or bare clone is bare. This is the accepted cost of the
+// allowlist, not an oversight: a repository that reached the data directory by
+// mirror or by out-of-band backup is refused until the key is unset. walden's
+// own restore path is materialization from the journal, which produces
+// repositories walden created.
 //
 // It is a compiled-in constant and must stay one. Making it configurable
 // would be a sixth knob, and a knob whose setting is "serve this repository
@@ -58,6 +85,7 @@ var initBareConfigKeys = map[string]struct{}{
 	"core.bare":                    {},
 	"core.ignorecase":              {},
 	"core.precomposeunicode":       {},
+	"core.symlinks":                {},
 	"extensions.objectformat":      {},
 	"extensions.refstorage":        {},
 }
@@ -89,10 +117,33 @@ var vouchedScopes = map[string]struct{}{
 }
 
 // maxVouchedKeyReport bounds how much of a key name reaches the refusal.
-// Section and variable names are short and git-defined, but a subsection name
-// between the two is arbitrary text out of the repository's own config file,
-// and the refusal has to stay printable on one line.
+// Section and variable names are short and git-defined, but what sits between
+// them is arbitrary text out of the repository's own config file, and the
+// refusal has to stay printable on one line.
 const maxVouchedKeyReport = 120
+
+// redactedSubsection stands in for a subsection name in the refusal a
+// requester receives.
+//
+// A key's section and variable are git's own vocabulary; a subsection between
+// them is arbitrary text the repository supplied, and in the keys most likely
+// to travel with a repository that came from somewhere else it is a URL —
+// which is how a credential ends up in a key *name*. `--name-only` withholds
+// every config value, but it cannot withhold that, and the refusal body goes
+// to whoever made the request: any holder of a valid token for the
+// repository, over routes that need only `r`. <repo>/config is not otherwise
+// readable over the git protocol, so putting a subsection on the wire would
+// be a disclosure walden does not currently make.
+//
+// So the wire gets the section.variable shape and the operator log gets the
+// key whole. That is the same split this file already applies to the
+// repository path and to git's stderr, and the same rule the contributor
+// guidance states for a journal URL and for any hash-shaped field that might
+// be a live credential. The refusal still tells an operator which key is at
+// issue to within its section and variable, which is what done-when #5 asks
+// of it; `git config --list --show-scope` on the box holding the repository
+// gives them the subsection, and that is a place the secret already is.
+const redactedSubsection = "<redacted>"
 
 // vouchProbeArgs are the arguments of the one question this check asks git,
 // in the one place that spells them, so the probe the tests measure is the
@@ -194,31 +245,74 @@ func (s *Store) VouchRepoConfig(ctx context.Context, repoPath string) error {
 	}
 
 	// The operator log carries the path, because the operator has to find the
-	// repository; the refusal itself carries only the key, which is the
-	// repository's own rather than anything about the server, and is the one
-	// thing the remedy needs. The value is in neither: --name-only never read
-	// it.
+	// repository, and the key whole, because that is where the remedy is
+	// spelled out in full. The value is in neither: --name-only never read it.
+	// This line is written on every branch that refuses, so whatever the wire
+	// withholds, the operator has it.
 	log.Printf("store: %s: repository config sets %q, which walden did not write", repoPath, key)
 
-	// The remedy names the key to unset only while the key is reported whole.
-	// A subsection name is arbitrary text out of the repository's own config
-	// file, so an absurdly long one is elided to keep the refusal on one line
-	// — and a `git config --unset` of an elided key would be a command that
-	// does not work, so that case gets the remedy that does.
-	if len(key) > maxVouchedKeyReport {
+	// The remedy names the key to unset only while the key reaches the wire
+	// whole — a `git config --unset` of a redacted or elided key would be a
+	// command that does not work, so those cases get the remedy that does.
+	// Both forms report the key through %q: a key name carries arbitrary
+	// bytes out of the repository's own config file, and this refusal is
+	// rendered on an operator's terminal and in an HTTP response body.
+	// Quoting is what keeps a control byte in it from being acted on there,
+	// and it makes the unset command copy-pasteable for a key that needs it.
+	shown, whole := reportableKey(key)
+	if !whole {
 		return refusal.RefuseWithCause(
 			"repository config unvouched",
-			fmt.Sprintf("this repository's config sets %s..., which walden did not write", key[:maxVouchedKeyReport]),
+			fmt.Sprintf("this repository's config sets %q, which walden did not write", shown),
 			"unset that key in the repository, or serve a repository walden created",
 			ErrRepoConfigUnvouched,
 		)
 	}
 	return refusal.RefuseWithCause(
 		"repository config unvouched",
-		fmt.Sprintf("this repository's config sets %s, which walden did not write", key),
-		fmt.Sprintf("unset it in the repository — git config --unset %s — or serve a repository walden created", key),
+		fmt.Sprintf("this repository's config sets %q, which walden did not write", shown),
+		fmt.Sprintf("unset it in the repository — git config --unset %q — or serve a repository walden created", shown),
 		ErrRepoConfigUnvouched,
 	)
+}
+
+// reportableKey renders key for the refusal a requester receives, and reports
+// whether what it returns is the whole key — which is what decides whether the
+// remedy can name a `git config --unset` that would work.
+//
+// git prints a key canonically as section.variable or
+// section.subsection.variable. Section and variable names carry no dots and
+// are lowercased by git; a subsection is arbitrary text and may contain any
+// number of them. So the first dot ends the section, the last begins the
+// variable, and anything between the two is subsection — redacted, for the
+// reason redactedSubsection gives.
+//
+// A key with no subsection is the repository's own name for a git-defined
+// setting and goes out whole, bounded by maxVouchedKeyReport in case some git
+// prints one longer than that. The bound cuts on a rune boundary: slicing
+// bytes would put a partial rune on the wire, which is how an elided key
+// stops being valid UTF-8.
+func reportableKey(key string) (shown string, whole bool) {
+	first := strings.Index(key, ".")
+	if last := strings.LastIndex(key, "."); first >= 0 && first != last {
+		return key[:first+1] + redactedSubsection + key[last:], false
+	}
+	if len(key) > maxVouchedKeyReport {
+		return truncateAtRune(key, maxVouchedKeyReport) + "...", false
+	}
+	return key, true
+}
+
+// truncateAtRune returns the longest prefix of s that is at most max bytes and
+// does not end inside a rune.
+func truncateAtRune(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 // unvouchedProbeRefusal is the refusal for a probe that could not answer, as

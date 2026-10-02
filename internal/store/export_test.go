@@ -48,6 +48,20 @@ func VouchProbeArgsForTest() []string {
 	return append([]string(nil), vouchProbeArgs...)
 }
 
+// ReportableKeyForTest exposes reportableKey, so the two things it does to a
+// key on its way to the wire — redacting a subsection, and bounding what is
+// left without cutting a rune in half — can be driven against key names
+// directly. Both are about bytes a repository's config file supplied, and
+// some of those bytes are awkward to get through a real git and a real
+// config file in a test.
+func ReportableKeyForTest(key string) (string, bool) {
+	return reportableKey(key)
+}
+
+// MaxVouchedKeyReportForTest exposes the bound, so a test states the length it
+// is about once.
+const MaxVouchedKeyReportForTest = maxVouchedKeyReport
+
 // FirstUnvouchedKeyForTest exposes firstUnvouchedKey, so its framing
 // assumptions can be driven directly against bytes a git version might
 // produce rather than only through an exec.

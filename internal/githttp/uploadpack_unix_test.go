@@ -49,10 +49,7 @@ func TestUploadPackAbortKillsChild(t *testing.T) {
 	// ever reading its stdin. `sleep` is invoked as a short-lived child
 	// process each iteration, not the script's own process, so the pid
 	// recorded here stays valid until this process is killed.
-	script := fmt.Sprintf("#!/bin/sh\necho $$ > %s\nwhile :; do\n  printf 'x'\n  sleep 0.2\ndone\n", pidFile)
-	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake git script: %v", err)
-	}
+	writeStandInGit(t, binDir, fmt.Sprintf("echo $$ > %s\nwhile :; do\n  printf 'x'\n  sleep 0.2\ndone\n", pidFile))
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	s := store.New(t.TempDir())

@@ -205,8 +205,14 @@ func (f *flushingWriter) Write(p []byte) (int, error) {
 // The pin exists so walden's behavior does not depend on the machine it
 // runs on: whatever the host's system or global git config happens to
 // set, the child sees none of it. It says nothing about what a
-// repository's own local config can do — that threat model is tracked
-// separately, in WALD-131. The spelling is byte-identical to the one
+// repository's own local config can do, which a pin on two other scopes
+// cannot reach: store.VouchRepoConfig is what covers that, and
+// resolveRepoDir below and ensureRepoForPush (create.go) call it between
+// them before any path reaches a git child given this environment —
+// resolveRepoDir for info/refs and the upload-pack POST,
+// ensureRepoForPush for the receive-pack POST, which is the one route
+// resolveRepoDir does not carry.
+// The spelling is byte-identical to the one
 // internal/store/repo.go already uses on CreateRepo's git init and on its
 // own hook-path and git-dir probes, so the whole codebase is greppable
 // for one string.
@@ -229,8 +235,9 @@ func gitEnv(wantV2 bool) []string {
 // is the only place an operator can tell which endpoint produced a given
 // 500. On success it returns the path and true. On failure it writes a
 // one-line refusal to w — mapping store.ErrStoreUnavailable to 500, every
-// other RepoPath refusal to 400, and a missing repository to 404 — and
-// returns false, telling the caller to stop.
+// other RepoPath refusal to 400, a missing repository to 404, and a
+// repository walden will not vouch for to 500 — and returns false, telling
+// the caller to stop.
 func (h *Handler) resolveRepoDir(ctx context.Context, w http.ResponseWriter, route, repo string) (string, bool) {
 	path, exists, err := h.store.ResolveRepo(ctx, repo)
 	if err != nil {
@@ -255,6 +262,31 @@ func (h *Handler) resolveRepoDir(ctx context.Context, w http.ResponseWriter, rou
 			"check the repository identifier or create it with a push",
 			store.ErrRepoNotFound,
 		))
+		return "", false
+	}
+
+	// Last, on the path that is about to become a git argument: walden will
+	// not hand a git child a repository whose own config it did not write.
+	// Both callers — info/refs for either service, and the upload-pack POST
+	// — are already past authorize, so this execs for nobody who has not
+	// cleared it.
+	//
+	// It sits here rather than in store.ResolveRepo although all three
+	// routes want it, for the reason the EnsureHook call site in create.go
+	// gives about itself: ensureRepoForPush calls ResolveRepo before
+	// Authorize, so a check there would exec git for an unauthenticated
+	// caller. The receive-pack POST gets it from that same call site
+	// instead, on the path it re-resolves.
+	//
+	// Unlike the hook check this one does gate reads, and the difference is
+	// what each failure costs. A repository that lost walden's hook serves a
+	// clone harmlessly, so refusing the clone would turn a durability defect
+	// into an availability outage — hookpresence_test.go pins that, and this
+	// line must not change it. A config that names a command for git to run
+	// is not harmless to read: serving it is what runs the command.
+	if err := h.store.VouchRepoConfig(ctx, path); err != nil {
+		log.Printf("githttp: %s: config unvouched for %q: %v", route, repo, err)
+		writeRefusal(w, http.StatusInternalServerError, err)
 		return "", false
 	}
 

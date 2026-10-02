@@ -105,6 +105,20 @@ func statRepoPath(path string) (bool, error) {
 // bypass the config-file neutralisation entirely. An allowlist keeps the
 // child's inputs enumerable on one screen and closes both, and anything
 // else besides, by construction.
+//
+// The environment allowlist settles GIT_TEMPLATE_DIR and nothing settles the
+// template git falls back to when no one names one, so the invocation names
+// one: `--template=`, explicitly empty. Without it, whatever config the
+// template directory compiled into the host's git happens to carry would be
+// merged into the config of every repository walden creates — a dependence on
+// the machine walden runs on, which is the thing the environment allowlist
+// exists to remove, and one that no pin on the system and global scopes
+// reaches. It is also what keeps VouchRepoConfig honest: a template-supplied
+// key would otherwise make walden refuse a repository it had just created
+// itself. `git init --bare --template=` is accepted and produces an ordinary
+// bare repository on git 2.47.2 (the image's pin) and 2.54.0 on Alpine Linux
+// and on 2.50.1 (Apple Git-155), each verified by initializing one and
+// reading its config keys back.
 func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 	path, err := s.RepoPath(repo)
 	if err != nil {
@@ -150,7 +164,7 @@ func (s *Store) CreateRepo(ctx context.Context, repo string) error {
 		env = append(env, "PATH="+p)
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "init", "--bare", "--initial-branch=main", tmp)
+	cmd := exec.CommandContext(ctx, "git", "init", "--bare", "--template=", "--initial-branch=main", tmp)
 	cmd.Env = env
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

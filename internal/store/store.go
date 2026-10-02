@@ -37,6 +37,18 @@ var (
 	// ErrStoreUnavailable into one sentence about failing to resolve that
 	// path, which would be a lie about this failure.
 	ErrHookUnavailable = errors.New("repository hook unavailable")
+	// ErrRepoConfigUnvouched marks an operator-fault refusal: a repository
+	// on disk carries a repository-scope config key walden did not write,
+	// so walden will not hand that directory to a git child at all. Like
+	// ErrHookUnavailable it is deliberately not an alias of
+	// ErrStoreUnavailable — the path resolved perfectly well, and githttp
+	// flattens every ErrStoreUnavailable into one sentence about failing
+	// to resolve a path, which would send the operator looking at the
+	// wrong thing. It is its own sentinel rather than a second meaning for
+	// ErrHookUnavailable because the two refuse different repositories and
+	// take different remedies, and because a hook-less repository still
+	// serves reads while this one does not.
+	ErrRepoConfigUnvouched = errors.New("repository config unvouched")
 )
 
 // Store manages bare git repositories under a base data directory.
@@ -166,6 +178,11 @@ type RepositoryManager interface {
 	// takes a context because it execs git to establish which hook that
 	// repository will run.
 	EnsureHook(ctx context.Context, repoPath string) error
+	// VouchRepoConfig refuses to serve the repository already resolved to
+	// repoPath if its own config carries a repository-scope key walden did
+	// not write. It takes a context because it execs git to ask what that
+	// repository's config sets.
+	VouchRepoConfig(ctx context.Context, repoPath string) error
 }
 
 // var _ RepositoryManager = (*Store)(nil) pins Store to the interface at

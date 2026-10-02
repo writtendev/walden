@@ -74,9 +74,31 @@ func newBareRepoWithCommit(t *testing.T, s *store.Store, repo string) string {
 	if err != nil {
 		t.Fatalf("RepoPath(%q): %v", repo, err)
 	}
-	runGit(t, t.TempDir(), "clone", "-q", "--bare", work, barePath)
+	initBareAndPush(t, work, barePath)
 
 	return sha
+}
+
+// initBareAndPush seeds the bare repository at barePath from the work tree at
+// work: `git init --bare` and then a push, rather than `git clone --bare`.
+//
+// The distinction is not cosmetic, and it is the reason this helper exists
+// instead of the one-liner it replaced. A bare clone writes remote.origin.url
+// into the repository it creates — a remote-tracking refspec is what --mirror
+// adds and --bare deliberately sets up none of — and walden refuses
+// to serve a repository carrying repository-scope config it did not write —
+// so a clone-seeded fixture tests a repository shape walden deliberately does
+// not serve. init-and-push produces the shape walden itself produces, which
+// is what these tests mean to be about.
+//
+// That walden will not serve a `git clone --bare` or `git clone --mirror`
+// output is the accepted cost of the allowlist, not a defect: the refusal
+// names the key and the remedy is `git config --unset`. internal/githttp's
+// repoconfig_test.go is where that behaviour is asserted on purpose.
+func initBareAndPush(t *testing.T, work, barePath string) {
+	t.Helper()
+	runGit(t, t.TempDir(), "init", "-q", "--bare", "--template=", "--initial-branch=main", barePath)
+	runGit(t, work, "push", "-q", barePath, "main")
 }
 
 // TestInfoRefsRealClient is the ticket's headline claim: a real `git

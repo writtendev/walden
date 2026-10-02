@@ -43,11 +43,9 @@ func TestSubprocessKillsGrandchild(t *testing.T) {
 
 	// The fake "git": records its own PID ($$), forks a background sleep 300 ($!),
 	// records the grandchild PID, and streams output indefinitely.
-	script := fmt.Sprintf("#!/bin/sh\necho $$ > %s\nsleep 300 &\necho $! > %s\nwhile :; do\n  printf 'x'\n  sleep 0.1\ndone\n",
+	serving := fmt.Sprintf("echo $$ > %s\nsleep 300 &\necho $! > %s\nwhile :; do\n  printf 'x'\n  sleep 0.1\ndone\n",
 		parentPidFile, childPidFile)
-	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake git: %v", err)
-	}
+	writeStandInGit(t, binDir, serving)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	s := store.New(t.TempDir())
@@ -127,10 +125,7 @@ func TestSubprocessKillsGrandchild(t *testing.T) {
 // any memory leak would originate from one of those three.
 func TestSubprocessLeakSoak(t *testing.T) {
 	binDir := t.TempDir()
-	script := "#!/bin/sh\nwhile :; do\n  printf 'x'\n  sleep 0.05\ndone\n"
-	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake git: %v", err)
-	}
+	writeStandInGit(t, binDir, "while :; do\n  printf 'x'\n  sleep 0.05\ndone\n")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	s := store.New(t.TempDir())

@@ -921,3 +921,54 @@ func TestReceivePackDenyKnobsPinnedOff(t *testing.T) {
 		t.Errorf("refs/heads/main still resolves to %q after delete", got)
 	}
 }
+
+// TestReceivePackAtomicNotAdvertised pins WALD-128's other product
+// statement: walden does not support `git push --atomic`.
+//
+// Under --atomic receive-pack applies every ref of a push or none, and the
+// pre-receive hook's input is byte-identical whether the client asked for
+// it or not -- so walden's probe would accept the appliable subset and
+// journal it while git applied nothing. walden drops the "atomic"
+// capability from its advertisement instead
+// (receive.advertiseAtomic=false, inforefs.go), which turns that into a
+// refusal the client's own git makes before sending anything.
+//
+// Asserted behaviourally, like TestReceivePackDenyKnobsPinnedOff above and
+// for the same reason: this looks for the outcome, not for a -c pair in an
+// argv. The second half is what keeps the pin honest -- an ordinary push
+// of the same two refs must still work, so this cannot pass by refusing
+// pushes in general.
+func TestReceivePackAtomicNotAdvertised(t *testing.T) {
+	s := store.New(t.TempDir())
+	barePath := newEmptyBareRepo(t, s, "repo")
+
+	h, tok := newTestHandler(t, s, "")
+	server := httptest.NewServer(h)
+	defer server.Close()
+	repoURL := authURL(server.URL, tok) + "/repo"
+
+	work, sha := newWorkTreeWithCommit(t)
+
+	atomicPush := exec.Command("git", "push", "--atomic", repoURL, "HEAD:refs/heads/a", "HEAD:refs/heads/b")
+	atomicPush.Dir = work
+	atomicPush.Env = gitClientEnv()
+	out, err := atomicPush.CombinedOutput()
+	if err == nil {
+		t.Fatalf("git push --atomic succeeded, want the client to refuse it:\n%s", out)
+	}
+	if !strings.Contains(string(out), "does not support --atomic push") {
+		t.Errorf("push output does not show the client refusing for lack of the capability:\n%s", out)
+	}
+	for _, ref := range []string{"refs/heads/a", "refs/heads/b"} {
+		if got := revParse(t, barePath, ref); got != "" {
+			t.Errorf("%s = %q after the refused atomic push, want it never created", ref, got)
+		}
+	}
+
+	runGit(t, work, "push", "-q", repoURL, "HEAD:refs/heads/a", "HEAD:refs/heads/b")
+	for _, ref := range []string{"refs/heads/a", "refs/heads/b"} {
+		if got := revParse(t, barePath, ref); got != sha {
+			t.Errorf("%s = %q after an ordinary push of the same two refs, want %q", ref, got, sha)
+		}
+	}
+}

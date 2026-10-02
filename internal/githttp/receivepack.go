@@ -176,6 +176,13 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request) {
 	// fix -- mechanical rule 3 keeps that kind of policy above walden
 	// rather than in it, and walden's token vocabulary is read/write/
 	// create, not "may rewrite history".
+	//
+	// One sibling pin is deliberately not here: receive.advertiseAtomic=
+	// false, which closes client-elected atomicity -- the other class the
+	// probe cannot see. It sits on the advertisement exec instead
+	// (inforefs.go), because that is the exec a push's capability list
+	// comes from; set here it had no effect at all. inforefs.go's comment
+	// carries the reason and what was measured.
 
 	releaseBody := func() {
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now())

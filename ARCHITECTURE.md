@@ -142,19 +142,32 @@ belongs above walden, not in it — walden's token vocabulary is read, write,
 and create, not "may rewrite history."
 
 The one push walden refuses outright, and the one place it is deliberately
-stricter than git: **a push whose own refs conflict as a directory and a
-file** — `refs/heads/feature` and `refs/heads/feature/x` in the same
+stricter than git: **a push naming two refs that conflict as a directory
+and a file** — `refs/heads/feature` and `refs/heads/feature/x` in the same
 push — **is refused whole, in one line, with nothing journaled for it,
-rather than partly applied.** git applies one of the two and refuses the
-other, but which one survives has changed between git versions, so there is
-no stable answer for walden to match and predicting one would be modelling
-git's conflict resolution rather than asking it. The conflict is found in
-the push's own ref names — a name that is a path prefix of another, counting
-only the refs the push leaves in place, so deleting one of the two in the
-same push is unaffected — never in git's wording for it. This is the same
-answer walden gives everywhere it cannot get a definitive one: refuse in one
-line rather than guess, because a client retrying a refused push still holds
-everything it was pushing and loses nothing.
+rather than partly applied.** Where both refs survive the push, git applies
+one of the two and refuses the other, but which one survives has changed
+between git versions, so there is no stable answer for walden to match and
+predicting one would be modelling git's conflict resolution rather than
+asking it. The conflict is found in the push's own ref names — a name that
+is a path prefix of another — never in git's wording for it.
+
+Every ref the push names counts, including one it deletes. A push that
+deletes `refs/heads/feature` and creates `refs/heads/feature/x` is a push
+git applies in full, so this is walden refusing something git would have
+accepted — stated plainly, and accepted deliberately. The reason is that
+walden has nothing it can ask about that push: `update-ref --stdin`
+evaluates its batch as one transaction against the refs on disk, with no
+notion of applying the delete first, so the create fails in every candidate
+set the probe can build and the accepted set comes back holding the delete
+alone. Journaling that is the worse direction of the two — a ref left on
+disk that no record names. The rule is therefore purely structural, with no
+second clause whose answer depends on something walden would have to go and
+ask. Either shape goes through as two pushes.
+
+This is the same answer walden gives everywhere it cannot get a definitive
+one: refuse in one line rather than guess, because a client retrying a
+refused push still holds everything it was pushing and loses nothing.
 
 The cost is one object-storage round trip of added latency on pushes
 (~50–150 ms), plus one local `git update-ref` exec (~15 ms, dominated by

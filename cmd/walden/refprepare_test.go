@@ -54,6 +54,22 @@ func assertNoLocks(t *testing.T, repoPath string) {
 	}
 }
 
+// readRef reads ref out of the bare repository at repoPath through the
+// real git binary, returning "" when it does not resolve. The counterpart
+// to setRef (prereceive_test.go), for the tests that have to show a probe
+// left the repository's refs exactly as it found them.
+func readRef(t *testing.T, repoPath, ref string) string {
+	t.Helper()
+	cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", ref)
+	cmd.Dir = repoPath
+	cmd.Env = append(cleanGitEnv(), "GIT_DIR=.")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // TestPrepareRefUpdatesAcceptsACleanSet is the common-path case: every
 // update in one push applies, so prepareRefUpdates makes exactly one exec
 // (proven indirectly by the other tests below driving multi-exec paths;
@@ -130,14 +146,22 @@ func TestPrepareRefUpdatesDFConflictRefusedBothOrders(t *testing.T) {
 	}
 }
 
-// TestPrepareRefUpdatesDFConflictOnlyAgainstSurvivingRefs pins the carve-out
-// the refusal above must not swallow: a push that deletes refs/heads/feature
-// and creates refs/heads/feature/x leaves only one of the two names in
-// place, so it is not a conflict and must reach git like any other push.
-// Both wire orders, because a delete is not always sorted where the client
-// typed it. What git then makes of the set is git's business and not this
-// test's; all this asserts is that walden did not refuse it out of hand.
-func TestPrepareRefUpdatesDFConflictOnlyAgainstSurvivingRefs(t *testing.T) {
+// TestPrepareRefUpdatesDFConflictCountsADeletedRef is the case the rule
+// above used to carve out: a push that deletes refs/heads/feature and
+// creates refs/heads/feature/x. Real git applies both of those updates
+// (confirmed against git 2.50.1 -- see refuseDirFileConflict's own
+// comment), so this is the push walden refuses and git would have taken;
+// it is refused anyway, because the probe cannot report that outcome. It
+// evaluates its batch against the refs on disk, where refs/heads/feature
+// still is, so the create fails in every candidate set and the accepted
+// set would come back holding the delete alone -- a ref left on disk that
+// no journal record names.
+//
+// This test is the carve-out's own test, rewritten to the opposite
+// expectation rather than deleted: it asserted only that walden did not
+// refuse, which is why it never saw the under-claim underneath. Both wire
+// orders, because a delete is not always sorted where the client typed it.
+func TestPrepareRefUpdatesDFConflictCountsADeletedRef(t *testing.T) {
 	pack, sha := realCommit(t)
 
 	deleteParent := journal.RefUpdate{Ref: "refs/heads/feature", OldOID: sha, NewOID: journal.ZeroOID40}
@@ -157,8 +181,25 @@ func TestPrepareRefUpdatesDFConflictOnlyAgainstSurvivingRefs(t *testing.T) {
 			realizeObjects(t, repoPath, pack)
 			setRef(t, repoPath, "refs/heads/feature", sha)
 
-			if _, err := prepareRefUpdates(context.Background(), repoPath, "", tt.updates); err != nil {
-				t.Fatalf("prepareRefUpdates refused a delete-and-create push: %v", err)
+			accepted, err := prepareRefUpdates(context.Background(), repoPath, "", tt.updates)
+			if err == nil {
+				t.Fatalf("prepareRefUpdates accepted %+v, want the whole push refused", accepted)
+			}
+			if accepted != nil {
+				t.Errorf("accepted = %+v alongside a refusal, want nil", accepted)
+			}
+			if strings.ContainsAny(err.Error(), "\n\r") {
+				t.Errorf("expected a single-line refusal, got: %q", err.Error())
+			}
+			for _, ref := range []string{"refs/heads/feature", "refs/heads/feature/x"} {
+				if !strings.Contains(err.Error(), ref) {
+					t.Errorf("refusal %q does not name %s", err.Error(), ref)
+				}
+			}
+			// The delete must not have been applied either: a refusal is
+			// the whole push refused, and this probe never commits.
+			if got := readRef(t, repoPath, "refs/heads/feature"); got != sha {
+				t.Errorf("refs/heads/feature = %q after the refusal, want it untouched at %q", got, sha)
 			}
 			assertNoLocks(t, repoPath)
 		})

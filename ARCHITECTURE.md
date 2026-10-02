@@ -141,6 +141,21 @@ write-scoped token for a repository can rewrite its history; that policy
 belongs above walden, not in it — walden's token vocabulary is read, write,
 and create, not "may rewrite history."
 
+One class remains that `prepare` cannot see and no server-side policy knob
+describes: the client electing atomicity. `git push --atomic` asks
+`receive-pack` to apply every ref of the push or none, and the hook's input
+is byte-identical whether the client asked for it or not — so on a push
+where one ref cannot apply, walden's probe would accept the rest and
+journal them while git applied nothing at all. It is closed the same way
+the four above are, by making it unable to fire: walden drops the `atomic`
+capability from its ref advertisement
+(`receive.advertiseAtomic=false`, on the `receive-pack` invocation that
+produces the advertisement), so a client asking for an atomic push is
+refused by its own git before it sends anything. That too is a product
+statement: **walden does not support `git push --atomic`.** The same push
+without `--atomic` is served normally, and gets the refs that apply plus
+git's own per-ref refusal for the ones that don't.
+
 The one push walden refuses outright, and the one place it is deliberately
 stricter than git: **a push naming two refs that conflict as a directory
 and a file** — `refs/heads/feature` and `refs/heads/feature/x` in the same

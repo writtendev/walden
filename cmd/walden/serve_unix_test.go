@@ -705,6 +705,59 @@ func TestServeEndToEndDFConflictRefusedWholeBothOrders(t *testing.T) {
 	}
 }
 
+// TestServeEndToEndDFConflictWithADeleteRefusedWhole is the delete-and-
+// create shape through the real client: one push deletes refs/heads/feature
+// and creates refs/heads/feature/x. git applies both when walden is not in
+// the way; walden refuses it whole, because its probe would have reported
+// only the delete and journaled a push git applied in full.
+//
+// This is the push walden refuses that git would accept, so it is tested
+// end to end rather than left to the unit case: the refusal has to reach
+// the client in one line, and the ref that would have been deleted has to
+// still be there afterwards -- a half-applied refusal is the failure this
+// whole ticket is about.
+func TestServeEndToEndDFConflictWithADeleteRefusedWhole(t *testing.T) {
+	s := bootE2EServer(t)
+
+	work := t.TempDir()
+	runLocalGit(t, work, "init", "-q", "-b", "main")
+	runLocalGit(t, work, "config", "user.email", "test@example.com")
+	runLocalGit(t, work, "config", "user.name", "Test")
+	runLocalGit(t, work, "commit", "-q", "--allow-empty", "-m", "initial")
+	runLocalGit(t, work, "push", "-q", s.repoURL, "HEAD:refs/heads/feature")
+
+	baseTx, baseSeg := s.txCount(), s.segmentCount()
+
+	pushCmd := exec.Command("git", "push", s.repoURL, ":refs/heads/feature", "HEAD:refs/heads/feature/x")
+	pushCmd.Dir = work
+	pushCmd.Env = e2eGitEnv()
+	out, err := pushCmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("delete-and-create push succeeded, want the whole push refused:\n%s", out)
+	}
+	if !strings.Contains(string(out), "one ref name is a directory prefix of the other") {
+		t.Errorf("push output does not carry walden's D/F refusal:\n%s", out)
+	}
+
+	verify := exec.Command("git", "--git-dir="+s.repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/feature")
+	verify.Env = e2eGitEnv()
+	if out, err := verify.CombinedOutput(); err != nil {
+		t.Errorf("refs/heads/feature no longer resolves after the refused push: %v\n%s", err, out)
+	}
+	verify = exec.Command("git", "--git-dir="+s.repoPath, "rev-parse", "--verify", "--quiet", "refs/heads/feature/x")
+	verify.Env = e2eGitEnv()
+	if out, err := verify.CombinedOutput(); err == nil {
+		t.Errorf("refs/heads/feature/x resolves to %s after the push, want it never created", strings.TrimSpace(string(out)))
+	}
+
+	if got, want := s.txCount(), baseTx; got != want {
+		t.Errorf("tx count after the refused push = %d, want %d (nothing journaled)", got, want)
+	}
+	if got, want := s.segmentCount(), baseSeg; got != want {
+		t.Errorf("segment count after the refused push = %d, want %d (nothing journaled)", got, want)
+	}
+}
+
 // helperStaleRefPrePush installs a pre-push hook in the *client* repository
 // at workDir that moves ref in the server's repository at repoPath to sha,
 // making that one refspec's old_oid stale for the push it is about to send.

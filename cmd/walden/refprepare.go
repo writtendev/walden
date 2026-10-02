@@ -4,10 +4,9 @@
 // words, exactly as it would if walden asked nothing at all.
 //
 // One shape of push is refused outright instead, before git is asked
-// anything: one whose own ref set puts two surviving refs in a
-// directory/file conflict (refuseDirFileConflict below). That is WALD-128's
-// 2026-09-28 amendment, and it is the only case where walden is
-// deliberately stricter than git.
+// anything: one naming two refs in a directory/file conflict
+// (refuseDirFileConflict below). That is WALD-128's 2026-09-28 amendment,
+// and it is the only case where walden is deliberately stricter than git.
 //
 // The instrument is `git update-ref --stdin`'s start/prepare/abort
 // sub-protocol: `prepare` validates a whole batch of ref updates --
@@ -46,14 +45,16 @@ import (
 	"github.com/writtendev/walden/internal/refusal"
 )
 
-// refPrepareWaitDelay bounds how long a probe's cmd.Wait may block after
-// cmd.Cancel (SIGTERM, below) has been sent. Mirrors
-// internal/githttp/gitcmd.go's gitWaitDelay for the identical reason: this
-// package has no context that is ever actually cancelled today (the hook's
-// ctx is context.Background(), passed down from run() in main.go), but
-// exec.CommandContext still requires *a* WaitDelay whenever Cancel is
-// overridden, and copying an established constant is simpler than
-// inventing a second one with no basis for a different value.
+// refPrepareWaitDelay bounds how long a probe's cmd.Wait may block once
+// the context is done and cmd.Cancel (SIGTERM, below) has been sent: an
+// update-ref that ignores or outlives the signal is killed and its pipes
+// closed after this long, rather than holding Wait open. Nothing in
+// os/exec requires the field to be set, and the hook has no context that
+// is ever cancelled today (ctx is context.Background(), passed down from
+// run() in main.go) -- it is set because a cancellation whose signal does
+// not land should still end, and the value is
+// internal/githttp/gitcmd.go's gitWaitDelay rather than a second number
+// invented here with no basis for differing.
 const refPrepareWaitDelay = 5 * time.Second
 
 // prepareRefUpdates asks git which of updates it will accept, applying them
@@ -123,75 +124,79 @@ func prepareRefUpdates(ctx context.Context, repoPath, quarantine string, updates
 	return accepted, nil
 }
 
-// refuseDirFileConflict refuses a push whose own ref set carries a
-// directory/file conflict: two refs the push would leave in place where
-// one name is a path prefix of the other, as "refs/heads/feature" is of
-// "refs/heads/feature/x". It returns nil for every other push, including
-// the single-ref case where the conflict is against a ref already on disk
-// rather than against another ref in the same push -- that one is not this
-// function's to find, and probePrepare already refuses it as an ordinary
-// per-ref no.
+// refuseDirFileConflict refuses a push that names two refs where one name
+// is a path prefix of the other, as "refs/heads/feature" is of
+// "refs/heads/feature/x". Every ref the push names counts, whether it
+// creates, updates, or deletes it. It returns nil for every other push,
+// including the single-ref case where the conflict is against a ref
+// already on disk rather than against another ref in the same push --
+// that one is not this function's to find, and probePrepare already
+// refuses it as an ordinary per-ref no.
 //
 // This is the one place walden is deliberately stricter than git, and the
-// one place it declines a push git would partly apply (WALD-128's
-// 2026-09-28 amendment). git applies one side of such a push and refuses
-// the other, but which side survives is not stable across git versions:
-// against git 2.50.1 the ref named first on the wire survived, and against
-// git 2.55.0 "refs/heads/feature/x" survived in both orders, the loser
-// reported as "refname conflict". Journaling a guess at the winner is how
-// this ticket's own reproduction ended up with the journal holding
-// refs/heads/feature while the disk held only refs/heads/feature/x: a
-// signed record of a move that never happened, and a missing record of one
-// that did. Refusing the whole push in one line is what walden does
-// everywhere else it cannot get a definitive answer, and it is the cheap
-// direction to be wrong in: the client still holds everything it was
-// pushing and loses nothing by retrying with one of the two names
-// changed.
+// one place it declines a push git would apply (WALD-128's 2026-09-28
+// amendment, as decided on 2026-10-02). Two shapes land here, and the
+// reason they get the same answer is that walden has nothing it can ask
+// about either one:
+//
+//   - Both refs survive the push. git applies one side and refuses the
+//     other, but which side survives is not stable across git versions:
+//     against git 2.50.1 the ref named first on the wire survived, and
+//     against git 2.55.0 "refs/heads/feature/x" survived in both orders,
+//     the loser reported as "refname conflict". Journaling a guess at the
+//     winner is how this ticket's own reproduction ended up with the
+//     journal holding refs/heads/feature while the disk held only
+//     refs/heads/feature/x: a signed record of a move that never
+//     happened, and a missing record of one that did.
+//   - One of the two is deleted in the same push. git applies both, so
+//     this is a push walden refuses and git would have accepted -- the
+//     cost of this rule, stated out loud. It is refused because the probe
+//     cannot report what git does: `update-ref --stdin` evaluates its
+//     whole batch as one transaction against the refs currently on disk,
+//     with no notion of applying the delete first, so the create fails
+//     inside every candidate set the loop can build and the accepted set
+//     comes back holding the delete alone. Confirmed against git 2.50.1:
+//     `git push ../bare.git :refs/heads/feature <sha>:refs/heads/feature/x`
+//     printed "- [deleted] feature" and "* [new branch] ... -> feature/x"
+//     and left refs/heads/feature/x on disk, while prepare on the same
+//     two updates answered "fatal: prepare: cannot lock ref
+//     'refs/heads/feature/x': 'refs/heads/feature' exists; cannot create
+//     'refs/heads/feature/x'" -- as did the create on its own. Journaling
+//     that subset is the WALD-46 direction, the worse one: a ref on disk
+//     that no record names.
+//
+// Refusing the whole push in one line is what walden does everywhere else
+// it cannot get a definitive answer, and it is the cheap direction to be
+// wrong in: the client still holds everything it was pushing, and either
+// shape goes through as two pushes.
 //
 // The conflict is found in the push's ref names, never in git's error
-// text: the two versions above spell the refusal differently, and matching
-// a message is what made the behaviour version-dependent in the first
-// place. A path-prefix relationship between two names is a property of
-// this function's input alone, so it reads the same on every git.
-//
-// Deletions are excluded because only refs that exist after the push can
-// collide: a push that deletes refs/heads/feature and creates
-// refs/heads/feature/x is an ordinary, legitimate push, and both git
-// 2.50.1 and git 2.55.0 applied both of its updates, in both wire orders.
+// text: the git versions above spell the refusal differently, and
+// matching a message is what made the behaviour version-dependent in the
+// first place. A path-prefix relationship between two names is a property
+// of this function's input alone, so it reads the same on every git, and
+// it is the whole of the rule -- there is no second clause whose answer
+// depends on something walden would have to go and ask.
 func refuseDirFileConflict(updates []journal.RefUpdate) error {
-	remaining := make(map[string]bool, len(updates))
+	named := make(map[string]bool, len(updates))
 	for _, u := range updates {
-		if !isRefDeletion(u) {
-			remaining[u.Ref] = true
-		}
+		named[u.Ref] = true
 	}
 	// updates in order, and each name's prefixes shortest-first, so a push
 	// carrying more than one conflict always names the same pair.
 	for _, u := range updates {
-		if isRefDeletion(u) {
-			continue
-		}
 		for i := 0; i < len(u.Ref); i++ {
-			if u.Ref[i] != '/' || !remaining[u.Ref[:i]] {
+			if u.Ref[i] != '/' || !named[u.Ref[:i]] {
 				continue
 			}
 			return refusal.Refuse(
 				"pre-receive refused",
-				fmt.Sprintf("this push would leave both %q and %q in place, and git will apply only one of them: one ref name is a directory prefix of the other", u.Ref[:i], u.Ref),
-				"rename one of the two so that neither ref name is a path prefix of the other, and push again",
+				fmt.Sprintf("this push names both %q and %q, and one ref name is a directory prefix of the other", u.Ref[:i], u.Ref),
+				"rename one of the two so that neither ref name is a path prefix of the other, or send them as two separate pushes",
 			)
 		}
 	}
 	return nil
-}
-
-// isRefDeletion reports whether u removes its ref rather than leaving one
-// behind, which git spells as an all-zero new_oid.
-// journal.ValidateRefUpdate -- already run over every update on this path
-// before journalPush is reached -- refuses an OID that is neither 40 nor
-// 64 hex characters, so these two constants are the whole of the shape.
-func isRefDeletion(u journal.RefUpdate) bool {
-	return u.NewOID == journal.ZeroOID40 || u.NewOID == journal.ZeroOID64
 }
 
 // probePrepare runs exactly one `git update-ref --stdin` start/prepare/

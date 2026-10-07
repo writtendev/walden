@@ -12,6 +12,10 @@ import (
 	"github.com/writtendev/walden/internal/store"
 )
 
+// JournalLessWarning is the exact warning printed on stderr at boot
+// and repeated on the root status page when walden runs without a journal.
+const JournalLessWarning = "walden: WARNING: journal-less mode: WALDEN_JOURNAL is unset, so durability is this disk alone"
+
 // Handler serves git smart HTTP requests.
 type Handler struct {
 	auth  auth.Authorizer
@@ -60,8 +64,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Root/status handler or route dispatcher placeholder for smart HTTP routes
+	if r.URL.Path != "/" {
+		writeRefusal(w, http.StatusNotFound, refusal.Refuse(
+			"not found",
+			fmt.Sprintf("no route matches %s", r.URL.Path),
+			"check the URL",
+		))
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeRefusal(w, http.StatusMethodNotAllowed, refusal.Refuse(
+			"method not allowed",
+			fmt.Sprintf("%s is not supported for /", r.Method),
+			"use GET, HEAD",
+		))
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if h.journalURL == "" {
+		fmt.Fprintln(w, JournalLessWarning)
+	}
 }
 
 // methodNotAllowed returns a handler that refuses every request reaching

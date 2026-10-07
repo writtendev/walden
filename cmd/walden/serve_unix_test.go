@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/writtendev/walden/internal/githttp"
 	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/store/storetest"
 )
@@ -200,6 +202,23 @@ func TestServeEndToEndCloneAndPush(t *testing.T) {
 
 	adminToken, addr := waitForServerBoot(t, stdoutPipe)
 
+	// Status page repeats the journal-less warning over HTTP.
+	statusResp, err := http.Get(fmt.Sprintf("http://%s/", addr))
+	if err != nil {
+		t.Fatalf("GET / status page: %v", err)
+	}
+	statusBody, err := io.ReadAll(statusResp.Body)
+	statusResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read status page body: %v", err)
+	}
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("status page returned %d, want %d", statusResp.StatusCode, http.StatusOK)
+	}
+	if !strings.Contains(string(statusBody), githttp.JournalLessWarning) {
+		t.Errorf("status page body %q does not contain journal-less warning %q", string(statusBody), githttp.JournalLessWarning)
+	}
+
 	// Push a real commit from a scratch work tree to the existing repo.
 	work := t.TempDir()
 	runLocalGit(t, work, "init", "-q", "-b", "main")
@@ -281,7 +300,7 @@ func TestServeEndToEndCloneAndPush(t *testing.T) {
 		t.Fatalf("walden serve did not exit within 10s of SIGINT")
 	}
 
-	const warning = "walden: WARNING: journal-less mode: WALDEN_JOURNAL is unset, so durability is this disk alone"
+	const warning = githttp.JournalLessWarning
 	if got := strings.Count(stderrBuf.String(), warning); got != 1 {
 		t.Errorf("expected the journal-less warning exactly once on stderr, got %d:\n%s", got, stderrBuf.String())
 	}
@@ -360,6 +379,23 @@ func TestServeEndToEndJournalsEveryPush(t *testing.T) {
 	})
 
 	adminToken, addr := waitForServerBoot(t, stdoutPipe)
+
+	// Status page does not contain the journal-less warning when a journal is configured.
+	statusResp, err := http.Get(fmt.Sprintf("http://%s/", addr))
+	if err != nil {
+		t.Fatalf("GET / status page: %v", err)
+	}
+	statusBody, err := io.ReadAll(statusResp.Body)
+	statusResp.Body.Close()
+	if err != nil {
+		t.Fatalf("read status page body: %v", err)
+	}
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("status page returned %d, want %d", statusResp.StatusCode, http.StatusOK)
+	}
+	if strings.Contains(string(statusBody), "journal-less mode") {
+		t.Errorf("status page body %q contains journal-less warning when journal is configured", string(statusBody))
+	}
 
 	work := t.TempDir()
 	runLocalGit(t, work, "init", "-q", "-b", "main")

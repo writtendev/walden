@@ -368,7 +368,7 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	if cfg.JournalURL == "" {
-		fmt.Fprintln(stderr, "walden: WARNING: journal-less mode: WALDEN_JOURNAL is unset, so durability is this disk alone")
+		fmt.Fprintln(stderr, githttp.JournalLessWarning)
 	}
 
 	// cfg.ListenAddr already passed config.Validate's net.SplitHostPort

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/writtendev/walden/internal/auth"
+	"github.com/writtendev/walden/internal/githttp"
 	"github.com/writtendev/walden/internal/journal"
 	"github.com/writtendev/walden/internal/store"
 	"github.com/writtendev/walden/internal/store/storetest"
@@ -1233,7 +1234,7 @@ func TestServeListenInUseRefuses(t *testing.T) {
 // ARCHITECTURE.md promises for journal-less mode, and its absence once a
 // journal is configured.
 func TestServeJournalWarning(t *testing.T) {
-	const warning = "walden: WARNING: journal-less mode: WALDEN_JOURNAL is unset, so durability is this disk alone"
+	const warning = githttp.JournalLessWarning
 
 	t.Run("unset", func(t *testing.T) {
 		dataDir := t.TempDir()

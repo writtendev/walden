@@ -111,7 +111,31 @@ func (h *Handler) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	// in hand.
 	wantV2 := service == "git-upload-pack" && r.Header.Get("Git-Protocol") == "version=2"
 
-	proc, err := startGit(r.Context(), gitEnv(wantV2), nil, nil, subcommand, "--stateless-rpc", advertiseFlag, path)
+	// walden does not support `git push --atomic`, and this is where that
+	// statement is made: receive.advertiseAtomic=false drops the "atomic"
+	// capability from the advertisement this exec produces, so a client
+	// asking for an atomic push is refused by its own git before it sends
+	// anything. The reason is the durability promise, and it is written up
+	// in ARCHITECTURE.md beside the four receive.deny* pins
+	// (receivepack.go) it is a sibling of: under --atomic receive-pack
+	// applies every ref or none, the pre-receive hook's probe answers
+	// per-ref, and the hook's input is byte-identical either way -- so on
+	// a push where one ref cannot apply, walden would journal the rest
+	// while git applied nothing.
+	//
+	// It is pinned on the advertisement rather than beside those four
+	// because this is the exec a push's capability list comes from. Pinned
+	// on receive-pack's own --stateless-rpc exec instead it had no effect:
+	// a `git push --atomic` over HTTP against a walden with the pin there
+	// and not here succeeded, both refs applied, because the client had
+	// already read "atomic" from this advertisement (git 2.50.1).
+	args := make([]string, 0, 6)
+	if subcommand == "receive-pack" {
+		args = append(args, "-c", "receive.advertiseAtomic=false")
+	}
+	args = append(args, subcommand, "--stateless-rpc", advertiseFlag, path)
+
+	proc, err := startGit(r.Context(), gitEnv(wantV2), nil, nil, args...)
 	if err != nil {
 		writeRefusal(w, http.StatusInternalServerError, refusal.Refuse(
 			"ref advertisement failed",

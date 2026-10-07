@@ -438,9 +438,11 @@ func TestProbePrepareQuarantineEnvironmentRefused(t *testing.T) {
 
 // TestPrepareRefUpdatesNonexistentObjectWithoutAlternates pins the second
 // negative control for variant C: when incoming objects exist only in the
-// quarantine directory and quarantine is omitted from alternates, git rejects
-// the ref as pointing to a nonexistent object. This is a genuine ref content
-// rejection, so prepareRefUpdates returns an empty accepted set without error.
+// quarantine directory and quarantine is omitted from alternates, git cannot
+// resolve the new object. Without alternates to make quarantine visible, the
+// probe cannot determine the push's validity and must refuse the push with
+// a single-line refusal mentioning "nonexistent object", rather than silently
+// dropping the update.
 func TestPrepareRefUpdatesNonexistentObjectWithoutAlternates(t *testing.T) {
 	repoPath := newBareRepo(t)
 	pack, sha := realCommit(t)
@@ -465,11 +467,17 @@ func TestPrepareRefUpdatesNonexistentObjectWithoutAlternates(t *testing.T) {
 	// Passing quarantine="" leaves GIT_ALTERNATE_OBJECT_DIRECTORIES unset,
 	// so sha cannot be resolved by git.
 	accepted, err := prepareRefUpdates(context.Background(), repoPath, "", updates)
-	if err != nil {
-		t.Fatalf("prepareRefUpdates: %v, want empty accepted set", err)
+	if err == nil {
+		t.Fatalf("prepareRefUpdates without alternates succeeded (accepted=%+v), want a refusal", accepted)
 	}
-	if len(accepted) != 0 {
-		t.Fatalf("accepted = %+v, want empty slice because object exists only in quarantine", accepted)
+	if accepted != nil {
+		t.Errorf("accepted = %+v alongside a refusal, want nil", accepted)
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("expected a single-line refusal, got: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "nonexistent object") {
+		t.Errorf("refusal %q does not mention nonexistent object", err.Error())
 	}
 	assertNoLocks(t, repoPath)
 }
@@ -571,9 +579,9 @@ func TestIsRefContentRejection(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "nonexistent object",
+			name: "nonexistent object is not a content rejection",
 			line: "fatal: prepare: cannot update ref 'refs/heads/main': trying to write ref 'refs/heads/main' with nonexistent object 1111111111111111111111111111111111111111",
-			want: true,
+			want: false,
 		},
 		{
 			name: "cannot update the ref variant",

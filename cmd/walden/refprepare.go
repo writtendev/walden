@@ -216,10 +216,10 @@ func refuseDirFileConflict(updates []journal.RefUpdate) error {
 //   - (false, nil): git says no. The process exited non-zero, stdout
 //     carried "start: ok" but not "prepare: ok", and stderr's first line
 //     is a ref content rejection (isRefContentRejection) -- stale old_oid,
-//     nonexistent object, D/F collision, or batch collision. The failure
-//     came from the prepare command itself evaluating the ref content, not
-//     from a lock acquisition failure, an environment defect, or a
-//     malformed command. This is git having answered the question,
+//     D/F collision, or batch collision. The failure came from the prepare
+//     command itself evaluating the ref content, not from a lock
+//     acquisition failure, an environment defect, an unresolvable object,
+//     or a malformed command. This is git having answered the question,
 //     definitively, and the caller narrows its candidate set accordingly.
 //   - (false, err): git could not answer, and err is a one-line refusal
 //     (Done-when 3). This covers two different shapes on purpose. First,
@@ -227,8 +227,8 @@ func refuseDirFileConflict(updates []journal.RefUpdate) error {
 //     fatal from an earlier command (a malformed line -- one of walden's
 //     own bugs, not git refusing content), an environment error (such as
 //     "ref updates forbidden inside quarantine environment" when
-//     quarantine was not stripped), an exec/fork failure, a cancelled
-//     context, a signal death. Second, and the one this ticket added
+//     quarantine was not stripped, or "nonexistent object" when alternates
+//     was omitted), an exec/fork failure, a cancelled context, a signal death. Second, and the one this ticket added
 //     deliberately: a "fatal: prepare: cannot lock ref" whose message is
 //     git failing to acquire a ref's on-disk lock (isLockAcquisitionFailure)
 //     rather than refusing its content. Two of this probe's own processes --
@@ -410,13 +410,16 @@ func refPrepareCommandBlock(updates []journal.RefUpdate) []byte {
 // passing.
 // isRefContentRejection reports whether errLine is git's diagnostic indicating
 // that git evaluated the candidate ref update(s) against repository state and
-// rejected them for a ref content reason (a stale old_oid, a nonexistent
-// object, a directory/file collision, or a batch collision), as opposed to a
-// lock acquisition failure, an environment error (such as running inside
-// quarantine), or a system error.
+// rejected them for a ref content reason (a stale old_oid, a directory/file
+// collision, or a batch collision), as opposed to a lock acquisition failure,
+// an environment error (such as running inside quarantine, or an unresolvable
+// object because alternates was omitted), or a system error.
 func isRefContentRejection(errLine string) bool {
 	const prefix = "fatal: prepare: "
 	if !strings.HasPrefix(errLine, prefix) {
+		return false
+	}
+	if strings.Contains(errLine, "nonexistent object") {
 		return false
 	}
 	msg := errLine[len(prefix):]

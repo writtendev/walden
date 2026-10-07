@@ -215,32 +215,42 @@ func refuseDirFileConflict(updates []journal.RefUpdate) error {
 //     process exited 0.
 //   - (false, nil): git says no. The process exited non-zero, stdout
 //     carried "start: ok" but not "prepare: ok", and stderr's first line
-//     is prefixed "fatal: prepare:" -- the failure came from the prepare
-//     command itself, evaluating the batch, not from something malformed
-//     in how walden built it. This is git having answered the question,
+//     is a ref content rejection (isRefContentRejection) -- stale old_oid,
+//     nonexistent object, D/F collision, or batch collision. The failure
+//     came from the prepare command itself evaluating the ref content, not
+//     from a lock acquisition failure, an environment defect, or a
+//     malformed command. This is git having answered the question,
 //     definitively, and the caller narrows its candidate set accordingly.
 //   - (false, err): git could not answer, and err is a one-line refusal
 //     (Done-when 3). This covers two different shapes on purpose. First,
 //     everything that is not the row above: no "start: ok" at all, a
 //     fatal from an earlier command (a malformed line -- one of walden's
-//     own bugs, not git refusing content), an exec/fork failure, a
-//     cancelled context, a signal death. Second, and the one this ticket
-//     added deliberately: a "fatal: prepare:" that *is* shaped like row
-//     two but whose message is git failing to acquire a ref's on-disk
-//     lock (isLockAcquisitionFailure) rather than refusing its content.
-//     Two of this probe's own processes -- or this probe racing an
-//     unrelated git process -- can collide on the same ref's lock file
-//     within the ~15ms one exec takes; reading that collision as "git
-//     says no" would have walden narrow the accepted set on a transient
-//     condition that says nothing about whether the ref update is valid,
-//     which is the WALD-46-class under-claim this ticket exists to close
-//     (see the decision recorded on WALD-128 itself). Refusing the whole
-//     push is always the safe direction here: the client retries, and
-//     nothing is ever journaled on a guess.
+//     own bugs, not git refusing content), an environment error (such as
+//     "ref updates forbidden inside quarantine environment" when
+//     quarantine was not stripped), an exec/fork failure, a cancelled
+//     context, a signal death. Second, and the one this ticket added
+//     deliberately: a "fatal: prepare: cannot lock ref" whose message is
+//     git failing to acquire a ref's on-disk lock (isLockAcquisitionFailure)
+//     rather than refusing its content. Two of this probe's own processes --
+//     or this probe racing an unrelated git process -- can collide on the
+//     same ref's lock file within the ~15ms one exec takes; reading that
+//     collision as "git says no" would have walden narrow the accepted set
+//     on a transient condition that says nothing about whether the ref
+//     update is valid, which is the WALD-46-class under-claim this ticket
+//     exists to close (see the decision recorded on WALD-128 itself).
+//     Refusing the whole push is always the safe direction here: the
+//     client retries, and nothing is ever journaled on a guess.
 func probePrepare(ctx context.Context, repoPath, quarantine string, updates []journal.RefUpdate) (bool, error) {
+	return probePrepareWithEnv(ctx, repoPath, refPrepareEnv(quarantine), updates)
+}
+
+// probePrepareWithEnv runs the probe with an explicit environment slice.
+// Extracted so unit tests can drive negative controls against git
+// (e.g. verifying an unstripped GIT_QUARANTINE_PATH refuses the push).
+func probePrepareWithEnv(ctx context.Context, repoPath string, env []string, updates []journal.RefUpdate) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "update-ref", "--stdin")
 	cmd.Dir = repoPath
-	cmd.Env = refPrepareEnv(quarantine)
+	cmd.Env = env
 	cmd.Stdin = bytes.NewReader(refPrepareCommandBlock(updates))
 	cmd.WaitDelay = refPrepareWaitDelay
 	// exec.CommandContext's default cancellation calls Process.Kill
@@ -269,7 +279,7 @@ func probePrepare(ctx context.Context, repoPath, quarantine string, updates []jo
 		return true, nil
 	}
 
-	if strings.Contains(out, "start: ok\n") && strings.HasPrefix(errLine, "fatal: prepare:") {
+	if strings.Contains(out, "start: ok\n") && isRefContentRejection(errLine) {
 		if isLockAcquisitionFailure(stderr.String()) {
 			return false, refusePrepareUnknown(errLine + " (a ref lock could not be acquired to check this push)")
 		}
@@ -398,6 +408,26 @@ func refPrepareCommandBlock(updates []journal.RefUpdate) []byte {
 // pairing, not either substring alone, is what keeps this from also
 // matching an unrelated message that happens to mention a lock in
 // passing.
+// isRefContentRejection reports whether errLine is git's diagnostic indicating
+// that git evaluated the candidate ref update(s) against repository state and
+// rejected them for a ref content reason (a stale old_oid, a nonexistent
+// object, a directory/file collision, or a batch collision), as opposed to a
+// lock acquisition failure, an environment error (such as running inside
+// quarantine), or a system error.
+func isRefContentRejection(errLine string) bool {
+	const prefix = "fatal: prepare: "
+	if !strings.HasPrefix(errLine, prefix) {
+		return false
+	}
+	msg := errLine[len(prefix):]
+	return strings.HasPrefix(msg, "cannot lock ref '") ||
+		strings.HasPrefix(msg, "cannot update ref '") ||
+		strings.HasPrefix(msg, "cannot update the ref '") ||
+		strings.HasPrefix(msg, "cannot delete ref '") ||
+		strings.HasPrefix(msg, "cannot process '") ||
+		strings.HasPrefix(msg, "multiple updates for ")
+}
+
 func isLockAcquisitionFailure(stderrText string) bool {
 	return strings.Contains(stderrText, "Unable to create") && strings.Contains(stderrText, ".lock")
 }

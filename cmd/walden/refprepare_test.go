@@ -405,6 +405,75 @@ func TestPrepareRefUpdatesVariantCEnvironment(t *testing.T) {
 	assertNoLocks(t, repoPath)
 }
 
+// TestProbePrepareQuarantineEnvironmentRefused pins the negative control for
+// variant C: if GIT_QUARANTINE_PATH is left in the probe's environment, git
+// refuses with "fatal: prepare: ref updates forbidden inside quarantine environment".
+// walden must classify this environment error as "could not answer" and refuse
+// the whole push in one line, rather than misclassifying it as a ref rejection
+// and silently dropping valid updates.
+func TestProbePrepareQuarantineEnvironmentRefused(t *testing.T) {
+	repoPath := newBareRepo(t)
+	pack, sha := realCommit(t)
+	realizeObjects(t, repoPath, pack)
+
+	updates := []journal.RefUpdate{
+		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: sha},
+	}
+	env := append(cleanGitEnv(), "GIT_DIR=.", "GIT_QUARANTINE_PATH="+filepath.Join(repoPath, "objects"))
+	ok, err := probePrepareWithEnv(context.Background(), repoPath, env, updates)
+	if err == nil {
+		t.Fatalf("probePrepareWithEnv with GIT_QUARANTINE_PATH set succeeded (ok=%v), want a refusal", ok)
+	}
+	if ok {
+		t.Errorf("ok = true alongside an error, want false")
+	}
+	if strings.ContainsAny(err.Error(), "\n\r") {
+		t.Errorf("expected a single-line refusal, got: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "ref updates forbidden inside quarantine environment") {
+		t.Errorf("refusal %q does not mention quarantine environment error", err.Error())
+	}
+	assertNoLocks(t, repoPath)
+}
+
+// TestPrepareRefUpdatesNonexistentObjectWithoutAlternates pins the second
+// negative control for variant C: when incoming objects exist only in the
+// quarantine directory and quarantine is omitted from alternates, git rejects
+// the ref as pointing to a nonexistent object. This is a genuine ref content
+// rejection, so prepareRefUpdates returns an empty accepted set without error.
+func TestPrepareRefUpdatesNonexistentObjectWithoutAlternates(t *testing.T) {
+	repoPath := newBareRepo(t)
+	pack, sha := realCommit(t)
+
+	quarantine := filepath.Join(repoPath, "objects", "tmp_objdir-incoming-x")
+	if err := os.MkdirAll(filepath.Join(quarantine, "pack"), 0o755); err != nil {
+		t.Fatalf("mkdir quarantine: %v", err)
+	}
+	packPath := filepath.Join(quarantine, "pack", "pack-x.pack")
+	if err := os.WriteFile(packPath, pack, 0o644); err != nil {
+		t.Fatalf("write quarantine pack: %v", err)
+	}
+	indexCmd := exec.Command("git", "index-pack", packPath)
+	indexCmd.Env = append(cleanGitEnv(), "GIT_DIR="+repoPath)
+	if out, err := indexCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git index-pack %s: %v\n%s", packPath, err, out)
+	}
+
+	updates := []journal.RefUpdate{
+		{Ref: "refs/heads/main", OldOID: journal.ZeroOID40, NewOID: sha},
+	}
+	// Passing quarantine="" leaves GIT_ALTERNATE_OBJECT_DIRECTORIES unset,
+	// so sha cannot be resolved by git.
+	accepted, err := prepareRefUpdates(context.Background(), repoPath, "", updates)
+	if err != nil {
+		t.Fatalf("prepareRefUpdates: %v, want empty accepted set", err)
+	}
+	if len(accepted) != 0 {
+		t.Fatalf("accepted = %+v, want empty slice because object exists only in quarantine", accepted)
+	}
+	assertNoLocks(t, repoPath)
+}
+
 // TestProbePrepareConcurrentDifferentRefsBothSucceed is a negative control
 // for the lock-collision reclassification: two probes racing two
 // *different* refs must both succeed normally, proving
@@ -472,6 +541,90 @@ func TestIsLockAcquisitionFailure(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isLockAcquisitionFailure(tt.msg); got != tt.want {
 				t.Errorf("isLockAcquisitionFailure(%q) = %v, want %v", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsRefContentRejection pins the exact discrimination between git's
+// content-level ref rejections (which narrow the candidate set) and
+// system/environment errors (which must refuse the whole push).
+func TestIsRefContentRejection(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "stale old_oid: reference already exists",
+			line: "fatal: prepare: cannot lock ref 'refs/heads/main': reference already exists",
+			want: true,
+		},
+		{
+			name: "stale old_oid: unexpected current sha",
+			line: "fatal: prepare: cannot lock ref 'refs/heads/main': is at 1111111111111111111111111111111111111111 but expected 2222222222222222222222222222222222222222",
+			want: true,
+		},
+		{
+			name: "D/F conflict against existing ref",
+			line: "fatal: prepare: cannot lock ref 'refs/heads/feature/x': 'refs/heads/feature' exists; cannot create 'refs/heads/feature/x'",
+			want: true,
+		},
+		{
+			name: "nonexistent object",
+			line: "fatal: prepare: cannot update ref 'refs/heads/main': trying to write ref 'refs/heads/main' with nonexistent object 1111111111111111111111111111111111111111",
+			want: true,
+		},
+		{
+			name: "cannot update the ref variant",
+			line: "fatal: prepare: cannot update the ref 'refs/heads/main': some error",
+			want: true,
+		},
+		{
+			name: "delete missing ref",
+			line: "fatal: prepare: cannot delete ref 'refs/heads/main': reference is missing",
+			want: true,
+		},
+		{
+			name: "batch collision",
+			line: "fatal: prepare: cannot process 'refs/heads/a' and 'refs/heads/a/x' at the same time",
+			want: true,
+		},
+		{
+			name: "multiple updates for ref in batch",
+			line: "fatal: prepare: multiple updates for ref 'refs/heads/main' not allowed",
+			want: true,
+		},
+		{
+			name: "quarantine environment error is not a content rejection",
+			line: "fatal: prepare: ref updates forbidden inside quarantine environment",
+			want: false,
+		},
+		{
+			name: "out of memory is not a content rejection",
+			line: "fatal: prepare: out of memory",
+			want: false,
+		},
+		{
+			name: "unable to read object is not a content rejection",
+			line: "fatal: prepare: unable to read object 1111111111111111111111111111111111111111",
+			want: false,
+		},
+		{
+			name: "update fatal is not a prepare fatal",
+			line: "fatal: cannot lock ref 'refs/heads/main': reference already exists",
+			want: false,
+		},
+		{
+			name: "empty string",
+			line: "",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRefContentRejection(tt.line); got != tt.want {
+				t.Errorf("isRefContentRejection(%q) = %v, want %v", tt.line, got, tt.want)
 			}
 		})
 	}

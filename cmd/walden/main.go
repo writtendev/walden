@@ -437,6 +437,11 @@ func runPreReceive(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		return err
 	}
 	if req.Journal == nil {
+		// In journal-less mode, walden skips journalPush and its ref
+		// validation probe (including directory/file conflict refusal).
+		// With no journal to maintain, there is no journal record to lie
+		// about what git applies, so git's native handling is allowed to
+		// proceed unmodified.
 		return nil
 	}
 	return journalPush(ctx, req, time.Now)

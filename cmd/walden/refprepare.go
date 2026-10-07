@@ -3,10 +3,13 @@
 // journal only that subset -- leaving git to refuse the rest, in its own
 // words, exactly as it would if walden asked nothing at all.
 //
-// One shape of push is refused outright instead, before git is asked
-// anything: one naming two refs in a directory/file conflict
-// (refuseDirFileConflict below). That is WALD-128's 2026-09-28 amendment,
-// and it is the only case where walden is deliberately stricter than git.
+// One shape of push is refused outright instead when a journal is configured,
+// before git is asked anything: one naming two refs in a directory/file
+// conflict (refuseDirFileConflict below). That is WALD-128's 2026-09-28
+// amendment, and one of three places where walden is deliberately stricter
+// than git (alongside refusing git push --atomic and refusing on lock
+// acquisition collision). In journal-less mode, where there is no journal
+// record to lie, walden leaves the push to git's native handling.
 //
 // The instrument is `git update-ref --stdin`'s start/prepare/abort
 // sub-protocol: `prepare` validates a whole batch of ref updates --
@@ -133,9 +136,13 @@ func prepareRefUpdates(ctx context.Context, repoPath, quarantine string, updates
 // that one is not this function's to find, and probePrepare already
 // refuses it as an ordinary per-ref no.
 //
-// This is the one place walden is deliberately stricter than git, and the
-// one place it declines a push git would apply (WALD-128's 2026-09-28
-// amendment, as decided on 2026-10-02). Two shapes land here, and the
+// This is one of three places walden is deliberately stricter than git, and
+// one of two where it declines a push git would apply (alongside refusing
+// git push --atomic, and refusing on transient lock acquisition collisions;
+// WALD-128's 2026-09-28 amendment, as decided on 2026-10-02). It runs only
+// when a journal is configured; in journal-less mode, there is no journal
+// record to lie, so git's native partial application is allowed to proceed.
+// Two shapes land here, and the
 // reason they get the same answer is that walden has nothing it can ask
 // about either one:
 //

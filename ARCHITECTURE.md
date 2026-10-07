@@ -103,7 +103,10 @@ Consequence, and the core promise, stated in both directions:
   success, the journal already knows about every ref move that produced it.
 - **The journal knows about no ref move that did not happen.** If `pre-receive`
   cannot determine that git will actually apply a ref update, it refuses
-  rather than journal a guess.
+  rather than journal a guess. (Two concurrent pushes to the same ref inside
+  the ~50–150 ms journal round trip remain a known residual race where git's
+  subsequent ref write can fail after the journal append succeeds; WALD-129's
+  replay rule detects and refuses that inapplicable transition on replay.)
 
 The second direction is the harder one, and it is not a corollary of the
 first: git's own per-ref checks — a directory/file conflict between two ref
@@ -126,6 +129,16 @@ refuses the whole push in one line rather than risk under-claiming, which is
 the worse direction of the two: a client retrying a refused push loses
 nothing, but a journal that has under-claimed a ref move is not one a replay
 can trust.
+
+Because the prepared transaction is aborted before journaling to release ref
+locks (holding ref locks across the network round trip would risk leaking
+`.lock` files indefinitely on process death), the window between the probe's
+check and git's write spans the journal round trip (~50–150 ms). Two
+concurrent pushes to the same ref inside that window can both pass the probe,
+with the loser's git ref write failing after its journal append succeeded.
+WALD-129 defines the replay rule that detects this discrepancy from the
+journal itself and refuses the inapplicable transition, making the residual
+harmless.
 
 `prepare` is blind to the four `receive.deny*` policy knobs
 (`denyDeletes`, `denyNonFastForwards`, `denyCurrentBranch`,
@@ -156,16 +169,19 @@ statement: **walden does not support `git push --atomic`.** The same push
 without `--atomic` is served normally, and gets the refs that apply plus
 git's own per-ref refusal for the ones that don't.
 
-The one push walden refuses outright, and the one place it is deliberately
-stricter than git: **a push naming two refs that conflict as a directory
+Alongside refusing `--atomic` pushes and refusing on lock-acquisition
+collisions, the third place walden is deliberately stricter than git: **when a
+journal is configured, a push naming two refs that conflict as a directory
 and a file** — `refs/heads/feature` and `refs/heads/feature/x` in the same
 push — **is refused whole, in one line, with nothing journaled for it,
 rather than partly applied.** Where both refs survive the push, git applies
 one of the two and refuses the other, but which one survives has changed
 between git versions, so there is no stable answer for walden to match and
 predicting one would be modelling git's conflict resolution rather than
-asking it. The conflict is found in the push's own ref names — a name that
-is a path prefix of another — never in git's wording for it.
+asking it. In journal-less mode, where there is no journal record to lie
+about the outcome, walden leaves the push to git's native handling. The
+conflict is found in the push's own ref names — a name that is a path
+prefix of another — never in git's wording for it.
 
 Every ref the push names counts, including one it deletes. A push that
 deletes `refs/heads/feature` and creates `refs/heads/feature/x` is a push

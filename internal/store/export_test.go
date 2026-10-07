@@ -20,6 +20,55 @@ func ClassifyRenameFailureForTest(err error, repo string) error {
 	return classifyRenameFailure(err, repo)
 }
 
+// InitBareConfigKeysForTest exposes the repository-config allowlist to the
+// external test package, as a copy, so the drift test can compare git's
+// actual output against it without being able to edit it into agreement.
+func InitBareConfigKeysForTest() map[string]struct{} {
+	out := make(map[string]struct{}, len(initBareConfigKeys))
+	for k := range initBareConfigKeys {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// VouchedScopesForTest exposes the scope filter to the external test package,
+// as a copy, for the same reason.
+func VouchedScopesForTest() map[string]struct{} {
+	out := make(map[string]struct{}, len(vouchedScopes))
+	for k := range vouchedScopes {
+		out[k] = struct{}{}
+	}
+	return out
+}
+
+// VouchProbeArgsForTest exposes the probe's arguments, so the drift test asks
+// git exactly the question VouchRepoConfig asks rather than a hand-copied
+// approximation of it that could drift from the one that runs.
+func VouchProbeArgsForTest() []string {
+	return append([]string(nil), vouchProbeArgs...)
+}
+
+// ReportableKeyForTest exposes reportableKey, so the two things it does to a
+// key on its way to the wire — redacting a subsection, and bounding what is
+// left without cutting a rune in half — can be driven against key names
+// directly. Both are about bytes a repository's config file supplied, and
+// some of those bytes are awkward to get through a real git and a real
+// config file in a test.
+func ReportableKeyForTest(key string) (string, bool) {
+	return reportableKey(key)
+}
+
+// MaxVouchedKeyReportForTest exposes the bound, so a test states the length it
+// is about once.
+const MaxVouchedKeyReportForTest = maxVouchedKeyReport
+
+// FirstUnvouchedKeyForTest exposes firstUnvouchedKey, so its framing
+// assumptions can be driven directly against bytes a git version might
+// produce rather than only through an exec.
+func FirstUnvouchedKeyForTest(out []byte) (string, error) {
+	return firstUnvouchedKey(out)
+}
+
 // sigv4ForTest exposes the unexported SigV4 signer (WALD-19) to the
 // external test package, the same way the rest of this file does for
 // store.go and repo.go. None of it is part of the package's public API;

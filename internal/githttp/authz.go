@@ -179,6 +179,20 @@ func writeAuthRefusal(w http.ResponseWriter, route, repo string, err error) {
 			"contact the operator",
 			store.ErrHookUnavailable,
 		))
+	case errors.Is(err, store.ErrRepoConfigUnvouched):
+		// Passed through to the wire as store wrote it, rather than replaced
+		// with wording true of every ErrRepoConfigUnvouched the way the
+		// ErrHookUnavailable case above has to be. store keeps both of these
+		// refusals path-free in every field — the repository path and git's
+		// stderr go to its own log line — so each can say which failure it
+		// actually was. The one that names a key names the repository's own
+		// key, quoted, with any subsection redacted and the value absent;
+		// store's own log line, written before it returned, has the key
+		// whole. So this line is the shorter of the two, deliberately: it
+		// records which route and repository refused, which store cannot
+		// know.
+		log.Printf("githttp: %s: config unvouched for %q: %v", route, repo, err)
+		writeRefusal(w, http.StatusInternalServerError, err)
 	case errors.Is(err, store.ErrStoreUnavailable):
 		log.Printf("githttp: %s: repository unavailable for %q: %v", route, repo, err)
 		why := "the server could not resolve the repository path"

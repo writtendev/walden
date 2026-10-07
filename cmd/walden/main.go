@@ -419,11 +419,11 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 // network call at all, and exits 0. That is the same guard WALD-43 left
 // behind, unchanged.
 //
-// Deliberately not done here: making exit 0 a durability guarantee. A
-// failed append is returned, and main() already turns a returned error
-// into a non-zero exit -- but proving that exit 0 happens strictly after
-// storage acknowledged both records, across every injected failure point,
-// is WALD-46.
+// A failed append is returned as a one-line refusal, and main() turns
+// that into a non-zero exit -- guaranteeing exit 0 happens strictly after
+// storage has acknowledged both records, and that any failure on the git side
+// or storage side blocks the ref update and leaves no false claims in the
+// journal (WALD-46).
 func runPreReceive(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	updates, err := parseRefUpdates(stdin)
 	if err != nil {

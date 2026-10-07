@@ -20,9 +20,7 @@ import (
 
 // hookRequest is the parsed shape of one pre-receive invocation: the
 // environment resolveHook read (WALD-43, plus WALD-44's quarantine
-// directory) and the ref updates parseRefUpdates read off stdin. WALD-46
-// makes the exit code depend on whether the journal append landed.
-// Nothing else needs to grow.
+// directory) and the ref updates parseRefUpdates read off stdin.
 type hookRequest struct {
 	Repo     string         // WALDEN_REPO
 	DataDir  string         // WALDEN_DATA_DIR
@@ -651,10 +649,11 @@ func isFanoutDir(name string) bool {
 // now is a parameter so a test can hold the clock still; runPreReceive
 // passes time.Now.
 //
-// What this does not own: making exit 0 mean "storage acknowledged both
-// records". A failure here is returned as an ordinary one-line refusal
-// and main() already turns that into a non-zero exit, but proving that is
-// always enough -- across every injected failure point -- is WALD-46.
+// A failure here is returned as an ordinary one-line refusal and main() turns
+// that into a non-zero exit -- guaranteeing exit 0 happens strictly after
+// storage has acknowledged both records, and that any failure on the git side
+// or storage side blocks the ref update and leaves no false claims in the
+// journal (WALD-46).
 func journalPush(ctx context.Context, req *hookRequest, now func() time.Time) error {
 	stream := journal.StreamID(req.Repo)
 	client := store.NewClient(req.Journal)

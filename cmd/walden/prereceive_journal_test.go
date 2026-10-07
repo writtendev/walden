@@ -4,8 +4,8 @@
 // two shapes of push that carry none, and for journal-less mode, which
 // must still touch nothing at all.
 //
-// Deliberately not here: fault injection over storetest rules, or any
-// assertion that the exit code is a durability guarantee. That is WALD-46.
+// Fault injection over storetest rules and the durability guarantee contract
+// are covered in durability_test.go and durability_unix_test.go (WALD-46).
 package main
 
 import (

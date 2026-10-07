@@ -547,12 +547,17 @@ func realPackfile(t *testing.T) []byte {
 // update from its contents, is not enough on its own anymore.
 func realCommit(t *testing.T) (pack []byte, sha string) {
 	t.Helper()
+	return realCommitMsg(t, "packed")
+}
+
+func realCommitMsg(t *testing.T, msg string) (pack []byte, sha string) {
+	t.Helper()
 	work := t.TempDir()
 	for _, args := range [][]string{
 		{"init", "-q", "-b", "main"},
 		{"config", "user.email", "test@example.com"},
 		{"config", "user.name", "Test"},
-		{"commit", "-q", "--allow-empty", "-m", "packed"},
+		{"commit", "-q", "--allow-empty", "-m", msg},
 	} {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = work
